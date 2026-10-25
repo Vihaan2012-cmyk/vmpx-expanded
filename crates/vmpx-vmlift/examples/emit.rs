@@ -88,6 +88,7 @@ fn main() {
         max_expression_nodes: 200_000,
         max_spill_slots: 64,
         import_calls: std::collections::BTreeMap::new(),
+        continuation: None,
     };
     let replacement =
         build_replacement(&exit.registers, &config, CodeAddress(va)).expect("replacement");

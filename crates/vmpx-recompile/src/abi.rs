@@ -57,6 +57,7 @@ fn operation_register_accesses(
     match operation {
         Operation::Label(_)
         | Operation::Jump(_)
+        | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::Return => {}
         Operation::MoveImmediate { destination, .. } | Operation::SpillLoad { destination, .. } => {
@@ -231,6 +232,7 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::MoveImmediate { .. }
         | Operation::Unary { .. }
         | Operation::Jump(_)
+        | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::Return => Ok(()),
     }
@@ -243,7 +245,9 @@ fn operation_successors(
 ) -> Vec<usize> {
     let mut successors = Vec::with_capacity(2);
     match &function.operations[index] {
-        Operation::Return => {}
+        // A return and an absolute tail jump both end the block: control leaves
+        // the function and never reaches the next operation.
+        Operation::Return | Operation::JumpToAddress(_) => {}
         Operation::Jump(label) => {
             if let Some(target) = labels.get(label) {
                 successors.push(*target);
@@ -704,7 +708,7 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
                 Operation::BranchIf { target, .. } => {
                     referenced.insert(*target);
                 }
-                Operation::Return => terminated = true,
+                Operation::Return | Operation::JumpToAddress(_) => terminated = true,
                 _ => {}
             }
         }

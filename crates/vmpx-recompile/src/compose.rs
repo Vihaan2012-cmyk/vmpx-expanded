@@ -309,6 +309,7 @@ impl Renamer {
                 right: self.source(against)?,
             },
             Operation::Jump(v) => Operation::Jump(self.label(v)?),
+            Operation::JumpToAddress(target) => Operation::JumpToAddress(target),
             Operation::BranchIf { condition, target } => Operation::BranchIf {
                 condition,
                 target: self.label(target)?,

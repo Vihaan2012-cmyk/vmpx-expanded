@@ -622,6 +622,34 @@ fn emit_direct_call(
     Ok(())
 }
 
+/// Emits an absolute tail jump. A near `jmp rel32` is used when the target is in
+/// range; otherwise the target is materialised into `RAX` and jumped through,
+/// which cannot fail for any 64-bit address.
+fn emit_absolute_jump(
+    output: &mut Vec<u8>,
+    address: CodeAddress,
+    target: NativeAddress,
+    operation_index: usize,
+) -> Result<(), CompileError> {
+    let next = address
+        .0
+        .checked_add(u64::try_from(output.len()).unwrap_or(0))
+        .and_then(|start| start.checked_add(5))
+        .ok_or(CompileError::CodeSizeOverflow)?;
+    let delta = i128::from(target.0) - i128::from(next);
+    if let Ok(displacement) = i32::try_from(delta) {
+        output.push(0xE9);
+        output.extend_from_slice(&displacement.to_le_bytes());
+        return Ok(());
+    }
+    let _ = operation_index;
+    // movabs rax, target ; jmp rax
+    output.extend_from_slice(&[0x48, 0xB8]);
+    output.extend_from_slice(&target.0.to_le_bytes());
+    output.extend_from_slice(&[0xFF, 0xE0]);
+    Ok(())
+}
+
 fn emit_iat_call(
     output: &mut Vec<u8>,
     address: CodeAddress,
@@ -832,6 +860,9 @@ pub fn compile(
                 })?;
             }
             Operation::Jump(target) => emit_jump(&mut output, *target, &mut fixups),
+            Operation::JumpToAddress(target) => {
+                emit_absolute_jump(&mut output, address, *target, operation_index)?;
+            }
             Operation::BranchIf { condition, target } => {
                 emit_conditional_jump(&mut output, *condition, *target, &mut fixups);
             }

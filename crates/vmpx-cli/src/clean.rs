@@ -786,11 +786,25 @@ pub fn analyze_clean_with_image(
             let inputs = replacement_inputs();
             let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
             for (assignments, exit) in &exit_states {
+                // The VM exit transfers to a protector continuation rather than
+                // returning to the caller. Resolve that continuation so the
+                // replacement can tail-jump into it after restoring the exit
+                // state, which is what makes it a drop-in for the VM entry.
+                let continuation = vmpx_vm::recover_modulo_image_targets(
+                    &pe,
+                    &exit.return_address,
+                    vmpx_vm::ModuloImageTargetLimits::default(),
+                )
+                .ok()
+                .filter(|report| report.complete && report.targets.len() == 1)
+                .map(|report| report.targets[0].va)
+                .map(|va| va.0);
                 let config = vmpx_vmlift::ReplacementConfig {
                     inputs: inputs.clone(),
                     max_expression_nodes: 200_000,
                     max_spill_slots: 64,
                     import_calls: import_calls_for(&pe, exit),
+                    continuation,
                 };
                 match vmpx_vmlift::build_replacement(
                     &exit.registers,

@@ -237,6 +237,9 @@ pub enum Operation {
         right: BinarySource,
     },
     Jump(Label),
+    /// Tail transfer to an absolute native address. The current frame must
+    /// already be torn down; nothing is pushed, so this is a real `jmp`.
+    JumpToAddress(NativeAddress),
     BranchIf {
         condition: Condition,
         target: Label,

@@ -47,6 +47,11 @@ pub struct ReplacementConfig {
     pub max_spill_slots: usize,
     /// Intrinsics that may be lowered to a real imported call.
     pub import_calls: BTreeMap<String, crate::ImportCall>,
+    /// Where the recovered VM exit transfers control instead of returning to the
+    /// original caller. The emitted function ends with a tail jump to this
+    /// address after restoring the exit register state, so the protector's own
+    /// native continuation runs and performs the real return.
+    pub continuation: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -280,7 +285,18 @@ pub fn build_replacement(
             slot: SpillSlot(result_slot),
         });
     }
-    operations.push(Operation::Return);
+    // End by transferring to the recovered continuation, which restores its own
+    // frame and returns to the original caller. Without one the function simply
+    // returns, which is only correct when the exit already targets the caller.
+    // The jump must be a real tail transfer: nothing is pushed, so the
+    // continuation sees exactly the stack the VM exit would have produced.
+    if let Some(target) = config.continuation {
+        operations.push(Operation::JumpToAddress(vmpx_recompile::NativeAddress(
+            target,
+        )));
+    } else {
+        operations.push(Operation::Return);
+    }
 
     // Every nonvolatile register the body writes must be preserved.
     for assignment in &assignments {
@@ -444,6 +460,7 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
             },
         },
         Operation::Jump(label) => Operation::Jump(label),
+        Operation::JumpToAddress(target) => Operation::JumpToAddress(target),
         Operation::BranchIf { condition, target } => Operation::BranchIf { condition, target },
         Operation::Return => Operation::Return,
     }
@@ -493,6 +510,7 @@ mod tests {
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
+            continuation: None,
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -513,6 +531,7 @@ mod tests {
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
+            continuation: None,
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -544,6 +563,7 @@ mod tests {
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
+            continuation: None,
         };
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");
