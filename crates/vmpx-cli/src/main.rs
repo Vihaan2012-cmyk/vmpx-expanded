@@ -71,6 +71,11 @@ enum Command {
         /// Write a versioned JSON unpacking report.
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Also write the analysis image in conventional file layout, which is
+        /// loadable by the Windows loader. The default `output` stays an
+        /// RVA-layout analysis image.
+        #[arg(long)]
+        conventional: Option<PathBuf>,
     },
     /// Profile `VMProtect` evidence and packed/mapped layout.
     Detect {
@@ -852,6 +857,7 @@ fn main() -> Result<()> {
             input,
             output,
             report,
+            conventional,
         } => {
             if input == output {
                 bail!("refusing to overwrite the input file");
@@ -880,6 +886,26 @@ fn main() -> Result<()> {
             }
             for warning in &result.report.warnings {
                 println!("[unpack] warning: {warning}");
+            }
+            if let Some(path) = &conventional {
+                if path == &input || path == &output || report.as_ref() == Some(path) {
+                    bail!("conventional path aliases an input, output, or report file");
+                }
+                let (bytes, layout) = vmpx_rebuild::relayout_conventional(&result.image)?;
+                fs::write(path, &bytes)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                let disk = read_file(path)?;
+                PeImage::parse(&disk).with_context(|| {
+                    format!("conventional output {} failed disk reparse", path.display())
+                })?;
+                println!(
+                    "[unpack] conventional layout: {} bytes, {} sections, {} zero-fill, headers={:#X}",
+                    layout.file_size,
+                    layout.sections.len(),
+                    layout.zero_fill_sections,
+                    layout.size_of_headers
+                );
+                println!("[verify] conventional image reparsed successfully from disk");
             }
             fs::write(&output, &result.image)
                 .with_context(|| format!("failed to write {}", output.display()))?;
