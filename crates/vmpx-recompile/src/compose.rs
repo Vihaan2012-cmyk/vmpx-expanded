@@ -145,37 +145,38 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     }
 
     // Slots are numbered from zero, so `next_slot` is exactly the count needed.
-    // The backend allows one virtual register per physical register. Fragments
-    // run in sequence and each value is spilled before the next begins, so a
-    // physical register reused by several fragments holds one value at a time.
-    // Alias every later virtual register onto the first one for its physical
-    // register and rewrite the operations to match.
-    // Give each physical register exactly one canonical storage id, then point
-    // every dead register at it. A live assignment keeps its own id so a value
-    // is never silently merged with another.
-    let mut canonical: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
-    let mut deduped: Vec<RegisterAssignment> = Vec::new();
+    //
+    // The backend allows one virtual register per physical register, but compose
+    // itself must never merge two values: two fragments that both compute into
+    // `RAX` hold different values and need distinct storage. Renaming is
+    // therefore unconditional, and aliasing happens only where a fragment
+    // explicitly declared a register dead on exit.
+    //
+    // A dead register may only be aliased onto a *live* home for the same
+    // physical register. If no live assignment exists, the dead register keeps
+    // its own storage, so the backend still rejects genuinely ambiguous input
+    // instead of silently merging values.
+    let mut live_home: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| !dead_ids.contains(&assignment.virtual_register.id))
+    {
+        live_home
+            .entry(assignment.physical_register)
+            .or_insert(assignment.virtual_register);
+    }
     let mut aliases: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
+    let mut deduped: Vec<RegisterAssignment> = Vec::new();
     for assignment in &assignments {
-        let physical = assignment.physical_register;
         let id = assignment.virtual_register.id;
-        if dead_ids.contains(&id) {
-            let target = *canonical
-                .entry(physical)
-                .or_insert(assignment.virtual_register);
-            if target.id != id {
-                aliases.insert(id, target);
-            } else {
-                deduped.push(*assignment);
+        match live_home.get(&assignment.physical_register) {
+            Some(home) if dead_ids.contains(&id) && home.id != id => {
+                aliases.insert(id, *home);
             }
-            continue;
+            _ => deduped.push(*assignment),
         }
-        // Live value: keep its own storage, and make it the canonical home.
-        canonical.insert(physical, assignment.virtual_register);
-        deduped.push(*assignment);
     }
     if !aliases.is_empty() {
-        let alias_map = aliases.clone();
         let mut renamer = Renamer {
             registers: aliases,
             slots: BTreeMap::new(),
@@ -188,21 +189,8 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
             .iter()
             .map(|operation| renamer.operation(operation))
             .collect::<Result<Vec<_>, _>>()?;
-        // An aliased register that was itself the canonical home of another
-        // alias chain must still resolve, so fold aliases transitively.
-        for (_, target) in &alias_map {
-            if !deduped
-                .iter()
-                .any(|assignment| assignment.virtual_register.id == target.id)
-                && let Some(source) = assignments
-                    .iter()
-                    .find(|assignment| assignment.virtual_register.id == target.id)
-            {
-                deduped.push(*source);
-            }
-        }
-        assignments = deduped;
     }
+    let assignments = deduped;
     let frame = StackFrame {
         stack_allocation: u32::from(next_slot).saturating_mul(8),
         preserve,

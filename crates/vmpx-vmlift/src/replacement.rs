@@ -20,7 +20,7 @@ use vmpx_vm::{Expr, X64NativeRegister};
 
 use vmpx_recompile::{
     CodeAddress, CompileError, CompiledFunction, Fragment, Function, Operation, PhysicalRegister,
-    RegisterAssignment, SpillSlot, VirtualRegister, compile, compose,
+    RegisterAssignment, SpillSlot, StackFrame, VirtualRegister, compile, compose,
 };
 
 use crate::{ExpressionCodegenConfig, ExpressionInput, lower_expression};
@@ -224,6 +224,35 @@ pub fn build_replacement(
         });
     }
 
+    // The epilogue is composed last and owns the architectural destinations. Its
+    // assignments are live, so compose aliases every dead scratch register onto
+    // them and each physical register ends with exactly one virtual register.
+    let mut epilogue_operations: Vec<Operation> = Vec::new();
+    let mut epilogue_assignments: Vec<RegisterAssignment> = Vec::new();
+    for (index, (register, _)) in ordered.iter().enumerate() {
+        let destination = VirtualRegister::qword(100_000 + u32::try_from(index).unwrap_or(0));
+        epilogue_assignments.push(RegisterAssignment::new(destination, physical_for(register)));
+        epilogue_operations.push(Operation::SpillLoad {
+            destination,
+            slot: SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?),
+        });
+    }
+    epilogue_operations.push(Operation::Return);
+    fragments.push(Fragment {
+        function: Function {
+            operations: epilogue_operations,
+            assignments: epilogue_assignments,
+            frame: StackFrame {
+                stack_allocation: 0,
+                preserve: Vec::new(),
+                call_ready: false,
+                preinitialized_slots: Vec::new(),
+            },
+        },
+        widths: BTreeMap::new(),
+        scratch_dead: BTreeSet::new(),
+    });
+
     let composition = compose(&fragments)?;
     let composed_stack = composition.function.frame.stack_allocation;
     let mut function = composition.function;
@@ -247,56 +276,6 @@ pub fn build_replacement(
         .operations
         .retain(|operation| !matches!(operation, Operation::Return));
 
-    // One epilogue load per register, reading the composed slot the fragment
-    // stored into. The epilogue reuses an existing assignment when the physical
-    // register already has one, because the backend permits a single virtual
-    // register per physical register.
-    let mut epilogue: Vec<Operation> = Vec::new();
-    let mut assignments = function.assignments.clone();
-    let mut emitted = BTreeSet::new();
-    for (index, (register, _)) in ordered.iter().enumerate() {
-        let physical = physical_for(register);
-        let slot = composition
-            .slot_maps
-            .get(index)
-            .and_then(|map| map.get(&0).copied())
-            .and_then(|slot| slot.checked_add(input_slot_count))
-            .ok_or(ReplacementError::TooManyInputs)?;
-        // The epilogue is the only live writer of architectural state. Give it
-        // one fresh virtual register per destination and drop every composed
-        // assignment for that physical register, since all of them belonged to
-        // fragments that have already finished.
-        // Reuse the capture register's storage when the input already occupies
-        // this architectural register; it has been read into a slot by then, so
-        // overwriting it is safe. Otherwise allocate a fresh home.
-        let destination = capture_assignments
-            .iter()
-            .chain(assignments.iter())
-            .find(|assignment| assignment.physical_register == physical)
-            .map(|assignment| assignment.virtual_register)
-            .unwrap_or_else(|| {
-                // No earlier assignment owns this register; the composed ones
-                // belonged to finished fragments, so drop them and take it over.
-                assignments.retain(|assignment| assignment.physical_register != physical);
-                let created = VirtualRegister::qword(100_000 + u32::try_from(index).unwrap_or(0));
-                assignments.push(RegisterAssignment::new(created, physical));
-                created
-            });
-        epilogue.push(Operation::SpillLoad {
-            destination,
-            slot: SpillSlot(slot),
-        });
-        emitted.insert(**register);
-    }
-    epilogue.push(Operation::Return);
-    // The capture block runs first, then every value, then the epilogue.
-    let mut operations = capture;
-    operations.append(&mut function.operations);
-    operations.extend(epilogue);
-    function.operations = operations;
-    let mut all_assignments = capture_assignments;
-    all_assignments.extend(assignments);
-    function.assignments = all_assignments;
     // Size the frame from the highest slot any operation actually touches.
     // Compose sizes it from the slots it renumbered, but the epilogue reads
     // those slots through the composed numbering, so measure the emitted body.
@@ -316,7 +295,7 @@ pub fn build_replacement(
     Ok(Replacement {
         function,
         compiled,
-        emitted,
+        emitted: ordered.iter().map(|(register, _)| **register).collect(),
     })
 }
 
