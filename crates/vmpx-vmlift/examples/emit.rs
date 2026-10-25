@@ -92,6 +92,7 @@ fn main() {
         effects: Vec::new(),
         effect_calls: Vec::new(),
         rflags: None,
+        symbol_rewrites: BTreeMap::new(),
     };
     let replacement =
         build_replacement(&exit.registers, &config, CodeAddress(va)).expect("replacement");

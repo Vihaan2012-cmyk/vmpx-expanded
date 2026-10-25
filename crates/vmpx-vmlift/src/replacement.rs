@@ -64,6 +64,15 @@ pub struct ReplacementConfig {
     /// part of the routine's contract: a caller that branches on a flag it
     /// expects the routine to have set would otherwise read this body's flags.
     pub rflags: Option<Expr>,
+    /// Rewrites applied to every lowered expression before code generation.
+    ///
+    /// This exists because a symbolic input can denote a value that is also
+    /// reachable from the frame. When the entry stub captures the native stack
+    /// pointer into a register it has already saved, that register carries two
+    /// distinct values at different times; the saved copy is loadable from the
+    /// frame, so rewriting the name to that load frees the register and keeps
+    /// both values correct.
+    pub symbol_rewrites: BTreeMap<String, Expr>,
 }
 
 /// One application-observable store the routine must perform.
@@ -319,8 +328,14 @@ pub fn build_replacement(
     // evaluated against the shared frame, so a store that targets the fresh
     // allocation reads the captured allocator result.
     for effect in &config.effects {
-        let address_expression = substitute_effect_bindings(&effect.address, &effect_bindings)?;
-        let value_expression = substitute_effect_bindings(&effect.value, &effect_bindings)?;
+        let address_expression = substitute_effect_bindings(
+            &rewrite_symbols(&effect.address, &config.symbol_rewrites)?,
+            &effect_bindings,
+        )?;
+        let value_expression = substitute_effect_bindings(
+            &rewrite_symbols(&effect.value, &config.symbol_rewrites)?,
+            &effect_bindings,
+        )?;
         let (address_operations, address) = lower_fragment(
             &address_expression,
             &inputs,
@@ -395,7 +410,8 @@ pub fn build_replacement(
         };
         // A value that reads an allocation the routine made must read the
         // result of the one call, not invoke the allocator again.
-        let bound = substitute_effect_bindings(expression, &effect_bindings).map_err(|error| {
+        let rewritten = rewrite_symbols(expression, &config.symbol_rewrites)?;
+        let bound = substitute_effect_bindings(&rewritten, &effect_bindings).map_err(|error| {
             ReplacementError::Lowering {
                 register: **register,
                 message: error.to_string(),
@@ -506,7 +522,10 @@ pub fn build_replacement(
     // materialised while the frame is still addressable, and `POPFQ` does not
     // touch the stack pointer beyond the one qword it consumes.
     if let Some(rflags) = &config.rflags {
-        let bound = substitute_effect_bindings(rflags, &effect_bindings)?;
+        let bound = substitute_effect_bindings(
+            &rewrite_symbols(rflags, &config.symbol_rewrites)?,
+            &effect_bindings,
+        )?;
         let (flag_operations, flag_value) = lower_fragment(
             &bound,
             &inputs,
@@ -594,6 +613,20 @@ pub fn build_replacement(
         compiled,
         emitted: ordered.iter().map(|(register, _)| **register).collect(),
     })
+}
+
+/// Applies caller-supplied symbol rewrites, which replace a symbolic input with
+/// an expression that denotes the same value by another route.
+fn rewrite_symbols(
+    expression: &Expr,
+    rewrites: &BTreeMap<String, Expr>,
+) -> Result<Expr, ReplacementError> {
+    if rewrites.is_empty() {
+        return Ok(expression.clone());
+    }
+    expression
+        .substitute(rewrites)
+        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))
 }
 
 /// Replaces the allocation intrinsics that stand for an effect call's result with
@@ -931,6 +964,7 @@ mod tests {
             effects: Vec::new(),
             effect_calls: Vec::new(),
             rflags: None,
+            symbol_rewrites: BTreeMap::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -955,6 +989,7 @@ mod tests {
             effects: Vec::new(),
             effect_calls: Vec::new(),
             rflags: None,
+            symbol_rewrites: BTreeMap::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -990,6 +1025,7 @@ mod tests {
             effects: Vec::new(),
             effect_calls: Vec::new(),
             rflags: None,
+            symbol_rewrites: BTreeMap::new(),
         };
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");

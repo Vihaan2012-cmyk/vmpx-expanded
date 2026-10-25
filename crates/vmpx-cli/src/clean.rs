@@ -352,6 +352,7 @@ fn handler_metrics(family: &vmpx_vm::RecoveredEntryPathFamily) -> (CleanHandlerM
 fn replacement_inputs(
     pe: &PeImage<'_>,
     entry: &vmpx_vm::VmEntryCandidate,
+    rewrites: &mut BTreeMap<String, vmpx_vm::Expr>,
 ) -> Result<Vec<(String, vmpx_recompile::PhysicalRegister)>, String> {
     use vmpx_recompile::PhysicalRegister;
     use vmpx_vm::X64NativeRegister;
@@ -365,6 +366,48 @@ fn replacement_inputs(
         .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
         .collect();
     // The VM stack root is whatever register the stub captured native RSP into.
+    //
+    // That register already carries `native_<reg>_initial` as an input: the
+    // stub's own entry value. The two are different values that live in the same
+    // register at different times - the stub's entry value is saved on the stack,
+    // and the same register is then overwritten with the captured RSP. Binding
+    // both names to one register would make them equal, which is wrong, and it is
+    // not fixable by picking another register because every architectural
+    // register is already an input.
+    let cursor_name = cursor.symbolic_name();
+    if inputs
+        .iter()
+        .any(|(name, register)| name == cursor_name && *register == physical_for(&cursor))
+    {
+        // The stub saved this register before overwriting it with the captured
+        // stack pointer, and the frame analysis proves which slot holds the saved
+        // value. Rewriting the name to a load from that slot keeps both values
+        // correct while freeing the register for `vsp_initial`.
+        let slot = frame
+            .slots
+            .iter()
+            .find(|slot| {
+                matches!(&slot.source,
+                    vmpx_vm::NativeFrameSource::Register { register }
+                        if register.symbolic_name() == cursor_name)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the stack cursor register {cursor_name} is also a symbolic input and has \
+                     no proven save slot, so `vsp_initial` cannot be bound"
+                )
+            })?;
+        let address = vmpx_vm::Expr::binary(
+            vmpx_vm::BinaryOp::Add,
+            vmpx_vm::Expr::register(vmpx_vm::BitWidth::W64, "vsp_initial"),
+            vmpx_vm::Expr::constant(vmpx_vm::BitWidth::W64, u64::from(slot.frame_offset)),
+        )
+        .map_err(|error| format!("saved-slot address failed: {error}"))?;
+        rewrites.insert(
+            cursor_name.to_owned(),
+            vmpx_vm::Expr::load(vmpx_vm::BitWidth::W64, address),
+        );
+    }
     inputs.push(("vsp_initial".to_owned(), physical_for(&cursor)));
     inputs.sort();
     inputs.dedup();
@@ -873,8 +916,9 @@ pub fn analyze_clean_with_image(
         let mut diagnostics = Vec::new();
         if let Some(next_rva) = next_rva {
             let va = pe.optional.image_base.0 + u64::from(next_rva.0);
+            let mut symbol_rewrites: BTreeMap<String, vmpx_vm::Expr> = BTreeMap::new();
             let inputs = match header_entry_candidate.as_ref() {
-                Some(entry) => match replacement_inputs(&pe, entry) {
+                Some(entry) => match replacement_inputs(&pe, entry, &mut symbol_rewrites) {
                     Ok(inputs) => inputs,
                     Err(error) => {
                         diagnostics.push(error);
@@ -918,6 +962,7 @@ pub fn analyze_clean_with_image(
                         })
                         .collect(),
                     rflags: Some(exit.rflags.clone()),
+                    symbol_rewrites: symbol_rewrites.clone(),
                     effect_calls: effects
                         .calls
                         .iter()
