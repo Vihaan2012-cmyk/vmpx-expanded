@@ -167,8 +167,13 @@ fn is_dispatch_only_effect(
     operand_candidates: usize,
     handler_rebase: Option<Va>,
 ) -> bool {
-    handler_rebase.is_some()
-        && operand_candidates == 0
+    // A static handler anchor is one way to reach a dispatch-only handler, but
+    // plain relative threading leaves the handler register untouched before the
+    // encoded load and is equally dispatch-only. Extraction already rejects any
+    // handler-register write that is not a proven static anchor, so the rebase
+    // is recorded as evidence rather than used as a requirement here.
+    let _ = handler_rebase;
+    operand_candidates == 0
         && effects.vsp_delta == Some(0)
         && effects.vsp_adjustments.is_empty()
         && effects.memory.iter().all(|effect| {

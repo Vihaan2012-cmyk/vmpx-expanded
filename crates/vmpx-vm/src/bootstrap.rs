@@ -374,11 +374,28 @@ impl ConcreteBootstrapMachine {
     }
 }
 
+/// Recognizes the terminal dispatch of a bootstrap trace.
+///
+/// Protector bootstraps dispatch either with an indirect branch through a
+/// register or with the equivalent `push reg; ret` tail, which transfers to the
+/// same register value. Both forms must be accepted, because which one a given
+/// VM instance uses is a mutation, not a semantic difference.
 fn terminal_handler_register(trace: &vmpx_disasm::DirectJumpTrace) -> Option<Register> {
-    let terminal = trace.instructions().last()?.instruction;
-    (terminal.flow_control() == FlowControl::IndirectBranch
-        && terminal.op0_kind() == OpKind::Register)
-        .then(|| terminal.op0_register().full_register())
+    let decoded = trace.instructions().collect::<Vec<_>>();
+    let terminal = decoded.last()?.instruction;
+    if terminal.flow_control() == FlowControl::IndirectBranch
+        && terminal.op0_kind() == OpKind::Register
+    {
+        return Some(terminal.op0_register().full_register());
+    }
+    // `push reg; ret` is an indirect jump through that register.
+    if terminal.mnemonic() == Mnemonic::Ret && terminal.op_count() == 0 {
+        let previous = decoded.get(decoded.len().checked_sub(2)?)?.instruction;
+        if previous.mnemonic() == Mnemonic::Push && previous.op0_kind() == OpKind::Register {
+            return Some(previous.op0_register().full_register());
+        }
+    }
+    None
 }
 
 fn writes_full_register(
