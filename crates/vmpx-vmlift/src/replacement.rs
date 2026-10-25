@@ -52,6 +52,31 @@ pub struct ReplacementConfig {
     /// address after restoring the exit register state, so the protector's own
     /// native continuation runs and performs the real return.
     pub continuation: Option<u64>,
+    /// Observable effects the virtualized routine performs, in execution order.
+    /// A replacement that omitted them would compute the right registers and
+    /// still be wrong, so they are emitted before the epilogue restores state.
+    pub effects: Vec<EffectStore>,
+    /// Imported calls whose result must be available to the effects. Each entry
+    /// performs one call at the start of the routine and binds the result to
+    /// the intrinsic name that stands for it.
+    pub effect_calls: Vec<EffectCall>,
+}
+
+/// One application-observable store the routine must perform.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectStore {
+    pub address: Expr,
+    pub value: Expr,
+    pub width: vmpx_vm::BitWidth,
+}
+
+/// One imported call the routine must perform, with its result bound to
+/// `result_intrinsic`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectCall {
+    pub result_intrinsic: String,
+    pub call: crate::ImportCall,
+    pub arguments: Vec<Expr>,
 }
 
 #[derive(Debug, Error)]
@@ -321,15 +346,27 @@ pub fn build_replacement(
         .iter()
         .any(|operation| matches!(operation, Operation::Call { .. }));
     // A call-ready frame reserves 32 bytes of shadow space below the spill area,
-    // so the allocation must cover it as well.
-    let shadow = if call_ready { 32 } else { 0 };
+    // so the allocation must cover it as well. Win64 also requires RSP to be
+    // 16-byte aligned at every call site: the return address pushed by the
+    // caller leaves RSP congruent to 8, so the pushes plus the allocation must
+    // bring it back to 0. Pad the allocation up when it does not.
+    let mut stack_allocation = u32::from(highest.saturating_add(1)).saturating_mul(8);
+    if call_ready {
+        stack_allocation = stack_allocation.saturating_add(32);
+        let pushes = u32::try_from(preserve.len())
+            .map_err(|_| ReplacementError::TooManyInputs)?
+            .saturating_mul(8);
+        let total = pushes.saturating_add(stack_allocation);
+        let residual = (8_u32.wrapping_sub(total)) & 0xF;
+        if residual != 0 {
+            stack_allocation = stack_allocation.saturating_add(residual);
+        }
+    }
     let function = Function {
         operations,
         assignments,
         frame: StackFrame {
-            stack_allocation: u32::from(highest.saturating_add(1))
-                .saturating_mul(8)
-                .saturating_add(shadow),
+            stack_allocation,
             preserve,
             call_ready,
             preinitialized_slots: (0..input_slot_count).map(SpillSlot).collect(),
@@ -511,6 +548,8 @@ mod tests {
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
             continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -532,6 +571,8 @@ mod tests {
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
             continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -564,6 +605,8 @@ mod tests {
             max_spill_slots: 32,
             import_calls: BTreeMap::new(),
             continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
         };
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");

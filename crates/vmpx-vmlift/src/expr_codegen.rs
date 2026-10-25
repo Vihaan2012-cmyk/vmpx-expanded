@@ -633,7 +633,7 @@ pub fn lower_expression(
     };
     context.lower(expression)?;
     context.operations.push(Operation::Return);
-    let stack_allocation = u32::try_from(context.peak_slot)
+    let mut stack_allocation = u32::try_from(context.peak_slot)
         .ok()
         .and_then(|slots| slots.checked_mul(8))
         .ok_or(ExpressionCodegenError::StorageIdOverflow)?;
@@ -652,6 +652,19 @@ pub fn lower_expression(
         .operations
         .iter()
         .any(|operation| matches!(operation, Operation::Call { .. }));
+    if has_call {
+        // Win64 requires 16-byte RSP alignment at a call site. The caller's
+        // return address leaves RSP congruent to 8, so the preserved-register
+        // pushes plus this allocation must sum to 8 modulo 16.
+        let pushes = u32::try_from(preserve.len())
+            .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?
+            .saturating_mul(8);
+        let total = pushes.saturating_add(stack_allocation);
+        let residual = (8_u32.wrapping_sub(total)) & 0xF;
+        if residual != 0 {
+            stack_allocation = stack_allocation.saturating_add(residual);
+        }
+    }
     let function = Function {
         operations: context.operations,
         assignments: context.assignments,

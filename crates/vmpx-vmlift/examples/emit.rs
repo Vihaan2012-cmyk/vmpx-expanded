@@ -89,6 +89,8 @@ fn main() {
         max_spill_slots: 64,
         import_calls: std::collections::BTreeMap::new(),
         continuation: None,
+        effects: Vec::new(),
+        effect_calls: Vec::new(),
     };
     let replacement =
         build_replacement(&exit.registers, &config, CodeAddress(va)).expect("replacement");

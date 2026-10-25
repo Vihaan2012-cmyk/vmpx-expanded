@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use vmpx_detect::{DetectionVerdict, ImageLayout, ProtectionReport, detect_vmprotect};
-use vmpx_disasm::{CfgLimits, recover_cfg};
+use vmpx_disasm::{CfgLimits, DirectJumpTraceLimits, recover_cfg};
 use vmpx_pe::{PeImage, PeKind, Rva};
 use vmpx_rebuild::{relayout_conventional, validate_for_loader};
 use vmpx_unpack::{UnpackLimits, UnpackReport, unpack_to_mapped_image};
@@ -343,23 +343,32 @@ fn handler_metrics(family: &vmpx_vm::RecoveredEntryPathFamily) -> (CleanHandlerM
 }
 
 /// Symbolic input name to the architectural register that carries it on entry.
-fn replacement_inputs() -> Vec<(String, vmpx_recompile::PhysicalRegister)> {
+///
+/// `vsp_initial` is the native RSP captured by the entry stub immediately before
+/// the bootstrap reserves its own frame (`mov r11,rsp` at the PE entry stub's
+/// call site). It is therefore a live architectural value at the stub, not a
+/// fresh root: a replacement that reads the wrong register would compute every
+/// stack-relative address from the wrong base.
+fn replacement_inputs(
+    pe: &PeImage<'_>,
+    entry: &vmpx_vm::VmEntryCandidate,
+) -> Result<Vec<(String, vmpx_recompile::PhysicalRegister)>, String> {
     use vmpx_recompile::PhysicalRegister;
     use vmpx_vm::X64NativeRegister;
+    let frame = vmpx_vm::analyze_x64_native_frame(pe, entry.rva, DirectJumpTraceLimits::default())
+        .map_err(|error| format!("native frame analysis failed: {error}"))?;
+    let cursor = frame
+        .cursor_architectural_register
+        .ok_or_else(|| "entry stub has no proven stack-cursor register".to_owned())?;
     let mut inputs: Vec<(String, PhysicalRegister)> = X64NativeRegister::ALL
         .iter()
         .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
         .collect();
-    // The VM stack root and the original return address have no architectural
-    // register of their own; the frame pointer carries both.
-    inputs.push(("vsp_initial".to_owned(), PhysicalRegister::Rbp));
-    inputs.push((
-        "native_return_address_initial".to_owned(),
-        PhysicalRegister::Rbp,
-    ));
+    // The VM stack root is whatever register the stub captured native RSP into.
+    inputs.push(("vsp_initial".to_owned(), physical_for(&cursor)));
     inputs.sort();
     inputs.dedup();
-    inputs
+    Ok(inputs)
 }
 
 fn physical_for(register: &vmpx_vm::X64NativeRegister) -> vmpx_recompile::PhysicalRegister {
@@ -519,7 +528,9 @@ pub fn analyze_clean_with_image(
         candidate.source == VmEntrySource::PeEntryPoint
             && candidate.rva == pe.optional.address_of_entry_point
     });
+    let mut header_entry_candidate: Option<vmpx_vm::VmEntryCandidate> = None;
     if let Some(entry) = header_entry {
+        header_entry_candidate = Some(entry.clone());
         if pe.coff.characteristics & IMAGE_FILE_DLL == 0 {
             blockers.push(
                 "generic finite input-domain recovery for an executable entry is not implemented"
@@ -822,7 +833,16 @@ pub fn analyze_clean_with_image(
         let mut diagnostics = Vec::new();
         if let Some(next_rva) = next_rva {
             let va = pe.optional.image_base.0 + u64::from(next_rva.0);
-            let inputs = replacement_inputs();
+            let inputs = match header_entry_candidate.as_ref() {
+                Some(entry) => match replacement_inputs(&pe, entry) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        diagnostics.push(error);
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
             let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
             for (assignments, exit) in exit_states.iter().chain(nested_exits.iter()) {
                 // The VM exit transfers to a protector continuation rather than
@@ -844,6 +864,8 @@ pub fn analyze_clean_with_image(
                     max_spill_slots: 64,
                     import_calls: import_calls_for(&pe, exit),
                     continuation,
+                    effects: Vec::new(),
+                    effect_calls: Vec::new(),
                 };
                 match vmpx_vmlift::build_replacement(
                     &exit.registers,

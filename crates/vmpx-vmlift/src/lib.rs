@@ -21,7 +21,9 @@ pub use expr_codegen::{
     ExpressionCodegenConfig, ExpressionCodegenError, ExpressionInput, LoweredExpression,
     compile_expression, lower_expression,
 };
-pub use replacement::{Replacement, ReplacementConfig, ReplacementError, build_replacement};
+pub use replacement::{
+    EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementError, build_replacement,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 
