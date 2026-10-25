@@ -647,6 +647,36 @@ mod tests {
     }
 
     #[test]
+    fn relayout_keeps_every_directory_file_backed() {
+        let image = pe_with_sections(&[
+            (".text", 0x1000, 0x400, 0x1000, 0x400, 0x6000_0020),
+            (".rdata", 0x2000, 0x200, 0x2000, 0x200, 0x4000_0040),
+            (".reloc", 0x3000, 0x40, 0x3000, 0x40, 0x4200_0040),
+            (".rsrc", 0x4000, 0x100, 0x4000, 0x100, 0x4000_0040),
+        ]);
+        let mut image = image;
+        // Point the resource directory at .rsrc so the check has real work.
+        let optional = 0x84 + 20;
+        image[optional + 112 + 2 * 8..optional + 112 + 2 * 8 + 4]
+            .copy_from_slice(&0x4000_u32.to_le_bytes());
+        image[optional + 112 + 2 * 8 + 4..optional + 112 + 2 * 8 + 8]
+            .copy_from_slice(&0x100_u32.to_le_bytes());
+        let (output, _) = relayout_conventional(&image).expect("relayout succeeds");
+        let reparsed = PeImage::parse(&output).expect("output reparses");
+        for directory in reparsed
+            .directories
+            .iter()
+            .filter(|directory| directory.is_present())
+        {
+            assert!(
+                reparsed.rva_to_file_offset(Rva(directory.address)).is_ok(),
+                "{} directory must stay file-backed",
+                directory.name
+            );
+        }
+    }
+
+    #[test]
     fn overlapping_sections_are_rejected() {
         let image = pe_with_sections(&[
             (".text", 0x1000, 0x2000, 0x1000, 0x200, 0x6000_0020),
