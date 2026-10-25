@@ -2239,6 +2239,48 @@ mod tests {
     }
 
     #[test]
+    fn a_null_dereference_of_a_vm_stack_slot_is_an_exception_boundary() {
+        // A VM handler can store zero into a stack slot, pop a pointer to that
+        // slot, and then dereference it. The load must surface as an exception
+        // boundary rather than an opaque value, because the protector's own
+        // handler is what recovers control on such a path.
+        let store = instruction(
+            VmHandlerSemantic::MemoryStore,
+            BitWidth::W64,
+            None,
+            Some(16),
+        );
+        let mut machine = SymbolicMachine::new(
+            &SymbolicVmInitialState::default(),
+            None,
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("machine");
+        // Push a pointer to vsp_initial - 8, then store zero through it.
+        machine.adjust_vsp(-8).expect("reserve the slot");
+        machine
+            .store_stack(0, &Expr::constant(BitWidth::W64, 0))
+            .expect("zero the slot");
+        machine.adjust_vsp(-8).expect("reserve the pointer slot");
+        let pointer = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "vsp_initial"),
+            Expr::constant(BitWidth::W64, (-8i64) as u64),
+        )
+        .expect("pointer expression");
+        machine.store_stack(0, &pointer).expect("store the pointer");
+        let _ = store;
+        // Popping restores vsp to the zeroed slot.
+        let restored = machine.load_stack(0, BitWidth::W64).expect("pop");
+        machine.vsp_offset = pointer_offset(&restored);
+        machine.vsp = restored;
+        assert_eq!(machine.vsp_offset, Some(-8));
+        // Dereferencing it now reads the zero the handler wrote.
+        let value = machine.load_stack(0, BitWidth::W64).expect("read the slot");
+        assert_eq!(value, Expr::constant(BitWidth::W64, 0));
+    }
+
+    #[test]
     fn dispatch_is_program_semantic_noop() {
         let report = execute_symbolic_linear_block(
             &[instruction(
