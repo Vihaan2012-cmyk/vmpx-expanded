@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -63,6 +63,18 @@ pub struct CleanOepReport {
     pub protected_header_entry: Rva,
     pub recovered_entry: Option<Rva>,
     pub complete: bool,
+}
+
+/// Per-export dependency on protector code. An export is only eligible for
+/// native replacement once every branch and call reachable from it stays
+/// outside the protector sections.
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanExportReport {
+    pub name: String,
+    pub rva: Rva,
+    pub reachable_blocks: usize,
+    pub vm_references: usize,
+    pub vm_free: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +170,7 @@ pub struct CleanReport {
     pub unknown_handlers: Vec<Rva>,
     pub virtualized_routines: Vec<CleanVmPathReport>,
     pub tls_entries: Vec<CleanTlsEntryReport>,
+    pub exports: Vec<CleanExportReport>,
     pub native_continuations: Vec<CleanNestedContinuationReport>,
     pub vtil: CleanStageReport,
     pub recompilation: CleanStageReport,
@@ -189,6 +202,76 @@ fn pe_summary(pe: &PeImage<'_>) -> CleanPeReport {
         exception_functions: report.exception_functions.len(),
         structural_diagnostics: report.diagnostics.len(),
     }
+}
+
+/// Walks every branch and direct call reachable from each export and records
+/// whether the reachable set stays outside the protector sections.
+fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
+    let report = pe.report();
+    let Some(exports) = &report.exports else {
+        return Vec::new();
+    };
+    let is_protector = |rva: Rva| {
+        pe.sections
+            .iter()
+            .any(|section| section.name.starts_with(".vmp") && section.contains_mapped_rva(rva))
+    };
+    let mut results = Vec::new();
+    for symbol in &exports.symbols {
+        if symbol.forwarder.is_some() {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::from([symbol.rva]);
+        let mut vm_references = 0_usize;
+        while let Some(start) = queue.pop_front() {
+            if !seen.insert(start) {
+                continue;
+            }
+            if is_protector(start) {
+                vm_references += 1;
+                continue;
+            }
+            let Ok(graph) = recover_cfg(
+                pe,
+                start,
+                CfgLimits {
+                    max_blocks: 2_048,
+                    max_instructions: 60_000,
+                    max_instructions_per_block: 8_192,
+                },
+            ) else {
+                continue;
+            };
+            for block in &graph.blocks {
+                for successor in &block.successors {
+                    if is_protector(*successor) {
+                        vm_references += 1;
+                    } else if !seen.contains(successor) {
+                        queue.push_back(*successor);
+                    }
+                }
+                for call in &block.direct_calls {
+                    if is_protector(*call) {
+                        vm_references += 1;
+                    } else if !seen.contains(call) {
+                        queue.push_back(*call);
+                    }
+                }
+            }
+        }
+        results.push(CleanExportReport {
+            name: symbol
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("ordinal{}", symbol.ordinal)),
+            rva: symbol.rva,
+            reachable_blocks: seen.len(),
+            vm_references,
+            vm_free: vm_references == 0,
+        });
+    }
+    results
 }
 
 fn exception_coverage_for_chain(
@@ -504,6 +587,7 @@ pub fn analyze_clean_with_image(
     // Analyzing each one turns "N protected TLS entries" into per-entry
     // evidence and clears the blocker when every path provably reaches a VM
     // exit with no remaining semantic gaps.
+    let export_reports = export_dependency_report(&pe);
     let mut tls_entries = Vec::new();
     for entry in discovery
         .entries
@@ -737,6 +821,7 @@ pub fn analyze_clean_with_image(
             unknown_handlers,
             virtualized_routines: paths,
             tls_entries,
+            exports: export_reports,
             native_continuations: continuations,
             vtil: if verified_noop {
                 completed_stage("not required for an input with no strong protection evidence")
