@@ -5,7 +5,7 @@ use serde::Serialize;
 use vmpx_detect::{DetectionVerdict, ImageLayout, ProtectionReport, detect_vmprotect};
 use vmpx_disasm::{CfgLimits, recover_cfg};
 use vmpx_pe::{PeImage, PeKind, Rva};
-use vmpx_rebuild::relayout_conventional;
+use vmpx_rebuild::{relayout_conventional, validate_for_loader};
 use vmpx_unpack::{UnpackLimits, UnpackReport, unpack_to_mapped_image};
 use vmpx_vm::{
     BitWidth, EntryPathRecoveryLimits, EntryProfileRecoveryLimits, Expr, ModuloImageTargetLimits,
@@ -114,6 +114,9 @@ pub struct CleanLayoutReport {
     pub size_of_headers: Option<u32>,
     pub sections: Option<usize>,
     pub zero_fill_sections: Option<usize>,
+    /// Result of walking every directory the Windows loader consumes.
+    pub loader_valid: Option<bool>,
+    pub loader_summary: Option<String>,
     pub diagnostics: Vec<String>,
 }
 
@@ -522,6 +525,8 @@ pub fn analyze_clean_with_image(
                 size_of_headers: None,
                 sections: None,
                 zero_fill_sections: None,
+                loader_valid: None,
+                loader_summary: None,
                 diagnostics: vec![
                     "input is already a conventional PE file; no relayout was required".to_owned(),
                 ],
@@ -530,20 +535,52 @@ pub fn analyze_clean_with_image(
         )
     } else {
         match relayout_conventional(&mapped) {
-            Ok((bytes, report)) => (
-                CleanLayoutReport {
-                    attempted: true,
-                    file_size: Some(report.file_size),
-                    size_of_headers: Some(report.size_of_headers),
-                    sections: Some(report.sections.len()),
-                    zero_fill_sections: Some(report.zero_fill_sections),
-                    diagnostics: vec![
-                        "conventional layout preserves every section RVA; it is not devirtualized"
-                            .to_owned(),
-                    ],
-                },
-                Some(bytes),
-            ),
+            Ok((bytes, report)) => {
+                let validation = validate_for_loader(&bytes);
+                let (loader_valid, loader_summary, mut layout_diagnostics) = match &validation {
+                    Ok(validation) => (
+                        Some(true),
+                        Some(format!(
+                            "{} imports in {} modules, {} exports, {} TLS callbacks, {} relocations",
+                            validation.import_symbols,
+                            validation.import_modules,
+                            validation.exports,
+                            validation.tls_callbacks,
+                            validation.relocation_entries
+                        )),
+                        vec![
+                            "conventional layout preserves every section RVA; it is not devirtualized"
+                                .to_owned(),
+                        ],
+                    ),
+                    Err(error) => (
+                        Some(false),
+                        Some(error.to_string()),
+                        vec![format!("loader validation failed: {error}")],
+                    ),
+                };
+                if validation.is_err() {
+                    errors.push(loader_summary.clone().unwrap_or_default());
+                }
+                layout_diagnostics.push(
+                    "the loaded memory image is byte-identical to the analysis image; only \
+                     SizeOfRawData and PointerToRawData change"
+                        .to_owned(),
+                );
+                (
+                    CleanLayoutReport {
+                        attempted: true,
+                        file_size: Some(report.file_size),
+                        size_of_headers: Some(report.size_of_headers),
+                        sections: Some(report.sections.len()),
+                        zero_fill_sections: Some(report.zero_fill_sections),
+                        loader_valid,
+                        loader_summary,
+                        diagnostics: layout_diagnostics,
+                    },
+                    Some(bytes),
+                )
+            }
             Err(error) => {
                 errors.push(format!("conventional layout failed: {error}"));
                 (
@@ -553,6 +590,8 @@ pub fn analyze_clean_with_image(
                         size_of_headers: None,
                         sections: None,
                         zero_fill_sections: None,
+                        loader_valid: Some(false),
+                        loader_summary: Some(error.to_string()),
                         diagnostics: vec![error.to_string()],
                     },
                     None,

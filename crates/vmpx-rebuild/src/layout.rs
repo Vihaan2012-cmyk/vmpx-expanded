@@ -7,6 +7,8 @@
 //! relocation, or code address needs rewriting.
 
 use thiserror::Error;
+
+use crate::IMAGE_SCN_MEM_EXECUTE;
 use vmpx_pe::{FileOffset, IMAGE_DIRECTORY_ENTRY_SECURITY, PeError, PeImage, PeKind, Rva, Section};
 
 const COFF_HEADER_SIZE: u64 = 20;
@@ -414,6 +416,168 @@ pub fn relayout_conventional(input: &[u8]) -> Result<(Vec<u8>, RelayoutReport), 
             zero_fill_sections,
         },
     ))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoaderValidationReport {
+    pub sections: usize,
+    pub import_modules: usize,
+    pub import_symbols: usize,
+    pub exports: usize,
+    pub tls_callbacks: usize,
+    pub relocation_blocks: usize,
+    pub relocation_entries: usize,
+    pub entry_executable: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum LoaderValidationError {
+    #[error("failed to parse PE: {0}")]
+    Pe(#[from] PeError),
+
+    #[error("{what} RVA {rva:?} is not backed by file data")]
+    NotFileBacked { what: &'static str, rva: Rva },
+
+    #[error("{what} RVA {rva:?} is not inside an executable section")]
+    NotExecutable { what: &'static str, rva: Rva },
+
+    #[error("import module {index} has an implausible name {name:?}")]
+    ImplausibleModule { index: usize, name: String },
+
+    #[error("import {module} symbol {index} has no name")]
+    MissingSymbolName { module: String, index: usize },
+
+    #[error("arithmetic overflow while validating {what}")]
+    Overflow { what: &'static str },
+}
+
+/// Validates every loader-consumed structure in a candidate output image.
+///
+/// A structurally parseable PE can still fail to load: an entry point in a
+/// zero-fill section, an import name outside file data, or a relocation target
+/// that is not mapped will all fault during loading. This walks each directory
+/// the loader itself walks and requires every referenced byte to be present.
+///
+/// # Errors
+///
+/// Returns the first structure that a loader could not resolve.
+#[allow(clippy::too_many_lines)]
+pub fn validate_for_loader(input: &[u8]) -> Result<LoaderValidationReport, LoaderValidationError> {
+    let pe = PeImage::parse(input)?;
+    let executable_section = |rva: Rva| {
+        pe.sections.iter().any(|section| {
+            section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 && section.contains_mapped_rva(rva)
+        })
+    };
+    let entry = pe.optional.address_of_entry_point;
+    if !executable_section(entry) {
+        return Err(LoaderValidationError::NotExecutable {
+            what: "entry point",
+            rva: entry,
+        });
+    }
+    pe.rva_to_file_offset(entry)
+        .map_err(|_| LoaderValidationError::NotFileBacked {
+            what: "entry point",
+            rva: entry,
+        })?;
+
+    let report = pe.report();
+    let mut import_symbols = 0_usize;
+    for (index, module) in report.imports.iter().enumerate() {
+        if !module.name.to_ascii_lowercase().ends_with(".dll") {
+            return Err(LoaderValidationError::ImplausibleModule {
+                index,
+                name: module.name.clone(),
+            });
+        }
+        for (symbol_index, symbol) in module.entries.iter().enumerate() {
+            if symbol.name.is_none() && symbol.ordinal.is_none() {
+                return Err(LoaderValidationError::MissingSymbolName {
+                    module: module.name.clone(),
+                    index: symbol_index,
+                });
+            }
+            import_symbols += 1;
+        }
+    }
+
+    let mut tls_callbacks = 0_usize;
+    if let Some(tls) = &report.tls {
+        let callback_rva = pe
+            .optional
+            .image_base
+            .checked_rva_of(tls.address_of_callbacks)
+            .ok_or(LoaderValidationError::NotFileBacked {
+                what: "TLS callback array",
+                rva: Rva(0),
+            })?;
+        pe.rva_to_file_offset(callback_rva)
+            .map_err(|_| LoaderValidationError::NotFileBacked {
+                what: "TLS callback array",
+                rva: callback_rva,
+            })?;
+        for callback in &tls.callbacks {
+            let rva = pe.optional.image_base.checked_rva_of(*callback).ok_or(
+                LoaderValidationError::NotFileBacked {
+                    what: "TLS callback",
+                    rva: Rva(0),
+                },
+            )?;
+            pe.rva_to_file_offset(rva)
+                .map_err(|_| LoaderValidationError::NotFileBacked {
+                    what: "TLS callback",
+                    rva,
+                })?;
+            tls_callbacks += 1;
+        }
+    }
+
+    let mut relocation_blocks = 0_usize;
+    let mut relocation_entries = 0_usize;
+    for block in &report.relocations {
+        relocation_blocks += 1;
+        for entry in &block.entries {
+            let Some(rva) = entry.target_rva else {
+                continue;
+            };
+            relocation_entries += 1;
+            pe.rva_to_file_offset(rva)
+                .map_err(|_| LoaderValidationError::NotFileBacked {
+                    what: "relocation target",
+                    rva,
+                })?;
+        }
+    }
+
+    let exports = report
+        .exports
+        .as_ref()
+        .map_or(0, |exports| exports.symbols.len());
+    if let Some(exports) = &report.exports {
+        for symbol in &exports.symbols {
+            if symbol.forwarder.is_some() {
+                continue;
+            }
+            pe.rva_to_file_offset(symbol.rva).map_err(|_| {
+                LoaderValidationError::NotFileBacked {
+                    what: "export",
+                    rva: symbol.rva,
+                }
+            })?;
+        }
+    }
+
+    Ok(LoaderValidationReport {
+        sections: pe.sections.len(),
+        import_modules: report.imports.len(),
+        import_symbols,
+        exports,
+        tls_callbacks,
+        relocation_blocks,
+        relocation_entries,
+        entry_executable: true,
+    })
 }
 
 /// True when the image already stores each section at its virtual address.

@@ -730,6 +730,16 @@ fn main() -> Result<()> {
             for diagnostic in &clean.layout.diagnostics {
                 println!("[layout] {diagnostic}");
             }
+            if let Some(summary) = &clean.layout.loader_summary {
+                println!(
+                    "[layout] loader validation {}: {summary}",
+                    if clean.layout.loader_valid == Some(true) {
+                        "passed"
+                    } else {
+                        "FAILED"
+                    }
+                );
+            }
             if let Some(bytes) = &conventional
                 && let Some(path) = &reconstructed
             {
@@ -892,12 +902,21 @@ fn main() -> Result<()> {
                     bail!("conventional path aliases an input, output, or report file");
                 }
                 let (bytes, layout) = vmpx_rebuild::relayout_conventional(&result.image)?;
+                let validation = vmpx_rebuild::validate_for_loader(&bytes)?;
                 fs::write(path, &bytes)
                     .with_context(|| format!("failed to write {}", path.display()))?;
                 let disk = read_file(path)?;
                 PeImage::parse(&disk).with_context(|| {
                     format!("conventional output {} failed disk reparse", path.display())
                 })?;
+                println!(
+                    "[unpack] loader validation: {} imports in {} modules, {} exports, {} TLS callbacks, {} relocations",
+                    validation.import_symbols,
+                    validation.import_modules,
+                    validation.exports,
+                    validation.tls_callbacks,
+                    validation.relocation_entries
+                );
                 println!(
                     "[unpack] conventional layout: {} bytes, {} sections, {} zero-fill, headers={:#X}",
                     layout.file_size,

@@ -197,6 +197,7 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
     assert_eq!(json["layout"]["attempted"], true);
     assert_eq!(json["layout"]["sections"], 27);
     assert_eq!(json["layout"]["zero_fill_sections"], 1);
+    assert_eq!(json["layout"]["loader_valid"], true);
     assert_eq!(json["validation"]["output_reparsed"], true);
 
     let bytes = fs::read(&reconstructed).expect("reconstructed image exists");

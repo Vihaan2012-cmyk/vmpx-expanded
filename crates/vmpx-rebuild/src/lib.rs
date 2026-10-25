@@ -7,8 +7,9 @@ pub use import_table::{
     plan_import_reconstruction, serialize_import_table,
 };
 pub use layout::{
-    LayoutError, RelayoutReport, SectionLayout, is_conventional_layout, is_discardable,
-    is_rva_layout, normalize_characteristics, relayout_conventional,
+    LayoutError, LoaderValidationError, LoaderValidationReport, RelayoutReport, SectionLayout,
+    is_conventional_layout, is_discardable, is_rva_layout, normalize_characteristics,
+    relayout_conventional, validate_for_loader,
 };
 
 use thiserror::Error;

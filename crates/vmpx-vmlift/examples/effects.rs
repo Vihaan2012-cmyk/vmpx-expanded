@@ -26,32 +26,52 @@ fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let bytes = fs::read(&args[1]).expect("read");
     let pe = PeImage::parse(&bytes).expect("parse");
-    let discovery = discover_vm_entries(&pe,
-        VmDiscoveryLimits { scan_executable_stubs: false, ..Default::default() }).expect("d");
+    let discovery = discover_vm_entries(
+        &pe,
+        VmDiscoveryLimits {
+            scan_executable_stubs: false,
+            ..Default::default()
+        },
+    )
+    .expect("d");
     let domains = BTreeMap::from([(
         "native_rdx_initial".to_owned(),
         (0..=3).map(|r| Expr::constant(BitWidth::W64, r)).collect(),
     )]);
     let limits = EntryPathRecoveryLimits {
         chain: VmProfileExplorerLimits {
-            max_segments: 32, max_instructions_per_segment: 2048, max_total_instructions: 8192,
-            ..Default::default() },
+            max_segments: 32,
+            max_instructions_per_segment: 2048,
+            max_total_instructions: 8192,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    for entry in discovery.entries.iter().filter(|e| e.source == VmEntrySource::PeEntryPoint) {
-        let Ok(family) = recover_entry_paths(&pe, entry, &domains, limits) else { continue };
+    for entry in discovery
+        .entries
+        .iter()
+        .filter(|e| e.source == VmEntrySource::PeEntryPoint)
+    {
+        let Ok(family) = recover_entry_paths(&pe, entry, &domains, limits) else {
+            continue;
+        };
         for path in &family.paths {
             let reason = path.assignments.get("native_rdx_initial").copied();
-            if reason != Some(1) { continue }
+            if reason != Some(1) {
+                continue;
+            }
             println!("=== reason {reason:?} stop {:?}", path.chain.stop_reason);
-            let mut reports: Vec<&vmpx_vm::SymbolicVmExecutionReport> = vec![&family.entry_profile.symbolic];
+            let mut reports: Vec<&vmpx_vm::SymbolicVmExecutionReport> =
+                vec![&family.entry_profile.symbolic];
             for s in &path.chain.segments {
                 reports.extend(s.symbolic.iter());
                 reports.extend(s.boundary_symbolic.iter());
                 reports.extend(s.transition_pop.iter());
             }
             for (i, r) in reports.iter().enumerate() {
-                if r.external_writes.is_empty() { continue }
+                if r.external_writes.is_empty() {
+                    continue;
+                }
                 println!(" report {i}: {} writes", r.external_writes.len());
                 for w in &r.external_writes {
                     println!("    {} <- {}", describe(&w.address), describe(&w.value));
@@ -61,7 +81,9 @@ fn main() {
             if let Some(exit) = &path.native_exit {
                 for (reg, v) in &exit.registers {
                     let d = describe(v);
-                    if d.starts_with("const") || d.starts_with("reg") { println!("   {reg:?} = {d}"); }
+                    if d.starts_with("const") || d.starts_with("reg") {
+                        println!("   {reg:?} = {d}");
+                    }
                 }
                 println!("   ret = {}", describe(&exit.return_address));
                 println!("   rflags = {}", describe(&exit.rflags));
