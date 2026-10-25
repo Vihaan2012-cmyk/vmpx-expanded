@@ -1,9 +1,14 @@
 mod import_table;
+mod layout;
 
 pub use import_table::{
     ImportModuleSpec, ImportReconstructionPlan, ImportSlotRemap, ImportTableError, ImportTarget,
     SerializedDirectoryRange, SerializedImportTable, install_import_directories,
     plan_import_reconstruction, serialize_import_table,
+};
+pub use layout::{
+    LayoutError, RelayoutReport, SectionLayout, is_conventional_layout, is_discardable,
+    is_rva_layout, normalize_characteristics, relayout_conventional,
 };
 
 use thiserror::Error;
