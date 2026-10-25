@@ -1,0 +1,15 @@
+[package]
+name = "vmpx-unpack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+lzma-rs.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+vmpx-pe = { path = "../vmpx-pe" }
+
+[lints]
+workspace = true

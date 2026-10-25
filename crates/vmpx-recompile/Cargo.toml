@@ -1,0 +1,13 @@
+[package]
+name = "vmpx-recompile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "vmpx-detect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+vmpx-pe = { path = "../vmpx-pe" }
+
+[lints]
+workspace = true
+
