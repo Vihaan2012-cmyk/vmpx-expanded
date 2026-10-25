@@ -408,6 +408,10 @@ fn replacement_inputs(
             vmpx_vm::Expr::load(vmpx_vm::BitWidth::W64, address),
         );
     }
+    // A rewritten symbol is no longer an input: its value comes from the frame,
+    // so keeping it here would make the capture block store one register into two
+    // slots and silently give both the same value.
+    inputs.retain(|(name, _)| !rewrites.contains_key(name));
     inputs.push(("vsp_initial".to_owned(), physical_for(&cursor)));
     inputs.sort();
     inputs.dedup();
