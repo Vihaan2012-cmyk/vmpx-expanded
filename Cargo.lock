@@ -386,6 +386,7 @@ dependencies = [
  "vmpx-disasm",
  "vmpx-pe",
  "vmpx-rebuild",
+ "vmpx-recompile",
  "vmpx-unpack",
  "vmpx-vm",
  "vmpx-vmlift",

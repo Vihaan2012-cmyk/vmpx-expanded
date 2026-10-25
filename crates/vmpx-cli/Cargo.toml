@@ -21,6 +21,7 @@ vmpx-detect = { path = "../vmpx-detect" }
 vmpx-disasm = { path = "../vmpx-disasm" }
 vmpx-vm = { path = "../vmpx-vm" }
 vmpx-rebuild = { path = "../vmpx-rebuild" }
+vmpx-recompile = { path = "../vmpx-recompile" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
 
 [lints]

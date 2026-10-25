@@ -342,6 +342,48 @@ fn handler_metrics(family: &vmpx_vm::RecoveredEntryPathFamily) -> (CleanHandlerM
     )
 }
 
+/// Symbolic input name to the architectural register that carries it on entry.
+fn replacement_inputs() -> Vec<(String, vmpx_recompile::PhysicalRegister)> {
+    use vmpx_recompile::PhysicalRegister;
+    use vmpx_vm::X64NativeRegister;
+    let mut inputs: Vec<(String, PhysicalRegister)> = X64NativeRegister::ALL
+        .iter()
+        .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+        .collect();
+    // The VM stack root and the original return address have no architectural
+    // register of their own; the frame pointer carries both.
+    inputs.push(("vsp_initial".to_owned(), PhysicalRegister::Rbp));
+    inputs.push((
+        "native_return_address_initial".to_owned(),
+        PhysicalRegister::Rbp,
+    ));
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
+fn physical_for(register: &vmpx_vm::X64NativeRegister) -> vmpx_recompile::PhysicalRegister {
+    use vmpx_recompile::PhysicalRegister as P;
+    use vmpx_vm::X64NativeRegister as R;
+    match register {
+        R::Rax => P::Rax,
+        R::Rbx => P::Rbx,
+        R::Rcx => P::Rcx,
+        R::Rdx => P::Rdx,
+        R::Rbp => P::Rbp,
+        R::Rsi => P::Rsi,
+        R::Rdi => P::Rdi,
+        R::R8 => P::R8,
+        R::R9 => P::R9,
+        R::R10 => P::R10,
+        R::R11 => P::R11,
+        R::R12 => P::R12,
+        R::R13 => P::R13,
+        R::R14 => P::R14,
+        R::R15 => P::R15,
+    }
+}
+
 fn stage(diagnostic: impl Into<String>) -> CleanStageReport {
     CleanStageReport {
         complete: false,
@@ -405,6 +447,8 @@ pub fn analyze_clean_with_image(
     let mut warnings = protection.warnings.clone();
     let mut errors = Vec::new();
     let mut paths = Vec::new();
+    // Exact native exit states retained for the recompilation stage.
+    let mut exit_states: Vec<(BTreeMap<String, u64>, vmpx_vm::NativeExitState)> = Vec::new();
     let mut continuations = Vec::new();
     let mut handlers = CleanHandlerMetrics {
         unique: 0,
@@ -457,6 +501,9 @@ pub fn analyze_clean_with_image(
                             issues.extend(path.chain.diagnostics.clone());
                         }
                         let exception_coverage = exception_coverage_for_chain(&pe, &path.chain);
+                        if let Some(exit) = path.native_exit.as_ref() {
+                            exit_states.push((path.assignments.clone(), exit.clone()));
+                        }
                         paths.push(CleanVmPathReport {
                             assignments: path.assignments.clone(),
                             segments: path.chain.segments.len(),
@@ -669,6 +716,69 @@ pub fn analyze_clean_with_image(
             "{unresolved_tls} loader-reachable TLS VM entry/entries remain semantically unresolved"
         ));
     }
+    // Native recompilation: emit a replacement function for every path whose
+    // exit state is fully concrete and lowerable. Emission does not authorise
+    // writing output, because the entry redirect and the remaining blockers are
+    // still unproven.
+    let mut recompilation = stage("no path reached a lowerable exit state");
+    if protection.verdict != DetectionVerdict::NoStrongEvidence {
+        let next_rva = vmpx_rebuild::next_section_rva(&mapped).ok();
+        let mut emitted = 0_u64;
+        let mut total_bytes = 0_u64;
+        let mut emitted_section = None;
+        let mut diagnostics = Vec::new();
+        if let Some(next_rva) = next_rva {
+            let va = pe.optional.image_base.0 + u64::from(next_rva.0);
+            let inputs = replacement_inputs();
+            let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
+            for (assignments, exit) in &exit_states {
+                let config = vmpx_vmlift::ReplacementConfig {
+                    inputs: inputs.clone(),
+                    max_expression_nodes: 200_000,
+                    max_spill_slots: 64,
+                };
+                match vmpx_vmlift::build_replacement(
+                    &exit.registers,
+                    &config,
+                    vmpx_recompile::CodeAddress(va + total_bytes),
+                ) {
+                    Ok(replacement) => {
+                        total_bytes += u64::try_from(replacement.compiled.bytes.len()).unwrap_or(0);
+                        functions.push((assignments.clone(), replacement.compiled.bytes.clone()));
+                        emitted += 1;
+                    }
+                    Err(error) => diagnostics.push(format!(
+                        "path {assignments:?} has no native replacement: {error}"
+                    )),
+                }
+            }
+            if !functions.is_empty() {
+                emitted_section = Some(functions);
+            }
+        }
+        if emitted == 0 {
+            recompilation = CleanStageReport {
+                complete: false,
+                metrics: BTreeMap::new(),
+                diagnostics,
+            };
+        } else {
+            recompilation = CleanStageReport {
+                complete: false,
+                metrics: BTreeMap::from([
+                    ("emitted".to_owned(), emitted),
+                    ("bytes".to_owned(), total_bytes),
+                ]),
+                diagnostics: {
+                    diagnostics.push(format!(
+                        "{emitted} native replacement function(s) emitted; the VM entry is not redirected because the remaining proofs are open"
+                    ));
+                    diagnostics
+                },
+            };
+        }
+        let _ = emitted_section;
+    }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
         && protection.image_layout == ImageLayout::ConventionalFile;
     if verified_noop {
@@ -828,11 +938,7 @@ pub fn analyze_clean_with_image(
             } else {
                 stage("semantic routine has not reached a complete exception-aware CFG")
             },
-            recompilation: if verified_noop {
-                completed_stage("not required for a verified no-op")
-            } else {
-                stage("no complete routine is eligible for native code generation")
-            },
+            recompilation,
             reconstruction: if verified_noop {
                 completed_stage("conventional input can be preserved byte-for-byte")
             } else {
