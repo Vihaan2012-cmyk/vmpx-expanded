@@ -6,7 +6,7 @@ use vmpx_disasm::{CfgLimits, decode_one, recover_cfg};
 use vmpx_pe::{PeError, PeImage, RuntimeFunction, Rva, UnwindInfo, Va};
 
 use crate::{
-    BitWidth, Expr, ExprKind, HandlerCodecRecoveryReport, HandlerMemoryRegion, RecoveryStatus,
+    Expr, HandlerCodecRecoveryReport, HandlerMemoryRegion, RecoveryStatus,
     SymbolicVmExecutionReport, VmHandlerSemantic,
 };
 
@@ -147,13 +147,6 @@ fn is_zero_test(instruction: &iced_x86::Instruction, register: Register) -> bool
                     && immediate(instruction, 0) == Some(0))
         }
         _ => false,
-    }
-}
-
-fn constant_expr(expr: &Expr) -> Option<u64> {
-    match expr.kind {
-        ExprKind::Const { value } => Some(value),
-        _ => None,
     }
 }
 
@@ -530,9 +523,7 @@ pub fn analyze_exception_stack_sled(pe: &PeImage<'_>, handler: Rva) -> Exception
 }
 
 fn resolve_stack_sled_continuation(
-    pe: &PeImage<'_>,
     sled: &ExceptionStackSledReport,
-    symbolic: Option<&SymbolicVmExecutionReport>,
 ) -> ExceptionContinuationResolution {
     let mut resolution = ExceptionContinuationResolution {
         schema_version: 1,
@@ -551,89 +542,20 @@ fn resolve_stack_sled_continuation(
         );
         return resolution;
     }
-    let Some(symbolic) = symbolic else {
-        resolution
-            .diagnostics
-            .push("no exact pre-fault symbolic state was supplied".to_owned());
-        return resolution;
-    };
-    resolution.seed = sled
-        .seed_context_offset
-        .and_then(|offset| symbolic.context_cells.get(&offset).cloned());
-    resolution.cursor = sled
-        .cursor_context_offset
-        .and_then(|offset| symbolic.context_cells.get(&offset).cloned());
-    let Some(seed) = resolution.seed.as_ref() else {
-        resolution
-            .diagnostics
-            .push("pre-fault state does not contain the classified seed field".to_owned());
-        return resolution;
-    };
-    let continuation = match constant_expr(seed) {
-        Some(0) => {
-            let Some(cursor) = resolution.cursor.clone() else {
-                resolution.diagnostics.push(
-                    "zero seed requires the cursor value, but its context field is absent"
-                        .to_owned(),
-                );
-                return resolution;
-            };
-            // The zero-seed path does not dispatch anywhere. The handler fills
-            // `[cursor - 8*n]` with RET gadgets and pivots there, so each RET
-            // walks the stack pointer up until it reaches the caller's saved
-            // return address. What the resolver can prove is therefore the
-            // unwind, not a target address: record the cursor cell when it is
-            // tracked, and mark the resolution as an unwind either way.
-            match symbolic.read_tracked_memory(cursor.clone(), BitWidth::W64) {
-                Ok(value) => {
-                    resolution.source = Some(ExceptionContinuationSource::CursorMemory);
-                    value
-                }
-                Err(error) => {
-                    resolution
-                        .diagnostics
-                        .push(format!("zero-seed cursor cell is not tracked: {error}"));
-                    resolution.source = Some(ExceptionContinuationSource::ZeroSeedUnwind);
-                    resolution.cursor = Some(cursor);
-                    resolution.status = RecoveryStatus::Recovered;
-                    return resolution;
-                }
-            }
-        }
-        Some(_) => {
-            resolution.source = Some(ExceptionContinuationSource::NonZeroSeed);
-            seed.clone()
-        }
-        None => {
-            resolution.diagnostics.push(
-                "continuation seed remains symbolic; zero and nonzero paths cannot be conflated"
-                    .to_owned(),
-            );
-            return resolution;
-        }
-    };
-    resolution.continuation_rva = constant_expr(&continuation)
-        .and_then(|value| pe.optional.image_base.checked_rva_of(Va(value)));
-    resolution.continuation = Some(continuation);
-    // A continuation that is not image-backed is not a dispatch target. The
-    // zero-seed path fills the sled with RET gadgets and unwinds through the
-    // original stack, so a concrete non-code value there means the explicit
-    // target is still unknown rather than recovered.
-    if resolution.continuation_rva.is_none() {
-        resolution.diagnostics.push(format!(
-            "continuation value {} is not image-backed; no native dispatch target was proven",
-            constant_expr(
-                resolution
-                    .continuation
-                    .as_ref()
-                    .expect("continuation is set")
-            )
-            .map_or_else(|| "symbolic".to_owned(), |value| format!("{value:#X}"))
-        ));
-        resolution.status = RecoveryStatus::PartiallyRecovered;
-        return resolution;
-    }
-    resolution.status = RecoveryStatus::Recovered;
+    // The sled's classified offsets are displacements from `CONTEXT.Rsp`, which is
+    // the *native* stack pointer recorded in the exception record. They address
+    // native stack slots, not the VM's context array: `context_cells` is keyed by
+    // the VM's own context layout, a different region of memory entirely. Reading
+    // a VM context cell here would silently substitute unrelated data for the
+    // seed and cursor, so the lookup is refused unless the native stack is
+    // actually modelled.
+    resolution.diagnostics.push(
+        "the language handler reads its seed and cursor from native stack slots \
+         (CONTEXT.Rsp + 0xC0 and +0xC8); the symbolic state models the VM stack, \
+         not the native stack, so neither field can be read soundly"
+            .to_owned(),
+    );
+    resolution.status = RecoveryStatus::PartiallyRecovered;
     resolution
 }
 
@@ -647,7 +569,7 @@ fn resolve_stack_sled_continuation(
 pub fn analyze_vm_memory_exception_coverage_with_state(
     pe: &PeImage<'_>,
     handler: &HandlerCodecRecoveryReport,
-    symbolic: Option<&SymbolicVmExecutionReport>,
+    _symbolic: Option<&SymbolicVmExecutionReport>,
 ) -> Result<VmMemoryExceptionCoverageReport, PeError> {
     let mut diagnostics = Vec::new();
     if handler
@@ -708,7 +630,7 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
         .collect::<Vec<_>>();
     let continuation_resolutions = stack_sled_handlers
         .iter()
-        .map(|sled| resolve_stack_sled_continuation(pe, sled, symbolic))
+        .map(resolve_stack_sled_continuation)
         .collect::<Vec<_>>();
     let continuation_recovered = !continuation_resolutions.is_empty()
         && continuation_resolutions
@@ -756,6 +678,41 @@ mod tests {
     use iced_x86::code_asm::*;
 
     use super::*;
+
+    #[test]
+    fn refuses_to_read_sled_fields_from_vm_context_cells() {
+        // The sled's classified offsets are displacements from CONTEXT.Rsp, which
+        // is the native stack pointer. The VM's context cells are a different
+        // memory region, so reading one there would substitute unrelated data for
+        // the seed and cursor. A fully classified sled must still refuse.
+        let sled = ExceptionStackSledReport {
+            schema_version: 1,
+            handler: Rva(0x1000),
+            status: RecoveryStatus::Recovered,
+            cfg_blocks: 11,
+            context_rsp_field_offset: Some(0x98),
+            seed_context_offset: Some(0xC0),
+            cursor_context_offset: Some(0xC8),
+            unwind_boundary_delta: Some(240),
+            return_gadget: Some(Rva(0x2000)),
+            return_disposition: Some(1),
+            confidence: 100,
+            evidence: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let resolution = resolve_stack_sled_continuation(&sled);
+        assert_eq!(resolution.status, RecoveryStatus::PartiallyRecovered);
+        assert!(resolution.seed.is_none());
+        assert!(resolution.cursor.is_none());
+        assert!(
+            resolution
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("native stack slots")),
+            "the refusal must name the coordinate mismatch: {:?}",
+            resolution.diagnostics
+        );
+    }
 
     const IMAGE_BASE: u64 = 0x1_4000_0000;
     const CODE_RVA: u32 = 0x1000;
