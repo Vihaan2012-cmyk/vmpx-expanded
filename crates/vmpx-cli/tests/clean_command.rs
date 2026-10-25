@@ -200,6 +200,16 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
     assert_eq!(json["layout"]["loader_valid"], true);
     assert_eq!(json["validation"]["output_reparsed"], true);
 
+    // The recompilation stage must emit real native code for every path whose
+    // exit state is fully lowerable. Both viable DLL-reason paths qualify.
+    assert_eq!(json["recompilation"]["metrics"]["emitted"], 2);
+    assert!(
+        json["recompilation"]["metrics"]["bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 512),
+        "emitted code must be more than a stub"
+    );
+
     let bytes = fs::read(&reconstructed).expect("reconstructed image exists");
     assert_eq!(
         u64::try_from(bytes.len()).expect("image length fits"),
