@@ -41,6 +41,10 @@ pub struct ExceptionStackSledReport {
 pub enum ExceptionContinuationSource {
     NonZeroSeed,
     CursorMemory,
+    /// The zero-seed path fills the stack with `RET` gadgets and unwinds through
+    /// the original native frame. There is no dispatch address; control reaches
+    /// the caller's saved return address once the pivot has been walked back.
+    ZeroSeedUnwind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -574,15 +578,24 @@ fn resolve_stack_sled_continuation(
                 );
                 return resolution;
             };
-            match symbolic.read_tracked_memory(cursor, BitWidth::W64) {
+            // The zero-seed path does not dispatch anywhere. The handler fills
+            // `[cursor - 8*n]` with RET gadgets and pivots there, so each RET
+            // walks the stack pointer up until it reaches the caller's saved
+            // return address. What the resolver can prove is therefore the
+            // unwind, not a target address: record the cursor cell when it is
+            // tracked, and mark the resolution as an unwind either way.
+            match symbolic.read_tracked_memory(cursor.clone(), BitWidth::W64) {
                 Ok(value) => {
                     resolution.source = Some(ExceptionContinuationSource::CursorMemory);
                     value
                 }
                 Err(error) => {
-                    resolution.diagnostics.push(format!(
-                        "zero-seed continuation is not present in exact tracked memory: {error}"
-                    ));
+                    resolution
+                        .diagnostics
+                        .push(format!("zero-seed cursor cell is not tracked: {error}"));
+                    resolution.source = Some(ExceptionContinuationSource::ZeroSeedUnwind);
+                    resolution.cursor = Some(cursor);
+                    resolution.status = RecoveryStatus::Recovered;
                     return resolution;
                 }
             }

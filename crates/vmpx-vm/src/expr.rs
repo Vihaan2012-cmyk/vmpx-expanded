@@ -580,6 +580,19 @@ fn simplify_intrinsic(width: BitWidth, name: String, arguments: Vec<Expr>) -> Ex
     {
         return Expr::constant(width, flags);
     }
+    // `vm_flags_<op>_wN` names a plain arithmetic operation on a flag word. When
+    // an argument is symbolic the constant evaluator above cannot fold it, but
+    // the intrinsic is still just that operation, so rewriting it keeps pointer
+    // arithmetic affine. Leaving it opaque would make every address derived from
+    // it unanalyzable, which in turn turns a valid stack load into an
+    // unresolvable one.
+    if let Some((operation, operand_width)) = vm_flags_operation(&name)
+        && operand_width == width
+        && let [left, right] = arguments.as_slice()
+        && let Ok(rewritten) = Expr::binary(operation, left.clone(), right.clone())
+    {
+        return rewritten.simplify();
+    }
     if width == BitWidth::W64
         && let Some(constants) = constants.as_deref()
         && let Some(value) = evaluate_x86_wide_integer_result(&name, &arguments, constants)
@@ -638,6 +651,27 @@ fn evaluate_x86_wide_integer_result(
         return Some((remainder << bits) | quotient);
     }
     None
+}
+
+/// The binary operation and width a `vm_flags_<op>_wN` intrinsic denotes.
+fn vm_flags_operation(name: &str) -> Option<(BinaryOp, BitWidth)> {
+    let (operation, suffix) = if let Some(suffix) = name.strip_prefix("vm_flags_add_w") {
+        (BinaryOp::Add, suffix)
+    } else if let Some(suffix) = name.strip_prefix("vm_flags_nor_w") {
+        (BinaryOp::And, suffix)
+    } else if let Some(suffix) = name.strip_prefix("vm_flags_nand_w") {
+        (BinaryOp::Or, suffix)
+    } else {
+        return None;
+    };
+    let width = match suffix {
+        "8" => BitWidth::W8,
+        "16" => BitWidth::W16,
+        "32" => BitWidth::W32,
+        "64" => BitWidth::W64,
+        _ => return None,
+    };
+    Some((operation, width))
 }
 
 fn evaluate_vm_flags(name: &str, arguments: &[u64]) -> Option<u64> {
