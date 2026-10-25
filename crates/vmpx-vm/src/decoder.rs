@@ -118,6 +118,11 @@ pub enum LinearDecodeStop {
     BytecodeError,
     RepeatedState,
     InstructionLimit,
+    /// The virtual instruction pointer left the section that held the initial
+    /// bytecode. Protector bytecode is confined to one section per profile, so
+    /// escaping it proves the decoder state has drifted and the decoded suffix
+    /// must not be trusted.
+    BytecodeSectionEscape,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

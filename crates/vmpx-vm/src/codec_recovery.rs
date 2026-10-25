@@ -822,6 +822,23 @@ pub fn recover_and_decode_linear_vm_stream(
     let mut cumulative_vsp_delta = Some(0_i64);
     let mut specs: BTreeMap<Va, VmHandlerDecodeSpec> = BTreeMap::new();
     let mut handler_recoveries = BTreeMap::new();
+    // Protector bytecode is fetched from an executable section. Containment is
+    // only meaningful when the stream starts in one: a stream whose initial VIP
+    // lands in a non-executable section (an unwind table, resource blob, or
+    // zero-fill range) has a wrong seed or decode offset, so decoding it would
+    // report data as a recovered program.
+    let bytecode_origin_section = pe
+        .optional
+        .image_base
+        .checked_rva_of(initial_state.vip)
+        .and_then(|rva| {
+            pe.sections
+                .iter()
+                .find(|section| {
+                    section.contains_mapped_rva(rva) && section.characteristics & 0x2000_0000 != 0
+                })
+                .map(|section| section.index)
+        });
 
     for _ in 0..max_instructions {
         if !seen.insert(state) {
@@ -833,6 +850,41 @@ pub fn recover_and_decode_linear_vm_stream(
                 None,
                 handler_recoveries,
             ));
+        }
+        // Protector bytecode stays inside the executable section that holds the
+        // entry stream. A VIP that starts outside one, or leaves it, means the
+        // decoder state has drifted, so the stream is refused instead of being
+        // reported as a decoded program.
+        if bytecode_origin_section.is_none() {
+            return Ok(linear_report(
+                Vec::new(),
+                state,
+                cumulative_vsp_delta,
+                LinearDecodeStop::BytecodeSectionEscape,
+                None,
+                handler_recoveries,
+            ));
+        }
+        if let Some(origin) = bytecode_origin_section {
+            let escaped = pe
+                .optional
+                .image_base
+                .checked_rva_of(state.vip)
+                .is_none_or(|rva| {
+                    !pe.sections
+                        .iter()
+                        .any(|section| section.index == origin && section.contains_mapped_rva(rva))
+                });
+            if escaped {
+                return Ok(linear_report(
+                    instructions,
+                    state,
+                    cumulative_vsp_delta,
+                    LinearDecodeStop::BytecodeSectionEscape,
+                    None,
+                    handler_recoveries,
+                ));
+            }
         }
         let spec = if let Some(spec) = specs.get(&state.handler) {
             spec.clone()
