@@ -5,7 +5,7 @@
 //! directly. This module renames those three namespaces into disjoint ranges
 //! before splicing, which is what a whole-routine replacement needs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     Address, BinarySource, CallTarget, Function, Label, Operation, RegisterAssignment, ShiftCount,
@@ -17,6 +17,10 @@ pub struct Fragment {
     pub function: Function,
     /// Widths of the virtual registers this fragment defines.
     pub widths: BTreeMap<u32, Width>,
+    /// Registers whose value is dead when the fragment ends. Two fragments may
+    /// name the same physical register here, and compose will alias them so the
+    /// backend's one-virtual-register-per-physical-register rule still holds.
+    pub scratch_dead: BTreeSet<crate::PhysicalRegister>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +49,8 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     let mut assignments: Vec<RegisterAssignment> = Vec::new();
     let mut fragment_starts = Vec::with_capacity(fragments.len());
     let mut slot_maps = Vec::with_capacity(fragments.len());
+    // Composed virtual-register ids that some fragment declared dead on exit.
+    let mut dead_ids: BTreeSet<u32> = BTreeSet::new();
     let mut next_register = 0_u32;
     let mut next_slot = 0_u16;
     let mut next_label = 0_u32;
@@ -86,6 +92,19 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
             operations.push(renamed);
         }
         if std::env::var_os("VMPX_COMPOSE_DEBUG").is_some() {
+            let dups: Vec<_> = {
+                let mut seen = BTreeMap::new();
+                let mut d = Vec::new();
+                for a in &assignments {
+                    if let Some(prev) = seen.insert(a.physical_register, a.virtual_register.id) {
+                        d.push((a.physical_register, prev, a.virtual_register.id));
+                    }
+                }
+                d
+            };
+            eprintln!("after fragment: dups={dups:?}");
+        }
+        if std::env::var_os("VMPX_COMPOSE_DEBUG").is_some() {
             eprintln!(
                 "frag start={} assigns={} next_reg={}",
                 fragment_starts.last().copied().unwrap_or(0),
@@ -94,6 +113,15 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
             );
         }
 
+        for assignment in &fragment.function.assignments {
+            if fragment
+                .scratch_dead
+                .contains(&assignment.physical_register)
+                && let Some(composed) = renamer.registers.get(&assignment.virtual_register.id)
+            {
+                dead_ids.insert(composed.id);
+            }
+        }
         next_register = renamer.next_register;
         next_slot = renamer.next_slot;
         slot_maps.push(
@@ -117,6 +145,61 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     }
 
     // Slots are numbered from zero, so `next_slot` is exactly the count needed.
+    // The backend allows one virtual register per physical register. Fragments
+    // run in sequence and each value is spilled before the next begins, so a
+    // physical register reused by several fragments holds one value at a time.
+    // Alias every later virtual register onto the first one for its physical
+    // register and rewrite the operations to match.
+    let mut canonical: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
+    let mut aliases: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
+    let mut deduped: Vec<RegisterAssignment> = Vec::new();
+    for assignment in &assignments {
+        let physical = assignment.physical_register;
+        let id = assignment.virtual_register.id;
+        match canonical.get(&physical) {
+            // Alias only when this register was declared dead by its fragment.
+            // A live value keeps its own assignment even if that leaves two
+            // virtual registers on one physical register; the backend then
+            // rejects it rather than silently dropping a value.
+            Some(existing) if dead_ids.contains(&id) => {
+                aliases.insert(id, *existing);
+            }
+            Some(_) => deduped.push(*assignment),
+            None => {
+                canonical.insert(physical, assignment.virtual_register);
+                deduped.push(*assignment);
+            }
+        }
+    }
+    if !aliases.is_empty() {
+        let alias_map = aliases.clone();
+        let mut renamer = Renamer {
+            registers: aliases,
+            slots: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            next_register,
+            next_slot,
+            next_label,
+        };
+        operations = operations
+            .iter()
+            .map(|operation| renamer.operation(operation))
+            .collect::<Result<Vec<_>, _>>()?;
+        // An aliased register that was itself the canonical home of another
+        // alias chain must still resolve, so fold aliases transitively.
+        for (_, target) in &alias_map {
+            if !deduped
+                .iter()
+                .any(|assignment| assignment.virtual_register.id == target.id)
+                && let Some(source) = assignments
+                    .iter()
+                    .find(|assignment| assignment.virtual_register.id == target.id)
+            {
+                deduped.push(*source);
+            }
+        }
+        assignments = deduped;
+    }
     let frame = StackFrame {
         stack_allocation: u32::from(next_slot).saturating_mul(8),
         preserve,
@@ -351,6 +434,7 @@ mod tests {
                 },
             },
             widths: BTreeMap::from([(0, Width::W64)]),
+            scratch_dead: BTreeSet::new(),
         }
     }
 

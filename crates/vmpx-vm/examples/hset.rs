@@ -1,5 +1,4 @@
 use std::{collections::BTreeSet, fs};
-use vmpx_disasm::DirectJumpTraceLimits;
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
     EntryProfileRecoveryLimits, HandlerCodecRecoveryConfig, HandlerEffectRoles, VmDiscoveryLimits,

@@ -8,6 +8,7 @@
 mod constant_dispatch;
 mod effect_liveness;
 mod expr_codegen;
+mod replacement;
 
 pub use constant_dispatch::{
     ConstantDispatchConfig, ConstantDispatchError, compile_constant_dispatch,
@@ -19,6 +20,7 @@ pub use expr_codegen::{
     ExpressionCodegenConfig, ExpressionCodegenError, ExpressionInput, LoweredExpression,
     compile_expression, lower_expression,
 };
+pub use replacement::{Replacement, ReplacementConfig, ReplacementError, build_replacement};
 
 use std::collections::{BTreeMap, BTreeSet};
 

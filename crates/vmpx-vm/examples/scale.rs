@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeSet, VecDeque},
     fs,
 };
 use vmpx_disasm::DirectJumpTraceLimits;
 use vmpx_disasm::{CfgLimits, recover_cfg};
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
-    EntryProfileRecoveryLimits, HandlerCodecRecoveryConfig, VmDiscoveryLimits, analyze_vm_entry_at,
+    HandlerCodecRecoveryConfig, VmDiscoveryLimits, analyze_vm_entry_at,
     recover_and_decode_linear_vm_stream, recover_bootstrap_dispatch,
 };
 
@@ -106,7 +106,7 @@ fn main() {
                     continue;
                 }
             };
-        let vsp = iced_x86::Register::None;
+
         match recover_and_decode_linear_vm_stream(
             &pe,
             bootstrap.initial_state.clone(),
@@ -141,7 +141,6 @@ fn main() {
                 failed += 1
             }
         }
-        let _ = EntryProfileRecoveryLimits::default();
     }
     println!("decoded {ok}, failed {failed}");
 }

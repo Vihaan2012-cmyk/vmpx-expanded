@@ -3,7 +3,7 @@ use std::{
     fs,
 };
 use vmpx_disasm::{CfgLimits, recover_cfg};
-use vmpx_pe::{PeImage, Rva};
+use vmpx_pe::PeImage;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

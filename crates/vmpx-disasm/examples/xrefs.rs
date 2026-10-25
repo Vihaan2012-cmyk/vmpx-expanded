@@ -1,6 +1,4 @@
-use iced_x86::{
-    Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, OpKind, Register,
-};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use std::{collections::BTreeMap, fs};
 use vmpx_pe::PeImage;
 

@@ -1,9 +1,8 @@
 use std::{collections::BTreeMap, fs};
-use vmpx_disasm::DirectJumpTraceLimits;
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
     EntryProfileRecoveryLimits, HandlerCodecRecoveryConfig, HandlerEffectRoles, VmDiscoveryLimits,
-    VmEntrySource, analyze_vm_entry_at, analyze_x64_native_frame, discover_vm_entries,
+    analyze_vm_entry_at, analyze_x64_native_frame, discover_vm_entries,
     recover_and_decode_linear_vm_stream, recover_bootstrap_dispatch,
 };
 

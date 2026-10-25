@@ -1,5 +1,4 @@
 use std::fs;
-use vmpx_disasm::DirectJumpTraceLimits;
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
     EntryProfileRecoveryLimits, VmDiscoveryLimits, analyze_vm_entry_at, analyze_x64_native_frame,
