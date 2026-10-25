@@ -1023,6 +1023,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flag_intrinsics_fold_with_symbolic_operands() {
+        // A flag intrinsic names a plain arithmetic operation. When one operand is
+        // symbolic the constant evaluator cannot fold it, but leaving it opaque
+        // would make every pointer derived from it non-affine, which turns a valid
+        // stack load into an unresolvable one.
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        let offset = Expr::constant(BitWidth::W64, (-80i64) as u64);
+        let sum = Expr::binary(BinaryOp::Add, base, offset).expect("affine sum");
+        let intrinsic = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_add_w64",
+            vec![Expr::constant(BitWidth::W64, 8), sum],
+        )
+        .simplify();
+        assert_eq!(
+            crate::symbolic_pointer_offset(&intrinsic, "vsp_initial"),
+            Some(-72),
+            "a flag intrinsic over a symbolic pointer stays affine"
+        );
+    }
+
+    #[test]
     fn folds_double_complement_pointer_offset() {
         let base = Expr::register(BitWidth::W64, "vsp_initial");
         let offset = Expr::constant(BitWidth::W64, 64);
