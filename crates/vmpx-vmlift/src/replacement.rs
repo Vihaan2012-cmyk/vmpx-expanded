@@ -101,6 +101,12 @@ pub enum ReplacementError {
 
     #[error("effect lowering failed: {0}")]
     Effect(#[from] crate::ExpressionCodegenError),
+
+    #[error("an imported effect call has more arguments than the Win64 register ABI allows")]
+    TooManyCallArguments,
+
+    #[error("could not bind an effect call result: {0}")]
+    EffectBindings(String),
 }
 
 #[derive(Debug)]
@@ -165,6 +171,8 @@ pub fn build_replacement(
     // Registers are canonicalised to one virtual register per physical register,
     // which is what the backend requires.
     let result_base = input_slot_count;
+    let effect_slot_count =
+        u16::try_from(config.effect_calls.len()).map_err(|_| ReplacementError::TooManyInputs)?;
     let mut operations: Vec<Operation> = Vec::new();
     let mut assignments: Vec<RegisterAssignment> = Vec::new();
     let mut canonical: BTreeMap<PhysicalRegister, VirtualRegister> = BTreeMap::new();
@@ -191,8 +199,38 @@ pub fn build_replacement(
     // frame slots, so a value that reads the same allocation does not invoke the
     // allocator again.
     let mut effects_operations: Vec<Operation> = Vec::new();
-    let mut effect_result_slots: BTreeMap<String, SpillSlot> = BTreeMap::new();
     let mut extra_inputs: Vec<ExpressionInput> = Vec::new();
+    // Every fragment gets a private window of frame slots starting here, above
+    // the shared input frame, the value results, and the effect results.
+    let mut window_base = result_base
+        .checked_add(u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?)
+        .and_then(|base| base.checked_add(effect_slot_count))
+        .ok_or(ReplacementError::TooManyInputs)?;
+    // The shared region ends where the first fragment window begins.
+    let shared_end = window_base;
+    // Every effect-result slot is registered before any fragment is lowered, so
+    // a fragment that reads an allocation sees the slot inside the shared input
+    // frame rather than above it.
+    for index in 0..config.effect_calls.len() {
+        let slot = SpillSlot(
+            u16::try_from(config.inputs.len())
+                .map_err(|_| ReplacementError::TooManyInputs)?
+                .checked_add(
+                    u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?,
+                )
+                .and_then(|base| base.checked_add(u16::try_from(index).ok()?))
+                .ok_or(ReplacementError::TooManyInputs)?,
+        );
+        extra_inputs.push(ExpressionInput::slot(
+            effect_result_name(index),
+            vmpx_vm::BitWidth::W64,
+            slot,
+        ));
+    }
+    // Calls run first so the effects that consume an allocation can read its
+    // result. The intrinsic that stands for the result is rewritten to the
+    // captured slot, which is what makes a single call serve every use.
+    let mut effect_bindings: BTreeMap<String, Expr> = BTreeMap::new();
     for (index, effect_call) in config.effect_calls.iter().enumerate() {
         let arguments = effect_call
             .arguments
@@ -200,8 +238,14 @@ pub fn build_replacement(
             .take(usize::from(effect_call.call.argument_count))
             .cloned()
             .collect::<Vec<_>>();
+        const ARGUMENT_REGISTERS: [PhysicalRegister; 4] = [
+            PhysicalRegister::Rcx,
+            PhysicalRegister::Rdx,
+            PhysicalRegister::R8,
+            PhysicalRegister::R9,
+        ];
         let mut lowered_arguments: Vec<VirtualRegister> = Vec::new();
-        for argument in &arguments {
+        for (argument_index, argument) in arguments.iter().enumerate() {
             let (argument_operations, argument_result) = lower_fragment(
                 argument,
                 &inputs,
@@ -210,19 +254,40 @@ pub fn build_replacement(
                 &mut canonical,
                 &mut assignments,
                 &mut next_register,
+                &mut window_base,
+                &shared_end,
             )?;
             effects_operations.extend(argument_operations);
-            lowered_arguments.push(argument_result);
+            // The call ABI requires each argument in its own register, so move
+            // the lowered value there once the expression has been evaluated.
+            let abi_register = *ARGUMENT_REGISTERS
+                .get(argument_index)
+                .ok_or(ReplacementError::TooManyCallArguments)?;
+            let destination = canonical_register(
+                abi_register,
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            );
+            if destination.id != argument_result.id {
+                effects_operations.push(Operation::Move {
+                    destination,
+                    source: argument_result,
+                });
+            }
+            lowered_arguments.push(destination);
         }
+        // The slot was registered with the shared frame above; the call writes
+        // it so every reader sees the one allocation.
         let result_slot = SpillSlot(
-            u16::try_from(config.inputs.len() + extra_inputs.len())
-                .map_err(|_| ReplacementError::TooManyInputs)?,
+            u16::try_from(config.inputs.len())
+                .map_err(|_| ReplacementError::TooManyInputs)?
+                .checked_add(
+                    u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?,
+                )
+                .and_then(|base| base.checked_add(u16::try_from(index).ok()?))
+                .ok_or(ReplacementError::TooManyInputs)?,
         );
-        extra_inputs.push(ExpressionInput::slot(
-            effect_result_name(index),
-            vmpx_vm::BitWidth::W64,
-            result_slot,
-        ));
         let result = canonical_register(
             PhysicalRegister::Rax,
             &mut canonical,
@@ -240,30 +305,39 @@ pub fn build_replacement(
             slot: result_slot,
             source: result,
         });
-        effect_result_slots.insert(effect_call.result_intrinsic.clone(), result_slot);
+        effect_bindings.insert(
+            effect_call.result_intrinsic.clone(),
+            Expr::register(vmpx_vm::BitWidth::W64, effect_result_name(index)),
+        );
     }
     // Every store the routine performs, in order. Each address and value is
     // evaluated against the shared frame, so a store that targets the fresh
     // allocation reads the captured allocator result.
     for effect in &config.effects {
+        let address_expression = substitute_effect_bindings(&effect.address, &effect_bindings)?;
+        let value_expression = substitute_effect_bindings(&effect.value, &effect_bindings)?;
         let (address_operations, address) = lower_fragment(
-            &effect.address,
+            &address_expression,
             &inputs,
             &extra_inputs,
             config,
             &mut canonical,
             &mut assignments,
             &mut next_register,
+            &mut window_base,
+            &shared_end,
         )?;
         effects_operations.extend(address_operations);
         let (value_operations, value) = lower_fragment(
-            &effect.value,
+            &value_expression,
             &inputs,
             &extra_inputs,
             config,
             &mut canonical,
             &mut assignments,
             &mut next_register,
+            &mut window_base,
+            &shared_end,
         )?;
         effects_operations.extend(value_operations);
         effects_operations.push(Operation::Store {
@@ -308,12 +382,19 @@ pub fn build_replacement(
             max_spill_slots: config.max_spill_slots,
             import_calls: config.import_calls.clone(),
         };
-        let lowered = lower_expression(expression, &per_value).map_err(|error| {
+        // A value that reads an allocation the routine made must read the
+        // result of the one call, not invoke the allocator again.
+        let bound = substitute_effect_bindings(expression, &effect_bindings).map_err(|error| {
             ReplacementError::Lowering {
                 register: **register,
                 message: error.to_string(),
             }
         })?;
+        let lowered =
+            lower_expression(&bound, &per_value).map_err(|error| ReplacementError::Lowering {
+                register: **register,
+                message: error.to_string(),
+            })?;
         let mut function = lowered.function;
         let result = function
             .assignments
@@ -326,25 +407,27 @@ pub fn build_replacement(
         function
             .operations
             .retain(|operation| !matches!(operation, Operation::Return));
-        // The lowering numbers its own temporaries from `input_slot_count`
-        // upward. Give each value a private window above the result slots so two
-        // values' temporaries never share storage.
+        // The lowering numbers its own temporaries from the input count upward,
+        // so the shared region it must leave alone ends where the windows begin.
+        // Give each value a private window above that, so two values never share
+        // storage and no value aliases a caller-owned slot.
         let value_count =
             u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?;
         let window = u16::try_from(config.max_spill_slots)
             .map_err(|_| ReplacementError::TooManyInputs)?
             .max(1);
-        let local_base = result_base
-            .checked_add(value_count)
+        let local_base = shared_end
+            .checked_add(effect_slot_count)
             .and_then(|base| base.checked_add(u16::try_from(index).ok()?.checked_mul(window)?))
             .ok_or(ReplacementError::TooManyInputs)?;
+        let _ = (result_base, value_count);
         for operation in &mut function.operations {
             match operation {
                 Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
-                    if slot.0 >= result_base {
+                    if slot.0 >= shared_end {
                         slot.0 = slot
                             .0
-                            .checked_sub(result_base)
+                            .checked_sub(shared_end)
                             .and_then(|offset| local_base.checked_add(offset))
                             .ok_or(ReplacementError::TooManyInputs)?;
                     }
@@ -463,7 +546,14 @@ pub fn build_replacement(
             stack_allocation,
             preserve,
             call_ready,
-            preinitialized_slots: (0..input_slot_count).map(SpillSlot).collect(),
+            // The shared input frame and the effect-result slots are written by
+            // the capture block and the call prelude before any fragment reads
+            // them, but the validator only tracks definitions per operation, so
+            // declaring them preinitialized is what makes a fragment's load of a
+            // caller-owned slot legal.
+            preinitialized_slots: (0..input_slot_count.saturating_add(effect_slot_count))
+                .map(SpillSlot)
+                .collect(),
         },
     };
 
@@ -473,6 +563,26 @@ pub fn build_replacement(
         compiled,
         emitted: ordered.iter().map(|(register, _)| **register).collect(),
     })
+}
+
+/// Replaces the allocation intrinsics that stand for an effect call's result with
+/// the frame slot the call wrote, so the store reads the captured value instead
+/// of invoking the allocator again.
+fn substitute_effect_bindings(
+    expression: &Expr,
+    bindings: &BTreeMap<String, Expr>,
+) -> Result<Expr, ReplacementError> {
+    if bindings.is_empty() {
+        return Ok(expression.clone());
+    }
+    Ok(expression
+        .rewrite_intrinsics(&mut |width, name, _arguments| {
+            bindings
+                .get(name)
+                .filter(|replacement| replacement.width == width)
+                .cloned()
+        })
+        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?)
 }
 
 /// The symbolic name bound to the result of effect call `index`.
@@ -494,6 +604,8 @@ fn lower_fragment(
     canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
     assignments: &mut Vec<RegisterAssignment>,
     next_register: &mut u32,
+    window_base: &mut u16,
+    shared_frame_slots: &u16,
 ) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
     let mut all_inputs = inputs.to_vec();
     all_inputs.extend(extra_inputs.iter().cloned());
@@ -505,6 +617,8 @@ fn lower_fragment(
             temporary_register: PhysicalRegister::R11,
             shift_count_register: PhysicalRegister::Rcx,
             max_expression_nodes: config.max_expression_nodes,
+            // The fragment allocates its temporaries above every slot already in
+            // the shared frame, so its own frame must be able to describe them.
             max_spill_slots: config.max_spill_slots,
             import_calls: config.import_calls.clone(),
         },
@@ -522,11 +636,35 @@ fn lower_fragment(
         );
     }
     // Rebase the fragment's private slots above the shared frame so two
-    // fragments never share storage.
-    let base = u16::try_from(all_inputs.len()).map_err(|_| ReplacementError::TooManyInputs)?;
-    let window = u16::try_from(config.max_spill_slots)
-        .map_err(|_| ReplacementError::TooManyInputs)?
-        .max(1);
+    // fragments never share storage. Slots the caller owns (the shared input
+    // frame and the effect results) keep their index, so the rebase starts at
+    // the end of the whole shared region rather than at the input count.
+    let shared_end = *shared_frame_slots;
+    // How many slots the fragment allocated for itself, measured from `base`.
+    let fragment_peak = lowered
+        .function
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => Some(slot.0),
+            _ => None,
+        })
+        .filter(|slot| *slot >= shared_end)
+        .max()
+        .map_or(0, |highest| {
+            highest.saturating_sub(shared_end).saturating_add(1)
+        });
+    // Each fragment owns a disjoint window above every region the shared frame
+    // already uses, so two fragments can never alias the same storage.
+    let window_start = *window_base;
+    *window_base = window_base
+        .checked_add(
+            u16::try_from(config.max_spill_slots)
+                .map_err(|_| ReplacementError::TooManyInputs)?
+                .max(fragment_peak)
+                .max(1),
+        )
+        .ok_or(ReplacementError::TooManyInputs)?;
     let mut operations = Vec::with_capacity(lowered.function.operations.len());
     for operation in &lowered.function.operations {
         if matches!(operation, Operation::Return) {
@@ -536,11 +674,13 @@ fn lower_fragment(
         if let Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } =
             &mut operation
         {
-            if slot.0 >= base {
+            // Only the fragment's own temporaries move; input and effect-result
+            // slots belong to the shared frame and keep their index.
+            if slot.0 >= shared_end {
                 slot.0 = slot
                     .0
-                    .checked_sub(base)
-                    .and_then(|offset| base.checked_add(window)?.checked_add(offset))
+                    .checked_sub(shared_end)
+                    .and_then(|offset| window_start.checked_add(offset))
                     .ok_or(ReplacementError::TooManyInputs)?;
             }
         }

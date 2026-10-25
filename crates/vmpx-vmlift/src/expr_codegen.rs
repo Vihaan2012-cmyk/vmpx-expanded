@@ -633,7 +633,19 @@ pub fn lower_expression(
     };
     context.lower(expression)?;
     context.operations.push(Operation::Return);
-    let mut stack_allocation = u32::try_from(context.peak_slot)
+    // Slot-backed inputs may already live above the peak the fragment reached
+    // for itself, so the frame must cover the highest input slot as well.
+    let highest_input_slot = config
+        .inputs
+        .iter()
+        .filter_map(|input| match input.source {
+            InputSource::Slot(slot) => Some(slot.0),
+            InputSource::Register(_) => None,
+        })
+        .max()
+        .map_or(0, |slot| slot.saturating_add(1));
+    let highest_slot = context.peak_slot.max(usize::from(highest_input_slot));
+    let mut stack_allocation = u32::try_from(highest_slot)
         .ok()
         .and_then(|slots| slots.checked_mul(8))
         .ok_or(ExpressionCodegenError::StorageIdOverflow)?;
@@ -653,6 +665,9 @@ pub fn lower_expression(
         .iter()
         .any(|operation| matches!(operation, Operation::Call { .. }));
     if has_call {
+        // A call-ready frame reserves 32 bytes of shadow space below the spill
+        // area, so the allocation has to cover that as well as the slots.
+        stack_allocation = stack_allocation.saturating_add(32);
         // Win64 requires 16-byte RSP alignment at a call site. The caller's
         // return address leaves RSP congruent to 8, so the preserved-register
         // pushes plus this allocation must sum to 8 modulo 16.
@@ -672,15 +687,10 @@ pub fn lower_expression(
             stack_allocation,
             preserve,
             // Slot-backed inputs are already populated by the caller, so a load
-            // from one is defined even though this body contains no store.
-            preinitialized_slots: config
-                .inputs
-                .iter()
-                .filter_map(|input| match input.source {
-                    InputSource::Slot(slot) => Some(slot),
-                    InputSource::Register(_) => None,
-                })
-                .collect(),
+            // from one is defined even though this body contains no store. Every
+            // slot below the highest input slot must be declared, because the
+            // caller's frame numbers its regions contiguously.
+            preinitialized_slots: (0..highest_input_slot).map(SpillSlot).collect(),
             // An expression that lowers an imported call needs a Win64
             // call-ready frame: the backend checks shadow space and alignment.
             call_ready: has_call,

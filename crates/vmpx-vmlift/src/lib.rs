@@ -14,7 +14,8 @@ pub use constant_dispatch::{
     ConstantDispatchConfig, ConstantDispatchError, compile_constant_dispatch,
 };
 pub use effect_liveness::{
-    EntryEffectLivenessReport, PathEffectLivenessReport, audit_entry_effect_liveness,
+    CollectedCall, CollectedEffects, CollectedStore, EntryEffectLivenessReport,
+    PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects,
 };
 pub use expr_codegen::ImportCall;
 pub use expr_codegen::{

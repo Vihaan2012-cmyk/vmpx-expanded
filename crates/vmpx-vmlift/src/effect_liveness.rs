@@ -34,6 +34,33 @@ pub struct PathEffectLivenessReport {
     pub ready_for_native_replacement: bool,
 }
 
+/// One application-observable store a replacement must perform.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CollectedStore {
+    pub address: Expr,
+    pub value: Expr,
+    pub width: vmpx_vm::BitWidth,
+}
+
+/// One imported call a replacement must perform, keyed by the intrinsic that
+/// stands for its result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CollectedCall {
+    pub result_intrinsic: String,
+    pub iat_rva: u32,
+    pub arguments: Vec<Expr>,
+}
+
+/// Everything one path must replay to be semantically equivalent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CollectedEffects {
+    pub stores: Vec<CollectedStore>,
+    pub calls: Vec<CollectedCall>,
+    /// Reasons an effect could not be represented, which must keep the path from
+    /// being treated as ready.
+    pub unsupported: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EntryEffectLivenessReport {
     pub schema_version: u32,
@@ -237,6 +264,13 @@ fn audit_path(
         ));
     }
     let nonvolatile_registers_preserved = preserves_nonvolatile(path, &mut issues);
+    // A path is only ready when its observable effects can actually be emitted.
+    // The counts alone would say "ready" while an effect had no representable
+    // form, so the collector's own refusals are folded in here.
+    let collected = collect_path_effects(family, path);
+    for reason in &collected.unsupported {
+        issues.push(reason.clone());
+    }
     let ready_for_native_replacement = path.native_exit.is_some()
         && issues.is_empty()
         && observable_writes == 0
@@ -262,6 +296,102 @@ fn audit_path(
 /// Win64 replacement may discard VM-local stack state and non-escaping fresh
 /// VM contexts. Unknown/global effects and ABI changes remain hard blockers.
 #[must_use]
+/// Collects the application-observable effects one path must replay, in
+/// execution order, together with the imported calls whose results they read.
+///
+/// The classification is deliberately the same one `audit_path` uses: a write
+/// counts as observable exactly when it is neither a VM-stack write nor a write
+/// into a dead allocation. Keeping one definition means a path cannot be judged
+/// ready for replacement while still hiding a store the replacement omits.
+pub fn collect_path_effects(
+    family: &RecoveredEntryPathFamily,
+    path: &RecoveredEntryPath,
+) -> CollectedEffects {
+    let reports = path_reports(family, path);
+    let fresh = fresh_names(&reports);
+    let escaping = fresh
+        .iter()
+        .filter(|name| allocation_escapes(name, path, &reports))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let dead = fresh
+        .difference(&escaping)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut stores = Vec::new();
+    let mut calls: BTreeMap<String, CollectedCall> = BTreeMap::new();
+    let mut unsupported = Vec::new();
+    for report in &reports {
+        for write in &report.external_writes {
+            if symbolic_pointer_offset(&write.address, VSP_ROOT).is_some() {
+                continue;
+            }
+            if write
+                .address
+                .intrinsic_dependencies()
+                .iter()
+                .any(|name| dead.contains(name))
+            {
+                continue;
+            }
+            stores.push(CollectedStore {
+                address: write.address.clone(),
+                value: write.value.clone(),
+                width: write.value.width,
+            });
+        }
+        for call in &report.native_calls {
+            let result_names = call_result_fresh_names(call);
+            let dead_producer = !result_names.is_empty()
+                && result_names.iter().all(|name| dead.contains(name))
+                && matches!(
+                    call.applied_effect.memory,
+                    NativeCallMemoryDecision::PreserveTrackedAndCreateFreshAllocation { .. }
+                );
+            if dead_producer {
+                continue;
+            }
+            let Some(vmpx_vm::NativeCallImportResolution::Unique { import, .. }) =
+                call.import_resolution.as_ref()
+            else {
+                unsupported.push(
+                    "an observable native call has no unique resolved import, so it cannot be emitted"
+                        .to_owned(),
+                );
+                continue;
+            };
+            let names = call_result_fresh_names(call);
+            if names.len() != 1 {
+                unsupported.push(
+                    "an observable native call does not produce exactly one allocation result"
+                        .to_owned(),
+                );
+                continue;
+            }
+            let name = names.into_iter().next().expect("one name");
+            let arguments = call
+                .invocation
+                .arguments
+                .iter()
+                .map(|argument| argument.value.clone())
+                .collect::<Vec<_>>();
+            calls.insert(
+                name.clone(),
+                CollectedCall {
+                    result_intrinsic: name,
+                    iat_rva: import.iat_rva.0,
+                    arguments,
+                },
+            );
+        }
+    }
+    CollectedEffects {
+        stores,
+        calls: calls.into_values().collect(),
+        unsupported,
+    }
+}
+
 pub fn audit_entry_effect_liveness(family: &RecoveredEntryPathFamily) -> EntryEffectLivenessReport {
     let paths = family
         .paths

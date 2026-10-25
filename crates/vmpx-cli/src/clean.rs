@@ -511,11 +511,22 @@ pub fn analyze_clean_with_image(
     let mut errors = Vec::new();
     let mut paths = Vec::new();
     // Exact native exit states retained for the recompilation stage.
-    let mut exit_states: Vec<(BTreeMap<String, u64>, vmpx_vm::NativeExitState)> = Vec::new();
+    // Each exit state carries the observable effects its replacement must
+    // replay. A replacement that only restored registers would compute the right
+    // values and skip the routine's real side effects.
+    let mut exit_states: Vec<(
+        BTreeMap<String, u64>,
+        vmpx_vm::NativeExitState,
+        vmpx_vmlift::CollectedEffects,
+    )> = Vec::new();
     // Nested VM entries reached through a recovered continuation. Each one is
     // recovered recursively so a path that re-enters the VM still terminates in
     // a native exit state rather than stopping at a protector transition.
-    let mut nested_exits: Vec<(BTreeMap<String, u64>, vmpx_vm::NativeExitState)> = Vec::new();
+    let mut nested_exits: Vec<(
+        BTreeMap<String, u64>,
+        vmpx_vm::NativeExitState,
+        vmpx_vmlift::CollectedEffects,
+    )> = Vec::new();
     let mut continuations = Vec::new();
     let mut handlers = CleanHandlerMetrics {
         unique: 0,
@@ -571,7 +582,11 @@ pub fn analyze_clean_with_image(
                         }
                         let exception_coverage = exception_coverage_for_chain(&pe, &path.chain);
                         if let Some(exit) = path.native_exit.as_ref() {
-                            exit_states.push((path.assignments.clone(), exit.clone()));
+                            exit_states.push((
+                                path.assignments.clone(),
+                                exit.clone(),
+                                vmpx_vmlift::collect_path_effects(&family, path),
+                            ));
                             // Follow a continuation that re-enters the VM, so the
                             // emitted chain can end at a real native return.
                             if let Ok(targets) = vmpx_vm::recover_modulo_image_targets(
@@ -602,7 +617,14 @@ pub fn analyze_clean_with_image(
                                         {
                                             let mut assignments = path.assignments.clone();
                                             assignments.extend(nested_path.assignments.clone());
-                                            nested_exits.push((assignments, nested_exit.clone()));
+                                            nested_exits.push((
+                                                assignments,
+                                                nested_exit.clone(),
+                                                vmpx_vmlift::collect_path_effects(
+                                                    &nested_family,
+                                                    nested_path,
+                                                ),
+                                            ));
                                         }
                                     }
                                 }
@@ -844,7 +866,7 @@ pub fn analyze_clean_with_image(
                 None => Vec::new(),
             };
             let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
-            for (assignments, exit) in exit_states.iter().chain(nested_exits.iter()) {
+            for (assignments, exit, effects) in exit_states.iter().chain(nested_exits.iter()) {
                 // The VM exit transfers to a protector continuation rather than
                 // returning to the caller. Resolve that continuation so the
                 // replacement can tail-jump into it after restoring the exit
@@ -864,8 +886,33 @@ pub fn analyze_clean_with_image(
                     max_spill_slots: 64,
                     import_calls: import_calls_for(&pe, exit),
                     continuation,
-                    effects: Vec::new(),
-                    effect_calls: Vec::new(),
+                    effects: effects
+                        .stores
+                        .iter()
+                        .map(|store| vmpx_vmlift::EffectStore {
+                            address: store.address.clone(),
+                            value: store.value.clone(),
+                            width: store.width,
+                        })
+                        .collect(),
+                    effect_calls: effects
+                        .calls
+                        .iter()
+                        .filter_map(|call| {
+                            let iat_va = pe
+                                .optional
+                                .image_base
+                                .checked_add_rva(vmpx_pe::Rva(call.iat_rva))?;
+                            Some(vmpx_vmlift::EffectCall {
+                                result_intrinsic: call.result_intrinsic.clone(),
+                                call: vmpx_vmlift::ImportCall {
+                                    iat_address: iat_va.0,
+                                    argument_count: u8::try_from(call.arguments.len()).ok()?,
+                                },
+                                arguments: call.arguments.clone(),
+                            })
+                        })
+                        .collect(),
                 };
                 match vmpx_vmlift::build_replacement(
                     &exit.registers,
