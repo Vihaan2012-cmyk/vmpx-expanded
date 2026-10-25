@@ -503,6 +503,10 @@ pub fn analyze_clean_with_image(
     let mut paths = Vec::new();
     // Exact native exit states retained for the recompilation stage.
     let mut exit_states: Vec<(BTreeMap<String, u64>, vmpx_vm::NativeExitState)> = Vec::new();
+    // Nested VM entries reached through a recovered continuation. Each one is
+    // recovered recursively so a path that re-enters the VM still terminates in
+    // a native exit state rather than stopping at a protector transition.
+    let mut nested_exits: Vec<(BTreeMap<String, u64>, vmpx_vm::NativeExitState)> = Vec::new();
     let mut continuations = Vec::new();
     let mut handlers = CleanHandlerMetrics {
         unique: 0,
@@ -557,6 +561,41 @@ pub fn analyze_clean_with_image(
                         let exception_coverage = exception_coverage_for_chain(&pe, &path.chain);
                         if let Some(exit) = path.native_exit.as_ref() {
                             exit_states.push((path.assignments.clone(), exit.clone()));
+                            // Follow a continuation that re-enters the VM, so the
+                            // emitted chain can end at a real native return.
+                            if let Ok(targets) = vmpx_vm::recover_modulo_image_targets(
+                                &pe,
+                                &exit.return_address,
+                                vmpx_vm::ModuloImageTargetLimits::default(),
+                            ) && targets.complete
+                                && targets.targets.len() == 1
+                                && let Some(target_rva) = targets.targets[0].rva
+                                && let Some(nested) = analyze_vm_entry_at(
+                                    &pe,
+                                    target_rva,
+                                    VmDiscoveryLimits::default(),
+                                )
+                                && nested.confidence >= 60
+                            {
+                                let nested_domains = BTreeMap::from([(
+                                    "native_rdx_initial".to_owned(),
+                                    (0_u64..=3)
+                                        .map(|reason| Expr::constant(BitWidth::W64, reason))
+                                        .collect::<Vec<_>>(),
+                                )]);
+                                if let Ok(nested_family) =
+                                    recover_entry_paths(&pe, &nested, &nested_domains, limits)
+                                {
+                                    for nested_path in &nested_family.paths {
+                                        if let Some(nested_exit) = nested_path.native_exit.as_ref()
+                                        {
+                                            let mut assignments = path.assignments.clone();
+                                            assignments.extend(nested_path.assignments.clone());
+                                            nested_exits.push((assignments, nested_exit.clone()));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         paths.push(CleanVmPathReport {
                             assignments: path.assignments.clone(),
@@ -785,7 +824,7 @@ pub fn analyze_clean_with_image(
             let va = pe.optional.image_base.0 + u64::from(next_rva.0);
             let inputs = replacement_inputs();
             let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
-            for (assignments, exit) in &exit_states {
+            for (assignments, exit) in exit_states.iter().chain(nested_exits.iter()) {
                 // The VM exit transfers to a protector continuation rather than
                 // returning to the caller. Resolve that continuation so the
                 // replacement can tail-jump into it after restoring the exit

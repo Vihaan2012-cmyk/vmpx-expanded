@@ -201,8 +201,9 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
     assert_eq!(json["validation"]["output_reparsed"], true);
 
     // The recompilation stage must emit real native code for every path whose
-    // exit state is fully lowerable. Both viable DLL-reason paths qualify.
-    assert_eq!(json["recompilation"]["metrics"]["emitted"], 2);
+    // exit state is fully lowerable: both viable DLL-reason paths, plus the VM
+    // entry that reason 0's continuation re-enters.
+    assert_eq!(json["recompilation"]["metrics"]["emitted"], 3);
     assert!(
         json["recompilation"]["metrics"]["bytes"]
             .as_u64()
