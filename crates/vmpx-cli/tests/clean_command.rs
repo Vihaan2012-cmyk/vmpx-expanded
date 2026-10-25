@@ -41,6 +41,16 @@ fn minimal_pe64() -> Vec<u8> {
     data
 }
 
+/// Controlled fixtures are not distributed with the repository. Point
+/// `VMPX_FIXTURE_DIR` at a directory containing `systems.original.xpl` and
+/// `systems.throughvmpstatic.thatsalsoopeninidaprornthroughmcp.xpl` to run the
+/// ignored large-fixture regressions.
+fn fixture_directory() -> PathBuf {
+    std::env::var_os("VMPX_FIXTURE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("testfilevmp"))
+}
+
 fn test_directory(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -56,6 +66,24 @@ fn run_clean(input: &Path, output: &Path, report: &Path) -> std::process::Output
         .arg(output)
         .args(["--report"])
         .arg(report)
+        .output()
+        .expect("vmpx clean process starts")
+}
+
+fn run_clean_reconstructed(
+    input: &Path,
+    output: &Path,
+    report: &Path,
+    reconstructed: &Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["clean"])
+        .arg(input)
+        .arg(output)
+        .args(["--report"])
+        .arg(report)
+        .args(["--reconstructed"])
+        .arg(reconstructed)
         .output()
         .expect("vmpx clean process starts")
 }
@@ -99,9 +127,9 @@ fn clean_protected_fixture_reports_blockers_without_writing_output() {
     fs::create_dir(&directory).expect("create isolated test directory");
     let output = directory.join("output.xpl");
     let report = directory.join("report.json");
-    let input = Path::new(
-        r"D:\vmp\testfilevmp\systems.throughvmpstatic.thatsalsoopeninidaprornthroughmcp.xpl",
-    );
+    let input =
+        fixture_directory().join("systems.throughvmpstatic.thatsalsoopeninidaprornthroughmcp.xpl");
+    let input = input.as_path();
 
     let result = run_clean(input, &output, &report);
     assert!(!result.status.success());
@@ -143,6 +171,59 @@ fn clean_protected_fixture_reports_blockers_without_writing_output() {
             }))
     );
 
+    fs::remove_file(report).expect("remove isolated report");
+    fs::remove_dir(directory).expect("remove isolated test directory");
+}
+
+#[test]
+#[ignore = "large controlled VMProtect fixture"]
+fn clean_protected_fixture_emits_conventional_layout_image() {
+    let directory = test_directory("clean-layout");
+    fs::create_dir(&directory).expect("create isolated test directory");
+    let output = directory.join("output.xpl");
+    let report = directory.join("report.json");
+    let reconstructed = directory.join("reconstructed.xpl");
+    let input = fixture_directory().join("systems.original.xpl");
+    let input = input.as_path();
+
+    let result = run_clean_reconstructed(input, &output, &report, &reconstructed);
+    assert!(!result.status.success(), "the proof gate must still refuse");
+    assert!(!output.exists(), "the strict output must stay absent");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read refusal report"))
+            .expect("valid refusal JSON");
+    assert_eq!(json["ready_to_write"], false);
+    assert_eq!(json["layout"]["attempted"], true);
+    assert_eq!(json["layout"]["sections"], 27);
+    assert_eq!(json["layout"]["zero_fill_sections"], 1);
+    assert_eq!(json["validation"]["output_reparsed"], true);
+
+    let bytes = fs::read(&reconstructed).expect("reconstructed image exists");
+    assert_eq!(
+        u64::try_from(bytes.len()).expect("image length fits"),
+        json["layout"]["file_size"]
+            .as_u64()
+            .expect("layout file size")
+    );
+    assert!(
+        bytes.len() < 253_702_144,
+        "layout must be smaller than the RVA image"
+    );
+
+    // The reconstructed image must reparse and keep the protector entry intact.
+    let check = Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["verify"])
+        .arg(&reconstructed)
+        .output()
+        .expect("verify starts");
+    assert!(
+        check.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    fs::remove_file(reconstructed).expect("remove reconstructed image");
     fs::remove_file(report).expect("remove isolated report");
     fs::remove_dir(directory).expect("remove isolated test directory");
 }

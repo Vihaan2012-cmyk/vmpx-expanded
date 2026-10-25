@@ -609,8 +609,13 @@ fn resolve_stack_sled_continuation(
     if resolution.continuation_rva.is_none() {
         resolution.diagnostics.push(format!(
             "continuation value {} is not image-backed; no native dispatch target was proven",
-            constant_expr(resolution.continuation.as_ref().expect("continuation is set"))
-                .map_or_else(|| "symbolic".to_owned(), |value| format!("{value:#X}"))
+            constant_expr(
+                resolution
+                    .continuation
+                    .as_ref()
+                    .expect("continuation is set")
+            )
+            .map_or_else(|| "symbolic".to_owned(), |value| format!("{value:#X}"))
         ));
         resolution.status = RecoveryStatus::PartiallyRecovered;
         return resolution;

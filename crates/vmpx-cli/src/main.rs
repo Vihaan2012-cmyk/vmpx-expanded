@@ -39,6 +39,11 @@ enum Command {
         /// Write the versioned recovery report even when the proof gate refuses output.
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Also write the conventional-layout image of the unpacked analysis
+        /// image. This file is loadable and structurally valid, but it is not
+        /// devirtualized: protector sections and VM handlers remain present.
+        #[arg(long)]
+        reconstructed: Option<PathBuf>,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -673,6 +678,7 @@ fn main() -> Result<()> {
             input,
             output,
             report,
+            reconstructed,
         } => {
             if input == output {
                 bail!("refusing to overwrite the input file");
@@ -691,8 +697,14 @@ fn main() -> Result<()> {
             {
                 bail!("report path aliases an input or output file");
             }
+            if let Some(path) = &reconstructed
+                && (path == &input || path == &output || report.as_ref() == Some(path))
+            {
+                bail!("reconstructed path aliases an input, output, or report file");
+            }
             let input_data = read_file(&input)?;
-            let mut clean = clean::analyze_clean(&input.display().to_string(), &input_data)?;
+            let (mut clean, conventional) =
+                clean::analyze_clean_with_image(&input.display().to_string(), &input_data)?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
                 clean.protection.verdict,
@@ -709,6 +721,30 @@ fn main() -> Result<()> {
             }
             for blocker in &clean.blockers {
                 println!("[clean] blocker: {blocker}");
+            }
+            for diagnostic in &clean.layout.diagnostics {
+                println!("[layout] {diagnostic}");
+            }
+            if let Some(bytes) = &conventional
+                && let Some(path) = &reconstructed
+            {
+                fs::write(path, bytes)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                let disk = read_file(path)?;
+                PeImage::parse(&disk).with_context(|| {
+                    format!(
+                        "reconstructed output {} failed disk reparse",
+                        path.display()
+                    )
+                })?;
+                clean.validation.output_written = true;
+                clean.validation.output_reparsed = true;
+                println!(
+                    "[layout] wrote {} bytes to {} (conventional layout, not devirtualized)",
+                    bytes.len(),
+                    path.display()
+                );
+                println!("[verify] reconstructed image reparsed successfully from disk");
             }
             if !clean.ready_to_write {
                 if let Some(report_path) = report {

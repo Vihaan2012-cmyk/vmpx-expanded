@@ -20,6 +20,7 @@ vmpx-unpack = { path = "../vmpx-unpack" }
 vmpx-detect = { path = "../vmpx-detect" }
 vmpx-disasm = { path = "../vmpx-disasm" }
 vmpx-vm = { path = "../vmpx-vm" }
+vmpx-rebuild = { path = "../vmpx-rebuild" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
 
 [lints]

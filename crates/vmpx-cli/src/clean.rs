@@ -5,6 +5,7 @@ use serde::Serialize;
 use vmpx_detect::{DetectionVerdict, ImageLayout, ProtectionReport, detect_vmprotect};
 use vmpx_disasm::{CfgLimits, recover_cfg};
 use vmpx_pe::{PeImage, PeKind, Rva};
+use vmpx_rebuild::relayout_conventional;
 use vmpx_unpack::{UnpackLimits, UnpackReport, unpack_to_mapped_image};
 use vmpx_vm::{
     BitWidth, EntryPathRecoveryLimits, EntryProfileRecoveryLimits, Expr, ModuloImageTargetLimits,
@@ -103,6 +104,19 @@ pub struct CleanStageReport {
     pub diagnostics: Vec<String>,
 }
 
+/// Outcome of converting the RVA-layout analysis image into a conventional
+/// file layout. This is a layout transform, not devirtualization: every VM
+/// handler, protector section, and unresolved path is still present.
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanLayoutReport {
+    pub attempted: bool,
+    pub file_size: Option<u64>,
+    pub size_of_headers: Option<u32>,
+    pub sections: Option<usize>,
+    pub zero_fill_sections: Option<usize>,
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CleanValidationReport {
@@ -130,6 +144,7 @@ pub struct CleanReport {
     pub vtil: CleanStageReport,
     pub recompilation: CleanStageReport,
     pub reconstruction: CleanStageReport,
+    pub layout: CleanLayoutReport,
     pub validation: CleanValidationReport,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -243,7 +258,24 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(dead_code)]
 pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
+    analyze_clean_with_image(input_path, input).map(|(report, _)| report)
+}
+
+/// Runs the same analysis and additionally returns the conventional-layout
+/// image when the mapped analysis image can be converted. The image is a
+/// layout artifact: it is loadable and structurally valid, but still contains
+/// every protector section and virtualized routine.
+///
+/// # Errors
+///
+/// Propagates input, unpacking, VM-analysis, and exception-metadata failures.
+#[allow(clippy::too_many_lines)]
+pub fn analyze_clean_with_image(
+    input_path: &str,
+    input: &[u8],
+) -> Result<(CleanReport, Option<Vec<u8>>)> {
     let input_pe = PeImage::parse(input).context("clean input is not a supported PE")?;
     let protection = detect_vmprotect(&input_pe);
     let (mapped, unpack_report) = match protection.image_layout {
@@ -481,76 +513,127 @@ pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
     blockers.sort();
     blockers.dedup();
 
-    Ok(CleanReport {
-        schema_version: 1,
-        input: CleanInputReport {
-            path: input_path.to_owned(),
-            sha256: sha256(input),
-            file_size: u64::try_from(input.len()).unwrap_or(u64::MAX),
-        },
-        pe: pe_report,
-        protection,
-        unpacking: CleanUnpackingReport {
-            performed: unpack_report.is_some(),
-            mapped_image_size: u64::try_from(mapped.len()).unwrap_or(u64::MAX),
-            report: unpack_report,
-        },
-        oep: if verified_noop {
-            CleanOepReport {
-                protected_header_entry: pe.optional.address_of_entry_point,
-                recovered_entry: Some(pe.optional.address_of_entry_point),
-                complete: true,
+    let (layout, conventional) = if verified_noop {
+        (
+            CleanLayoutReport {
+                attempted: false,
+                file_size: None,
+                size_of_headers: None,
+                sections: None,
+                zero_fill_sections: None,
+                diagnostics: vec![
+                    "input is already a conventional PE file; no relayout was required".to_owned(),
+                ],
+            },
+            None,
+        )
+    } else {
+        match relayout_conventional(&mapped) {
+            Ok((bytes, report)) => (
+                CleanLayoutReport {
+                    attempted: true,
+                    file_size: Some(report.file_size),
+                    size_of_headers: Some(report.size_of_headers),
+                    sections: Some(report.sections.len()),
+                    zero_fill_sections: Some(report.zero_fill_sections),
+                    diagnostics: vec![
+                        "conventional layout preserves every section RVA; it is not devirtualized"
+                            .to_owned(),
+                    ],
+                },
+                Some(bytes),
+            ),
+            Err(error) => {
+                errors.push(format!("conventional layout failed: {error}"));
+                (
+                    CleanLayoutReport {
+                        attempted: true,
+                        file_size: None,
+                        size_of_headers: None,
+                        sections: None,
+                        zero_fill_sections: None,
+                        diagnostics: vec![error.to_string()],
+                    },
+                    None,
+                )
             }
-        } else {
-            CleanOepReport {
-                protected_header_entry: pe.optional.address_of_entry_point,
-                recovered_entry: None,
-                complete: false,
-            }
-        },
-        imports: CleanImportReport {
-            parsed_modules: report.imports.len(),
-            parsed_symbols: import_symbols,
-            reconstruction_complete: verified_noop,
-            unresolved: if verified_noop {
-                Vec::new()
+        }
+    };
+
+    Ok((
+        CleanReport {
+            schema_version: 1,
+            input: CleanInputReport {
+                path: input_path.to_owned(),
+                sha256: sha256(input),
+                file_size: u64::try_from(input.len()).unwrap_or(u64::MAX),
+            },
+            pe: pe_report,
+            protection,
+            unpacking: CleanUnpackingReport {
+                performed: unpack_report.is_some(),
+                mapped_image_size: u64::try_from(mapped.len()).unwrap_or(u64::MAX),
+                report: unpack_report,
+            },
+            oep: if verified_noop {
+                CleanOepReport {
+                    protected_header_entry: pe.optional.address_of_entry_point,
+                    recovered_entry: Some(pe.optional.address_of_entry_point),
+                    complete: true,
+                }
             } else {
-                vec![
+                CleanOepReport {
+                    protected_header_entry: pe.optional.address_of_entry_point,
+                    recovered_entry: None,
+                    complete: false,
+                }
+            },
+            imports: CleanImportReport {
+                parsed_modules: report.imports.len(),
+                parsed_symbols: import_symbols,
+                reconstruction_complete: verified_noop,
+                unresolved: if verified_noop {
+                    Vec::new()
+                } else {
+                    vec![
                     "parsed protector-era imports are not yet reduced to proven application imports"
                         .to_owned(),
                 ]
+                },
             },
+            vm_instances: discovery.instances,
+            vm_entries: discovery.entries,
+            handlers,
+            unknown_handlers,
+            virtualized_routines: paths,
+            native_continuations: continuations,
+            vtil: if verified_noop {
+                completed_stage("not required for an input with no strong protection evidence")
+            } else {
+                stage("semantic routine has not reached a complete exception-aware CFG")
+            },
+            recompilation: if verified_noop {
+                completed_stage("not required for a verified no-op")
+            } else {
+                stage("no complete routine is eligible for native code generation")
+            },
+            reconstruction: if verified_noop {
+                completed_stage("conventional input can be preserved byte-for-byte")
+            } else {
+                stage("no replacement image is emitted while proof blockers remain")
+            },
+            layout,
+            validation: CleanValidationReport {
+                input_parsed: true,
+                mapped_image_parsed: true,
+                output_written: false,
+                output_reparsed: false,
+            },
+            warnings,
+            errors,
+            ready_to_write: blockers.is_empty(),
+            blockers,
         },
-        vm_instances: discovery.instances,
-        vm_entries: discovery.entries,
-        handlers,
-        unknown_handlers,
-        virtualized_routines: paths,
-        native_continuations: continuations,
-        vtil: if verified_noop {
-            completed_stage("not required for an input with no strong protection evidence")
-        } else {
-            stage("semantic routine has not reached a complete exception-aware CFG")
-        },
-        recompilation: if verified_noop {
-            completed_stage("not required for a verified no-op")
-        } else {
-            stage("no complete routine is eligible for native code generation")
-        },
-        reconstruction: if verified_noop {
-            completed_stage("conventional input can be preserved byte-for-byte")
-        } else {
-            stage("no replacement image is emitted while proof blockers remain")
-        },
-        validation: CleanValidationReport {
-            input_parsed: true,
-            mapped_image_parsed: true,
-            output_written: false,
-            output_reparsed: false,
-        },
-        warnings,
-        errors,
-        ready_to_write: blockers.is_empty(),
-        blockers,
-    })
+        conventional,
+    ))
 }

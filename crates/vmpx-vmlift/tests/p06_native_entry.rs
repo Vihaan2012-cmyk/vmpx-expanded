@@ -141,12 +141,8 @@ fn refuses_p06_reintegration_at_proven_exception_transition() {
         coverage.coverage[0].unwind.exception_handler,
         Some(Rva(0x0EE0_F248))
     );
-    let cfg = vmpx_disasm::recover_cfg(
-        &pe,
-        Rva(0x0EE0_F248),
-        vmpx_disasm::CfgLimits::default(),
-    )
-    .expect("exception handler CFG");
+    let cfg = vmpx_disasm::recover_cfg(&pe, Rva(0x0EE0_F248), vmpx_disasm::CfgLimits::default())
+        .expect("exception handler CFG");
     for block in cfg.blocks {
         eprintln!("BLOCK {} -> {:?}", block.start, block.successors);
         for instruction in block.instructions {
