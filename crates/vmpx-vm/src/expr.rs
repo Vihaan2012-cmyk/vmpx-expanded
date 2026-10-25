@@ -516,7 +516,12 @@ fn simplify_unary(op: UnaryOp, value: Expr) -> Expr {
     }
 }
 
-/// Recognizes `not(not(x) + c) + c` and returns `x`.
+/// Recognizes `not(not(x) + a) + b` and returns `x + (b - a)`.
+///
+/// Complementing is an involution, so `not(not(x) + a) == x - a` in wrapping
+/// arithmetic. VMProtect uses this pair with differing constants to express a
+/// plain pointer adjustment, which must fold here or every stack-relative
+/// address it builds stays opaque.
 fn fold_double_complement_offset(complement: &Expr, offset: &Expr) -> Option<Expr> {
     let ExprKind::Unary {
         op: UnaryOp::Not,
@@ -538,15 +543,30 @@ fn fold_double_complement_offset(complement: &Expr, offset: &Expr) -> Option<Exp
             op: UnaryOp::Not,
             value: base,
         },
-        offset_side,
+        inner_offset,
     ) = (&left.kind, right)
     else {
         return None;
     };
-    if **offset_side != *offset || offset.width != base.width {
+    let width = base.width;
+    if offset.width != width || inner_offset.width != width {
         return None;
     }
-    Some((**base).clone())
+    let (Some(outer), Some(inner)) = (constant_value(offset), constant_value(inner_offset)) else {
+        return None;
+    };
+    if outer == inner {
+        return Some((**base).clone());
+    }
+    let delta = outer.wrapping_sub(inner);
+    Some(Expr {
+        width,
+        kind: ExprKind::Binary {
+            op: BinaryOp::Add,
+            left: base.clone(),
+            right: Box::new(Expr::constant(width, delta)),
+        },
+    })
 }
 
 fn simplify_intrinsic(width: BitWidth, name: String, arguments: Vec<Expr>) -> Expr {
@@ -981,6 +1001,31 @@ mod tests {
         let expression =
             Expr::binary(BinaryOp::Add, Expr::unary(UnaryOp::Not, inner), offset).expect("add");
         assert_eq!(expression.simplify(), base);
+    }
+
+    #[test]
+    fn folds_double_complement_with_differing_offsets() {
+        // not(not(x) + 64) + 72 == x + 8
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        let inner = Expr::binary(
+            BinaryOp::Add,
+            Expr::unary(UnaryOp::Not, base.clone()),
+            Expr::constant(BitWidth::W64, 64),
+        )
+        .expect("add");
+        let expression = Expr::binary(
+            BinaryOp::Add,
+            Expr::unary(UnaryOp::Not, inner),
+            Expr::constant(BitWidth::W64, 72),
+        )
+        .expect("add");
+        let expected = Expr::binary(
+            BinaryOp::Add,
+            base,
+            Expr::constant(BitWidth::W64, 8),
+        )
+        .expect("add");
+        assert_eq!(expression.simplify(), expected.simplify());
     }
 
     #[test]
