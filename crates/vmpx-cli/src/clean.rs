@@ -506,7 +506,8 @@ pub fn analyze_clean_with_image(
         blockers.extend([
             "original module entry point is not recovered".to_owned(),
             "application import set is not proven independently reconstructed".to_owned(),
-            "native code reintegration has not produced a complete replacement image".to_owned(),
+            "native code reintegration has not produced a devirtualized replacement image"
+                .to_owned(),
             "VMProtect sections remain referenced by unresolved paths".to_owned(),
         ]);
     }
@@ -620,7 +621,9 @@ pub fn analyze_clean_with_image(
             reconstruction: if verified_noop {
                 completed_stage("conventional input can be preserved byte-for-byte")
             } else {
-                stage("no replacement image is emitted while proof blockers remain")
+                stage(
+                    "a conventional layout image can be written, but no devirtualized routine is eligible for native replacement",
+                )
             },
             layout,
             validation: CleanValidationReport {
