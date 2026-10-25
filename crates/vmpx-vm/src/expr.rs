@@ -1019,12 +1019,8 @@ mod tests {
             Expr::constant(BitWidth::W64, 72),
         )
         .expect("add");
-        let expected = Expr::binary(
-            BinaryOp::Add,
-            base,
-            Expr::constant(BitWidth::W64, 8),
-        )
-        .expect("add");
+        let expected =
+            Expr::binary(BinaryOp::Add, base, Expr::constant(BitWidth::W64, 8)).expect("add");
         assert_eq!(expression.simplify(), expected.simplify());
     }
 
