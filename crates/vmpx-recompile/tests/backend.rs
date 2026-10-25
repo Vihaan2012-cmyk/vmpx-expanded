@@ -1361,3 +1361,94 @@ fn consecutive_labels_alias_one_instruction() {
         compiled.label_offsets[&second]
     );
 }
+
+#[test]
+fn tail_jump_tears_down_the_frame_and_does_not_return() {
+    // A tail transfer must leave the stack exactly as the caller expects. The
+    // frame teardown has to run, and no `ret` may precede the jump, because a
+    // `ret` would hand control to this function's caller instead.
+    let value = vr(1);
+    let function = Function {
+        assignments: vec![assigned(value, PhysicalRegister::Rbx)],
+        frame: StackFrame {
+            stack_allocation: 40,
+            preserve: vec![PhysicalRegister::Rbx],
+            call_ready: false,
+            preinitialized_slots: vec![],
+        },
+        operations: vec![
+            Operation::MoveImmediate {
+                destination: value,
+                value: 7,
+            },
+            Operation::JumpToAddress(vmpx_recompile::NativeAddress(0x2000)),
+        ],
+    };
+    let compiled = compile(&function, CodeAddress(0x1000)).expect("compile tail jump");
+    let instructions = decode_all(&compiled.bytes, 0x1000);
+    let mnemonics = instructions
+        .iter()
+        .map(|i| i.mnemonic())
+        .collect::<Vec<_>>();
+    assert!(
+        !mnemonics.contains(&Mnemonic::Ret),
+        "a tail jump must not emit a ret: {mnemonics:?}"
+    );
+    let jump = instructions
+        .iter()
+        .position(|i| i.mnemonic() == Mnemonic::Jmp)
+        .expect("one jump");
+    // The stack pointer is restored before the jump.
+    assert!(
+        instructions[..jump]
+            .iter()
+            .any(|i| i.mnemonic() == Mnemonic::Add && i.op0_register() == Register::RSP),
+        "frame allocation is released before the jump"
+    );
+    assert!(
+        instructions[..jump]
+            .iter()
+            .any(|i| i.mnemonic() == Mnemonic::Pop && i.op0_register() == Register::RBX),
+        "the preserved register is restored before the jump"
+    );
+}
+
+#[test]
+fn restoring_flags_leaves_the_stack_pointer_unchanged() {
+    // `popfq` reads its value from `[rsp]` and then advances the stack pointer,
+    // so the emitted sequence must reserve a slot first and let the pop consume
+    // it. The net effect on RSP has to be zero.
+    let value = vr(1);
+    let function = Function {
+        assignments: vec![assigned(value, PhysicalRegister::R10)],
+        frame: StackFrame::default(),
+        operations: vec![
+            Operation::MoveImmediate {
+                destination: value,
+                value: 0x206,
+            },
+            Operation::RestoreFlags { value },
+            Operation::Return,
+        ],
+    };
+    let compiled = compile(&function, CodeAddress(0x1000)).expect("compile flag restore");
+    let instructions = decode_all(&compiled.bytes, 0x1000);
+    let popfq = instructions
+        .iter()
+        .position(|i| i.mnemonic() == Mnemonic::Popfq)
+        .expect("one popfq");
+    let reserve = instructions[..popfq]
+        .iter()
+        .rev()
+        .find(|i| i.mnemonic() == Mnemonic::Sub && i.op0_register() == Register::RSP)
+        .expect("the flag slot is reserved before the pop");
+    assert_eq!(reserve.immediate(1), 8);
+    // The value is stored at the reserved slot, not below it.
+    let store = instructions[..popfq]
+        .iter()
+        .rev()
+        .find(|i| i.mnemonic() == Mnemonic::Mov && i.op0_kind() == iced_x86::OpKind::Memory)
+        .expect("the flag value is written to the slot");
+    assert_eq!(store.memory_displacement64(), 0);
+    assert_eq!(store.memory_base(), Register::RSP);
+}
