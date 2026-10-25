@@ -212,6 +212,17 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
         "emitted code must be more than a stub"
     );
 
+    // The exported plugin entry points must be reported honestly: a devirtualized
+    // image is only clean if no exported function still reaches VM code. This
+    // asserts the report actually carries that evidence rather than staying
+    // silent about it.
+    let exports = json["exports"].as_array().expect("export reports");
+    assert!(!exports.is_empty(), "the plugin exports must be reported");
+    assert!(
+        exports.iter().any(|export| export["vm_free"] == false),
+        "the fixture still has exports reaching VM code; the report must say so"
+    );
+
     let bytes = fs::read(&reconstructed).expect("reconstructed image exists");
     assert_eq!(
         u64::try_from(bytes.len()).expect("image length fits"),
