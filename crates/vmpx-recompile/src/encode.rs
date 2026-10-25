@@ -306,6 +306,29 @@ fn emit_source_binary(
     }
 }
 
+/// Materialises `rflags` from a register without disturbing the stack.
+///
+/// `POPFQ` reads its value from `[rsp]` and then advances the stack pointer, so a
+/// bare `popfq` would shift the stack by eight bytes. The value is written just
+/// below the current stack pointer and the stack pointer is advanced over it
+/// before the pop, which leaves the pointer exactly where it started.
+fn emit_restore_flags(
+    assembler: &mut CodeAssembler,
+    source: MachineRegister,
+) -> Result<(), iced_x86::IcedError> {
+    // Reserve the slot, fill it, then pop it: the subtraction and the pop cancel
+    // out, so the stack pointer ends exactly where it started. A `push` would
+    // have saved a register we do not need and would have clobbered the slot.
+    assembler.sub(rsp, 8)?;
+    match source {
+        MachineRegister::W64(source) => assembler.mov(qword_ptr(rsp), source)?,
+        MachineRegister::W32(source) => assembler.mov(dword_ptr(rsp), source)?,
+        MachineRegister::W16(source) => assembler.mov(word_ptr(rsp), source)?,
+        MachineRegister::W8(source) => assembler.mov(byte_ptr(rsp), source)?,
+    }
+    assembler.popfq()
+}
+
 fn emit_move_immediate(
     assembler: &mut CodeAssembler,
     destination: MachineRegister,
@@ -883,6 +906,12 @@ pub fn compile(
             }
             Operation::BranchIf { condition, target } => {
                 emit_conditional_jump(&mut output, *condition, *target, &mut fixups);
+            }
+            Operation::RestoreFlags { value } => {
+                let source = assigned(&validated, *value)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_restore_flags(assembler, source)
+                })?;
             }
             Operation::Return => {
                 emit_epilogue(&mut output, function, address, operation_index)?;

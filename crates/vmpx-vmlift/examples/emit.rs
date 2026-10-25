@@ -91,6 +91,7 @@ fn main() {
         continuation: None,
         effects: Vec::new(),
         effect_calls: Vec::new(),
+        rflags: None,
     };
     let replacement =
         build_replacement(&exit.registers, &config, CodeAddress(va)).expect("replacement");

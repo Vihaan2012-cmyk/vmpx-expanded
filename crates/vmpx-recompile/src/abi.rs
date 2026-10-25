@@ -59,6 +59,7 @@ fn operation_register_accesses(
         | Operation::Jump(_)
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
+        | Operation::RestoreFlags { .. }
         | Operation::Return => {}
         Operation::MoveImmediate { destination, .. } | Operation::SpillLoad { destination, .. } => {
             written.insert(*destination);
@@ -234,6 +235,7 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::Jump(_)
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
+        | Operation::RestoreFlags { .. }
         | Operation::Return => Ok(()),
     }
 }

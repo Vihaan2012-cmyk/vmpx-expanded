@@ -895,6 +895,7 @@ pub fn analyze_clean_with_image(
                             width: store.width,
                         })
                         .collect(),
+                    rflags: Some(exit.rflags.clone()),
                     effect_calls: effects
                         .calls
                         .iter()

@@ -245,6 +245,11 @@ pub enum Operation {
         target: Label,
     },
     Return,
+    /// Materialises `rflags` from `value` without disturbing the stack. Used to
+    /// hand a caller the exact condition state a virtualized routine produced.
+    RestoreFlags {
+        value: VirtualRegister,
+    },
 }
 
 /// One lowered function and the allocation/frame facts required to emit it.

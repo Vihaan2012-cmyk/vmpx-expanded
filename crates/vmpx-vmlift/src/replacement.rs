@@ -60,6 +60,10 @@ pub struct ReplacementConfig {
     /// performs one call at the start of the routine and binds the result to
     /// the intrinsic name that stands for it.
     pub effect_calls: Vec<EffectCall>,
+    /// The condition state the routine leaves for its caller. Restoring it is
+    /// part of the routine's contract: a caller that branches on a flag it
+    /// expects the routine to have set would otherwise read this body's flags.
+    pub rflags: Option<Expr>,
 }
 
 /// One application-observable store the routine must perform.
@@ -202,6 +206,7 @@ pub fn build_replacement(
     let mut extra_inputs: Vec<ExpressionInput> = Vec::new();
     // Every fragment gets a private window of frame slots starting here, above
     // the shared input frame, the value results, and the effect results.
+    let mut inputs = inputs;
     let mut window_base = result_base
         .checked_add(u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?)
         .and_then(|base| base.checked_add(effect_slot_count))
@@ -346,8 +351,14 @@ pub fn build_replacement(
         });
     }
     operations.extend(effects_operations);
-    let mut inputs = inputs;
-    inputs.extend(extra_inputs);
+    // Value bodies read the effect results too, so they join the shared input
+    // frame before any register is computed. `lower_fragment` already appends
+    // them, so only the ones not yet present are added here.
+    for input in extra_inputs.iter() {
+        if !inputs.iter().any(|existing| existing.name == input.name) {
+            inputs.push(input.clone());
+        }
+    }
 
     // 2. One body per exit register. Each body reads its inputs from the shared
     // frame and stores its result into its own slot.
@@ -491,6 +502,26 @@ pub fn build_replacement(
     // returns, which is only correct when the exit already targets the caller.
     // The jump must be a real tail transfer: nothing is pushed, so the
     // continuation sees exactly the stack the VM exit would have produced.
+    // Restore the condition state before the frame goes away. The value is
+    // materialised while the frame is still addressable, and `POPFQ` does not
+    // touch the stack pointer beyond the one qword it consumes.
+    if let Some(rflags) = &config.rflags {
+        let bound = substitute_effect_bindings(rflags, &effect_bindings)?;
+        let (flag_operations, flag_value) = lower_fragment(
+            &bound,
+            &inputs,
+            &extra_inputs,
+            config,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+            &mut window_base,
+            &shared_end,
+        )?;
+        operations.extend(flag_operations);
+        operations.push(Operation::RestoreFlags { value: flag_value });
+    }
+
     // A tail jump tears the frame down itself, so it replaces the return rather
     // than following it; emitting both would leave an unreachable `ret`.
     match config.continuation {
@@ -585,6 +616,34 @@ fn substitute_effect_bindings(
         .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?)
 }
 
+/// Rewrites `vm_flags_<op>_wN` intrinsics to the arithmetic they denote.
+///
+/// These intrinsics describe how a VM handler computed a flag word from a plain
+/// binary operation. They hold no VM state, so a native replacement performs the
+/// same operation directly instead of refusing to lower the name.
+fn rewrite_vm_flag_intrinsics(expression: &Expr) -> Result<Expr, ReplacementError> {
+    let rewritten = expression
+        .rewrite_intrinsics(&mut |width, name, arguments| {
+            let operation = match name {
+                "vm_flags_add_w8" | "vm_flags_add_w16" | "vm_flags_add_w32"
+                | "vm_flags_add_w64" => vmpx_vm::BinaryOp::Add,
+                "vm_flags_nor_w8" | "vm_flags_nor_w16" | "vm_flags_nor_w32"
+                | "vm_flags_nor_w64" => vmpx_vm::BinaryOp::And,
+                "vm_flags_nand_w8" | "vm_flags_nand_w16" | "vm_flags_nand_w32"
+                | "vm_flags_nand_w64" => vmpx_vm::BinaryOp::Or,
+                _ => return None,
+            };
+            let [left, right] = arguments else {
+                return None;
+            };
+            Expr::binary(operation, left.clone(), right.clone())
+                .ok()
+                .filter(|value| value.width == width)
+        })
+        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+    Ok(rewritten)
+}
+
 /// The symbolic name bound to the result of effect call `index`.
 fn effect_result_name(index: usize) -> String {
     format!("__effect_result_{index}")
@@ -608,7 +667,17 @@ fn lower_fragment(
     shared_frame_slots: &u16,
 ) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
     let mut all_inputs = inputs.to_vec();
-    all_inputs.extend(extra_inputs.iter().cloned());
+    for input in extra_inputs {
+        if !all_inputs
+            .iter()
+            .any(|existing| existing.name == input.name)
+        {
+            all_inputs.push(input.clone());
+        }
+    }
+    // The flag intrinsic names a plain arithmetic operation on the flag word;
+    // it carries no VM state, so it lowers to the operation it denotes.
+    let expression = &rewrite_vm_flag_intrinsics(expression)?;
     let lowered = lower_expression(
         expression,
         &ExpressionCodegenConfig {
@@ -806,6 +875,9 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
         },
         Operation::Jump(label) => Operation::Jump(label),
         Operation::JumpToAddress(target) => Operation::JumpToAddress(target),
+        Operation::RestoreFlags { value } => Operation::RestoreFlags {
+            value: register(value),
+        },
         Operation::BranchIf { condition, target } => Operation::BranchIf { condition, target },
         Operation::Return => Operation::Return,
     }
@@ -858,6 +930,7 @@ mod tests {
             continuation: None,
             effects: Vec::new(),
             effect_calls: Vec::new(),
+            rflags: None,
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -881,6 +954,7 @@ mod tests {
             continuation: None,
             effects: Vec::new(),
             effect_calls: Vec::new(),
+            rflags: None,
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -915,6 +989,7 @@ mod tests {
             continuation: None,
             effects: Vec::new(),
             effect_calls: Vec::new(),
+            rflags: None,
         };
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");
