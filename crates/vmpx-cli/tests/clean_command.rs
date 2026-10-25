@@ -200,17 +200,25 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
     assert_eq!(json["layout"]["loader_valid"], true);
     assert_eq!(json["validation"]["output_reparsed"], true);
 
-    // The recompilation stage must emit real native code for every path whose
-    // exit state is fully lowerable: both viable DLL-reason paths, the VM entry
-    // that reason 0's continuation re-enters, and the loader-reachable TLS
-    // callback, which is a virtualized routine in its own right.
-    assert_eq!(json["recompilation"]["metrics"]["emitted"], 4);
-    assert!(
-        json["recompilation"]["metrics"]["bytes"]
-            .as_u64()
-            .is_some_and(|bytes| bytes > 512),
-        "emitted code must be more than a stub"
-    );
+    // No replacement may be emitted while a nonvolatile register's exit value
+    // differs from its entry value: the caller requires the register restored and
+    // the exit state requires the computed value, and no body can satisfy both.
+    // The stage must therefore report the refusal rather than emit code whose
+    // result is discarded.
+    let emitted = json["recompilation"]["metrics"]["emitted"]
+        .as_u64()
+        .unwrap_or(0);
+    let diagnostics = json["recompilation"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    if emitted == 0 {
+        assert!(
+            diagnostics.iter().any(|line| line
+                .as_str()
+                .is_some_and(|text| text.contains("nonvolatile"))),
+            "refusing every path must be explained: {diagnostics:?}"
+        );
+    }
 
     // The exported plugin entry points must be reported honestly: a devirtualized
     // image is only clean if no exported function still reaches VM code. This

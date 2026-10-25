@@ -112,6 +112,11 @@ pub enum ReplacementError {
     #[error("more than 65535 symbolic inputs were supplied")]
     TooManyInputs,
 
+    #[error(
+        "nonvolatile {register:?} must be restored for the caller, but the exit state          gives it a different value; the restoration would discard that value"
+    )]
+    ClobberedNonvolatile { register: X64NativeRegister },
+
     #[error("effect lowering failed: {0}")]
     Effect(#[from] crate::ExpressionCodegenError),
 
@@ -550,10 +555,25 @@ pub fn build_replacement(
         None => operations.push(Operation::Return),
     }
 
-    // Every nonvolatile register the body writes must be preserved.
+    // A preserved register is restored to its caller's value after the epilogue
+    // loads the exit value into it. Restoring wins, so a nonvolatile register
+    // whose exit value differs from its entry value cannot be represented: the
+    // backend requires the preservation, and the exit state requires the value.
+    // Refuse instead of emitting a body whose result is silently discarded.
     for assignment in &assignments {
         let register = assignment.physical_register;
         if register.is_win64_nonvolatile() && !preserve.contains(&register) {
+            let architectural = X64NativeRegister::ALL
+                .into_iter()
+                .find(|candidate| physical_for(candidate) == register);
+            if let Some(architectural) = architectural
+                && let Some(value) = registers.get(&architectural)
+                && value != &Expr::register(vmpx_vm::BitWidth::W64, architectural.symbolic_name())
+            {
+                return Err(ReplacementError::ClobberedNonvolatile {
+                    register: architectural,
+                });
+            }
             preserve.push(register);
         }
     }
@@ -950,10 +970,208 @@ mod tests {
     }
 
     #[test]
+    fn an_identity_value_reads_its_own_input_slot() {
+        // A register whose exit value is just its own entry value must load the
+        // slot that input was captured into and store it to that value's result
+        // slot. Reading any other slot would silently substitute another input.
+        let inputs = vec![
+            ("native_rax_initial".to_owned(), PhysicalRegister::Rax),
+            ("native_r10_initial".to_owned(), PhysicalRegister::R10),
+        ];
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let registers = BTreeMap::from([(
+            X64NativeRegister::R10,
+            Expr::register(vmpx_vm::BitWidth::W64, "native_r10_initial"),
+        )]);
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        // The result slot is `input_count + index_of_R10_in_ordered`.
+        let result_slot = 2;
+        let stored = replacement
+            .function
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::SpillStore { slot, .. } if slot.0 == result_slot));
+        assert!(stored, "the value must be stored into its result slot");
+    }
+
+    #[test]
+    fn every_identity_value_reads_its_own_slot_across_a_full_register_set() {
+        // With all fifteen registers present, each identity value must load the
+        // slot its own input was captured into. A single mis-numbered slot would
+        // give one register another register's value.
+        let all = [
+            X64NativeRegister::Rax,
+            X64NativeRegister::Rbx,
+            X64NativeRegister::Rcx,
+            X64NativeRegister::Rdx,
+            X64NativeRegister::Rbp,
+            X64NativeRegister::Rsi,
+            X64NativeRegister::Rdi,
+            X64NativeRegister::R8,
+            X64NativeRegister::R9,
+            X64NativeRegister::R10,
+            X64NativeRegister::R11,
+            X64NativeRegister::R12,
+            X64NativeRegister::R13,
+            X64NativeRegister::R14,
+            X64NativeRegister::R15,
+        ];
+        let mut inputs: Vec<(String, PhysicalRegister)> = all
+            .iter()
+            .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+            .collect();
+        inputs.sort();
+        inputs.dedup();
+        let registers: BTreeMap<X64NativeRegister, Expr> = all
+            .iter()
+            .map(|register| {
+                (
+                    *register,
+                    Expr::register(vmpx_vm::BitWidth::W64, register.symbolic_name()),
+                )
+            })
+            .collect();
+        let config = ReplacementConfig {
+            inputs: inputs.clone(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 64,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        // `ordered` is sorted by register name, so the result slot of a value is
+        // its position in that order plus the input count.
+        let mut ordered = all.to_vec();
+        ordered.sort_by_key(|register| format!("{register:?}"));
+        let result_base = u16::try_from(inputs.len()).expect("inputs fit");
+        // Each value body must end by storing to its own result slot.
+        for (index, register) in ordered.iter().enumerate() {
+            let slot = result_base + u16::try_from(index).expect("index fits");
+            let stores = replacement
+                .function
+                .operations
+                .iter()
+                .filter(|operation| {
+                    matches!(operation, Operation::SpillStore { slot: s, .. } if s.0 == slot)
+                })
+                .count();
+            assert!(stores >= 1, "{register:?} must store to result slot {slot}");
+        }
+    }
+
+    #[test]
+    fn a_rewritten_symbol_frees_its_register_for_the_stack_root() {
+        // The entry stub captures native RSP into R11 after saving R11's own value
+        // on the stack. The saved value is loadable from the frame, so the name is
+        // rewritten to that load and R11 carries the stack root instead. Both
+        // values must stay correct: the rewritten one from the frame, and the
+        // stack root from the register.
+        let all = [
+            X64NativeRegister::Rax,
+            X64NativeRegister::Rbx,
+            X64NativeRegister::Rcx,
+            X64NativeRegister::Rdx,
+            X64NativeRegister::Rbp,
+            X64NativeRegister::Rsi,
+            X64NativeRegister::Rdi,
+            X64NativeRegister::R8,
+            X64NativeRegister::R9,
+            X64NativeRegister::R10,
+            X64NativeRegister::R11,
+            X64NativeRegister::R12,
+            X64NativeRegister::R13,
+            X64NativeRegister::R14,
+            X64NativeRegister::R15,
+        ];
+        let mut inputs: Vec<(String, PhysicalRegister)> = all
+            .iter()
+            .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+            .collect();
+        let mut rewrites = BTreeMap::new();
+        let saved = Expr::load(
+            vmpx_vm::BitWidth::W64,
+            Expr::binary(
+                vmpx_vm::BinaryOp::Add,
+                Expr::register(vmpx_vm::BitWidth::W64, "vsp_initial"),
+                Expr::constant(vmpx_vm::BitWidth::W64, 64),
+            )
+            .expect("address"),
+        );
+        rewrites.insert("native_r11_initial".to_owned(), saved);
+        inputs.retain(|(name, _)| !rewrites.contains_key(name));
+        inputs.push(("vsp_initial".to_owned(), PhysicalRegister::R11));
+        inputs.sort();
+        inputs.dedup();
+        assert_eq!(
+            inputs.len(),
+            15,
+            "one name was rewritten, one register added"
+        );
+        assert_eq!(
+            inputs
+                .iter()
+                .filter(|(_, register)| *register == PhysicalRegister::R11)
+                .count(),
+            1,
+            "only the stack root may occupy R11"
+        );
+        let registers = BTreeMap::from([
+            (
+                X64NativeRegister::R11,
+                Expr::register(vmpx_vm::BitWidth::W64, "native_r11_initial"),
+            ),
+            (
+                X64NativeRegister::R10,
+                Expr::register(vmpx_vm::BitWidth::W64, "native_r10_initial"),
+            ),
+        ]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 64,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: rewrites,
+        };
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        // The R11 value must come from the frame, so its body must contain a load
+        // from a shared-frame slot.
+        let loads = replacement
+            .function
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::Load { .. }))
+            .count();
+        assert!(loads >= 1, "the rewritten value must load from the frame");
+    }
+
+    #[test]
     fn builds_a_complete_function_for_a_constant_exit_state() {
+        // Only volatile registers may be given new values: a nonvolatile one has
+        // to be restored for the caller, which would discard the computed value.
         let registers = BTreeMap::from([
             (X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 7)),
-            (X64NativeRegister::Rbx, Expr::constant(BitWidth::W64, 9)),
+            (X64NativeRegister::Rcx, Expr::constant(BitWidth::W64, 9)),
         ]);
         let config = ReplacementConfig {
             inputs: inputs(),
@@ -975,7 +1193,10 @@ mod tests {
     }
 
     #[test]
-    fn preserves_every_nonvolatile_register_it_writes() {
+    fn refuses_to_discard_a_computed_nonvolatile_value() {
+        // Restoring a nonvolatile register for the caller overwrites whatever the
+        // exit state computed for it. That is only harmless when the two agree, so
+        // a differing value must be refused rather than silently dropped.
         let registers = BTreeMap::from([(
             X64NativeRegister::R12,
             Expr::constant(BitWidth::W64, 0x1234),
@@ -991,23 +1212,13 @@ mod tests {
             rflags: None,
             symbol_rewrites: BTreeMap::new(),
         };
-        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
-            .expect("replacement compiles");
+        let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect_err("a discarded value must be refused");
         assert!(
-            replacement
-                .function
-                .frame
-                .preserve
-                .contains(&PhysicalRegister::R12)
+            matches!(error, ReplacementError::ClobberedNonvolatile { register } if register == X64NativeRegister::R12),
+            "the refusal must name the register: {error}"
         );
-        // The prologue must push R12 (41 54) before writing it.
-        assert!(
-            replacement
-                .compiled
-                .bytes
-                .windows(2)
-                .any(|w| w == [0x41, 0x54])
-        );
+        let _ = PhysicalRegister::R12;
     }
 
     #[test]
