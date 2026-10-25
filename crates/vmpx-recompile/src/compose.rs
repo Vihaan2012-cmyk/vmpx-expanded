@@ -50,7 +50,9 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     let mut fragment_starts = Vec::with_capacity(fragments.len());
     let mut slot_maps = Vec::with_capacity(fragments.len());
     // Composed virtual-register ids that some fragment declared dead on exit.
-    let mut dead_ids: BTreeSet<u32> = BTreeSet::new();
+    // One composed virtual register per physical register, shared by every
+    // fragment that names it.
+    let mut physical_home: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
     let mut next_register = 0_u32;
     let mut next_slot = 0_u16;
     let mut next_label = 0_u32;
@@ -59,68 +61,40 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
 
     for fragment in fragments {
         fragment_starts.push(operations.len());
+        // A virtual register denotes a physical register. Every fragment
+        // register that maps to the same physical register therefore maps to the
+        // same composed virtual register: the fragments run in sequence, so they
+        // are writing the same architectural storage, and their distinct values
+        // are kept apart by the spill slots each one stores into.
+        let mut registers: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
+        for assignment in &fragment.function.assignments {
+            let physical = assignment.physical_register;
+            let canonical = match physical_home.get(&physical) {
+                Some(existing) => *existing,
+                None => {
+                    let created =
+                        VirtualRegister::new(next_register, assignment.virtual_register.width);
+                    next_register = next_register
+                        .checked_add(1)
+                        .ok_or(ComposeError::RegisterOverflow)?;
+                    physical_home.insert(physical, created);
+                    assignments.push(RegisterAssignment::new(created, physical));
+                    created
+                }
+            };
+            registers.insert(assignment.virtual_register.id, canonical);
+        }
         let mut renamer = Renamer {
-            registers: BTreeMap::new(),
+            registers,
             slots: BTreeMap::new(),
             labels: BTreeMap::new(),
             next_register,
             next_slot,
             next_label,
         };
-
-        // Assignments first so every fragment register has a home.
-        //
-        // Every fragment register keeps a distinct virtual register. The
-        // backend rejects two virtual registers sharing one physical register,
-        // so a caller that reuses a physical register across fragments must
-        // resolve that conflict before composing; compose does not silently
-        // alias two values together.
-        for assignment in &fragment.function.assignments {
-            let renamed = renamer.register(assignment.virtual_register)?;
-            if !assignments
-                .iter()
-                .any(|existing| existing.virtual_register.id == renamed.id)
-            {
-                assignments.push(RegisterAssignment::new(
-                    renamed,
-                    assignment.physical_register,
-                ));
-            }
-        }
         for operation in &fragment.function.operations {
             let renamed = renamer.operation(operation)?;
             operations.push(renamed);
-        }
-        if std::env::var_os("VMPX_COMPOSE_DEBUG").is_some() {
-            let dups: Vec<_> = {
-                let mut seen = BTreeMap::new();
-                let mut d = Vec::new();
-                for a in &assignments {
-                    if let Some(prev) = seen.insert(a.physical_register, a.virtual_register.id) {
-                        d.push((a.physical_register, prev, a.virtual_register.id));
-                    }
-                }
-                d
-            };
-            eprintln!("after fragment: dups={dups:?}");
-        }
-        if std::env::var_os("VMPX_COMPOSE_DEBUG").is_some() {
-            eprintln!(
-                "frag start={} assigns={} next_reg={}",
-                fragment_starts.last().copied().unwrap_or(0),
-                fragment.function.assignments.len(),
-                renamer.next_register
-            );
-        }
-
-        for assignment in &fragment.function.assignments {
-            if fragment
-                .scratch_dead
-                .contains(&assignment.physical_register)
-                && let Some(composed) = renamer.registers.get(&assignment.virtual_register.id)
-            {
-                dead_ids.insert(composed.id);
-            }
         }
         next_register = renamer.next_register;
         next_slot = renamer.next_slot;
@@ -144,53 +118,7 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
         slot_bytes = slot_bytes.saturating_add(fragment.function.frame.stack_allocation);
     }
 
-    // Slots are numbered from zero, so `next_slot` is exactly the count needed.
-    //
-    // The backend allows one virtual register per physical register, but compose
-    // itself must never merge two values: two fragments that both compute into
-    // `RAX` hold different values and need distinct storage. Renaming is
-    // therefore unconditional, and aliasing happens only where a fragment
-    // explicitly declared a register dead on exit.
-    //
-    // A dead register may only be aliased onto a *live* home for the same
-    // physical register. If no live assignment exists, the dead register keeps
-    // its own storage, so the backend still rejects genuinely ambiguous input
-    // instead of silently merging values.
-    let mut live_home: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| !dead_ids.contains(&assignment.virtual_register.id))
-    {
-        live_home
-            .entry(assignment.physical_register)
-            .or_insert(assignment.virtual_register);
-    }
-    let mut aliases: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
-    let mut deduped: Vec<RegisterAssignment> = Vec::new();
-    for assignment in &assignments {
-        let id = assignment.virtual_register.id;
-        match live_home.get(&assignment.physical_register) {
-            Some(home) if dead_ids.contains(&id) && home.id != id => {
-                aliases.insert(id, *home);
-            }
-            _ => deduped.push(*assignment),
-        }
-    }
-    if !aliases.is_empty() {
-        let mut renamer = Renamer {
-            registers: aliases,
-            slots: BTreeMap::new(),
-            labels: BTreeMap::new(),
-            next_register,
-            next_slot,
-            next_label,
-        };
-        operations = operations
-            .iter()
-            .map(|operation| renamer.operation(operation))
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-    let assignments = deduped;
+    // Assignments were built canonically above, one per physical register.
     let frame = StackFrame {
         stack_allocation: u32::from(next_slot).saturating_mul(8),
         preserve,
@@ -395,7 +323,7 @@ mod tests {
     use super::*;
     use crate::{PhysicalRegister, UnaryOp};
 
-    fn fragment(value: u64) -> Fragment {
+    fn fragment_with(value: u64, physical: PhysicalRegister) -> Fragment {
         let register = VirtualRegister::qword(0);
         Fragment {
             function: Function {
@@ -418,7 +346,7 @@ mod tests {
                     },
                     Operation::Return,
                 ],
-                assignments: vec![RegisterAssignment::new(register, PhysicalRegister::Rax)],
+                assignments: vec![RegisterAssignment::new(register, physical)],
                 frame: StackFrame {
                     stack_allocation: 8,
                     preserve: Vec::new(),
@@ -432,18 +360,24 @@ mod tests {
     }
 
     #[test]
-    fn compose_gives_each_fragment_disjoint_namespaces() {
-        let composition = compose(&[fragment(1), fragment(2)]).expect("compose");
+    fn compose_shares_one_virtual_register_per_physical_register() {
+        // Two fragments that both compute into RAX write the same architectural
+        // storage in sequence; their distinct values are kept apart by the slots
+        // each stores into, not by separate registers.
+        let composition = compose(&[
+            fragment_with(1, PhysicalRegister::Rax),
+            fragment_with(2, PhysicalRegister::Rax),
+        ])
+        .expect("compose");
         assert_eq!(composition.fragment_starts, vec![0, 5]);
         assert_eq!(composition.function.operations.len(), 10);
-        // Two fragments each used register id 0 and slot 0; both must be renamed.
         let registers: std::collections::BTreeSet<u32> = composition
             .function
             .assignments
             .iter()
             .map(|assignment| assignment.virtual_register.id)
             .collect();
-        assert_eq!(registers.len(), 2);
+        assert_eq!(registers.len(), 1);
         let slots: std::collections::BTreeSet<u16> = composition
             .function
             .operations
@@ -456,8 +390,22 @@ mod tests {
             })
             .collect();
         assert_eq!(slots.len(), 2);
-        // Two fragments each use one slot; both slots are live in the composed
-        // frame, so the allocation covers both.
         assert_eq!(composition.function.frame.stack_allocation, 16);
+    }
+
+    #[test]
+    fn compose_keeps_distinct_registers_for_distinct_physical_homes() {
+        let composition = compose(&[
+            fragment_with(1, PhysicalRegister::Rax),
+            fragment_with(2, PhysicalRegister::Rbx),
+        ])
+        .expect("compose");
+        let registers: std::collections::BTreeSet<u32> = composition
+            .function
+            .assignments
+            .iter()
+            .map(|assignment| assignment.virtual_register.id)
+            .collect();
+        assert_eq!(registers.len(), 2);
     }
 }
