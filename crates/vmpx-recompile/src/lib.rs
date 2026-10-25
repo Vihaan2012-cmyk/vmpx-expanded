@@ -5,11 +5,13 @@
 //! approximated.
 
 mod abi;
+mod compose;
 mod encode;
 mod error;
 mod ir;
 
 pub use abi::{RegisterAssignment, StackFrame, validate_function};
+pub use compose::{ComposeError, Composition, Fragment, compose};
 pub use encode::{CodeAddress, CompiledFunction, compile};
 pub use error::CompileError;
 pub use ir::{

@@ -491,12 +491,23 @@ pub fn lower_expression(
         .ok()
         .and_then(|slots| slots.checked_mul(8))
         .ok_or(ExpressionCodegenError::StorageIdOverflow)?;
+    // Any Win64 nonvolatile register this expression writes must be preserved
+    // by the emitted frame. The backend enforces that invariant, so a caller
+    // selecting a nonvolatile result or temporary register would otherwise get
+    // a hard rejection instead of a correct function prologue.
+    let mut preserve = Vec::new();
+    for assignment in &context.assignments {
+        let register = assignment.physical_register;
+        if register.is_win64_nonvolatile() && !preserve.contains(&register) {
+            preserve.push(register);
+        }
+    }
     let function = Function {
         operations: context.operations,
         assignments: context.assignments,
         frame: StackFrame {
             stack_allocation,
-            preserve: Vec::new(),
+            preserve,
             call_ready: false,
         },
     };
