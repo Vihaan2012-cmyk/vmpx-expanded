@@ -181,17 +181,26 @@ pub fn recover_entry_profile(
             message: context_mapping.diagnostics.join("; "),
         }
     })?;
+    // A profile either ends at a linear block boundary (branch, native call,
+    // exit) or at a cross-profile transition handler. Transition handlers have
+    // no program-level semantic of their own, so requiring one would reject a
+    // valid entry whose first profile hands control to another profile. Both
+    // shapes are accepted here; the chain explorer proves which applies.
     let boundary_semantic = decode
         .handler_recoveries
         .get(&decode.decode.final_state.handler)
         .and_then(|handler| handler.handler_analysis.as_ref())
         .map(|analysis| analysis.semantic)
-        .filter(|semantic| semantic.ends_linear_block())
-        .ok_or(EntryProfileRecoveryError::MissingBoundarySemantic)?;
+        .filter(|semantic| semantic.ends_linear_block());
+    if boundary_semantic.is_none()
+        && decode.decode.stop_reason != crate::LinearDecodeStop::MissingHandlerSpec
+    {
+        return Err(EntryProfileRecoveryError::MissingBoundarySemantic);
+    }
     let operational = &decode.decode.instructions[operational_instruction_offset..];
     let symbolic = execute_symbolic_linear_block_with_initial_state(
         operational,
-        Some(boundary_semantic),
+        boundary_semantic,
         limits.symbolic,
         &symbolic_initial,
         Some(pe),

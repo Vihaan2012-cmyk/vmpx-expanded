@@ -174,11 +174,45 @@ pub fn recover_entry_paths(
     limits: EntryPathRecoveryLimits,
 ) -> Result<RecoveredEntryPathFamily, EntryPathRecoveryError> {
     let entry_profile = recover_entry_profile(pe, entry, limits.entry)?;
-    let branch_target = entry_profile
-        .symbolic
-        .branch_target
-        .as_ref()
-        .ok_or(EntryPathRecoveryError::MissingBranchTarget)?;
+    // An entry whose first profile ends in a virtual branch is specialized per
+    // branch target. An entry that instead ends in a cross-profile transition
+    // has no branch target at all: its successor state comes from the
+    // transition, which the chain explorer recovers directly.
+    let Some(branch_target) = entry_profile.symbolic.branch_target.as_ref() else {
+        let symbolic = entry_profile.symbolic.continuation_state();
+        let first = entry_profile.decode.decode.final_state.clone();
+        let chain = explore_vm_profile_chain(
+            pe,
+            VmProfileExecutionState {
+                decoder: first,
+                profile: entry_profile.profile,
+                symbolic,
+            },
+            limits.chain,
+        )?;
+        let native_exit = extract_native_exit(&chain)?;
+        let assignments = BTreeMap::new();
+        let path = RecoveredEntryPath {
+            assignments: assignments.clone(),
+            chain,
+            native_exit,
+        };
+        return Ok(RecoveredEntryPathFamily {
+            entry_profile,
+            branch_enumeration: crate::SymbolicDomainReport {
+                schema_version: 1,
+                dependencies: Vec::new(),
+                unresolved_dependencies: Vec::new(),
+                combinations_evaluated: 1,
+                unique_values: Vec::new(),
+                alternatives: Vec::new(),
+                complete: true,
+            },
+            domain_complete: true,
+            all_paths_reach_vm_exit: path.native_exit.is_some(),
+            paths: vec![path],
+        });
+    };
     let branch_enumeration = enumerate_symbolic_value(branch_target, domains, limits.domain)?;
     if branch_enumeration.alternatives.len() > limits.max_paths {
         return Err(EntryPathRecoveryError::PathLimit {
