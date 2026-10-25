@@ -448,3 +448,82 @@ fn physical_for(register: &X64NativeRegister) -> PhysicalRegister {
         X64NativeRegister::R15 => PhysicalRegister::R15,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmpx_vm::BitWidth;
+
+    fn inputs() -> Vec<(String, PhysicalRegister)> {
+        vec![
+            ("native_rax_initial".to_owned(), PhysicalRegister::Rbx),
+            ("native_rcx_initial".to_owned(), PhysicalRegister::Rsi),
+            ("vsp_initial".to_owned(), PhysicalRegister::Rdi),
+        ]
+    }
+
+    #[test]
+    fn builds_a_complete_function_for_a_constant_exit_state() {
+        let registers = BTreeMap::from([
+            (X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 7)),
+            (X64NativeRegister::Rbx, Expr::constant(BitWidth::W64, 9)),
+        ]);
+        let config = ReplacementConfig {
+            inputs: inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("replacement compiles");
+        assert_eq!(replacement.emitted.len(), 2);
+        assert!(replacement.compiled.bytes.len() > 16);
+        // The emitted body must end in RET.
+        assert_eq!(replacement.compiled.bytes.last().copied(), Some(0xC3));
+    }
+
+    #[test]
+    fn preserves_every_nonvolatile_register_it_writes() {
+        let registers = BTreeMap::from([(
+            X64NativeRegister::R12,
+            Expr::constant(BitWidth::W64, 0x1234),
+        )]);
+        let config = ReplacementConfig {
+            inputs: inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("replacement compiles");
+        assert!(
+            replacement
+                .function
+                .frame
+                .preserve
+                .contains(&PhysicalRegister::R12)
+        );
+        // The prologue must push R12 (41 54) before writing it.
+        assert!(
+            replacement
+                .compiled
+                .bytes
+                .windows(2)
+                .any(|w| w == [0x41, 0x54])
+        );
+    }
+
+    #[test]
+    fn refuses_an_expression_it_cannot_lower() {
+        let registers = BTreeMap::from([(
+            X64NativeRegister::Rax,
+            Expr::intrinsic(BitWidth::W64, "fresh_allocation_return_epoch_0", vec![]),
+        )]);
+        let config = ReplacementConfig {
+            inputs: inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+        };
+        let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect_err("intrinsic must not be emitted");
+        assert!(matches!(error, ReplacementError::Lowering { .. }));
+    }
+}
