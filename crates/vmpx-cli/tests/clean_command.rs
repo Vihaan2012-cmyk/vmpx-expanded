@@ -228,3 +228,77 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
     fs::remove_file(report).expect("remove isolated report");
     fs::remove_dir(directory).expect("remove isolated test directory");
 }
+
+/// The strongest available correctness statement for the layout stage: the
+/// conventional image must map into memory byte-for-byte identically to the
+/// RVA-layout analysis image produced by unpacking, which is itself verified
+/// byte-identical to the external VMPStatic reference. Only the raw-layout
+/// section fields may differ.
+#[test]
+#[ignore = "large controlled VMProtect fixture"]
+fn conventional_image_maps_identically_to_the_analysis_image() {
+    let directory = test_directory("clean-map");
+    fs::create_dir(&directory).expect("create isolated test directory");
+    let output = directory.join("output.xpl");
+    let report = directory.join("report.json");
+    let reconstructed = directory.join("reconstructed.xpl");
+    let mapped = directory.join("mapped.xpl");
+    let input = fixture_directory().join("systems.original.xpl");
+    let input = input.as_path();
+
+    let unpack = Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["unpack"])
+        .arg(input)
+        .arg(&mapped)
+        .output()
+        .expect("unpack starts");
+    assert!(
+        unpack.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&unpack.stderr)
+    );
+
+    let result = run_clean_reconstructed(input, &output, &report, &reconstructed);
+    assert!(!result.status.success());
+
+    fn loaded_image(bytes: &[u8]) -> Vec<u8> {
+        let pe = vmpx_pe::PeImage::parse(bytes).expect("valid PE");
+        let mut image = vec![0_u8; pe.optional.size_of_image as usize];
+        let headers = pe.optional.size_of_headers as usize;
+        image[..headers].copy_from_slice(&bytes[..headers]);
+        for section in &pe.sections {
+            let span = section.mapped_span() as usize;
+            let start = section.virtual_address.0 as usize;
+            let mut chunk = vec![0_u8; span];
+            if section.size_of_raw_data != 0 {
+                let raw = section.pointer_to_raw_data.0 as usize;
+                let available = (section.size_of_raw_data as usize).min(bytes.len() - raw);
+                chunk[..available].copy_from_slice(&bytes[raw..raw + available]);
+            }
+            image[start..start + span].copy_from_slice(&chunk);
+        }
+        // SizeOfRawData and PointerToRawData are loader metadata, not content.
+        let table = pe.nt_headers_offset.0 as usize
+            + 4
+            + 20
+            + usize::try_from(pe.coff.size_of_optional_header).expect("optional header");
+        for index in 0..pe.sections.len() {
+            let base = table + index * 40;
+            image[base + 16..base + 24].fill(0);
+        }
+        image
+    }
+
+    let mapped_bytes = fs::read(&mapped).expect("read analysis image");
+    let reconstructed_bytes = fs::read(&reconstructed).expect("read conventional image");
+    assert_eq!(
+        loaded_image(&mapped_bytes),
+        loaded_image(&reconstructed_bytes),
+        "conventional layout must preserve the loaded memory image exactly"
+    );
+
+    fs::remove_file(mapped).expect("remove analysis image");
+    fs::remove_file(reconstructed).expect("remove conventional image");
+    fs::remove_file(report).expect("remove report");
+    fs::remove_dir(directory).expect("remove directory");
+}
