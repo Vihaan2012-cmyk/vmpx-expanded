@@ -98,6 +98,9 @@ pub enum ReplacementError {
 
     #[error("more than 65535 symbolic inputs were supplied")]
     TooManyInputs,
+
+    #[error("effect lowering failed: {0}")]
+    Effect(#[from] crate::ExpressionCodegenError),
 }
 
 #[derive(Debug)]
@@ -181,6 +184,96 @@ pub fn build_replacement(
         capture_ops.push(Operation::SpillStore { slot, source });
     }
     operations.extend(capture_ops);
+
+    // 1b. Effect prelude. The virtualized routine's application-observable
+    // effects run here, in their original order, before any register value is
+    // computed. Imported calls execute once and their results are captured into
+    // frame slots, so a value that reads the same allocation does not invoke the
+    // allocator again.
+    let mut effects_operations: Vec<Operation> = Vec::new();
+    let mut effect_result_slots: BTreeMap<String, SpillSlot> = BTreeMap::new();
+    let mut extra_inputs: Vec<ExpressionInput> = Vec::new();
+    for (index, effect_call) in config.effect_calls.iter().enumerate() {
+        let arguments = effect_call
+            .arguments
+            .iter()
+            .take(usize::from(effect_call.call.argument_count))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut lowered_arguments: Vec<VirtualRegister> = Vec::new();
+        for argument in &arguments {
+            let (argument_operations, argument_result) = lower_fragment(
+                argument,
+                &inputs,
+                &extra_inputs,
+                config,
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            )?;
+            effects_operations.extend(argument_operations);
+            lowered_arguments.push(argument_result);
+        }
+        let result_slot = SpillSlot(
+            u16::try_from(config.inputs.len() + extra_inputs.len())
+                .map_err(|_| ReplacementError::TooManyInputs)?,
+        );
+        extra_inputs.push(ExpressionInput::slot(
+            effect_result_name(index),
+            vmpx_vm::BitWidth::W64,
+            result_slot,
+        ));
+        let result = canonical_register(
+            PhysicalRegister::Rax,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        );
+        effects_operations.push(Operation::Call {
+            target: CallTarget::ImportAddressTable(vmpx_recompile::NativeAddress(
+                effect_call.call.iat_address,
+            )),
+            arguments: lowered_arguments,
+            result: Some(result),
+        });
+        effects_operations.push(Operation::SpillStore {
+            slot: result_slot,
+            source: result,
+        });
+        effect_result_slots.insert(effect_call.result_intrinsic.clone(), result_slot);
+    }
+    // Every store the routine performs, in order. Each address and value is
+    // evaluated against the shared frame, so a store that targets the fresh
+    // allocation reads the captured allocator result.
+    for effect in &config.effects {
+        let (address_operations, address) = lower_fragment(
+            &effect.address,
+            &inputs,
+            &extra_inputs,
+            config,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        )?;
+        effects_operations.extend(address_operations);
+        let (value_operations, value) = lower_fragment(
+            &effect.value,
+            &inputs,
+            &extra_inputs,
+            config,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        )?;
+        effects_operations.extend(value_operations);
+        effects_operations.push(Operation::Store {
+            address: Address::new(address, 0),
+            source: value,
+        });
+    }
+    operations.extend(effects_operations);
+    let mut inputs = inputs;
+    inputs.extend(extra_inputs);
 
     // 2. One body per exit register. Each body reads its inputs from the shared
     // frame and stores its result into its own slot.
@@ -315,12 +408,13 @@ pub fn build_replacement(
     // returns, which is only correct when the exit already targets the caller.
     // The jump must be a real tail transfer: nothing is pushed, so the
     // continuation sees exactly the stack the VM exit would have produced.
-    if let Some(target) = config.continuation {
-        operations.push(Operation::JumpToAddress(vmpx_recompile::NativeAddress(
+    // A tail jump tears the frame down itself, so it replaces the return rather
+    // than following it; emitting both would leave an unreachable `ret`.
+    match config.continuation {
+        Some(target) => operations.push(Operation::JumpToAddress(vmpx_recompile::NativeAddress(
             target,
-        )));
-    } else {
-        operations.push(Operation::Return);
+        ))),
+        None => operations.push(Operation::Return),
     }
 
     // Every nonvolatile register the body writes must be preserved.
@@ -379,6 +473,80 @@ pub fn build_replacement(
         compiled,
         emitted: ordered.iter().map(|(register, _)| **register).collect(),
     })
+}
+
+/// The symbolic name bound to the result of effect call `index`.
+fn effect_result_name(index: usize) -> String {
+    format!("__effect_result_{index}")
+}
+
+/// Lowers one expression into operations that leave its value in the returned
+/// register, rebased onto the replacement's canonical register and slot layout.
+///
+/// The fragment is compiled with its own private slot window, so its temporaries
+/// cannot collide with the shared input frame or with another fragment's slots.
+#[allow(clippy::too_many_arguments)]
+fn lower_fragment(
+    expression: &Expr,
+    inputs: &[ExpressionInput],
+    extra_inputs: &[ExpressionInput],
+    config: &ReplacementConfig,
+    canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
+    assignments: &mut Vec<RegisterAssignment>,
+    next_register: &mut u32,
+) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
+    let mut all_inputs = inputs.to_vec();
+    all_inputs.extend(extra_inputs.iter().cloned());
+    let lowered = lower_expression(
+        expression,
+        &ExpressionCodegenConfig {
+            inputs: all_inputs.clone(),
+            result_register: PhysicalRegister::R10,
+            temporary_register: PhysicalRegister::R11,
+            shift_count_register: PhysicalRegister::Rcx,
+            max_expression_nodes: config.max_expression_nodes,
+            max_spill_slots: config.max_spill_slots,
+            import_calls: config.import_calls.clone(),
+        },
+    )?;
+    let mut map: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
+    for assignment in &lowered.function.assignments {
+        map.insert(
+            assignment.virtual_register.id,
+            canonical_register(
+                assignment.physical_register,
+                canonical,
+                assignments,
+                next_register,
+            ),
+        );
+    }
+    // Rebase the fragment's private slots above the shared frame so two
+    // fragments never share storage.
+    let base = u16::try_from(all_inputs.len()).map_err(|_| ReplacementError::TooManyInputs)?;
+    let window = u16::try_from(config.max_spill_slots)
+        .map_err(|_| ReplacementError::TooManyInputs)?
+        .max(1);
+    let mut operations = Vec::with_capacity(lowered.function.operations.len());
+    for operation in &lowered.function.operations {
+        if matches!(operation, Operation::Return) {
+            continue;
+        }
+        let mut operation = rename_registers(operation, &map);
+        if let Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } =
+            &mut operation
+        {
+            if slot.0 >= base {
+                slot.0 = slot
+                    .0
+                    .checked_sub(base)
+                    .and_then(|offset| base.checked_add(window)?.checked_add(offset))
+                    .ok_or(ReplacementError::TooManyInputs)?;
+            }
+        }
+        operations.push(operation);
+    }
+    Ok((operations, map[&lowered.result.id]))
 }
 
 /// Returns the canonical virtual register for a physical register, allocating

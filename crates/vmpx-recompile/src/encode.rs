@@ -668,6 +668,18 @@ fn emit_epilogue(
     address: CodeAddress,
     operation_index: usize,
 ) -> Result<(), CompileError> {
+    emit_frame_teardown(output, function, address, operation_index)?;
+    append_assembled(output, address, operation_index, CodeAssembler::ret)
+}
+
+/// Restores the stack the prologue created without returning, so a tail transfer
+/// can follow it.
+fn emit_frame_teardown(
+    output: &mut Vec<u8>,
+    function: &Function,
+    address: CodeAddress,
+    operation_index: usize,
+) -> Result<(), CompileError> {
     if function.frame.stack_allocation != 0 {
         let stack_allocation = i32::try_from(function.frame.stack_allocation).map_err(|_| {
             CompileError::StackAllocationTooLarge {
@@ -683,7 +695,7 @@ fn emit_epilogue(
             assembler.pop(machine_register(register))
         })?;
     }
-    append_assembled(output, address, operation_index, CodeAssembler::ret)
+    Ok(())
 }
 
 /// Compiles a validated lowered function and resolves all branches in a second
@@ -861,6 +873,12 @@ pub fn compile(
             }
             Operation::Jump(target) => emit_jump(&mut output, *target, &mut fixups),
             Operation::JumpToAddress(target) => {
+                // A tail transfer must leave the stack exactly as the caller
+                // expects it, so the frame is torn down before the jump. Jumping
+                // with the allocation still in place would hand the target a
+                // stack shifted by the whole frame, and returning first would
+                // transfer control to the caller instead.
+                emit_frame_teardown(&mut output, function, address, operation_index)?;
                 emit_absolute_jump(&mut output, address, *target, operation_index)?;
             }
             Operation::BranchIf { condition, target } => {
