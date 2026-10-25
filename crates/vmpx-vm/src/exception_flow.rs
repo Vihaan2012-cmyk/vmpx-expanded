@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use iced_x86::{Mnemonic, OpKind, Register};
 use serde::Serialize;
@@ -153,6 +153,73 @@ fn constant_expr(expr: &Expr) -> Option<u64> {
     }
 }
 
+/// Breadth-first block order rooted at the handler entry, plus per-instruction
+/// execution indices. Protector handlers scatter fragments across the image,
+/// so any "happens before" relation must come from CFG reachability rather than
+/// ascending RVA.
+struct BlockExecutionOrder {
+    block_order: Vec<usize>,
+    instruction_rank: BTreeMap<Rva, usize>,
+}
+
+impl BlockExecutionOrder {
+    fn new(graph: &vmpx_disasm::ControlFlowGraph) -> Self {
+        let index_of = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.start, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut block_order = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::from([graph.entry]);
+        visited.insert(graph.entry);
+        while let Some(start) = queue.pop_front() {
+            let Some(&index) = index_of.get(&start) else {
+                continue;
+            };
+            block_order.push(index);
+            for successor in &graph.blocks[index].successors {
+                if visited.insert(*successor) {
+                    queue.push_back(*successor);
+                }
+            }
+        }
+        // Keep unreachable blocks (defensive decode artifacts) deterministic and
+        // last, so they can never satisfy an ordering proof by accident.
+        for index in 0..graph.blocks.len() {
+            if !block_order.contains(&index) {
+                block_order.push(index);
+            }
+        }
+        let mut instruction_rank = BTreeMap::new();
+        let mut rank = 0;
+        for index in &block_order {
+            for instruction in &graph.blocks[*index].instructions {
+                instruction_rank.insert(instruction.rva, rank);
+                rank += 1;
+            }
+        }
+        Self {
+            block_order,
+            instruction_rank,
+        }
+    }
+
+    /// Rank of an instruction in execution order, or `None` when the address is
+    /// not part of the recovered handler.
+    fn rank(&self, rva: Rva) -> Option<usize> {
+        self.instruction_rank.get(&rva).copied()
+    }
+
+    fn precedes(&self, earlier: Rva, later: Rva) -> bool {
+        match (self.rank(earlier), self.rank(later)) {
+            (Some(earlier), Some(later)) => earlier < later,
+            _ => false,
+        }
+    }
+}
+
 /// Recognizes a language handler that builds a bounded virtual-unwind stack by
 /// copying a recovered continuation seed and a validated `ret` gadget through a
 /// cursor. Classification is based on register/memory effects and control-flow
@@ -199,16 +266,21 @@ pub fn analyze_exception_stack_sled(pe: &PeImage<'_>, handler: Rva) -> Exception
             graph.status
         ));
     }
+    // VMProtect scatters handler fragments across the image, so RVA order is
+    // not execution order. Linearize blocks by breadth-first reachability from
+    // the handler entry and use that order for every "happens before" test.
+    let execution_order = BlockExecutionOrder::new(&graph);
     let mut instructions = Vec::new();
-    for summary in graph.blocks.iter().flat_map(|block| &block.instructions) {
-        match decode_one(pe, summary.rva) {
-            Ok(decoded) => instructions.push(decoded),
-            Err(error) => report
-                .diagnostics
-                .push(format!("could not re-decode {}: {error}", summary.rva)),
+    for block_index in execution_order.block_order.iter().copied() {
+        for summary in &graph.blocks[block_index].instructions {
+            match decode_one(pe, summary.rva) {
+                Ok(decoded) => instructions.push(decoded),
+                Err(error) => report
+                    .diagnostics
+                    .push(format!("could not re-decode {}: {error}", summary.rva)),
+            }
         }
     }
-    instructions.sort_by_key(|decoded| decoded.rva);
 
     let context_rsp_load = instructions.iter().find(|decoded| {
         let instruction = &decoded.instruction;
@@ -317,7 +389,7 @@ pub fn analyze_exception_stack_sled(pe: &PeImage<'_>, handler: Rva) -> Exception
     let gadget = cursor_load.and_then(|cursor| {
         gadget_definitions.iter().find(|gadget| {
             stores.iter().any(|store| {
-                store.rva > gadget.rva
+                execution_order.precedes(gadget.rva, store.rva)
                     && store.address == cursor.register
                     && store.value == gadget.register
             })
@@ -343,8 +415,9 @@ pub fn analyze_exception_stack_sled(pe: &PeImage<'_>, handler: Rva) -> Exception
                     .iter()
                     .any(|decoded| is_zero_test(&decoded.instruction, load.register))
                 && stores.iter().any(|store| {
-                    store.rva > load.rva
-                        && gadget.is_none_or(|gadget| store.rva < gadget.rva)
+                    execution_order.precedes(load.rva, store.rva)
+                        && gadget
+                            .is_none_or(|gadget| execution_order.precedes(store.rva, gadget.rva))
                         && store.address == cursor.register
                         && store.value == load.register
                 })
