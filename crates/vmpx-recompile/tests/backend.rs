@@ -132,6 +132,7 @@ fn emits_balanced_nonvolatile_frame() {
             preserve: vec![PhysicalRegister::Rbx],
             call_ready: true,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::MoveImmediate {
@@ -189,6 +190,7 @@ fn rejects_unpreserved_nonvolatile_and_bad_alignment() {
         preserve: vec![PhysicalRegister::R12],
         call_ready: true,
         preinitialized_slots: Vec::new(),
+        tail_transfer: false,
     };
     assert_eq!(
         validate_function(&function),
@@ -327,6 +329,7 @@ fn emits_width_specific_spill_accesses() {
                 preserve: vec![],
                 call_ready: false,
                 preinitialized_slots: Vec::new(),
+                tail_transfer: false,
             },
             operations: vec![
                 Operation::SpillStore {
@@ -369,6 +372,7 @@ fn call_ready_spills_follow_shadow_space_and_require_frame_capacity() {
             preserve: vec![],
             call_ready: true,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::SpillStore {
@@ -397,6 +401,7 @@ fn call_ready_spills_follow_shadow_space_and_require_frame_capacity() {
             preserve: vec![],
             call_ready: true,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         ..function
     };
@@ -416,6 +421,7 @@ fn call_ready_frame() -> StackFrame {
         preserve: vec![],
         call_ready: true,
         preinitialized_slots: Vec::new(),
+        tail_transfer: false,
     }
 }
 
@@ -688,6 +694,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             preserve: vec![],
             call_ready: false,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::SpillLoad {
@@ -718,6 +725,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             preserve: vec![],
             call_ready: false,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::SpillStore {
@@ -751,6 +759,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             preserve: vec![],
             call_ready: false,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::SpillStore {
@@ -797,6 +806,7 @@ fn spill_initialization_meet_uses_the_narrowest_cfg_predecessor() {
             preserve: vec![],
             call_ready: false,
             preinitialized_slots: Vec::new(),
+            tail_transfer: false,
         },
         operations: vec![
             Operation::BranchIf {
@@ -1375,6 +1385,7 @@ fn tail_jump_tears_down_the_frame_and_does_not_return() {
             preserve: vec![PhysicalRegister::Rbx],
             call_ready: false,
             preinitialized_slots: vec![],
+            tail_transfer: false,
         },
         operations: vec![
             Operation::MoveImmediate {
@@ -1451,4 +1462,47 @@ fn restoring_flags_leaves_the_stack_pointer_unchanged() {
         .expect("the flag value is written to the slot");
     assert_eq!(store.memory_displacement64(), 0);
     assert_eq!(store.memory_base(), Register::RSP);
+}
+
+#[test]
+fn a_tail_transfer_releases_the_frame_without_restoring_registers() {
+    // A body that transfers control elsewhere is not a callee. Its computed
+    // register values must reach the transfer target, so the saved nonvolatile
+    // registers are discarded rather than popped back: one stack adjustment
+    // covers the pushes and the allocation, then control leaves.
+    let value = vr(1);
+    let function = Function {
+        assignments: vec![assigned(value, PhysicalRegister::R12)],
+        frame: StackFrame {
+            stack_allocation: 40,
+            preserve: vec![PhysicalRegister::R12],
+            call_ready: false,
+            preinitialized_slots: vec![],
+            tail_transfer: true,
+        },
+        operations: vec![
+            Operation::MoveImmediate {
+                destination: value,
+                value: 0x1234,
+            },
+            Operation::JumpToAddress(vmpx_recompile::NativeAddress(0x2000)),
+        ],
+    };
+    let compiled = compile(&function, CodeAddress(0x1000)).expect("compile tail transfer");
+    let instructions = decode_all(&compiled.bytes, 0x1000);
+    assert!(
+        !instructions.iter().any(|i| i.mnemonic() == Mnemonic::Pop),
+        "a tail transfer must not restore the saved registers"
+    );
+    let jump = instructions
+        .iter()
+        .position(|i| i.mnemonic() == Mnemonic::Jmp)
+        .expect("one jump");
+    // One adjustment releases pushes (8) plus allocation (40) = 48.
+    let release = instructions[..jump]
+        .iter()
+        .rev()
+        .find(|i| i.mnemonic() == Mnemonic::Add && i.op0_register() == Register::RSP)
+        .expect("the frame is released before the jump");
+    assert_eq!(release.immediate(1), 48);
 }

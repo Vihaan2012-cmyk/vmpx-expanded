@@ -37,6 +37,15 @@ pub struct StackFrame {
     /// routine uses these for its shared input frame, so a load from one is
     /// defined even though no store appears in the emitted body.
     pub preinitialized_slots: Vec<SpillSlot>,
+    /// The body ends by transferring control to another function rather than
+    /// returning to its own caller.
+    ///
+    /// The preserved registers are still saved in the prologue, because the body
+    /// uses them for its own computation. They are *not* restored: the transfer
+    /// target is entitled to see the values the body computed for them. The frame
+    /// is therefore released with a single stack adjustment instead of a run of
+    /// pops.
+    pub tail_transfer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -609,8 +618,12 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
             .get(&register.id)
             .copied()
             .ok_or(CompileError::UnassignedRegister { register })?;
+        // A body that transfers control elsewhere is not a callee: it hands the
+        // transfer target the values it computed, so the caller's saved values are
+        // not restored and preservation is not required.
         if physical_register.is_win64_nonvolatile()
             && !function.frame.preserve.contains(&physical_register)
+            && !function.frame.tail_transfer
         {
             return Err(CompileError::UnpreservedNonvolatile {
                 register: physical_register,

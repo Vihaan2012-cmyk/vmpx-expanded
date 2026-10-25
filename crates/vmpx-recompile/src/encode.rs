@@ -695,14 +695,34 @@ fn emit_epilogue(
     append_assembled(output, address, operation_index, CodeAssembler::ret)
 }
 
-/// Restores the stack the prologue created without returning, so a tail transfer
+/// Releases the stack the prologue created without returning, so a tail transfer
 /// can follow it.
+///
+/// When the body transfers control elsewhere, the saved nonvolatile registers are
+/// deliberately not restored: the transfer target is entitled to the values the
+/// body computed for them. The frame is released with one adjustment large enough
+/// to cover both the allocation and the pushes, which leaves the stack pointer
+/// exactly where the caller's `call` put it.
 fn emit_frame_teardown(
     output: &mut Vec<u8>,
     function: &Function,
     address: CodeAddress,
     operation_index: usize,
 ) -> Result<(), CompileError> {
+    if function.frame.tail_transfer {
+        let pushed = u32::try_from(function.frame.preserve.len())
+            .map_err(|_| CompileError::CodeSizeOverflow)?
+            .saturating_mul(8);
+        let total = pushed.saturating_add(function.frame.stack_allocation);
+        if total != 0 {
+            let total = i32::try_from(total)
+                .map_err(|_| CompileError::StackAllocationTooLarge { bytes: total })?;
+            append_assembled(output, address, operation_index, |assembler| {
+                assembler.add(rsp, total)
+            })?;
+        }
+        return Ok(());
+    }
     if function.frame.stack_allocation != 0 {
         let stack_allocation = i32::try_from(function.frame.stack_allocation).map_err(|_| {
             CompileError::StackAllocationTooLarge {

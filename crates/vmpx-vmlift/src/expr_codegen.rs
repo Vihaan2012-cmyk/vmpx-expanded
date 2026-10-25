@@ -694,6 +694,8 @@ pub fn lower_expression(
             // An expression that lowers an imported call needs a Win64
             // call-ready frame: the backend checks shadow space and alignment.
             call_ready: has_call,
+            // A fragment is inlined into its caller, so it returns normally.
+            tail_transfer: false,
         },
     };
     validate_function(&function)?;

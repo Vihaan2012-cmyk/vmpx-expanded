@@ -124,6 +124,7 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
         preserve,
         preinitialized_slots: Vec::new(),
         call_ready: false,
+        tail_transfer: false,
     };
     Ok(Composition {
         function: Function {
@@ -356,6 +357,7 @@ mod tests {
                     preserve: Vec::new(),
                     preinitialized_slots: Vec::new(),
                     call_ready: false,
+                    tail_transfer: false,
                 },
             },
             widths: BTreeMap::from([(0, Width::W64)]),

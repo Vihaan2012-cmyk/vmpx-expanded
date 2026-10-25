@@ -555,24 +555,35 @@ pub fn build_replacement(
         None => operations.push(Operation::Return),
     }
 
-    // A preserved register is restored to its caller's value after the epilogue
-    // loads the exit value into it. Restoring wins, so a nonvolatile register
-    // whose exit value differs from its entry value cannot be represented: the
-    // backend requires the preservation, and the exit state requires the value.
-    // Refuse instead of emitting a body whose result is silently discarded.
+    // A preserved register is saved in the prologue because the body uses it for
+    // its own computation. Whether it is restored depends on where control goes.
+    //
+    // With a continuation the body transfers control to the protector's native
+    // code, which is entitled to the values this body computed. The saved values
+    // are discarded rather than restored, so no register has to hold its entry
+    // value and any exit value can be emitted.
+    //
+    // Without a continuation the body returns to its own caller and must honour
+    // the callee-save convention. A nonvolatile register whose exit value differs
+    // from its entry value cannot satisfy both, so it is refused rather than
+    // silently discarded.
+    let tail_transfer = config.continuation.is_some();
     for assignment in &assignments {
         let register = assignment.physical_register;
         if register.is_win64_nonvolatile() && !preserve.contains(&register) {
-            let architectural = X64NativeRegister::ALL
-                .into_iter()
-                .find(|candidate| physical_for(candidate) == register);
-            if let Some(architectural) = architectural
-                && let Some(value) = registers.get(&architectural)
-                && value != &Expr::register(vmpx_vm::BitWidth::W64, architectural.symbolic_name())
-            {
-                return Err(ReplacementError::ClobberedNonvolatile {
-                    register: architectural,
-                });
+            if !tail_transfer {
+                let architectural = X64NativeRegister::ALL
+                    .into_iter()
+                    .find(|candidate| physical_for(candidate) == register);
+                if let Some(architectural) = architectural
+                    && let Some(value) = registers.get(&architectural)
+                    && value
+                        != &Expr::register(vmpx_vm::BitWidth::W64, architectural.symbolic_name())
+                {
+                    return Err(ReplacementError::ClobberedNonvolatile {
+                        register: architectural,
+                    });
+                }
             }
             preserve.push(register);
         }
@@ -624,6 +635,7 @@ pub fn build_replacement(
             preinitialized_slots: (0..input_slot_count.saturating_add(effect_slot_count))
                 .map(SpillSlot)
                 .collect(),
+            tail_transfer,
         },
     };
 
