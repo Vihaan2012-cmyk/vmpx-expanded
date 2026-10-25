@@ -516,6 +516,39 @@ fn simplify_unary(op: UnaryOp, value: Expr) -> Expr {
     }
 }
 
+/// Recognizes `not(not(x) + c) + c` and returns `x`.
+fn fold_double_complement_offset(complement: &Expr, offset: &Expr) -> Option<Expr> {
+    let ExprKind::Unary {
+        op: UnaryOp::Not,
+        value: inner,
+    } = &complement.kind
+    else {
+        return None;
+    };
+    let ExprKind::Binary {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = &inner.kind
+    else {
+        return None;
+    };
+    let (
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            value: base,
+        },
+        offset_side,
+    ) = (&left.kind, right)
+    else {
+        return None;
+    };
+    if **offset_side != *offset || offset.width != base.width {
+        return None;
+    }
+    Some((**base).clone())
+}
+
 fn simplify_intrinsic(width: BitWidth, name: String, arguments: Vec<Expr>) -> Expr {
     let constants = arguments
         .iter()
@@ -685,6 +718,14 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         }
     }
     if op == BinaryOp::Add {
+        // `not(not(x) + c) + c == x` for any constant `c`. VMProtect uses this
+        // pair to express a plain pointer adjustment, so folding it here keeps
+        // stack-relative addresses recognizable instead of opaque.
+        if let Some(folded) = fold_double_complement_offset(&left, &right)
+            .or_else(|| fold_double_complement_offset(&right, &left))
+        {
+            return folded;
+        }
         return normalize_addition(width, left, right);
     }
     let zero_right = constant_value(&right) == Some(0);
@@ -926,6 +967,42 @@ fn rotate_right(value: u64, width: BitWidth, count: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folds_double_complement_pointer_offset() {
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        let offset = Expr::constant(BitWidth::W64, 64);
+        let inner = Expr::binary(
+            BinaryOp::Add,
+            Expr::unary(UnaryOp::Not, base.clone()),
+            offset.clone(),
+        )
+        .expect("add");
+        let expression =
+            Expr::binary(BinaryOp::Add, Expr::unary(UnaryOp::Not, inner), offset).expect("add");
+        assert_eq!(expression.simplify(), base);
+    }
+
+    #[test]
+    fn does_not_fold_double_complement_with_mismatched_offset() {
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        let inner = Expr::binary(
+            BinaryOp::Add,
+            Expr::unary(UnaryOp::Not, base),
+            Expr::constant(BitWidth::W64, 64),
+        )
+        .expect("add");
+        let expression = Expr::binary(
+            BinaryOp::Add,
+            Expr::unary(UnaryOp::Not, inner),
+            Expr::constant(BitWidth::W64, 72),
+        )
+        .expect("add");
+        assert!(matches!(
+            expression.simplify().kind,
+            ExprKind::Binary { .. }
+        ));
+    }
 
     #[test]
     fn folds_width_truncated_arithmetic() {
