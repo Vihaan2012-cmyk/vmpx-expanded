@@ -646,6 +646,52 @@ mod tests {
         assert_eq!(bss.virtual_size, 0x8000);
     }
 
+    /// The load-bearing property: a conventional relayout must not change any
+    /// byte of what the Windows loader maps into memory, apart from the section
+    /// header table itself. `SizeOfRawData` and `PointerToRawData` are loader
+    /// metadata; every mapped byte of section content must be identical.
+    fn loaded_image_without_section_table(bytes: &[u8]) -> Vec<u8> {
+        let pe = PeImage::parse(bytes).expect("valid PE");
+        let mut image = vec![0_u8; pe.optional.size_of_image as usize];
+        let headers = usize::try_from(pe.optional.size_of_headers).expect("headers");
+        image[..headers].copy_from_slice(&bytes[..headers]);
+        for section in &pe.sections {
+            let span = section.mapped_span() as usize;
+            let start = section.virtual_address.0 as usize;
+            let mut chunk = vec![0_u8; span];
+            if section.size_of_raw_data != 0 {
+                let raw = section.pointer_to_raw_data.0 as usize;
+                let available = (section.size_of_raw_data as usize).min(bytes.len() - raw);
+                chunk[..available].copy_from_slice(&bytes[raw..raw + available]);
+            }
+            image[start..start + span].copy_from_slice(&chunk);
+        }
+        let table = pe.nt_headers_offset.0 as usize
+            + 4
+            + COFF_HEADER_SIZE as usize
+            + usize::try_from(pe.coff.size_of_optional_header).expect("optional header");
+        let table_end = table + pe.sections.len() * SECTION_HEADER_SIZE as usize;
+        for byte in &mut image[table..table_end] {
+            *byte = 0;
+        }
+        image
+    }
+
+    #[test]
+    fn relayout_preserves_the_loaded_memory_image_exactly() {
+        let image = pe_with_sections(&[
+            (".text", 0x1000, 0x400, 0x1000, 0x400, 0x6000_0020),
+            (".data", 0x2000, 0x300, 0x2000, 0x300, 0xC000_0040),
+            (".bss", 0x3000, 0x2000, 0, 0, 0xC000_0080),
+            (".reloc", 0x5000, 0x80, 0x5000, 0x80, 0x4200_0040),
+        ]);
+        let (output, _) = relayout_conventional(&image).expect("relayout succeeds");
+        assert_eq!(
+            loaded_image_without_section_table(&image),
+            loaded_image_without_section_table(&output)
+        );
+    }
+
     #[test]
     fn relayout_keeps_every_directory_file_backed() {
         let image = pe_with_sections(&[
