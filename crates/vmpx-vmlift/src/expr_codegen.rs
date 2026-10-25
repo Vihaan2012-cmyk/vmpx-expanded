@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use vmpx_recompile::{
-    Address, BinaryOp as NativeBinaryOp, BinarySource, CodeAddress, CompileError, CompiledFunction,
-    Function, Operation, PhysicalRegister, RegisterAssignment, ResizeOp as NativeResizeOp,
-    ShiftCount, ShiftOp, SpillSlot, StackFrame, UnaryOp as NativeUnaryOp, VirtualRegister, Width,
-    compile, validate_function,
+    Address, BinaryOp as NativeBinaryOp, BinarySource, CallTarget, CodeAddress, CompileError,
+    CompiledFunction, Function, NativeAddress, Operation, PhysicalRegister, RegisterAssignment,
+    ResizeOp as NativeResizeOp, ShiftCount, ShiftOp, SpillSlot, StackFrame,
+    UnaryOp as NativeUnaryOp, VirtualRegister, Width, compile, validate_function,
 };
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, ResizeOp, UnaryOp};
 
@@ -62,6 +62,21 @@ pub struct ExpressionCodegenConfig {
     pub shift_count_register: PhysicalRegister,
     pub max_expression_nodes: usize,
     pub max_spill_slots: usize,
+    /// Intrinsics that may be lowered to a real imported call, keyed by the
+    /// intrinsic name. A fresh-allocation intrinsic stands for the return value
+    /// of an allocator call, so lowering it emits that call rather than
+    /// inventing a value. Any intrinsic absent from this map is refused.
+    pub import_calls: BTreeMap<String, ImportCall>,
+}
+
+/// How to emit one imported call for an intrinsic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportCall {
+    /// File offset of the IAT slot holding the imported address.
+    pub iat_address: u64,
+    /// Number of leading intrinsic arguments passed as the call's arguments,
+    /// starting at `RCX`.
+    pub argument_count: u8,
 }
 
 impl Default for ExpressionCodegenConfig {
@@ -73,6 +88,7 @@ impl Default for ExpressionCodegenConfig {
             shift_count_register: PhysicalRegister::Rcx,
             max_expression_nodes: 65_536,
             max_spill_slots: BACKEND_SPILL_LIMIT,
+            import_calls: BTreeMap::new(),
         }
     }
 }
@@ -112,6 +128,9 @@ pub enum ExpressionCodegenError {
     #[error("expression requires unsupported intrinsic {name}")]
     UnsupportedIntrinsic { name: String },
 
+    #[error("imported call takes {count} arguments, exceeding the four register slots")]
+    TooManyCallArguments { count: usize },
+
     #[error("memory-load address must be 64-bit, got {width:?}")]
     AddressWidth { width: BitWidth },
 
@@ -138,6 +157,81 @@ struct LoweringContext<'a> {
     operations: Vec<Operation>,
     next_slot: usize,
     peak_slot: usize,
+}
+
+impl LoweringContext<'_> {
+    /// Lowers an intrinsic that stands for an imported call's return value.
+    ///
+    /// The intrinsic's leading arguments become the call arguments, the call is
+    /// emitted against the IAT slot, and the return value is left in `RAX`, which
+    /// is then moved into the accumulator.
+    fn lower_import_call(
+        &mut self,
+        expression: &Expr,
+        call: &ImportCall,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        const ARGUMENT_REGISTERS: [PhysicalRegister; 4] = [
+            PhysicalRegister::Rcx,
+            PhysicalRegister::Rdx,
+            PhysicalRegister::R8,
+            PhysicalRegister::R9,
+        ];
+        let count = usize::from(call.argument_count);
+        if count > ARGUMENT_REGISTERS.len() {
+            return Err(ExpressionCodegenError::TooManyCallArguments { count });
+        }
+        let mut argument_registers = Vec::with_capacity(count);
+        for (index, argument) in arguments.iter().take(count).enumerate() {
+            // Evaluate the argument into the accumulator, then move it into its
+            // ABI register.
+            self.lower(argument)?;
+            let target = VirtualRegister::qword(ACCUMULATOR_ID);
+            let destination = VirtualRegister::qword(
+                9_000
+                    + u32::try_from(index)
+                        .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?,
+            );
+            // Reuse the shift-count register's storage when the ABI argument is
+            // RCX: the lowering already assigns that physical register, and the
+            // backend allows one virtual register per physical register.
+            let destination = self
+                .assignments
+                .iter()
+                .find(|assignment| assignment.physical_register == ARGUMENT_REGISTERS[index])
+                .map_or(destination, |assignment| assignment.virtual_register);
+            if !self
+                .assignments
+                .iter()
+                .any(|assignment| assignment.virtual_register.id == destination.id)
+            {
+                self.assignments.push(RegisterAssignment::new(
+                    destination,
+                    ARGUMENT_REGISTERS[index],
+                ));
+            }
+            self.operations.push(Operation::Move {
+                destination,
+                source: target,
+            });
+            argument_registers.push(destination);
+        }
+        let result = VirtualRegister::qword(
+            9_500 + u32::try_from(count).map_err(|_| ExpressionCodegenError::StorageIdOverflow)?,
+        );
+        self.assignments
+            .push(RegisterAssignment::new(result, PhysicalRegister::Rax));
+        self.operations.push(Operation::Call {
+            target: CallTarget::ImportAddressTable(NativeAddress(call.iat_address)),
+            arguments: argument_registers,
+            result: Some(result),
+        });
+        self.operations.push(Operation::Move {
+            destination: accumulator(expression.width),
+            source: result,
+        });
+        Ok(())
+    }
 }
 
 fn native_width(width: BitWidth) -> Width {
@@ -237,8 +331,13 @@ impl LoweringContext<'_> {
                     address: Address::new(accumulator(BitWidth::W64), 0),
                 });
             }
-            ExprKind::Intrinsic { name, .. } => {
-                return Err(ExpressionCodegenError::UnsupportedIntrinsic { name: name.clone() });
+            ExprKind::Intrinsic { name, arguments } => {
+                let Some(call) = self.config.import_calls.get(name).cloned() else {
+                    return Err(ExpressionCodegenError::UnsupportedIntrinsic {
+                        name: name.clone(),
+                    });
+                };
+                self.lower_import_call(expression, &call, arguments)?;
             }
             ExprKind::Extract { value, lsb } => {
                 self.lower(value)?;
@@ -549,6 +648,10 @@ pub fn lower_expression(
             preserve.push(register);
         }
     }
+    let has_call = context
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, Operation::Call { .. }));
     let function = Function {
         operations: context.operations,
         assignments: context.assignments,
@@ -565,7 +668,9 @@ pub fn lower_expression(
                     InputSource::Register(_) => None,
                 })
                 .collect(),
-            call_ready: false,
+            // An expression that lowers an imported call needs a Win64
+            // call-ready frame: the backend checks shadow space and alignment.
+            call_ready: has_call,
         },
     };
     validate_function(&function)?;

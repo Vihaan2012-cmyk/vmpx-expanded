@@ -16,6 +16,7 @@ pub use constant_dispatch::{
 pub use effect_liveness::{
     EntryEffectLivenessReport, PathEffectLivenessReport, audit_entry_effect_liveness,
 };
+pub use expr_codegen::ImportCall;
 pub use expr_codegen::{
     ExpressionCodegenConfig, ExpressionCodegenError, ExpressionInput, LoweredExpression,
     compile_expression, lower_expression,

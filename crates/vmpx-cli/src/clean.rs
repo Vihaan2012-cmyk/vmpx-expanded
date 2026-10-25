@@ -384,6 +384,60 @@ fn physical_for(register: &vmpx_vm::X64NativeRegister) -> vmpx_recompile::Physic
     }
 }
 
+/// Maps each fresh-allocation intrinsic in an exit state to the imported call it
+/// stands for, so the lowering can emit a real call instead of refusing.
+///
+/// The intrinsic's first argument is the allocator's hint/name entry. The import
+/// directory is searched for the symbol whose hint/name entry has that address;
+/// its IAT slot becomes the call target. Any intrinsic that cannot be resolved
+/// this way stays absent and is therefore still refused.
+fn import_calls_for(
+    pe: &PeImage<'_>,
+    exit: &vmpx_vm::NativeExitState,
+) -> BTreeMap<String, vmpx_vmlift::ImportCall> {
+    let mut names: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    for value in exit.registers.values() {
+        let vmpx_vm::ExprKind::Intrinsic { name, arguments } = &value.kind else {
+            continue;
+        };
+        if !name.starts_with("fresh_allocation_return_epoch_") || arguments.len() < 2 {
+            continue;
+        }
+        let vmpx_vm::ExprKind::Const { value: target } = arguments[0].kind else {
+            continue;
+        };
+        names.insert(target, (name.clone(), target));
+    }
+    let report = pe.report();
+    let mut calls = BTreeMap::new();
+    for (name, target) in names.values() {
+        // The target is a hint/name entry; find the import whose name entry has
+        // that address and take its IAT slot.
+        // `lookup_value` is the original INT entry: the VA of the hint/name pair
+        // for a named import, which is exactly what the intrinsic records.
+        let Some(symbol) = report
+            .imports
+            .iter()
+            .flat_map(|module| module.entries.iter())
+            .find(|entry| entry.lookup_value == *target)
+        else {
+            continue;
+        };
+        // The backend encodes a direct call to this address, so it must be the
+        // IAT slot's virtual address, not its file offset.
+        if let Some(va) = pe.optional.image_base.checked_add_rva(symbol.iat_rva) {
+            calls.insert(
+                name.clone(),
+                vmpx_vmlift::ImportCall {
+                    iat_address: va.0,
+                    argument_count: 1,
+                },
+            );
+        }
+    }
+    calls
+}
+
 fn stage(diagnostic: impl Into<String>) -> CleanStageReport {
     CleanStageReport {
         complete: false,
@@ -736,6 +790,7 @@ pub fn analyze_clean_with_image(
                     inputs: inputs.clone(),
                     max_expression_nodes: 200_000,
                     max_spill_slots: 64,
+                    import_calls: import_calls_for(&pe, exit),
                 };
                 match vmpx_vmlift::build_replacement(
                     &exit.registers,

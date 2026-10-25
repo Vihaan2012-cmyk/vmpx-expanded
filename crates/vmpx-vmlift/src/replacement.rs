@@ -45,6 +45,8 @@ pub struct ReplacementConfig {
     pub inputs: Vec<(String, PhysicalRegister)>,
     pub max_expression_nodes: usize,
     pub max_spill_slots: usize,
+    /// Intrinsics that may be lowered to a real imported call.
+    pub import_calls: BTreeMap<String, crate::ImportCall>,
 }
 
 #[derive(Debug, Error)]
@@ -181,6 +183,7 @@ pub fn build_replacement(
             shift_count_register: PhysicalRegister::Rcx,
             max_expression_nodes: config.max_expression_nodes,
             max_spill_slots: config.max_spill_slots,
+            import_calls: config.import_calls.clone(),
         };
         let lowered = lower_expression(expression, &per_value).map_err(|error| {
             ReplacementError::Lowering {
@@ -200,11 +203,17 @@ pub fn build_replacement(
         function
             .operations
             .retain(|operation| !matches!(operation, Operation::Return));
-        // Every slot the lowering allocated for its own temporaries sits at or
-        // above the input frame; move those above the result slots so no value's
-        // temporaries collide with another's results.
+        // The lowering numbers its own temporaries from `input_slot_count`
+        // upward. Give each value a private window above the result slots so two
+        // values' temporaries never share storage.
+        let value_count =
+            u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?;
+        let window = u16::try_from(config.max_spill_slots)
+            .map_err(|_| ReplacementError::TooManyInputs)?
+            .max(1);
         let local_base = result_base
-            .checked_add(u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?)
+            .checked_add(value_count)
+            .and_then(|base| base.checked_add(u16::try_from(index).ok()?.checked_mul(window)?))
             .ok_or(ReplacementError::TooManyInputs)?;
         for operation in &mut function.operations {
             match operation {
@@ -281,6 +290,8 @@ pub fn build_replacement(
         }
     }
 
+    // Every body's temporaries were rebased above the result slots, so the frame
+    // must cover the highest slot actually referenced by the emitted body.
     let highest = operations
         .iter()
         .filter_map(|operation| match operation {
@@ -289,13 +300,22 @@ pub fn build_replacement(
         })
         .max()
         .unwrap_or(0);
+    // A body that contains an imported call needs a Win64 call-ready frame.
+    let call_ready = operations
+        .iter()
+        .any(|operation| matches!(operation, Operation::Call { .. }));
+    // A call-ready frame reserves 32 bytes of shadow space below the spill area,
+    // so the allocation must cover it as well.
+    let shadow = if call_ready { 32 } else { 0 };
     let function = Function {
         operations,
         assignments,
         frame: StackFrame {
-            stack_allocation: u32::from(highest.saturating_add(1)).saturating_mul(8),
+            stack_allocation: u32::from(highest.saturating_add(1))
+                .saturating_mul(8)
+                .saturating_add(shadow),
             preserve,
-            call_ready: false,
+            call_ready,
             preinitialized_slots: (0..input_slot_count).map(SpillSlot).collect(),
         },
     };
@@ -472,6 +492,7 @@ mod tests {
             inputs: inputs(),
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -491,6 +512,7 @@ mod tests {
             inputs: inputs(),
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
         };
         let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect("replacement compiles");
@@ -521,6 +543,7 @@ mod tests {
             inputs: inputs(),
             max_expression_nodes: 10_000,
             max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
         };
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");
