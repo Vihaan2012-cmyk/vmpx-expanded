@@ -66,6 +66,20 @@ pub struct CleanOepReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct CleanTlsEntryReport {
+    pub entry: Rva,
+    pub confidence: u8,
+    pub recovered: bool,
+    pub domain_complete: bool,
+    pub all_paths_reach_vm_exit: bool,
+    pub segments: usize,
+    pub decoded_operations: usize,
+    pub stop_reason: Option<VmProfileChainStop>,
+    pub native_exit_recovered: bool,
+    pub issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct CleanHandlerMetrics {
     pub unique: usize,
     pub classified: usize,
@@ -143,6 +157,7 @@ pub struct CleanReport {
     pub handlers: CleanHandlerMetrics,
     pub unknown_handlers: Vec<Rva>,
     pub virtualized_routines: Vec<CleanVmPathReport>,
+    pub tls_entries: Vec<CleanTlsEntryReport>,
     pub native_continuations: Vec<CleanNestedContinuationReport>,
     pub vtil: CleanStageReport,
     pub recompilation: CleanStageReport,
@@ -485,14 +500,89 @@ pub fn analyze_clean_with_image(
         blockers.push("protected header entry has no recovered VM profile".to_owned());
     }
 
-    let protected_tls = discovery
+    // A TLS callback is only a blocker if its VM behaviour is still unknown.
+    // Analyzing each one turns "N protected TLS entries" into per-entry
+    // evidence and clears the blocker when every path provably reaches a VM
+    // exit with no remaining semantic gaps.
+    let mut tls_entries = Vec::new();
+    for entry in discovery
         .entries
         .iter()
         .filter(|entry| entry.source == VmEntrySource::TlsCallback)
-        .count();
-    if protected_tls != 0 {
+    {
+        let domains = BTreeMap::from([(
+            "native_rdx_initial".to_owned(),
+            (0_u64..=3)
+                .map(|reason| Expr::constant(BitWidth::W64, reason))
+                .collect(),
+        )]);
+        let limits = EntryPathRecoveryLimits {
+            chain: VmProfileExplorerLimits {
+                max_segments: 32,
+                max_instructions_per_segment: 2_048,
+                max_total_instructions: 8_192,
+                ..VmProfileExplorerLimits::default()
+            },
+            ..EntryPathRecoveryLimits::default()
+        };
+        let report = match recover_entry_paths(&pe, entry, &domains, limits) {
+            Ok(family) => {
+                let mut issues = Vec::new();
+                let mut native_exit_recovered = true;
+                let mut segments = 0_usize;
+                let mut decoded_operations = 0_usize;
+                let mut stop_reason = None;
+                for path in &family.paths {
+                    segments = segments.max(path.chain.segments.len());
+                    decoded_operations = decoded_operations.max(path.chain.total_instructions);
+                    stop_reason = stop_reason.or(Some(path.chain.stop_reason));
+                    if path.native_exit.is_none() {
+                        native_exit_recovered = false;
+                        issues.push(format!(
+                            "path {:?} has no exact native exit state: {:?}",
+                            path.assignments, path.chain.stop_reason
+                        ));
+                    }
+                    issues.extend(path.chain.diagnostics.iter().cloned());
+                }
+                if !family.domain_complete {
+                    issues.push("the TLS entry domain is not complete".to_owned());
+                }
+                if !family.all_paths_reach_vm_exit {
+                    issues.push("not every TLS entry path reaches a proven VM exit".to_owned());
+                }
+                CleanTlsEntryReport {
+                    entry: entry.rva,
+                    confidence: entry.confidence,
+                    recovered: family.domain_complete && family.all_paths_reach_vm_exit,
+                    domain_complete: family.domain_complete,
+                    all_paths_reach_vm_exit: family.all_paths_reach_vm_exit,
+                    segments,
+                    decoded_operations,
+                    stop_reason,
+                    native_exit_recovered,
+                    issues,
+                }
+            }
+            Err(error) => CleanTlsEntryReport {
+                entry: entry.rva,
+                confidence: entry.confidence,
+                recovered: false,
+                domain_complete: false,
+                all_paths_reach_vm_exit: false,
+                segments: 0,
+                decoded_operations: 0,
+                stop_reason: None,
+                native_exit_recovered: false,
+                issues: vec![format!("TLS entry recovery failed: {error}")],
+            },
+        };
+        tls_entries.push(report);
+    }
+    let unresolved_tls = tls_entries.iter().filter(|entry| !entry.recovered).count();
+    if unresolved_tls != 0 {
         blockers.push(format!(
-            "{protected_tls} loader-reachable TLS VM entry/entries remain protected"
+            "{unresolved_tls} loader-reachable TLS VM entry/entries remain semantically unresolved"
         ));
     }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
@@ -646,6 +736,7 @@ pub fn analyze_clean_with_image(
             handlers,
             unknown_handlers,
             virtualized_routines: paths,
+            tls_entries,
             native_continuations: continuations,
             vtil: if verified_noop {
                 completed_stage("not required for an input with no strong protection evidence")
