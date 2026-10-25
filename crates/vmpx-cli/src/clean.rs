@@ -762,6 +762,11 @@ pub fn analyze_clean_with_image(
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
     let mut tls_entries = Vec::new();
+    let mut tls_exit_states: Vec<(
+        BTreeMap<String, u64>,
+        vmpx_vm::NativeExitState,
+        vmpx_vmlift::CollectedEffects,
+    )> = Vec::new();
     for entry in discovery
         .entries
         .iter()
@@ -807,6 +812,19 @@ pub fn analyze_clean_with_image(
                 }
                 if !family.all_paths_reach_vm_exit {
                     issues.push("not every TLS entry path reaches a proven VM exit".to_owned());
+                }
+                // A loader-reachable TLS callback is a virtualized routine in its
+                // own right. Its exit states belong in the emission set for the
+                // same reason the header entry's do: they are the only code that
+                // can replace it.
+                for path in &family.paths {
+                    if let Some(exit) = path.native_exit.as_ref() {
+                        tls_exit_states.push((
+                            path.assignments.clone(),
+                            exit.clone(),
+                            vmpx_vmlift::collect_path_effects(&family, path),
+                        ));
+                    }
                 }
                 CleanTlsEntryReport {
                     entry: entry.rva,
@@ -866,7 +884,11 @@ pub fn analyze_clean_with_image(
                 None => Vec::new(),
             };
             let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
-            for (assignments, exit, effects) in exit_states.iter().chain(nested_exits.iter()) {
+            for (assignments, exit, effects) in exit_states
+                .iter()
+                .chain(nested_exits.iter())
+                .chain(tls_exit_states.iter())
+            {
                 // The VM exit transfers to a protector continuation rather than
                 // returning to the caller. Resolve that continuation so the
                 // replacement can tail-jump into it after restoring the exit
