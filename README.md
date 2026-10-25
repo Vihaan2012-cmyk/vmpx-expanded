@@ -1,4 +1,4 @@
-# vmp-re
+# vmpx
 
 Static analysis and recovery tooling for VMProtect-protected Windows binaries,
 written in Rust. Covers PE parsing, unpacking, VM handler discovery, lifting and
