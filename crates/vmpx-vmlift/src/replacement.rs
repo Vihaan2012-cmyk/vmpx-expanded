@@ -19,8 +19,9 @@ use thiserror::Error;
 use vmpx_vm::{Expr, X64NativeRegister};
 
 use vmpx_recompile::{
-    CodeAddress, CompileError, CompiledFunction, Fragment, Function, Operation, PhysicalRegister,
-    RegisterAssignment, SpillSlot, StackFrame, VirtualRegister, compile, compose,
+    Address, BinarySource, CallTarget, CodeAddress, CompileError, CompiledFunction, Function,
+    Operation, PhysicalRegister, RegisterAssignment, ShiftCount, SpillSlot, StackFrame,
+    VirtualRegister, compile,
 };
 
 use crate::{ExpressionCodegenConfig, ExpressionInput, lower_expression};
@@ -118,16 +119,43 @@ pub fn build_replacement(
     let input_slot_count =
         u16::try_from(config.inputs.len()).map_err(|_| ReplacementError::TooManyInputs)?;
 
-    let mut fragments: Vec<Fragment> = Vec::new();
+    // Assemble the routine directly rather than through `compose`. Compose
+    // renumbers spill slots per fragment into one shared range, which would give
+    // each fragment a different index for the same shared input slot. Here the
+    // slot layout is fixed up front:
+    //
+    //   [0, input_slot_count)              shared input frame
+    //   [result_base + i)                  result slot for value i
+    //
+    // Registers are canonicalised to one virtual register per physical register,
+    // which is what the backend requires.
+    let result_base = input_slot_count;
+    let mut operations: Vec<Operation> = Vec::new();
+    let mut assignments: Vec<RegisterAssignment> = Vec::new();
+    let mut canonical: BTreeMap<PhysicalRegister, VirtualRegister> = BTreeMap::new();
+    let mut next_register = 0_u32;
+    let mut preserve: Vec<PhysicalRegister> = Vec::new();
+
+    // 1. Capture block: fill the shared input frame from the entry registers.
+    let mut capture_ops: Vec<Operation> = Vec::new();
+    for (index, (_, register)) in config.inputs.iter().enumerate() {
+        let slot = SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?);
+        let source = canonical_register(
+            *register,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        );
+        capture_ops.push(Operation::SpillStore { slot, source });
+    }
+    operations.extend(capture_ops);
+
+    // 2. One body per exit register. Each body reads its inputs from the shared
+    // frame and stores its result into its own slot.
     for (index, (register, expression)) in ordered.iter().enumerate() {
-        // Pick a scratch result and a distinct temporary that is not the shift
-        // count register and not this value's own destination.
         let destination = physical_for(register);
         let mut candidates = SCRATCH
             .into_iter()
-            // A scratch may coincide with another value's destination: that
-            // value's own fragment has already finished by then, and compose
-            // aliases the dead scratch onto the existing assignment.
             .filter(|candidate| *candidate != destination)
             .collect::<Vec<_>>();
         if candidates.len() < 2 {
@@ -135,7 +163,6 @@ pub fn build_replacement(
                 register: **register,
             });
         }
-        // Rotate the choice so consecutive values do not all pin one register.
         let rotation = index % candidates.len();
         candidates.rotate_left(rotation);
         let result_scratch = candidates[0];
@@ -173,114 +200,88 @@ pub fn build_replacement(
         function
             .operations
             .retain(|operation| !matches!(operation, Operation::Return));
-        // Each fragment writes its own value; the slot is resolved after
-        // composition, where the numbering is known.
-        function.operations.push(Operation::SpillStore {
-            slot: SpillSlot(0),
-            source: result,
-        });
-        function.operations.push(Operation::Return);
-        let widths = function
-            .assignments
-            .iter()
-            .map(|assignment| {
-                (
-                    assignment.virtual_register.id,
-                    assignment.virtual_register.width,
-                )
-            })
-            .collect();
-        // Every scratch this value used is dead once it has been spilled. The
-        // value's own destination is not written by this fragment, so it is not
-        // listed.
-        let own_destination = physical_for(register);
-        if std::env::var_os("VMPX_REP_DEBUG").is_some() {
-            eprintln!(
-                "value {index} {register:?} dest={destination:?} result={result_scratch:?} temp={temporary_scratch:?} assigns={:?}",
-                function
-                    .assignments
-                    .iter()
-                    .map(|a| a.physical_register)
-                    .collect::<Vec<_>>()
-            );
-        }
-        // A fragment only reads inputs, computes through scratch, and stores its
-        // result to a slot; nothing it assigns is live when it ends. Every
-        // register it names is therefore dead and may share storage with a later
-        // fragment.
-        // The fragment only spills; the epilogue is the sole writer of
-        // architectural state. Nothing this fragment assigns is live when it
-        // ends, including a register that happens to be a later destination.
-        let _ = own_destination;
-        let scratch_dead: BTreeSet<PhysicalRegister> = function
-            .assignments
-            .iter()
-            .map(|assignment| assignment.physical_register)
-            .collect();
-        fragments.push(Fragment {
-            function,
-            widths,
-            scratch_dead,
-        });
-    }
-
-    // The epilogue is composed last and owns the architectural destinations. Its
-    // assignments are live, so compose aliases every dead scratch register onto
-    // them and each physical register ends with exactly one virtual register.
-    let mut epilogue_operations: Vec<Operation> = Vec::new();
-    let mut epilogue_assignments: Vec<RegisterAssignment> = Vec::new();
-    for (index, (register, _)) in ordered.iter().enumerate() {
-        let destination = VirtualRegister::qword(100_000 + u32::try_from(index).unwrap_or(0));
-        epilogue_assignments.push(RegisterAssignment::new(destination, physical_for(register)));
-        epilogue_operations.push(Operation::SpillLoad {
-            destination,
-            slot: SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?),
-        });
-    }
-    epilogue_operations.push(Operation::Return);
-    fragments.push(Fragment {
-        function: Function {
-            operations: epilogue_operations,
-            assignments: epilogue_assignments,
-            frame: StackFrame {
-                stack_allocation: 0,
-                preserve: Vec::new(),
-                call_ready: false,
-                preinitialized_slots: Vec::new(),
-            },
-        },
-        widths: BTreeMap::new(),
-        scratch_dead: BTreeSet::new(),
-    });
-
-    let composition = compose(&fragments)?;
-    let composed_stack = composition.function.frame.stack_allocation;
-    let mut function = composition.function;
-
-    // Every slot index below `input_slot_count` belongs to the shared input
-    // frame. Shift all composed slots above it so the two frames never overlap.
-    if input_slot_count != 0 {
+        // Every slot the lowering allocated for its own temporaries sits at or
+        // above the input frame; move those above the result slots so no value's
+        // temporaries collide with another's results.
+        let local_base = result_base
+            .checked_add(u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?)
+            .ok_or(ReplacementError::TooManyInputs)?;
         for operation in &mut function.operations {
             match operation {
                 Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
-                    slot.0 = slot
-                        .0
-                        .checked_add(input_slot_count)
-                        .ok_or(ReplacementError::TooManyInputs)?;
+                    if slot.0 >= result_base {
+                        slot.0 = slot
+                            .0
+                            .checked_sub(result_base)
+                            .and_then(|offset| local_base.checked_add(offset))
+                            .ok_or(ReplacementError::TooManyInputs)?;
+                    }
                 }
                 _ => {}
             }
         }
-    }
-    function
-        .operations
-        .retain(|operation| !matches!(operation, Operation::Return));
 
-    // Size the frame from the highest slot any operation actually touches.
-    // Compose sizes it from the slots it renumbered, but the epilogue reads
-    // those slots through the composed numbering, so measure the emitted body.
-    let highest = function
-        .operations
+        // Rewrite this body's registers onto the canonical per-register ids.
+        let mut body_ops: Vec<Operation> = Vec::new();
+        let mut body_map: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
+        for assignment in &function.assignments {
+            let canonical_id = canonical_register(
+                assignment.physical_register,
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            );
+            body_map.insert(assignment.virtual_register.id, canonical_id);
+        }
+        for operation in &function.operations {
+            body_ops.push(rename_registers(operation, &body_map));
+        }
+        operations.extend(body_ops);
+
+        let result_slot = result_base
+            .checked_add(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?)
+            .ok_or(ReplacementError::TooManyInputs)?;
+        let canonical_result = body_map[&result.id];
+        operations.push(Operation::SpillStore {
+            slot: SpillSlot(result_slot),
+            source: canonical_result,
+        });
+
+        for register in &function.frame.preserve {
+            if !preserve.contains(register) {
+                preserve.push(*register);
+            }
+        }
+    }
+
+    // 3. Epilogue: load each result slot into its architectural register.
+    for (index, (register, _)) in ordered.iter().enumerate() {
+        let physical = physical_for(register);
+        let destination = canonical_register(
+            physical,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        );
+        let result_slot = result_base
+            .checked_add(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?)
+            .ok_or(ReplacementError::TooManyInputs)?;
+        operations.push(Operation::SpillLoad {
+            destination,
+            slot: SpillSlot(result_slot),
+        });
+    }
+    operations.push(Operation::Return);
+
+    // Every nonvolatile register the body writes must be preserved.
+    for assignment in &assignments {
+        let register = assignment.physical_register;
+        if register.is_win64_nonvolatile() && !preserve.contains(&register) {
+            preserve.push(register);
+        }
+    }
+
+    let highest = operations
         .iter()
         .filter_map(|operation| match operation {
             Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => Some(slot.0),
@@ -288,8 +289,16 @@ pub fn build_replacement(
         })
         .max()
         .unwrap_or(0);
-    function.frame.stack_allocation = u32::from(highest.saturating_add(1)).saturating_mul(8);
-    let _ = composed_stack;
+    let function = Function {
+        operations,
+        assignments,
+        frame: StackFrame {
+            stack_allocation: u32::from(highest.saturating_add(1)).saturating_mul(8),
+            preserve,
+            call_ready: false,
+            preinitialized_slots: (0..input_slot_count).map(SpillSlot).collect(),
+        },
+    };
 
     let compiled = compile(&function, address)?;
     Ok(Replacement {
@@ -297,6 +306,127 @@ pub fn build_replacement(
         compiled,
         emitted: ordered.iter().map(|(register, _)| **register).collect(),
     })
+}
+
+/// Returns the canonical virtual register for a physical register, allocating
+/// one on first use. The backend allows exactly one virtual register per
+/// physical register, so every fragment naming the same register shares it.
+fn canonical_register(
+    physical: PhysicalRegister,
+    canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
+    assignments: &mut Vec<RegisterAssignment>,
+    next_register: &mut u32,
+) -> VirtualRegister {
+    if let Some(existing) = canonical.get(&physical) {
+        return *existing;
+    }
+    let created = VirtualRegister::qword(*next_register);
+    *next_register = next_register.saturating_add(1);
+    canonical.insert(physical, created);
+    assignments.push(RegisterAssignment::new(created, physical));
+    created
+}
+
+/// Rewrites the virtual registers of one operation through `map`.
+fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>) -> Operation {
+    let register = |value: VirtualRegister| -> VirtualRegister {
+        map.get(&value.id).copied().unwrap_or(value)
+    };
+    match *operation {
+        Operation::Label(label) => Operation::Label(label),
+        Operation::MoveImmediate { destination, value } => Operation::MoveImmediate {
+            destination: register(destination),
+            value,
+        },
+        Operation::Move {
+            destination,
+            source,
+        } => Operation::Move {
+            destination: register(destination),
+            source: register(source),
+        },
+        Operation::Binary {
+            operation,
+            destination,
+            source,
+        } => Operation::Binary {
+            operation,
+            destination: register(destination),
+            source: match source {
+                BinarySource::Register(value) => BinarySource::Register(register(value)),
+                BinarySource::Immediate(value) => BinarySource::Immediate(value),
+            },
+        },
+        Operation::Unary {
+            operation,
+            destination,
+        } => Operation::Unary {
+            operation,
+            destination: register(destination),
+        },
+        Operation::Shift {
+            operation,
+            destination,
+            count,
+        } => Operation::Shift {
+            operation,
+            destination: register(destination),
+            count: match count {
+                ShiftCount::Register(value) => ShiftCount::Register(register(value)),
+                ShiftCount::Immediate(value) => ShiftCount::Immediate(value),
+            },
+        },
+        Operation::Resize {
+            operation,
+            destination,
+            source,
+        } => Operation::Resize {
+            operation,
+            destination: register(destination),
+            source: register(source),
+        },
+        Operation::Load {
+            destination,
+            address,
+        } => Operation::Load {
+            destination: register(destination),
+            address: Address::new(register(address.base), address.displacement),
+        },
+        Operation::Store { address, source } => Operation::Store {
+            address: Address::new(register(address.base), address.displacement),
+            source: register(source),
+        },
+        Operation::SpillLoad { destination, slot } => Operation::SpillLoad {
+            destination: register(destination),
+            slot,
+        },
+        Operation::SpillStore { slot, source } => Operation::SpillStore {
+            slot,
+            source: register(source),
+        },
+        Operation::Call {
+            target,
+            ref arguments,
+            result,
+        } => Operation::Call {
+            target: match target {
+                CallTarget::Register(value) => CallTarget::Register(register(value)),
+                other => other,
+            },
+            arguments: arguments.iter().map(|value| register(*value)).collect(),
+            result: result.map(register),
+        },
+        Operation::Compare { left, right } => Operation::Compare {
+            left: register(left),
+            right: match right {
+                BinarySource::Register(value) => BinarySource::Register(register(value)),
+                BinarySource::Immediate(value) => BinarySource::Immediate(value),
+            },
+        },
+        Operation::Jump(label) => Operation::Jump(label),
+        Operation::BranchIf { condition, target } => Operation::BranchIf { condition, target },
+        Operation::Return => Operation::Return,
+    }
 }
 
 fn physical_for(register: &X64NativeRegister) -> PhysicalRegister {
