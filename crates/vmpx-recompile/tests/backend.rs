@@ -131,6 +131,7 @@ fn emits_balanced_nonvolatile_frame() {
             stack_allocation: 32,
             preserve: vec![PhysicalRegister::Rbx],
             call_ready: true,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::MoveImmediate {
@@ -187,6 +188,7 @@ fn rejects_unpreserved_nonvolatile_and_bad_alignment() {
         stack_allocation: 40,
         preserve: vec![PhysicalRegister::R12],
         call_ready: true,
+        preinitialized_slots: Vec::new(),
     };
     assert_eq!(
         validate_function(&function),
@@ -324,6 +326,7 @@ fn emits_width_specific_spill_accesses() {
                 stack_allocation: 8,
                 preserve: vec![],
                 call_ready: false,
+                preinitialized_slots: Vec::new(),
             },
             operations: vec![
                 Operation::SpillStore {
@@ -365,6 +368,7 @@ fn call_ready_spills_follow_shadow_space_and_require_frame_capacity() {
             stack_allocation: 40,
             preserve: vec![],
             call_ready: true,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::SpillStore {
@@ -392,6 +396,7 @@ fn call_ready_spills_follow_shadow_space_and_require_frame_capacity() {
             stack_allocation: 32,
             preserve: vec![],
             call_ready: true,
+            preinitialized_slots: Vec::new(),
         },
         ..function
     };
@@ -410,6 +415,7 @@ fn call_ready_frame() -> StackFrame {
         stack_allocation: 40,
         preserve: vec![],
         call_ready: true,
+        preinitialized_slots: Vec::new(),
     }
 }
 
@@ -681,6 +687,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             stack_allocation: 8,
             preserve: vec![],
             call_ready: false,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::SpillLoad {
@@ -710,6 +717,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             stack_allocation: 8,
             preserve: vec![],
             call_ready: false,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::SpillStore {
@@ -742,6 +750,7 @@ fn rejects_uninitialized_and_partially_initialized_spill_loads() {
             stack_allocation: 8,
             preserve: vec![],
             call_ready: false,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::SpillStore {
@@ -787,6 +796,7 @@ fn spill_initialization_meet_uses_the_narrowest_cfg_predecessor() {
             stack_allocation: 8,
             preserve: vec![],
             call_ready: false,
+            preinitialized_slots: Vec::new(),
         },
         operations: vec![
             Operation::BranchIf {

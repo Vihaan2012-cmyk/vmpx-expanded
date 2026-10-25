@@ -150,26 +150,29 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     // physical register reused by several fragments holds one value at a time.
     // Alias every later virtual register onto the first one for its physical
     // register and rewrite the operations to match.
+    // Give each physical register exactly one canonical storage id, then point
+    // every dead register at it. A live assignment keeps its own id so a value
+    // is never silently merged with another.
     let mut canonical: BTreeMap<crate::PhysicalRegister, VirtualRegister> = BTreeMap::new();
-    let mut aliases: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
     let mut deduped: Vec<RegisterAssignment> = Vec::new();
+    let mut aliases: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
     for assignment in &assignments {
         let physical = assignment.physical_register;
         let id = assignment.virtual_register.id;
-        match canonical.get(&physical) {
-            // Alias only when this register was declared dead by its fragment.
-            // A live value keeps its own assignment even if that leaves two
-            // virtual registers on one physical register; the backend then
-            // rejects it rather than silently dropping a value.
-            Some(existing) if dead_ids.contains(&id) => {
-                aliases.insert(id, *existing);
-            }
-            Some(_) => deduped.push(*assignment),
-            None => {
-                canonical.insert(physical, assignment.virtual_register);
+        if dead_ids.contains(&id) {
+            let target = *canonical
+                .entry(physical)
+                .or_insert(assignment.virtual_register);
+            if target.id != id {
+                aliases.insert(id, target);
+            } else {
                 deduped.push(*assignment);
             }
+            continue;
         }
+        // Live value: keep its own storage, and make it the canonical home.
+        canonical.insert(physical, assignment.virtual_register);
+        deduped.push(*assignment);
     }
     if !aliases.is_empty() {
         let alias_map = aliases.clone();
@@ -203,6 +206,7 @@ pub fn compose(fragments: &[Fragment]) -> Result<Composition, ComposeError> {
     let frame = StackFrame {
         stack_allocation: u32::from(next_slot).saturating_mul(8),
         preserve,
+        preinitialized_slots: Vec::new(),
         call_ready: false,
     };
     Ok(Composition {
@@ -430,6 +434,7 @@ mod tests {
                 frame: StackFrame {
                     stack_allocation: 8,
                     preserve: Vec::new(),
+                    preinitialized_slots: Vec::new(),
                     call_ready: false,
                 },
             },

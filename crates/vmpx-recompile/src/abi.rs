@@ -33,6 +33,10 @@ pub struct StackFrame {
     /// Require the body stack state to satisfy Win64 call-site alignment and
     /// shadow-space requirements.
     pub call_ready: bool,
+    /// Slots the caller has already populated before the body runs. A composed
+    /// routine uses these for its shared input frame, so a load from one is
+    /// defined even though no store appears in the emitted body.
+    pub preinitialized_slots: Vec<SpillSlot>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,7 +300,11 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
     }
     let mut entry_states: Vec<Option<BTreeMap<SpillSlot, u8>>> =
         vec![None; function.operations.len()];
-    entry_states[0] = Some(BTreeMap::new());
+    let mut initial: BTreeMap<SpillSlot, u8> = BTreeMap::new();
+    for slot in &function.frame.preinitialized_slots {
+        initial.insert(*slot, 8);
+    }
+    entry_states[0] = Some(initial);
     let mut pending = VecDeque::from([0_usize]);
     while let Some(index) = pending.pop_front() {
         let Some(mut state) = entry_states[index].clone() else {

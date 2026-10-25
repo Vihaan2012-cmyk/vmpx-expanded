@@ -81,11 +81,7 @@ fn main() {
         names.dedup();
         let mut inputs: Vec<ExpressionInput> = Vec::new();
         for (name, p) in names.into_iter().zip(phys) {
-            inputs.push(ExpressionInput {
-                name,
-                width: BitWidth::W64,
-                physical_register: p,
-            });
+            inputs.push(ExpressionInput::register(name, BitWidth::W64, p));
         }
         let config = ExpressionCodegenConfig {
             inputs: inputs.clone(),

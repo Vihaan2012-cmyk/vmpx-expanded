@@ -19,7 +19,39 @@ const BACKEND_SPILL_LIMIT: usize = 4_096;
 pub struct ExpressionInput {
     pub name: String,
     pub width: BitWidth,
-    pub physical_register: PhysicalRegister,
+    /// Where the value lives when the expression starts. A register input is
+    /// captured from that register; a pre-spilled input is read directly from a
+    /// caller-allocated frame slot, which lets several expressions share one
+    /// set of inputs without consuming registers.
+    pub source: InputSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputSource {
+    Register(PhysicalRegister),
+    /// Frame slot already holding the value, addressed from the function's
+    /// frame base.
+    Slot(SpillSlot),
+}
+
+impl ExpressionInput {
+    #[must_use]
+    pub fn register(name: impl Into<String>, width: BitWidth, register: PhysicalRegister) -> Self {
+        Self {
+            name: name.into(),
+            width,
+            source: InputSource::Register(register),
+        }
+    }
+
+    #[must_use]
+    pub fn slot(name: impl Into<String>, width: BitWidth, slot: SpillSlot) -> Self {
+        Self {
+            name: name.into(),
+            width,
+            source: InputSource::Slot(slot),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,33 +480,48 @@ pub fn lower_expression(
                 name: input.name.clone(),
             });
         }
-        let register_id = if let Some(existing) = physical_ids.get(&input.physical_register) {
-            *existing
-        } else {
-            let offset = u32::try_from(input_index)
-                .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?;
-            let id = FIRST_INPUT_ID
-                .checked_add(offset)
-                .ok_or(ExpressionCodegenError::StorageIdOverflow)?;
-            physical_ids.insert(input.physical_register, id);
-            assignments.push(RegisterAssignment::new(
-                VirtualRegister::qword(id),
-                input.physical_register,
-            ));
-            id
-        };
-        let input_slot = slot(input_index, config.max_spill_slots)?;
-        inputs.insert(
-            input.name.clone(),
-            InputBinding {
-                width: input.width,
-                slot: input_slot,
-            },
-        );
-        operations.push(Operation::SpillStore {
-            slot: input_slot,
-            source: register(register_id, input.width),
-        });
+        match input.source {
+            InputSource::Register(physical) => {
+                let register_id = if let Some(existing) = physical_ids.get(&physical) {
+                    *existing
+                } else {
+                    let offset = u32::try_from(input_index)
+                        .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?;
+                    let id = FIRST_INPUT_ID
+                        .checked_add(offset)
+                        .ok_or(ExpressionCodegenError::StorageIdOverflow)?;
+                    physical_ids.insert(physical, id);
+                    assignments.push(RegisterAssignment::new(
+                        VirtualRegister::qword(id),
+                        physical,
+                    ));
+                    id
+                };
+                let input_slot = slot(input_index, config.max_spill_slots)?;
+                inputs.insert(
+                    input.name.clone(),
+                    InputBinding {
+                        width: input.width,
+                        slot: input_slot,
+                    },
+                );
+                operations.push(Operation::SpillStore {
+                    slot: input_slot,
+                    source: register(register_id, input.width),
+                });
+            }
+            InputSource::Slot(existing) => {
+                // The caller already spilled this value, so read it in place and
+                // consume no register at entry.
+                inputs.insert(
+                    input.name.clone(),
+                    InputBinding {
+                        width: input.width,
+                        slot: existing,
+                    },
+                );
+            }
+        }
     }
 
     let mut context = LoweringContext {
@@ -508,6 +555,16 @@ pub fn lower_expression(
         frame: StackFrame {
             stack_allocation,
             preserve,
+            // Slot-backed inputs are already populated by the caller, so a load
+            // from one is defined even though this body contains no store.
+            preinitialized_slots: config
+                .inputs
+                .iter()
+                .filter_map(|input| match input.source {
+                    InputSource::Slot(slot) => Some(slot),
+                    InputSource::Register(_) => None,
+                })
+                .collect(),
             call_ready: false,
         },
     };
@@ -540,11 +597,7 @@ mod tests {
     use super::*;
 
     fn input(name: &str, width: BitWidth, physical_register: PhysicalRegister) -> ExpressionInput {
-        ExpressionInput {
-            name: name.to_owned(),
-            width,
-            physical_register,
-        }
+        ExpressionInput::register(name, width, physical_register)
     }
 
     #[test]
