@@ -67,6 +67,14 @@ pub struct ExpressionCodegenConfig {
     /// of an allocator call, so lowering it emits that call rather than
     /// inventing a value. Any intrinsic absent from this map is refused.
     pub import_calls: BTreeMap<String, ImportCall>,
+    /// First slot the fragment may use for its own storage.
+    ///
+    /// A caller that reserves slots above its inputs, such as the value result
+    /// slots of a composed replacement, sets this so the fragment never numbers a
+    /// temporary onto a slot the caller already owns. `max_spill_slots` stays a
+    /// count of slots the fragment itself may use, so the absolute limit is this
+    /// value plus that count.
+    pub first_scratch_slot: Option<u16>,
 }
 
 /// How to emit one imported call for an intrinsic.
@@ -89,6 +97,7 @@ impl Default for ExpressionCodegenConfig {
             max_expression_nodes: 65_536,
             max_spill_slots: BACKEND_SPILL_LIMIT,
             import_calls: BTreeMap::new(),
+            first_scratch_slot: None,
         }
     }
 }
@@ -157,6 +166,9 @@ struct LoweringContext<'a> {
     operations: Vec<Operation>,
     next_slot: usize,
     peak_slot: usize,
+    /// Absolute ceiling for `next_slot`: the window start plus the slots the
+    /// fragment is allowed to use.
+    absolute_slot_limit: usize,
 }
 
 impl LoweringContext<'_> {
@@ -272,7 +284,7 @@ fn slot(index: usize, limit: usize) -> Result<SpillSlot, ExpressionCodegenError>
 
 impl LoweringContext<'_> {
     fn allocate_slot(&mut self) -> Result<SpillSlot, ExpressionCodegenError> {
-        let allocated = slot(self.next_slot, self.config.max_spill_slots)?;
+        let allocated = slot(self.next_slot, self.absolute_slot_limit)?;
         self.next_slot = self.next_slot.saturating_add(1);
         self.peak_slot = self.peak_slot.max(self.next_slot);
         Ok(allocated)
@@ -623,13 +635,22 @@ pub fn lower_expression(
         }
     }
 
+    let first_slot = config
+        .first_scratch_slot
+        .map_or(config.inputs.len(), |slot| usize::from(slot));
+    // `max_spill_slots` counts the slots this fragment may use, so the absolute
+    // ceiling is where its window starts plus that count.
+    let absolute_slot_limit = first_slot
+        .saturating_add(config.max_spill_slots)
+        .min(BACKEND_SPILL_LIMIT);
     let mut context = LoweringContext {
         config,
         inputs,
         assignments,
         operations,
-        next_slot: config.inputs.len(),
-        peak_slot: config.inputs.len(),
+        next_slot: first_slot,
+        peak_slot: first_slot,
+        absolute_slot_limit,
     };
     context.lower(expression)?;
     context.operations.push(Operation::Return);

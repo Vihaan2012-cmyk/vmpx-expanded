@@ -412,6 +412,9 @@ pub fn build_replacement(
             max_expression_nodes: config.max_expression_nodes,
             max_spill_slots: config.max_spill_slots,
             import_calls: config.import_calls.clone(),
+            // Start above the shared frame: a value's temporaries must never land
+            // on an input slot or on another value's result slot.
+            first_scratch_slot: Some(shared_end),
         };
         // A value that reads an allocation the routine made must read the
         // result of the one call, not invoke the allocator again.
@@ -755,6 +758,9 @@ fn lower_fragment(
             // the shared frame, so its own frame must be able to describe them.
             max_spill_slots: config.max_spill_slots,
             import_calls: config.import_calls.clone(),
+            // Number temporaries from the window this fragment was given, so none
+            // can alias a slot the shared frame owns.
+            first_scratch_slot: Some(*window_base),
         },
     )?;
     let mut map: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
@@ -774,7 +780,11 @@ fn lower_fragment(
     // frame and the effect results) keep their index, so the rebase starts at
     // the end of the whole shared region rather than at the input count.
     let shared_end = *shared_frame_slots;
-    // How many slots the fragment allocated for itself, measured from `base`.
+    // The lowering was told to start at this fragment's window, so its slots are
+    // already where they belong and must not be moved again. Only slots below the
+    // window that are not shared-frame slots would need rebasing, and there are
+    // none by construction.
+    let window_start = *window_base;
     let fragment_peak = lowered
         .function
         .operations
@@ -783,14 +793,13 @@ fn lower_fragment(
             Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => Some(slot.0),
             _ => None,
         })
-        .filter(|slot| *slot >= shared_end)
+        .filter(|slot| *slot >= window_start)
         .max()
         .map_or(0, |highest| {
-            highest.saturating_sub(shared_end).saturating_add(1)
+            highest.saturating_sub(window_start).saturating_add(1)
         });
     // Each fragment owns a disjoint window above every region the shared frame
     // already uses, so two fragments can never alias the same storage.
-    let window_start = *window_base;
     *window_base = window_base
         .checked_add(
             u16::try_from(config.max_spill_slots)
@@ -808,15 +817,10 @@ fn lower_fragment(
         if let Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } =
             &mut operation
         {
-            // Only the fragment's own temporaries move; input and effect-result
-            // slots belong to the shared frame and keep their index.
-            if slot.0 >= shared_end {
-                slot.0 = slot
-                    .0
-                    .checked_sub(shared_end)
-                    .and_then(|offset| window_start.checked_add(offset))
-                    .ok_or(ReplacementError::TooManyInputs)?;
-            }
+            // The fragment already numbered its temporaries inside its own
+            // window, so they stay put. Input slots below the window belong to the
+            // shared frame and also keep their index.
+            let _ = (shared_end, &slot);
         }
         operations.push(operation);
     }
@@ -1175,6 +1179,61 @@ mod tests {
             .filter(|operation| matches!(operation, Operation::Load { .. }))
             .count();
         assert!(loads >= 1, "the rewritten value must load from the frame");
+    }
+
+    #[test]
+    fn a_fragment_temporary_never_lands_on_a_value_result_slot() {
+        // The lowering numbers temporaries from the input count, which lies below
+        // the value result slots. A fragment that is not told where its window
+        // starts would put its first temporary exactly on the first result slot,
+        // and the flag restore would then read a register value instead of the
+        // flag word.
+        let inputs = vec![
+            ("native_rax_initial".to_owned(), PhysicalRegister::Rax),
+            ("native_rcx_initial".to_owned(), PhysicalRegister::Rcx),
+            ("native_rdx_initial".to_owned(), PhysicalRegister::Rdx),
+        ];
+        let registers = BTreeMap::from([
+            (X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 1)),
+            (X64NativeRegister::Rcx, Expr::constant(BitWidth::W64, 2)),
+        ]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: Some(
+                Expr::binary(
+                    vmpx_vm::BinaryOp::Add,
+                    Expr::register(BitWidth::W64, "native_rax_initial"),
+                    Expr::constant(BitWidth::W64, 8),
+                )
+                .expect("sum"),
+            ),
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        // Result slots are [3, 5) for two values. The flag fragment's own storage
+        // must be at or above the shared region end (5), never inside it.
+        let shared_end = 3 + 2;
+        let flag_slots = replacement
+            .function
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::SpillStore { slot, .. } => Some(slot.0),
+                _ => None,
+            })
+            .filter(|slot| *slot >= shared_end)
+            .collect::<Vec<_>>();
+        assert!(
+            !flag_slots.is_empty(),
+            "the flag fragment must own storage above the shared region"
+        );
     }
 
     #[test]
