@@ -230,6 +230,18 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
         exports.iter().any(|export| export["vm_free"] == false),
         "the fixture still has exports reaching VM code; the report must say so"
     );
+    // The count is of distinct virtualized routines, not of edges: the VM's own
+    // dispatch lands on handler interiors, which the CFG sees as ordinary
+    // successors. Counting those would overstate the remaining work roughly
+    // sixfold.
+    let total: u64 = exports
+        .iter()
+        .map(|export| export["vm_references"].as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        total <= 12,
+        "export reachability must count distinct VM entries, got {total}"
+    );
 
     let bytes = fs::read(&reconstructed).expect("reconstructed image exists");
     assert_eq!(

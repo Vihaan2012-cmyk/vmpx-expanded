@@ -223,6 +223,9 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
         }
         let mut seen = BTreeSet::new();
         let mut queue = VecDeque::from([symbol.rva]);
+        // Distinct virtualized routines this export can reach. Counting edges
+        // instead would report the same routine many times and overstate the work.
+        let mut vm_entries: BTreeSet<u32> = BTreeSet::new();
         let mut vm_references = 0_usize;
         while let Some(start) = queue.pop_front() {
             if !seen.insert(start) {
@@ -246,20 +249,41 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
             for block in &graph.blocks {
                 for successor in &block.successors {
                     if is_protector(*successor) {
-                        vm_references += 1;
+                        // Not every protector address is a routine: the VM's own
+                        // dispatch lands on handler interiors, which the CFG sees
+                        // as ordinary successors. Only an address that presents an
+                        // entry stub is a virtualized routine worth replacing.
+                        if vmpx_vm::analyze_vm_entry_at(
+                            pe,
+                            *successor,
+                            vmpx_vm::VmDiscoveryLimits::default(),
+                        )
+                        .is_some_and(|candidate| candidate.confidence >= 60)
+                        {
+                            vm_entries.insert(successor.0);
+                        }
                     } else if !seen.contains(successor) {
                         queue.push_back(*successor);
                     }
                 }
                 for call in &block.direct_calls {
                     if is_protector(*call) {
-                        vm_references += 1;
+                        if vmpx_vm::analyze_vm_entry_at(
+                            pe,
+                            *call,
+                            vmpx_vm::VmDiscoveryLimits::default(),
+                        )
+                        .is_some_and(|candidate| candidate.confidence >= 60)
+                        {
+                            vm_entries.insert(call.0);
+                        }
                     } else if !seen.contains(call) {
                         queue.push_back(*call);
                     }
                 }
             }
         }
+        vm_references = vm_entries.len();
         results.push(CleanExportReport {
             name: symbol
                 .name
