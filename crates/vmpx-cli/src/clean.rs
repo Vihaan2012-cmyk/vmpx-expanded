@@ -917,6 +917,7 @@ pub fn analyze_clean_with_image(
         let mut emitted = 0_u64;
         let mut total_bytes = 0_u64;
         let mut emitted_section = None;
+        let mut placed: Vec<(BTreeMap<String, u64>, Rva)> = Vec::new();
         let mut diagnostics = Vec::new();
         if let Some(next_rva) = next_rva {
             let va = pe.optional.image_base.0 + u64::from(next_rva.0);
@@ -992,6 +993,19 @@ pub fn analyze_clean_with_image(
                     vmpx_recompile::CodeAddress(va + total_bytes),
                 ) {
                     Ok(replacement) => {
+                        // Record where this body landed so a redirect can target
+                        // it: the entry stub has to jump somewhere specific.
+                        let entry_rva = vmpx_pe::Rva(
+                            u32::try_from(next_rva.0)
+                                .ok()
+                                .and_then(|base| {
+                                    u32::try_from(total_bytes)
+                                        .ok()
+                                        .and_then(|offset| base.checked_add(offset))
+                                })
+                                .unwrap_or(next_rva.0),
+                        );
+                        placed.push((assignments.clone(), entry_rva));
                         total_bytes += u64::try_from(replacement.compiled.bytes.len()).unwrap_or(0);
                         functions.push((assignments.clone(), replacement.compiled.bytes.clone()));
                         emitted += 1;
@@ -1019,6 +1033,14 @@ pub fn analyze_clean_with_image(
                     ("bytes".to_owned(), total_bytes),
                 ]),
                 diagnostics: {
+                    // Where each body landed, so a redirect target is stated
+                    // rather than implied by the layout.
+                    for (assignments, rva) in &placed {
+                        diagnostics.push(format!(
+                            "replacement for {assignments:?} placed at RVA {:#x}",
+                            rva.0
+                        ));
+                    }
                     diagnostics.push(format!(
                         "{emitted} native replacement function(s) emitted; the VM entry is not redirected because the remaining proofs are open"
                     ));
