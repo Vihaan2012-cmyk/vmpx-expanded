@@ -242,6 +242,16 @@ fn clean_protected_fixture_emits_conventional_layout_image() {
         total <= 12,
         "export reachability must count distinct VM entries, got {total}"
     );
+    // The reachable routines are named, not merely counted, so the remaining work
+    // is addressable.
+    let named: usize = exports
+        .iter()
+        .map(|export| export["vm_entries"].as_array().map_or(0, Vec::len))
+        .sum();
+    assert_eq!(
+        named as u64, total,
+        "every counted routine must also be listed by address"
+    );
 
     let bytes = fs::read(&reconstructed).expect("reconstructed image exists");
     assert_eq!(

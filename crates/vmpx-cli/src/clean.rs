@@ -73,7 +73,13 @@ pub struct CleanExportReport {
     pub name: String,
     pub rva: Rva,
     pub reachable_blocks: usize,
+    /// Distinct virtualized routines this export can reach. The VM's own dispatch
+    /// lands on handler interiors, which the CFG cannot tell from call targets, so
+    /// only addresses that present an entry stub are counted.
     pub vm_references: usize,
+    /// RVAs of those routines, so the remaining work is addressable rather than a
+    /// bare count.
+    pub vm_entries: Vec<Rva>,
     pub vm_free: bool,
 }
 
@@ -292,6 +298,7 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
             rva: symbol.rva,
             reachable_blocks: seen.len(),
             vm_references,
+            vm_entries: vm_entries.iter().map(|rva| Rva(*rva)).collect(),
             vm_free: vm_references == 0,
         });
     }
