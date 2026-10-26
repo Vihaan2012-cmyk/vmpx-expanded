@@ -650,20 +650,37 @@ pub fn analyze_clean_with_image(
                                 )
                                 && nested.confidence >= 60
                             {
-                                let nested_domains = BTreeMap::from([(
-                                    "native_rdx_initial".to_owned(),
-                                    (0_u64..=3)
-                                        .map(|reason| Expr::constant(BitWidth::W64, reason))
-                                        .collect::<Vec<_>>(),
-                                )]);
+                                // The nested entry is reached after the VM has run,
+                                // so its inputs are the register values this exit
+                                // produced, not fresh loader parameters. Analysing
+                                // it with a DllMain reason domain would invent a
+                                // value the VM never left there.
+                                let nested_domains: BTreeMap<String, Vec<Expr>> = exit
+                                    .registers
+                                    .iter()
+                                    .filter(|(_, value)| {
+                                        matches!(value.kind, vmpx_vm::ExprKind::Const { .. })
+                                    })
+                                    .map(|(register, value)| {
+                                        (register.symbolic_name().to_owned(), vec![value.clone()])
+                                    })
+                                    .collect();
                                 if let Ok(nested_family) =
                                     recover_entry_paths(&pe, &nested, &nested_domains, limits)
                                 {
                                     for nested_path in &nested_family.paths {
                                         if let Some(nested_exit) = nested_path.native_exit.as_ref()
                                         {
+                                            // Label the nested body distinctly: it
+                                            // inherits the outer assignments, so an
+                                            // unmarked copy would be indistinguishable
+                                            // from the outer path in diagnostics.
                                             let mut assignments = path.assignments.clone();
                                             assignments.extend(nested_path.assignments.clone());
+                                            assignments.insert(
+                                                "nested_entry".to_owned(),
+                                                u64::from(target_rva.0),
+                                            );
                                             nested_exits.push((
                                                 assignments,
                                                 nested_exit.clone(),
