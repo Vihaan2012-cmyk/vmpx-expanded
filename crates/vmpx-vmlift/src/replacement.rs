@@ -117,6 +117,12 @@ pub enum ReplacementError {
     )]
     ClobberedNonvolatile { register: X64NativeRegister },
 
+    #[error(
+        "the exit flag value depends on the stack root, so it is an address rather than a \
+         condition state; restoring it would give the continuation garbage flags"
+    )]
+    FlagsAreNotAConditionState,
+
     #[error("effect lowering failed: {0}")]
     Effect(#[from] crate::ExpressionCodegenError),
 
@@ -530,6 +536,17 @@ pub fn build_replacement(
     // materialised while the frame is still addressable, and `POPFQ` does not
     // touch the stack pointer beyond the one qword it consumes.
     if let Some(rflags) = &config.rflags {
+        // A condition state is a small set of bits. An expression that depends on
+        // the stack root is an address, not a flag word: the exit state read a
+        // pointer where the flags belong. Restoring it would hand the continuation
+        // a garbage condition state, so the body is refused instead.
+        if rflags
+            .dependencies()
+            .iter()
+            .any(|name| name == "vsp_initial")
+        {
+            return Err(ReplacementError::FlagsAreNotAConditionState);
+        }
         let bound = substitute_effect_bindings(
             &rewrite_symbols(rflags, &config.symbol_rewrites)?,
             &effect_bindings,
@@ -1179,6 +1196,44 @@ mod tests {
             .filter(|operation| matches!(operation, Operation::Load { .. }))
             .count();
         assert!(loads >= 1, "the rewritten value must load from the frame");
+    }
+
+    #[test]
+    fn refuses_a_flag_value_that_is_an_address() {
+        // A condition state is a small set of bits. An expression built on the
+        // stack root is an address, which means the exit state read a pointer
+        // where the flags belong; restoring it would hand the continuation
+        // garbage flags.
+        let inputs = vec![
+            ("native_rax_initial".to_owned(), PhysicalRegister::Rax),
+            ("vsp_initial".to_owned(), PhysicalRegister::Rdi),
+        ];
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 1))]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: Some(
+                Expr::binary(
+                    vmpx_vm::BinaryOp::Add,
+                    Expr::register(BitWidth::W64, "vsp_initial"),
+                    Expr::constant(BitWidth::W64, (-88i64) as u64),
+                )
+                .expect("sum"),
+            ),
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect_err("an address is not a flag word");
+        assert!(
+            matches!(error, ReplacementError::FlagsAreNotAConditionState),
+            "the refusal must name the reason: {error}"
+        );
     }
 
     #[test]
