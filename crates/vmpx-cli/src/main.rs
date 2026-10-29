@@ -653,7 +653,7 @@ fn analyze_oep(pe: &PeImage<'_>) -> Result<OepAnalysis> {
         .map(|candidate| candidate.rva)
         .collect();
     let mut evidence = Vec::new();
-    let (assessment, confidence) = if let Some(entry) = header_vm {
+    let (mut assessment, confidence) = if let Some(entry) = header_vm {
         evidence.extend(
             entry
                 .evidence
@@ -664,18 +664,45 @@ fn analyze_oep(pe: &PeImage<'_>) -> Result<OepAnalysis> {
     } else {
         ("unresolved", None)
     };
+    let mut warnings = Vec::new();
+    let mut recovered_entry = None;
+    if let Some(entry) = header_vm {
+        if pe.coff.characteristics & 0x2000 == 0 {
+            warnings.push(
+                "OEP recovery from the entry continuation is only implemented for DLL entries"
+                    .to_owned(),
+            );
+        } else {
+            match clean::header_entry_continuations(pe, entry) {
+                Ok(candidates) => {
+                    let decision = vmpx_vm::decide_oep(&candidates, |rva| {
+                        clean::is_native_continuation(pe, rva)
+                    });
+                    evidence.extend(decision.evidence.iter().map(|item| format!("oep: {item}")));
+                    if decision.recovered_entry.is_some() {
+                        assessment = decision.assessment;
+                    }
+                    recovered_entry = decision.recovered_entry;
+                }
+                Err(error) => warnings.push(format!("header entry path recovery failed: {error}")),
+            }
+        }
+    }
+    if recovered_entry.is_none() {
+        warnings.push(
+            "no original native module entry is emitted until a VM-exit/native-transition path is decoded".to_owned(),
+        );
+    }
+    warnings.push("the supplied workspace has no unprotected semantic oracle".to_owned());
     Ok(OepAnalysis {
         schema_version: 1,
         header_entry,
         header_entry_vm_confidence: confidence,
         header_entry_assessment: assessment,
-        recovered_entry: None,
+        recovered_entry,
         native_tls_candidates,
         evidence,
-        warnings: vec![
-            "no original native module entry is emitted until a VM-exit/native-transition path is decoded".to_owned(),
-            "the supplied workspace has no unprotected semantic oracle".to_owned(),
-        ],
+        warnings,
     })
 }
 
