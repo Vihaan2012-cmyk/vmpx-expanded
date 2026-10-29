@@ -12,7 +12,7 @@ pub use layout::{
     is_conventional_layout, is_discardable, is_rva_layout, normalize_characteristics,
     relayout_conventional, validate_for_loader,
 };
-pub use reintegrate::set_tls_callback;
+pub use reintegrate::{ReintegrationReport, ReintegrationRequest, reintegrate, set_tls_callback};
 
 use thiserror::Error;
 use vmpx_pe::{

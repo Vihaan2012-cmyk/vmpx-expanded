@@ -1,7 +1,82 @@
-use crate::{RebuildError, add_offset, write_bytes};
+use crate::{
+    AppendSection, AppendedSection, RebuildError, add_offset, append_section, set_entry_point,
+    validate_for_loader, write_bytes,
+};
 use vmpx_pe::{FileOffset, IMAGE_DIRECTORY_ENTRY_TLS, PeImage, Rva, Va};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const REINTEGRATION_CHARACTERISTICS: u32 = 0x6000_0020; // CODE | READ | EXECUTE
+
+/// Inputs for one reintegration pass: a file-backed payload section plus any
+/// redirects to point at it. `vmpx-rebuild` stays free of codegen crates by
+/// taking already-rendered bytes and absolute RVAs rather than building them.
+pub struct ReintegrationRequest<'a> {
+    pub section_name: [u8; 8],
+    pub payload: &'a [u8],
+    pub entry_redirect: Option<Rva>,
+    pub tls_redirects: &'a [(usize, Rva)],
+}
+
+/// Outcome of a reintegration pass: what was appended, which redirects landed,
+/// and whether the result still satisfies the OS loader.
+pub struct ReintegrationReport {
+    pub section: AppendedSection,
+    pub entry_redirected: bool,
+    pub tls_redirected: usize,
+    pub loader_valid: bool,
+    pub diagnostics: Vec<String>,
+}
+
+/// Appends `request.payload` as a new section, then applies the requested
+/// entry-point and TLS-callback redirects, then records a loader-validation
+/// pass/fail without failing the call on an invalid result.
+///
+/// # Errors
+///
+/// Propagates any error from `append_section`, `set_entry_point`, or
+/// `set_tls_callback`.
+pub fn reintegrate(
+    conventional: &[u8],
+    request: ReintegrationRequest<'_>,
+) -> Result<(Vec<u8>, ReintegrationReport), RebuildError> {
+    let rebuilt = append_section(
+        conventional,
+        AppendSection {
+            name: request.section_name,
+            data: request.payload,
+            characteristics: REINTEGRATION_CHARACTERISTICS,
+        },
+    )?;
+    let mut bytes = rebuilt.bytes;
+    let mut entry_redirected = false;
+    if let Some(entry) = request.entry_redirect {
+        bytes = set_entry_point(&bytes, entry)?;
+        entry_redirected = true;
+    }
+    let mut tls_redirected = 0;
+    for (index, target) in request.tls_redirects {
+        bytes = set_tls_callback(&bytes, *index, *target)?;
+        tls_redirected += 1;
+    }
+    let mut diagnostics = Vec::new();
+    let loader_valid = match validate_for_loader(&bytes) {
+        Ok(_) => true,
+        Err(error) => {
+            diagnostics.push(error.to_string());
+            false
+        }
+    };
+    Ok((
+        bytes,
+        ReintegrationReport {
+            section: rebuilt.section,
+            entry_redirected,
+            tls_redirected,
+            loader_valid,
+            diagnostics,
+        },
+    ))
+}
 
 /// Rewrites one TLS callback array entry to an executable, file-backed RVA
 /// and reparses the resulting image before returning it.
@@ -194,5 +269,24 @@ mod tests {
             set_tls_callback(&input, 9, Rva(0x2000)),
             Err(RebuildError::TlsCallbackIndex { index: 9, count: 1 })
         ));
+    }
+
+    #[test]
+    fn reintegrates_payload_and_redirects_entry() {
+        // minimal conventional PE32+ with one R+X section and header slack for one
+        // more section header (reuse Task 2's builder without the TLS directory).
+        let input = minimal_conventional_pe();
+        let planned = crate::next_section_rva(&input).expect("planned rva");
+        let payload = vec![0x90u8, 0x90, 0xC3]; // nop; nop; ret — stand-in body
+        let (bytes, report) = reintegrate(&input, ReintegrationRequest {
+            section_name: *b".vmpx0\0\0",
+            payload: &payload,
+            entry_redirect: Some(planned),
+            tls_redirects: &[],
+        }).expect("reintegrate");
+        let pe = PeImage::parse(&bytes).expect("reparse");
+        assert_eq!(pe.optional.address_of_entry_point, planned);
+        assert_eq!(report.section.rva, planned);
+        assert!(report.entry_redirected);
     }
 }
