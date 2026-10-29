@@ -668,13 +668,21 @@ pub fn analyze_clean_with_image(
     // Unknown counts as incomplete: a group only skips its dispatcher fallback
     // when its family was proven complete.
     let mut header_family_complete = false;
+    let exe_header_rva = header_entry
+        .filter(|_| pe.coff.characteristics & IMAGE_FILE_DLL == 0)
+        .map(|entry| entry.rva);
+    let mut exe_entry_function = None;
     if let Some(entry) = header_entry {
         header_entry_candidate = Some(entry.clone());
         if pe.coff.characteristics & IMAGE_FILE_DLL == 0 {
-            blockers.push(
-                "generic finite input-domain recovery for an executable entry is not implemented"
-                    .to_owned(),
-            );
+            // No DllMain-style reason selects a path: the executable entry is
+            // recovered as a single complete input-closed path or stays a blocker.
+            let decision =
+                crate::input_closed_functions::decide_exe_entry(entry.confidence, || {
+                    crate::input_closed_functions::recover_input_closed(&pe, entry.rva)
+                });
+            blockers.extend(decision.blocker);
+            exe_entry_function = decision.function;
         } else {
             let (domains, limits) = dll_entry_recovery_inputs();
             match recover_entry_paths(&pe, entry, &domains, limits) {
@@ -903,9 +911,14 @@ pub fn analyze_clean_with_image(
     let input_closed_functions = if protection.verdict == DetectionVerdict::NoStrongEvidence {
         completed_stage("not required for an input with no strong protection evidence")
     } else {
-        let (functions, mut diagnostics) =
-            crate::input_closed_functions::recover_input_closed_functions(&pe, &vm_inventory);
-        diagnostics.extend(functions.iter().map(|function| {
+        let mut recovered = crate::input_closed_functions::recover_input_closed_functions(
+            &pe,
+            &vm_inventory,
+            exe_header_rva,
+        );
+        recovered.closed.extend(exe_entry_function);
+        let mut diagnostics = std::mem::take(&mut recovered.diagnostics);
+        diagnostics.extend(recovered.closed.iter().map(|function| {
             format!(
                 "{}: input-closed ({} inputs bound, live-in {:?})",
                 function.rva,
@@ -913,12 +926,28 @@ pub fn analyze_clean_with_image(
                 function.live_in
             )
         }));
+        diagnostics.extend(recovered.branching.iter().map(|function| {
+            format!(
+                "{}: branching, {} path(s), {} inputs bound, proven-exhaustive finite domain {:?} (live-in {:?})",
+                function.rva,
+                function.paths.len(),
+                function.inputs.len(),
+                function.certificates,
+                function.live_in
+            )
+        }));
         CleanStageReport {
             complete: false,
-            metrics: BTreeMap::from([(
-                "recovered".to_owned(),
-                u64::try_from(functions.len()).unwrap_or(u64::MAX),
-            )]),
+            metrics: BTreeMap::from([
+                (
+                    "recovered".to_owned(),
+                    u64::try_from(recovered.closed.len()).unwrap_or(u64::MAX),
+                ),
+                (
+                    "recovered_branching".to_owned(),
+                    u64::try_from(recovered.branching.len()).unwrap_or(u64::MAX),
+                ),
+            ]),
             diagnostics,
         }
     };

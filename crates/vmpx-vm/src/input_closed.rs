@@ -9,9 +9,7 @@ use crate::{Expr, NativeExitState};
 /// else (memory epochs/snapshots, native-call results, fresh allocations,
 /// timestamp counter, unknown names) is opaque machine state and never closed.
 fn is_pure_intrinsic(name: &str) -> bool {
-    name.starts_with("vm_flags_")
-        || name.starts_with("x86_unsigned_")
-        || name == "table_checksum_low_byte_xor_recurrence_w32"
+    name.starts_with("vm_flags_") || name.starts_with("x86_unsigned_")
 }
 
 /// True iff `expr` depends only on constants, registers named in `allowed`, and
@@ -152,6 +150,16 @@ mod tests {
             vec![Expr::intrinsic(BitWidth::W8, "memory_load_epoch_2", vec![])],
         );
         assert!(!is_input_closed(&exit_with(bad), &allowed()));
+    }
+
+    #[test]
+    fn is_input_closed_table_checksum_reads_memory_so_is_not_pure() {
+        let checksum = Expr::intrinsic(
+            BitWidth::W32,
+            "table_checksum_low_byte_xor_recurrence_w32",
+            vec![w64("native_rax_initial")],
+        );
+        assert!(!is_input_closed(&exit_with(checksum), &allowed()));
     }
 
     #[test]

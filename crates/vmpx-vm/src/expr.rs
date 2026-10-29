@@ -674,7 +674,7 @@ fn vm_flags_operation(name: &str) -> Option<(BinaryOp, BitWidth)> {
     Some((operation, width))
 }
 
-fn evaluate_vm_flags(name: &str, arguments: &[u64]) -> Option<u64> {
+pub(crate) fn evaluate_vm_flags(name: &str, arguments: &[u64]) -> Option<u64> {
     let (semantic, width) = match name {
         "vm_flags_add_w8" => (BinaryOp::Add, BitWidth::W8),
         "vm_flags_add_w16" => (BinaryOp::Add, BitWidth::W16),

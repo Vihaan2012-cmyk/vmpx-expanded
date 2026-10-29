@@ -5,12 +5,13 @@ use thiserror::Error;
 use vmpx_pe::{PeImage, Va};
 
 use crate::{
-    EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprError, ExprKind,
+    DispatchExtractionCandidate, DomainCertificate, EntryProfileRecoveryError,
+    EntryProfileRecoveryLimits, Expr, ExprError, ExprKind, InputDomainLimits, InputDomainRefusal,
     NativeExitState, NativeExitStateError, RecoveredEntryProfile, SymbolicDomainError,
     SymbolicDomainLimits, SymbolicDomainReport, VmEntryCandidate, VmProfileChainReport,
     VmProfileChainStop, VmProfileExecutionState, VmProfileExplorerError, VmProfileExplorerLimits,
-    enumerate_symbolic_value, explore_vm_profile_chain, recover_entry_profile,
-    recover_native_exit_state,
+    enumerate_symbolic_value, explore_vm_profile_chain, infer_branch_input_domains,
+    recover_entry_profile, recover_native_exit_state,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +160,57 @@ fn extract_native_exit(
     Ok(Some(recover_native_exit_state(symbolic, exit)?))
 }
 
+/// The unique dispatch candidate and handler anchor that decode a branch target.
+fn branch_dispatch(
+    entry_profile: &RecoveredEntryProfile,
+) -> Result<(&DispatchExtractionCandidate, Va), EntryPathRecoveryError> {
+    let boundary = entry_profile
+        .decode
+        .handler_recoveries
+        .get(&entry_profile.decode.decode.final_state.handler)
+        .ok_or(EntryPathRecoveryError::AmbiguousBranchDispatch { count: 0 })?;
+    let [dispatch] = boundary.dispatch_analysis.candidates.as_slice() else {
+        return Err(EntryPathRecoveryError::AmbiguousBranchDispatch {
+            count: boundary.dispatch_analysis.candidates.len(),
+        });
+    };
+    let handler_anchor = dispatch
+        .handler_rebase
+        .ok_or(EntryPathRecoveryError::MissingHandlerAnchor)?;
+    Ok((dispatch, handler_anchor))
+}
+
+/// Decodes the bytecode at `value` and explores the chain from `symbolic`.
+fn explore_branch(
+    pe: &PeImage<'_>,
+    entry_profile: &RecoveredEntryProfile,
+    dispatch: &DispatchExtractionCandidate,
+    handler_anchor: Va,
+    value: u64,
+    symbolic: crate::SymbolicVmInitialState,
+    limits: VmProfileExplorerLimits,
+) -> Result<(VmProfileChainReport, Option<NativeExitState>), EntryPathRecoveryError> {
+    let first = dispatch.codec.decode(
+        pe,
+        crate::RelativeDispatchState {
+            vip: Va(value),
+            rolling_key: value,
+            handler: handler_anchor,
+        },
+    )?;
+    let chain = explore_vm_profile_chain(
+        pe,
+        VmProfileExecutionState {
+            decoder: first.state_after,
+            profile: entry_profile.profile,
+            symbolic,
+        },
+        limits,
+    )?;
+    let native_exit = extract_native_exit(&chain)?;
+    Ok((chain, native_exit))
+}
+
 /// Recovers every explicitly bounded entry path starting at the first virtual
 /// branch. Each assignment is independently specialized before decoding and
 /// retains its full profile chain and exact native exit state.
@@ -220,19 +272,7 @@ pub fn recover_entry_paths(
             limit: limits.max_paths,
         });
     }
-    let boundary = entry_profile
-        .decode
-        .handler_recoveries
-        .get(&entry_profile.decode.decode.final_state.handler)
-        .ok_or(EntryPathRecoveryError::AmbiguousBranchDispatch { count: 0 })?;
-    let [dispatch] = boundary.dispatch_analysis.candidates.as_slice() else {
-        return Err(EntryPathRecoveryError::AmbiguousBranchDispatch {
-            count: boundary.dispatch_analysis.candidates.len(),
-        });
-    };
-    let handler_anchor = dispatch
-        .handler_rebase
-        .ok_or(EntryPathRecoveryError::MissingHandlerAnchor)?;
+    let (dispatch, handler_anchor) = branch_dispatch(&entry_profile)?;
 
     let mut paths = Vec::with_capacity(branch_enumeration.alternatives.len());
     for alternative in &branch_enumeration.alternatives {
@@ -241,24 +281,15 @@ pub fn recover_entry_paths(
             .symbolic
             .continuation_state()
             .substitute(&replacements)?;
-        let first = dispatch.codec.decode(
+        let (chain, native_exit) = explore_branch(
             pe,
-            crate::RelativeDispatchState {
-                vip: Va(alternative.value),
-                rolling_key: alternative.value,
-                handler: handler_anchor,
-            },
-        )?;
-        let chain = explore_vm_profile_chain(
-            pe,
-            VmProfileExecutionState {
-                decoder: first.state_after,
-                profile: entry_profile.profile,
-                symbolic,
-            },
+            &entry_profile,
+            dispatch,
+            handler_anchor,
+            alternative.value,
+            symbolic,
             limits.chain,
         )?;
-        let native_exit = extract_native_exit(&chain)?;
         paths.push(RecoveredEntryPath {
             assignments: alternative.assignments.clone(),
             chain,
@@ -273,5 +304,123 @@ pub fn recover_entry_paths(
         entry_profile,
         branch_enumeration,
         paths,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BranchingRecoveryLimits {
+    pub paths: EntryPathRecoveryLimits,
+    pub input_domain: InputDomainLimits,
+    /// Distinct branch-target values that may be explored.
+    pub max_targets: usize,
+}
+
+impl Default for BranchingRecoveryLimits {
+    fn default() -> Self {
+        Self {
+            paths: EntryPathRecoveryLimits::default(),
+            input_domain: InputDomainLimits::default(),
+            max_targets: 16,
+        }
+    }
+}
+
+/// Paths of a function whose first virtual branch depends on its live-in
+/// registers, with a proven-exhaustive inferred input domain.
+///
+/// `family.paths[i]` is taken exactly when `branch_target == targets[i]`; the
+/// targets are the complete image of `branch_target` over all register values.
+/// Paths are explored from the unspecialized entry state (their `assignments`
+/// are empty), so each exit stays an expression over the live-in registers and
+/// holds for every input in its class, not just a witness.
+#[derive(Clone, Debug)]
+pub struct GuardedEntryPathFamily {
+    pub family: RecoveredEntryPathFamily,
+    pub branch_target: Expr,
+    pub targets: Vec<u64>,
+    pub certificates: BTreeMap<String, DomainCertificate>,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq, Serialize)]
+pub enum BranchingRecoveryError {
+    #[error(transparent)]
+    Path(#[from] EntryPathRecoveryError),
+    #[error("input domain is not provably finite: {0}")]
+    Undecidable(#[from] InputDomainRefusal),
+    #[error("branch has {count} distinct targets, exceeding limit {limit}")]
+    TargetLimit { count: usize, limit: usize },
+}
+
+/// Recovers a function whose first virtual branch depends on its inputs, but
+/// only when a finite domain for those inputs can be proven exhaustive.
+///
+/// A branch deeper than the first one stays symbolic, so its path never reaches
+/// a VM exit and `all_paths_reach_vm_exit` is false.
+///
+/// # Errors
+///
+/// Fails closed on anything undecidable or beyond the limits.
+pub fn recover_branching_entry_paths(
+    pe: &PeImage<'_>,
+    entry: &VmEntryCandidate,
+    limits: BranchingRecoveryLimits,
+) -> Result<GuardedEntryPathFamily, BranchingRecoveryError> {
+    let entry_profile = recover_entry_profile(pe, entry, limits.paths.entry)
+        .map_err(EntryPathRecoveryError::from)?;
+    let branch_target = entry_profile
+        .symbolic
+        .branch_target
+        .clone()
+        .ok_or(EntryPathRecoveryError::MissingBranchTarget)?;
+    let inferred = infer_branch_input_domains(&branch_target, limits.input_domain)?;
+    let domain_limits = SymbolicDomainLimits {
+        max_values_per_variable: limits
+            .paths
+            .domain
+            .max_values_per_variable
+            .max(limits.input_domain.max_values_per_variable),
+        ..limits.paths.domain
+    };
+    let branch_enumeration =
+        enumerate_symbolic_value(&branch_target, &inferred.domains, domain_limits)
+            .map_err(EntryPathRecoveryError::from)?;
+    let targets = branch_enumeration.unique_values.clone();
+    if targets.len() > limits.max_targets {
+        return Err(BranchingRecoveryError::TargetLimit {
+            count: targets.len(),
+            limit: limits.max_targets,
+        });
+    }
+    let (dispatch, handler_anchor) = branch_dispatch(&entry_profile)?;
+    let mut paths = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let (chain, native_exit) = explore_branch(
+            pe,
+            &entry_profile,
+            dispatch,
+            handler_anchor,
+            *target,
+            entry_profile.symbolic.continuation_state(),
+            limits.paths.chain,
+        )?;
+        paths.push(RecoveredEntryPath {
+            assignments: BTreeMap::new(),
+            chain,
+            native_exit,
+        });
+    }
+    let all_paths_reach_vm_exit =
+        !paths.is_empty() && paths.iter().all(|path| path.native_exit.is_some());
+    Ok(GuardedEntryPathFamily {
+        family: RecoveredEntryPathFamily {
+            domain_complete: branch_enumeration.complete,
+            all_paths_reach_vm_exit,
+            entry_profile,
+            branch_enumeration,
+            paths,
+        },
+        branch_target,
+        targets,
+        certificates: inferred.certificates,
     })
 }

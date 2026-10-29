@@ -12,13 +12,14 @@ mod exception_flow;
 mod expr;
 mod handler_slice;
 mod image_concretize;
+mod input_closed;
+mod input_domain;
 mod model;
 mod native_api;
 mod native_call;
 mod native_call_verify;
 mod native_context;
 mod native_continuation;
-mod input_closed;
 mod native_exit_state;
 mod native_vm_chain;
 mod oep;
@@ -78,8 +79,9 @@ pub use effect_extract::{
     HandlerResizeEffect, HandlerVspAdjustment, classify_handler_effects, extract_handler_effects,
 };
 pub use entry_paths::{
-    EntryPathRecoveryError, EntryPathRecoveryLimits, RecoveredEntryPath, RecoveredEntryPathFamily,
-    recover_entry_paths,
+    BranchingRecoveryError, BranchingRecoveryLimits, EntryPathRecoveryError,
+    EntryPathRecoveryLimits, GuardedEntryPathFamily, RecoveredEntryPath, RecoveredEntryPathFamily,
+    recover_branching_entry_paths, recover_entry_paths,
 };
 pub use entry_profile::{
     EntryProfileRecoveryError, EntryProfileRecoveryLimits, RecoveredEntryProfile,
@@ -100,6 +102,11 @@ pub use image_concretize::{
     ModuloImageTargetError, ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
     concretize_with_immutable_image, recover_modulo_image_targets,
 };
+pub use input_closed::{is_expr_input_closed, is_input_closed};
+pub use input_domain::{
+    AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
+    InputDomainRefusal, add_flags_cover, infer_branch_input_domains,
+};
 pub use model::{
     BytecodeDirection, EffectKnowledge, RecoveryStatus, StateValue, VmContextLayout, VmDecodeState,
     VmHandlerAnalysis, VmHandlerSemantic, VmInstruction,
@@ -119,7 +126,6 @@ pub use native_continuation::{
     NativeContinuationLimits, NativeContinuationReport, NativeObservedCString, NativeObservedCall,
     NativeObservedValue, analyze_native_continuation,
 };
-pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use native_exit_state::{
     NativeExitState, NativeExitStateError, recover_native_exit_state,
     recover_profile_chain_native_exit_state,
