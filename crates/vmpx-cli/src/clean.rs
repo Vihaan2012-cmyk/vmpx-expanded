@@ -180,6 +180,7 @@ pub struct CleanReport {
     pub native_continuations: Vec<CleanNestedContinuationReport>,
     pub vtil: CleanStageReport,
     pub recompilation: CleanStageReport,
+    pub reintegration: CleanStageReport,
     pub reconstruction: CleanStageReport,
     pub layout: CleanLayoutReport,
     pub validation: CleanValidationReport,
@@ -544,13 +545,14 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
 pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
-    analyze_clean_with_image(input_path, input).map(|(report, _)| report)
+    analyze_clean_with_image(input_path, input).map(|(report, _, _)| report)
 }
 
 /// Runs the same analysis and additionally returns the conventional-layout
 /// image when the mapped analysis image can be converted. The image is a
 /// layout artifact: it is loadable and structurally valid, but still contains
-/// every protector section and virtualized routine.
+/// every protector section and virtualized routine. Also returns the
+/// reintegrated image when emitted replacement bodies were redirected into it.
 ///
 /// # Errors
 ///
@@ -559,7 +561,7 @@ pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
 pub fn analyze_clean_with_image(
     input_path: &str,
     input: &[u8],
-) -> Result<(CleanReport, Option<Vec<u8>>)> {
+) -> Result<(CleanReport, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let input_pe = PeImage::parse(input).context("clean input is not a supported PE")?;
     let protection = detect_vmprotect(&input_pe);
     let (mapped, unpack_report) = match protection.image_layout {
@@ -955,20 +957,32 @@ pub fn analyze_clean_with_image(
             "{unresolved_tls} loader-reachable TLS VM entry/entries remain semantically unresolved"
         ));
     }
+    // The conventional image is computed up front so compiled body addresses
+    // match where `append_section` will place them below.
+    let planning_image = if protection.verdict == DetectionVerdict::NoStrongEvidence {
+        None
+    } else {
+        relayout_conventional(&mapped).ok().map(|(bytes, _)| bytes)
+    };
     // Native recompilation: emit a replacement function for every path whose
     // exit state is fully concrete and lowerable. Emission does not authorise
     // writing output, because the entry redirect and the remaining blockers are
     // still unproven.
     let mut recompilation = stage("no path reached a lowerable exit state");
+    let mut reintegration = stage("native code reintegration was not attempted");
+    let mut reintegrated: Option<Vec<u8>> = None;
     if protection.verdict != DetectionVerdict::NoStrongEvidence {
-        let next_rva = vmpx_rebuild::next_section_rva(&mapped).ok();
+        let planned = planning_image.as_deref().and_then(|bytes| {
+            vmpx_rebuild::next_section_rva(bytes)
+                .ok()
+                .map(|rva| (bytes, rva))
+        });
         let mut emitted = 0_u64;
         let mut total_bytes = 0_u64;
-        let mut emitted_section = None;
         let mut placed: Vec<(BTreeMap<String, u64>, Rva)> = Vec::new();
         let mut diagnostics = Vec::new();
-        if let Some(next_rva) = next_rva {
-            let va = pe.optional.image_base.0 + u64::from(next_rva.0);
+        if let Some((image, planned_rva)) = planned {
+            let va = pe.optional.image_base.0 + u64::from(planned_rva.0);
             let mut symbol_rewrites: BTreeMap<String, vmpx_vm::Expr> = BTreeMap::new();
             let inputs = match header_entry_candidate.as_ref() {
                 Some(entry) => match replacement_inputs(&pe, entry, &mut symbol_rewrites) {
@@ -980,11 +994,15 @@ pub fn analyze_clean_with_image(
                 },
                 None => Vec::new(),
             };
-            let mut functions: Vec<(BTreeMap<String, u64>, Vec<u8>)> = Vec::new();
-            for (assignments, exit, effects) in exit_states
-                .iter()
-                .chain(nested_exits.iter())
-                .chain(tls_exit_states.iter())
+            // Header-entry bodies are kept apart so they can be laid out as one
+            // dispatcher group below; nested and TLS bodies still compile and
+            // count here but are not yet wired into a redirect.
+            let mut header_bodies: Vec<(u64, Vec<u8>)> = Vec::new();
+            let header_tagged = exit_states.iter().map(|(a, e, f)| (true, a, e, f));
+            let nested_tagged = nested_exits.iter().map(|(a, e, f)| (false, a, e, f));
+            let tls_tagged = tls_exit_states.iter().map(|(a, e, f)| (false, a, e, f));
+            for (is_header, assignments, exit, effects) in
+                header_tagged.chain(nested_tagged).chain(tls_tagged)
             {
                 // The VM exit transfers to a protector continuation rather than
                 // returning to the caller. Resolve that continuation so the
@@ -1044,18 +1062,23 @@ pub fn analyze_clean_with_image(
                         // Record where this body landed so a redirect can target
                         // it: the entry stub has to jump somewhere specific.
                         let entry_rva = vmpx_pe::Rva(
-                            u32::try_from(next_rva.0)
+                            u32::try_from(planned_rva.0)
                                 .ok()
                                 .and_then(|base| {
                                     u32::try_from(total_bytes)
                                         .ok()
                                         .and_then(|offset| base.checked_add(offset))
                                 })
-                                .unwrap_or(next_rva.0),
+                                .unwrap_or(planned_rva.0),
                         );
                         placed.push((assignments.clone(), entry_rva));
-                        total_bytes += u64::try_from(replacement.compiled.bytes.len()).unwrap_or(0);
-                        functions.push((assignments.clone(), replacement.compiled.bytes.clone()));
+                        let body = replacement.compiled.bytes;
+                        total_bytes += u64::try_from(body.len()).unwrap_or(0);
+                        if is_header
+                            && let Some(&domain_value) = assignments.get("native_rdx_initial")
+                        {
+                            header_bodies.push((domain_value, body));
+                        }
                         emitted += 1;
                     }
                     Err(error) => diagnostics.push(format!(
@@ -1063,8 +1086,53 @@ pub fn analyze_clean_with_image(
                     )),
                 }
             }
-            if !functions.is_empty() {
-                emitted_section = Some(functions);
+            if !header_bodies.is_empty() {
+                let dispatcher_used = header_bodies.len() > 1;
+                let built = if dispatcher_used {
+                    layout_reintegration_payload(
+                        planned_rva,
+                        pe.optional.image_base.0,
+                        &header_bodies,
+                        vmpx_recompile::PhysicalRegister::Rdx,
+                        pe.optional.address_of_entry_point,
+                    )
+                } else {
+                    Ok((header_bodies[0].1.clone(), planned_rva))
+                };
+                reintegration = match built {
+                    Ok((payload, redirect)) => match vmpx_rebuild::reintegrate(
+                        image,
+                        vmpx_rebuild::ReintegrationRequest {
+                            section_name: *b".vmpx0\0\0",
+                            payload: &payload,
+                            entry_redirect: Some(redirect),
+                            tls_redirects: &[],
+                        },
+                    ) {
+                        Ok((bytes, report)) => {
+                            reintegrated = Some(bytes);
+                            CleanStageReport {
+                                complete: true,
+                                metrics: BTreeMap::from([
+                                    ("section_rva".to_owned(), u64::from(report.section.rva.0)),
+                                    (
+                                        "section_size".to_owned(),
+                                        u64::from(report.section.virtual_size),
+                                    ),
+                                    ("entries_redirected".to_owned(), 1),
+                                    ("dispatchers".to_owned(), u64::from(dispatcher_used)),
+                                ]),
+                                diagnostics: vec![
+                                    "header entry redirected; TLS-callback and \
+                                     nested-continuation redirects are not yet wired"
+                                        .to_owned(),
+                                ],
+                            }
+                        }
+                        Err(error) => stage(format!("reintegrate failed: {error}")),
+                    },
+                    Err(error) => stage(format!("header dispatcher assembly failed: {error}")),
+                };
             }
         }
         if emitted == 0 {
@@ -1096,7 +1164,6 @@ pub fn analyze_clean_with_image(
                 },
             };
         }
-        let _ = emitted_section;
     }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
         && protection.image_layout == ImageLayout::ConventionalFile;
@@ -1258,6 +1325,7 @@ pub fn analyze_clean_with_image(
                 stage("semantic routine has not reached a complete exception-aware CFG")
             },
             recompilation,
+            reintegration,
             reconstruction: if verified_noop {
                 completed_stage("conventional input can be preserved byte-for-byte")
             } else {
@@ -1278,5 +1346,62 @@ pub fn analyze_clean_with_image(
             blockers,
         },
         conventional,
+        reintegrated,
     ))
+}
+
+// Returns (payload, entry_dispatcher_rva, per-entry dispatcher RVAs). Bodies are
+// placed first at `base`, dispatchers after, so body VAs stay as compiled.
+fn layout_reintegration_payload(
+    base: Rva,
+    image_base: u64,
+    bodies: &[(u64, Vec<u8>)],
+    domain_reg: vmpx_recompile::PhysicalRegister,
+    original_entry_rva: Rva,
+) -> Result<(Vec<u8>, Rva), String> {
+    let mut payload = Vec::new();
+    let mut arms = Vec::new();
+    let mut offset = 0u32;
+    for (value, bytes) in bodies {
+        let body_rva = base.0.checked_add(offset).ok_or("body rva overflow")?;
+        arms.push(vmpx_recompile::DispatchArm {
+            value: *value,
+            body: image_base + u64::from(body_rva),
+        });
+        payload.extend_from_slice(bytes);
+        offset = offset
+            .checked_add(u32::try_from(bytes.len()).map_err(|_| "body too large")?)
+            .ok_or("offset overflow")?;
+    }
+    let dispatcher_rva = Rva(base.0.checked_add(offset).ok_or("dispatcher rva overflow")?);
+    let dispatcher = vmpx_recompile::emit_domain_dispatcher(
+        domain_reg,
+        &arms,
+        image_base + u64::from(original_entry_rva.0),
+        image_base + u64::from(dispatcher_rva.0),
+    )
+    .map_err(|e| e.to_string())?;
+    payload.extend_from_slice(&dispatcher);
+    Ok((payload, dispatcher_rva))
+}
+
+#[cfg(test)]
+mod reintegration_tests {
+    use super::*;
+    use vmpx_pe::Rva;
+    use vmpx_recompile::PhysicalRegister;
+
+    #[test]
+    fn dispatcher_follows_bodies_and_targets_each_body() {
+        let base = Rva(0x2000);
+        let image_base = 0x1_4000_0000;
+        let bodies = vec![(0u64, vec![0x90, 0xC3]), (1u64, vec![0x90, 0x90, 0xC3])];
+        let (payload, dispatcher_rva) = layout_reintegration_payload(
+            base, image_base, &bodies, PhysicalRegister::Rdx, Rva(0x1000),
+        ).expect("layout");
+        // bodies total 5 bytes, so the dispatcher starts at base + 5.
+        assert_eq!(dispatcher_rva, Rva(0x2005));
+        assert_eq!(&payload[..5], &[0x90, 0xC3, 0x90, 0x90, 0xC3]);
+        assert!(payload.len() > 5); // dispatcher bytes appended
+    }
 }

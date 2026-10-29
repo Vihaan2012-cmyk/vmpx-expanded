@@ -708,7 +708,7 @@ fn main() -> Result<()> {
                 bail!("reconstructed path aliases an input, output, or report file");
             }
             let input_data = read_file(&input)?;
-            let (mut clean, conventional) =
+            let (mut clean, conventional, _reintegrated) =
                 clean::analyze_clean_with_image(&input.display().to_string(), &input_data)?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
