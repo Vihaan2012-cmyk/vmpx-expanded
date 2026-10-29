@@ -1,0 +1,20 @@
+[package]
+name = "vmpx-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "egui desktop front-end that drives the vmpx CLI and renders its JSON reports"
+
+[[bin]]
+name = "vmpx-ui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = "0.15"
+serde_json.workspace = true
+
+[lints]
+workspace = true

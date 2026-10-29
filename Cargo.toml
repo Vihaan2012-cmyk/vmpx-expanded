@@ -7,6 +7,7 @@ members = [
     "crates/vmpx-pe",
     "crates/vmpx-rebuild",
     "crates/vmpx-recompile",
+    "crates/vmpx-ui",
     "crates/vmpx-unpack",
     "crates/vmpx-vm",
     "crates/vmpx-vmlift",
