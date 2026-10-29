@@ -19,7 +19,8 @@ use vmpx_vmlift::audit_entry_effect_liveness;
 
 use crate::sha256;
 
-const IMAGE_FILE_DLL: u16 = 0x2000;
+pub(crate) const IMAGE_FILE_DLL: u16 = 0x2000;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CleanInputReport {
@@ -619,8 +620,8 @@ pub fn analyze_clean_with_image(
             && candidate.rva == pe.optional.address_of_entry_point
     });
     let mut header_entry_candidate: Option<vmpx_vm::VmEntryCandidate> = None;
-    // Single-resolved continuation RVAs of the header entry's recovered paths.
-    let mut oep_candidates: Vec<Rva> = Vec::new();
+    // Per header path: its single-resolved continuation RVA, or None.
+    let mut oep_paths: Vec<Option<Rva>> = Vec::new();
     // Unknown counts as incomplete: a group only skips its dispatcher fallback
     // when its family was proven complete.
     let mut header_family_complete = false;
@@ -648,7 +649,7 @@ pub fn analyze_clean_with_image(
                             )
                             .ok()
                         });
-                        oep_candidates.extend(
+                        oep_paths.push(
                             continuation_targets
                                 .as_ref()
                                 .and_then(single_continuation_rva),
@@ -1265,7 +1266,9 @@ pub fn analyze_clean_with_image(
     }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
         && protection.image_layout == ImageLayout::ConventionalFile;
-    let oep_decision = decide_oep(&oep_candidates, |rva| is_native_continuation(&pe, rva));
+    let oep_decision = decide_oep(&oep_paths, header_family_complete, |rva| {
+        is_native_continuation(&pe, rva)
+    });
     if verified_noop {
         warnings
             .push("input has no strong VMProtect evidence; clean is a verified no-op".to_owned());
@@ -1600,38 +1603,46 @@ pub(crate) fn single_continuation_rva(report: &vmpx_vm::ModuloImageTargetReport)
     }
 }
 
-/// A continuation is native when it lies in a mapped non-`.vmp` section and is
-/// not itself a VM entry stub.
+/// A continuation is native when it lies in an executable non-`.vmp` section and
+/// is neither a VM entry stub nor the protected header entry itself.
 pub(crate) fn is_native_continuation(pe: &PeImage<'_>, rva: Rva) -> bool {
     let in_native_section = pe.sections.iter().any(|section| {
-        section.contains_mapped_rva(rva) && !section.name.to_ascii_lowercase().starts_with(".vmp")
+        section.contains_mapped_rva(rva)
+            && section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+            && !section.name.to_ascii_lowercase().starts_with(".vmp")
     });
     in_native_section
+        && rva != pe.optional.address_of_entry_point
         && !analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
             .is_some_and(|candidate| candidate.confidence >= 60)
 }
 
-/// Single-resolved continuation RVAs of a DLL header entry's recovered paths.
+/// Recovers a DLL header entry's paths: whether the family is proven complete,
+/// and each path's single-resolved continuation RVA (None when unresolved).
 pub(crate) fn header_entry_continuations(
     pe: &PeImage<'_>,
     entry: &vmpx_vm::VmEntryCandidate,
-) -> Result<Vec<Rva>, String> {
+) -> Result<(bool, Vec<Option<Rva>>), String> {
     let (domains, limits) = dll_entry_recovery_inputs();
     let family = recover_entry_paths(pe, entry, &domains, limits).map_err(|e| e.to_string())?;
-    Ok(family
+    let paths = family
         .paths
         .iter()
-        .filter_map(|path| path.native_exit.as_ref())
-        .filter_map(|exit| {
-            recover_modulo_image_targets(
+        .map(|path| {
+            let exit = path.native_exit.as_ref()?;
+            let report = recover_modulo_image_targets(
                 pe,
                 &exit.return_address,
                 ModuloImageTargetLimits::default(),
             )
-            .ok()
+            .ok()?;
+            single_continuation_rva(&report)
         })
-        .filter_map(|report| single_continuation_rva(&report))
-        .collect())
+        .collect();
+    Ok((
+        family.domain_complete && family.all_paths_reach_vm_exit,
+        paths,
+    ))
 }
 
 /// A lone body may replace the entry outright only when the family is proven

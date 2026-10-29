@@ -667,15 +667,15 @@ fn analyze_oep(pe: &PeImage<'_>) -> Result<OepAnalysis> {
     let mut warnings = Vec::new();
     let mut recovered_entry = None;
     if let Some(entry) = header_vm {
-        if pe.coff.characteristics & 0x2000 == 0 {
+        if pe.coff.characteristics & clean::IMAGE_FILE_DLL == 0 {
             warnings.push(
                 "OEP recovery from the entry continuation is only implemented for DLL entries"
                     .to_owned(),
             );
         } else {
             match clean::header_entry_continuations(pe, entry) {
-                Ok(candidates) => {
-                    let decision = vmpx_vm::decide_oep(&candidates, |rva| {
+                Ok((family_complete, paths)) => {
+                    let decision = vmpx_vm::decide_oep(&paths, family_complete, |rva| {
                         clean::is_native_continuation(pe, rva)
                     });
                     evidence.extend(decision.evidence.iter().map(|item| format!("oep: {item}")));

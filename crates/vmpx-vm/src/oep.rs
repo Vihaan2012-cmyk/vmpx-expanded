@@ -10,55 +10,65 @@ pub struct OepDecision {
     pub evidence: Vec<String>,
 }
 
-/// Decides the original entry point from the single-resolved continuation RVAs
-/// of the header entry's recovered paths. Only a unique native continuation is
-/// accepted; anything else leaves the entry unrecovered.
+/// Decides the original entry point from the header entry's recovered paths.
+/// `paths` holds one entry per recovered path: its single-resolved continuation
+/// RVA, or `None` when the path has no native exit or no unique concrete target.
+/// Recovery is strict: the path family must be proven complete, every path must
+/// resolve to a native continuation, and all of them must agree on one RVA.
 #[must_use]
-pub fn decide_oep(candidates: &[Rva], is_native: impl Fn(Rva) -> bool) -> OepDecision {
-    let distinct: BTreeSet<Rva> = candidates.iter().copied().collect();
-    let mut evidence = vec![format!(
-        "{} continuation candidate(s), {} distinct",
-        candidates.len(),
-        distinct.len()
-    )];
-    let mut native = Vec::new();
-    for rva in distinct {
-        if is_native(rva) {
-            native.push(rva);
-        } else {
-            evidence.push(format!(
-                "candidate {rva} is not native (protector section or VM entry) and is excluded"
-            ));
+pub fn decide_oep(
+    paths: &[Option<Rva>],
+    family_complete: bool,
+    is_native: impl Fn(Rva) -> bool,
+) -> OepDecision {
+    let unresolved = |mut evidence: Vec<String>, reason: String| {
+        evidence.push(reason);
+        OepDecision {
+            recovered_entry: None,
+            assessment: "unresolved",
+            evidence,
         }
+    };
+    let mut evidence = vec![format!("{} recovered header path(s)", paths.len())];
+    if !family_complete {
+        return unresolved(
+            evidence,
+            "the header path family is not proven complete".to_owned(),
+        );
     }
-    match native.as_slice() {
-        [only] => {
+    if paths.is_empty() {
+        return unresolved(evidence, "no header path was recovered".to_owned());
+    }
+    let missing = paths.iter().filter(|path| path.is_none()).count();
+    if missing != 0 {
+        return unresolved(
+            evidence,
+            format!("{missing} path(s) have no unique concrete continuation target"),
+        );
+    }
+    let distinct: BTreeSet<Rva> = paths.iter().flatten().copied().collect();
+    if let Some(rva) = distinct.iter().find(|rva| !is_native(**rva)) {
+        return unresolved(
+            evidence,
+            format!(
+                "continuation {rva} is not native (non-executable, protector section, VM entry or header entry)"
+            ),
+        );
+    }
+    let mut distinct = distinct.into_iter();
+    match (distinct.next(), distinct.next()) {
+        (Some(only), None) => {
             evidence.push(format!(
-                "the single native continuation {only} is the original entry point"
+                "all paths continue at native {only}; candidate original entry (native continuation)"
             ));
             OepDecision {
-                recovered_entry: Some(*only),
+                recovered_entry: Some(only),
                 assessment: "recovered_native_continuation",
                 evidence,
             }
         }
-        [] => {
-            evidence.push("no native continuation was resolved".to_owned());
-            OepDecision {
-                recovered_entry: None,
-                assessment: "unresolved",
-                evidence,
-            }
-        }
-        many => {
-            evidence.push(format!(
-                "{} distinct native continuations ({}); the entry point is ambiguous",
-                many.len(),
-                many.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+        _ => {
+            evidence.push("paths continue at more than one native RVA".to_owned());
             OepDecision {
                 recovered_entry: None,
                 assessment: "ambiguous",
@@ -72,47 +82,63 @@ pub fn decide_oep(candidates: &[Rva], is_native: impl Fn(Rva) -> bool) -> OepDec
 mod tests {
     use super::*;
 
+    const A: Option<Rva> = Some(Rva(0x4000));
+    const B: Option<Rva> = Some(Rva(0x5000));
+    const VMP: Option<Rva> = Some(Rva(0x9000));
+
+    fn native_below_9000(rva: Rva) -> bool {
+        rva.0 < 0x9000
+    }
+
     #[test]
-    fn single_native_continuation_is_the_oep() {
-        let d = decide_oep(&[Rva(0x4000)], |r| r == Rva(0x4000));
-        assert_eq!(d.recovered_entry, Some(Rva(0x4000)));
+    fn all_paths_agreeing_on_one_native_rva_is_the_oep() {
+        let d = decide_oep(&[A, A, A], true, native_below_9000);
+        assert_eq!(d.recovered_entry, A);
         assert_eq!(d.assessment, "recovered_native_continuation");
         assert!(!d.evidence.is_empty());
     }
 
     #[test]
-    fn a_vmp_or_ambiguous_target_is_not_oep() {
-        assert_eq!(decide_oep(&[Rva(0x9000)], |_| false).recovered_entry, None);
+    fn a_failed_path_among_resolved_ones_vetoes() {
+        let d = decide_oep(&[A, None, A], true, native_below_9000);
+        assert_eq!(d.recovered_entry, None);
+        assert_eq!(d.assessment, "unresolved");
+    }
+
+    #[test]
+    fn a_native_and_non_native_mix_vetoes() {
+        let d = decide_oep(&[A, VMP], true, native_below_9000);
+        assert_eq!(d.recovered_entry, None);
+        assert_eq!(d.assessment, "unresolved");
+        assert!(d.evidence.iter().any(|line| line.contains("9000")));
+    }
+
+    #[test]
+    fn a_lone_non_native_target_is_not_oep() {
         assert_eq!(
-            decide_oep(&[Rva(0x4000), Rva(0x5000)], |_| true).recovered_entry,
+            decide_oep(&[VMP], true, native_below_9000).recovered_entry,
             None
         );
-        assert_eq!(decide_oep(&[], |_| true).recovered_entry, None);
     }
 
     #[test]
-    fn assessments_distinguish_unresolved_from_ambiguous() {
-        assert_eq!(decide_oep(&[], |_| true).assessment, "unresolved");
-        assert_eq!(
-            decide_oep(&[Rva(0x9000)], |_| false).assessment,
-            "unresolved"
-        );
-        assert_eq!(
-            decide_oep(&[Rva(0x4000), Rva(0x5000)], |_| true).assessment,
-            "ambiguous"
-        );
+    fn distinct_native_targets_are_ambiguous() {
+        let d = decide_oep(&[A, B], true, |_| true);
+        assert_eq!(d.recovered_entry, None);
+        assert_eq!(d.assessment, "ambiguous");
     }
 
     #[test]
-    fn duplicate_paths_to_one_native_target_still_recover() {
-        let d = decide_oep(&[Rva(0x4000), Rva(0x4000), Rva(0x4000)], |_| true);
-        assert_eq!(d.recovered_entry, Some(Rva(0x4000)));
+    fn no_paths_is_unresolved() {
+        let d = decide_oep(&[], true, |_| true);
+        assert_eq!(d.recovered_entry, None);
+        assert_eq!(d.assessment, "unresolved");
     }
 
     #[test]
-    fn a_vmp_candidate_does_not_make_a_native_one_ambiguous_but_is_recorded() {
-        let d = decide_oep(&[Rva(0x4000), Rva(0x9000)], |r| r == Rva(0x4000));
-        assert_eq!(d.recovered_entry, Some(Rva(0x4000)));
-        assert!(d.evidence.iter().any(|line| line.contains("9000")));
+    fn an_incomplete_family_never_recovers() {
+        let d = decide_oep(&[A, A], false, |_| true);
+        assert_eq!(d.recovered_entry, None);
+        assert_eq!(d.assessment, "unresolved");
     }
 }
