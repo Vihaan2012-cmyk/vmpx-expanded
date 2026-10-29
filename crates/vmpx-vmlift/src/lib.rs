@@ -8,6 +8,7 @@
 mod constant_dispatch;
 mod effect_liveness;
 mod expr_codegen;
+mod live_in;
 mod replacement;
 
 pub use constant_dispatch::{
@@ -21,6 +22,9 @@ pub use expr_codegen::ImportCall;
 pub use expr_codegen::{
     ExpressionCodegenConfig, ExpressionCodegenError, ExpressionInput, LoweredExpression,
     compile_expression, lower_expression,
+};
+pub use live_in::{
+    AccessKind, EntryCallingConvention, RegisterAccess, calling_convention, infer_live_in,
 };
 pub use replacement::{
     EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementError, build_replacement,
