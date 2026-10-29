@@ -44,6 +44,11 @@ Plus conditional gaps — notably finite input-domain recovery for executable (n
 - **"Any binary" is a direction, not a guarantee.** Correctness is *proven* on synthetic fixtures we construct and *empirically confirmed* on local samples. Coverage is bounded by the VMProtect constructs we have lifted and proved; outside that, sound mode refuses.
 - SP1 does not attempt OEP recovery, import reconstruction, `.vmp` stripping, or optimization — those are SP2/SP3/SP5/SP6.
 
+### 2.1 Design principles
+
+- **Fully static — no dynamic dumper.** The target is never executed. `vmpx-unpack` already performs the "dump" statically (it decompresses the LZMA-packed sections and reconstructs the mapped image in memory without running a single target instruction), and devirtualization is symbolic, not real, execution. A consequence worth stating loudly: **runtime anti-debug/anti-tamper never fires against our analysis** — there is no live process, PEB, timing source, or breakpoint for it to detect. A dynamic dumper would be a different architecture that reintroduces the entire anti-debug problem and requires an anti-anti-debug layer; it is explicitly out of scope and not planned.
+- **Anti-debug handling is a selectable output policy, not an analysis concern.** Anti-debug/anti-tamper logic is part of a virtualized routine's semantics, so the emit stage offers two behaviors: *faithful reproduction* (default — reproduces the checks exactly, so the output stays behavior-equivalent and still detects debuggers) and *neutralization* (an explicit, labeled `--neutralize` mode that forces the "no debugger" path for a debuggable clean binary, deliberately **non-equivalent** and therefore never the default). Identifying anti-debug/integrity constructs rides on the existing handler classification (the pipeline already models integrity handlers in `crates/vmpx-vm/src/checksum_handler.rs`); the neutralization passes live naturally alongside SP6's optimization stage.
+
 ---
 
 ## 3. Validation strategy
@@ -63,7 +68,8 @@ Plus conditional gaps — notably finite input-domain recovery for executable (n
 | SP3 | Import-set reconstruction (reduce protector-era imports to the proven app set) | blocker 2 | SP1 |
 | SP4 | Executable (non-DLL) entry finite input-domain recovery (`clean.rs:624`) | widens coverage beyond DLL/TLS | SP1 |
 | SP5 | Dangling `.vmp` reference resolution + section stripping | blocker 4 | SP1–SP3 |
-| SP6 | Optimizing recompilation via VTIL + differential verification engine | cleanest output; quality, not coverage | SP1; independently sequenceable |
+| SP6 | Optimizing recompilation via VTIL + differential verification engine (and anti-debug `--neutralize` passes) | cleanest output; quality, not coverage | SP1; independently sequenceable |
+| SP7 | egui/eframe UI frontend | usability; drives the library/CLI, surfaces reports, blockers, and mode toggles | SP1 (separate track, no core changes) |
 
 ### DoD ladder (each rung independently useful and testable)
 - **L1 — SP1 experimental:** produces a loadable PE with replacements spliced into a new section and the entry redirected; reparses, passes `validate_for_loader`, and runs against a local VMP sample. Default/sound mode still refuses. *First rung that yields a testable binary.*
@@ -76,6 +82,8 @@ Plus conditional gaps — notably finite input-domain recovery for executable (n
 1. **Soundness default.** The existing proof gate stays; sound emission is unlocked only when a sub-project's proof genuinely passes. Experimental emission is a separate, explicit, labeled flag.
 2. **Fixture-first.** Every component gets synthetic fixtures as the CI oracle; local samples are the out-of-band behavioral check.
 3. **Equivalence-preserving.** No transformation (especially SP6 optimization) may change observable behavior; where a transformation could, it ships with a verification check, not faith.
+4. **Static-only.** No sub-project runs the target. This is what keeps anti-debug a non-issue; any proposal that requires execution is out of scope until explicitly re-opened as a separate dynamic track.
+5. **Behavior-changing modes are opt-in and labeled.** `--experimental` (gate-relaxed emission) and `--neutralize` (anti-debug stripping) each weaken a guarantee; both are off by default, loudly labeled in output and report, and never alter the sound-`output` semantics.
 
 ---
 
@@ -211,11 +219,14 @@ Bodies are already compiled assuming they start at `next_section_rva` and pack s
   - **Equivalence-preserving requirement:** every pass must preserve observable behavior. SP6 ships with a **differential verification engine** — the "debug engine" — that executes the original VM and the optimized native replacement over the recovered input domain and asserts identical register/memory/effect results. This is the pass validator and the local-sample equivalence oracle.
   - **Independently sequenceable:** VTIL optimization sits between lift and recompile and can land as a quality improvement before SP5, turned on by default only once its verifier is trusted.
   - **Open question (carried to SP6 planning):** whether the "debug engine" should *also* emit readable debug artifacts (PDB symbols or a commented annotated disassembly of the output) in addition to being the differential verifier. Default assumption: differential verifier first; readable-symbols as a separate optional deliverable.
+  - **Anti-debug `--neutralize` passes** live here: identify anti-debug/integrity constructs (via handler classification, building on `checksum_handler.rs`) and, when the flag is set, rewrite their guards to the non-detecting path. Off by default; the differential verifier confirms that *faithful* mode is unchanged and documents exactly what `--neutralize` alters.
+- **SP7 — egui/eframe UI frontend.** A separate crate (e.g. `vmpx-ui`) that drives the `vmpx` library (not a core change): choose an input binary, run detect/unpack/clean, and display the structured reports, the blockers list, recovered VM entries/handlers, and the mode toggles (`--experimental`, `--neutralize`). Immediate-mode egui keeps iteration fast; it consumes the same report structs the CLI serializes. Sequenced after SP1 so there is emission to drive, but it touches no devirtualization logic and can proceed in parallel.
 
 ---
 
 ## 7. Risks & open questions
 - **Header-table room (SP1).** Some VMProtect layouts may leave no room for an extra section header. SP1 fails cleanly here; a header-rebuild enhancement may be needed for real coverage.
+- **Integrity / anti-tamper interaction (SP1).** If the sample runs a self-checksum that covers the PE headers, the entry/TLS redirect could trip it while the VM and its checksum handler are still live (i.e. in experimental/partial output). SP1's append-only section + header-only edits avoid touching checksummed `.vmp` bytes, which mitigates the common case; full resolution comes at SP5, where stripping `.vmp` removes the checksum handlers. Documented so experimental output on an integrity-protected sample is understood, not surprising.
 - **Dispatcher fallback correctness (SP1).** Falling back to the original (still-protected) entry is only a safety net for inputs outside the recovered domain; if the domain is proven complete, the fallback is unreachable. Experimental mode with an incomplete domain relies on it and must label that.
 - **Soundness of experimental output.** Experimental emission can be confidently wrong; mitigated by quarantine (separate path), loud labeling, and the blockers list in the report. It is a test artifact, not a product.
 - **Behavior-vs-bit reversibility.** Must remain explicit in user-facing docs so "clean/reversible" is not misread as original-file reconstruction.
