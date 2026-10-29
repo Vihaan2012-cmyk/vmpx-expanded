@@ -1,5 +1,6 @@
 mod import_table;
 mod layout;
+mod reintegrate;
 
 pub use import_table::{
     ImportModuleSpec, ImportReconstructionPlan, ImportSlotRemap, ImportTableError, ImportTarget,
@@ -11,6 +12,7 @@ pub use layout::{
     is_conventional_layout, is_discardable, is_rva_layout, normalize_characteristics,
     relayout_conventional, validate_for_loader,
 };
+pub use reintegrate::set_tls_callback;
 
 use thiserror::Error;
 use vmpx_pe::{
@@ -117,6 +119,15 @@ pub enum RebuildError {
 
     #[error("serialized output failed invariant: {0}")]
     OutputInvariant(String),
+
+    #[error("no TLS directory is present")]
+    NoTlsDirectory,
+
+    #[error("TLS callback index {index} is out of range for {count} callback(s)")]
+    TlsCallbackIndex { index: usize, count: usize },
+
+    #[error("TLS callback target RVA {rva:?} is not inside an executable section")]
+    TlsCallbackNotExecutable { rva: Rva },
 }
 
 fn align_u32(value: u32, alignment: u32, what: &'static str) -> Result<u32, RebuildError> {
@@ -163,7 +174,7 @@ fn checked_usize(value: u64, what: &'static str) -> Result<usize, RebuildError> 
     usize::try_from(value).map_err(|_| RebuildError::Overflow { what })
 }
 
-fn write_bytes(
+pub(crate) fn write_bytes(
     output: &mut [u8],
     offset: FileOffset,
     value: &[u8],
@@ -198,7 +209,7 @@ fn write_u32(
     write_bytes(output, offset, &value.to_le_bytes(), what)
 }
 
-fn add_offset(
+pub(crate) fn add_offset(
     base: FileOffset,
     amount: u64,
     what: &'static str,
