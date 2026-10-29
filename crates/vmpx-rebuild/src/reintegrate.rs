@@ -2,7 +2,7 @@ use crate::{
     AppendSection, AppendedSection, RebuildError, add_offset, append_section, set_entry_point,
     validate_for_loader, write_bytes,
 };
-use vmpx_pe::{FileOffset, IMAGE_DIRECTORY_ENTRY_TLS, PeImage, Rva, Va};
+use vmpx_pe::{FileOffset, IMAGE_DIRECTORY_ENTRY_TLS, PeImage, PeKind, Rva, Va};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const REINTEGRATION_CHARACTERISTICS: u32 = 0x6000_0020; // CODE | READ | EXECUTE
@@ -83,20 +83,26 @@ pub fn reintegrate(
 ///
 /// # Errors
 ///
-/// Rejects malformed images, a missing TLS directory, an out-of-range
-/// callback index, a non-executable target, and any value that does not
-/// survive output reparse.
+/// Rejects malformed or non-PE32+ images, a missing TLS directory, an
+/// out-of-range callback index, a non-executable or non-file-backed target,
+/// and any value that does not survive output reparse.
 pub fn set_tls_callback(input: &[u8], index: usize, target: Rva) -> Result<Vec<u8>, RebuildError> {
     let pe = PeImage::parse(input).map_err(|source| RebuildError::Pe {
         stage: "input",
         source,
     })?;
+    // The TLS directory layout and 8-byte callback VAs below are PE32+ only.
+    if pe.optional.kind != PeKind::Pe32Plus {
+        return Err(RebuildError::UnsupportedKind(pe.optional.kind));
+    }
     let executable = pe.sections.iter().any(|section| {
         section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 && section.contains_mapped_rva(target)
     });
     if !executable {
         return Err(RebuildError::TlsCallbackNotExecutable { rva: target });
     }
+    pe.rva_to_file_offset(target)
+        .map_err(|_| RebuildError::TlsCallbackNotFileBacked { rva: target })?;
 
     let tls = pe.report().tls.ok_or(RebuildError::NoTlsDirectory)?;
     let count = tls.callbacks.len();
@@ -260,6 +266,27 @@ mod tests {
         let pe = PeImage::parse(&output).expect("reparse");
         let tls = pe.report().tls.expect("tls present");
         assert_eq!(tls.callbacks[0], Va(image_base + u64::from(target.0)));
+    }
+
+    #[test]
+    fn rejects_a_target_that_is_executable_but_not_file_backed() {
+        let (mut input, _, _) = pe_with_one_tls_callback();
+        // Shrink raw data so RVA 0x2000 stays mapped but has no file bytes.
+        put_u32(&mut input, SECTION_TABLE_OFFSET + 16, 0x1000);
+        assert!(matches!(
+            set_tls_callback(&input, 0, Rva(0x2000)),
+            Err(RebuildError::TlsCallbackNotFileBacked { rva: Rva(0x2000) })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_non_pe32_plus_image() {
+        let (mut input, _, _) = pe_with_one_tls_callback();
+        put_u16(&mut input, OPTIONAL_OFFSET, 0x010B);
+        assert!(matches!(
+            set_tls_callback(&input, 0, Rva(0x2000)),
+            Err(RebuildError::UnsupportedKind(PeKind::Pe32))
+        ));
     }
 
     #[test]

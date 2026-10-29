@@ -4,7 +4,8 @@
 mod runner;
 mod view;
 
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::time::Duration;
 
 use eframe::egui;
 use runner::{Action, Job, JobResult, Launcher};
@@ -18,6 +19,7 @@ struct App {
     no_scan: bool,
     rx: Option<Receiver<JobResult>>,
     running: Option<String>,
+    running_action: Option<Action>,
     last: Option<JobResult>,
 }
 
@@ -32,6 +34,7 @@ impl Default for App {
             no_scan: false,
             rx: None,
             running: None,
+            running_action: None,
             last: None,
         }
     }
@@ -58,6 +61,7 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         self.running = Some(action.label().to_owned());
+        self.running_action = Some(action);
         self.rx = Some(rx);
         std::thread::spawn(move || {
             let result = runner::run(&job);
@@ -68,10 +72,31 @@ impl App {
 
     fn poll(&mut self) {
         let Some(rx) = &self.rx else { return };
-        if let Ok(result) = rx.try_recv() {
-            self.last = Some(result);
-            self.rx = None;
-            self.running = None;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.last = Some(result);
+                self.rx = None;
+                self.running = None;
+                self.running_action = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            // The worker dropped its sender without a result: it panicked.
+            Err(TryRecvError::Disconnected) => {
+                if let Some(action) = self.running_action.take() {
+                    self.last = Some(JobResult {
+                        action,
+                        command_line: String::new(),
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        json: None,
+                        elapsed: Duration::ZERO,
+                        error: Some("the worker thread stopped without a result".to_owned()),
+                    });
+                }
+                self.rx = None;
+                self.running = None;
+            }
         }
     }
 

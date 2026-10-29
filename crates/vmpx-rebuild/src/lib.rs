@@ -128,6 +128,9 @@ pub enum RebuildError {
 
     #[error("TLS callback target RVA {rva:?} is not inside an executable section")]
     TlsCallbackNotExecutable { rva: Rva },
+
+    #[error("TLS callback target RVA {rva:?} is not backed by file data")]
+    TlsCallbackNotFileBacked { rva: Rva },
 }
 
 fn align_u32(value: u32, alignment: u32, what: &'static str) -> Result<u32, RebuildError> {

@@ -234,13 +234,11 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
         // Distinct virtualized routines this export can reach. Counting edges
         // instead would report the same routine many times and overstate the work.
         let mut vm_entries: BTreeSet<u32> = BTreeSet::new();
-        let mut vm_references = 0_usize;
         while let Some(start) = queue.pop_front() {
             if !seen.insert(start) {
                 continue;
             }
             if is_protector(start) {
-                vm_references += 1;
                 continue;
             }
             let Ok(graph) = recover_cfg(
@@ -291,7 +289,7 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
                 }
             }
         }
-        vm_references = vm_entries.len();
+        let vm_references = vm_entries.len();
         results.push(CleanExportReport {
             name: symbol
                 .name
@@ -621,6 +619,9 @@ pub fn analyze_clean_with_image(
             && candidate.rva == pe.optional.address_of_entry_point
     });
     let mut header_entry_candidate: Option<vmpx_vm::VmEntryCandidate> = None;
+    // Unknown counts as incomplete: a group only skips its dispatcher fallback
+    // when its family was proven complete.
+    let mut header_family_complete = false;
     if let Some(entry) = header_entry {
         header_entry_candidate = Some(entry.clone());
         if pe.coff.characteristics & IMAGE_FILE_DLL == 0 {
@@ -631,7 +632,7 @@ pub fn analyze_clean_with_image(
         } else {
             let domains = BTreeMap::from([(
                 "native_rdx_initial".to_owned(),
-                (0_u64..=3)
+                NATIVE_RDX_DOMAIN
                     .map(|reason| Expr::constant(BitWidth::W64, reason))
                     .collect(),
             )]);
@@ -646,6 +647,8 @@ pub fn analyze_clean_with_image(
             };
             match recover_entry_paths(&pe, entry, &domains, limits) {
                 Ok(family) => {
+                    header_family_complete =
+                        family.domain_complete && family.all_paths_reach_vm_exit;
                     let audit = audit_entry_effect_liveness(&family);
                     (handlers, unknown_handlers) = handler_metrics(&family);
                     for (path, live) in family.paths.iter().zip(&audit.paths) {
@@ -860,6 +863,7 @@ pub fn analyze_clean_with_image(
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
     let mut tls_entries = Vec::new();
+    let mut tls_family_complete: BTreeMap<Rva, bool> = BTreeMap::new();
     let mut tls_exit_states: Vec<(
         Rva,
         BTreeMap<String, u64>,
@@ -873,7 +877,7 @@ pub fn analyze_clean_with_image(
     {
         let domains = BTreeMap::from([(
             "native_rdx_initial".to_owned(),
-            (0_u64..=3)
+            NATIVE_RDX_DOMAIN
                 .map(|reason| Expr::constant(BitWidth::W64, reason))
                 .collect(),
         )]);
@@ -906,6 +910,10 @@ pub fn analyze_clean_with_image(
                     }
                     issues.extend(path.chain.diagnostics.iter().cloned());
                 }
+                tls_family_complete.insert(
+                    entry.rva,
+                    family.domain_complete && family.all_paths_reach_vm_exit,
+                );
                 if !family.domain_complete {
                     issues.push("the TLS entry domain is not complete".to_owned());
                 }
@@ -962,11 +970,15 @@ pub fn analyze_clean_with_image(
     }
     // The conventional image is computed up front so compiled body addresses
     // match where `append_section` will place them below.
-    let planning_image = if protection.verdict == DetectionVerdict::NoStrongEvidence {
+    let mut relayout = if protection.verdict == DetectionVerdict::NoStrongEvidence {
         None
     } else {
-        relayout_conventional(&mapped).ok().map(|(bytes, _)| bytes)
+        Some(relayout_conventional(&mapped))
     };
+    let planning_image = relayout
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|(bytes, _)| bytes);
     // Native recompilation: emit a replacement function for every path whose
     // exit state is fully concrete and lowerable. Emission does not authorise
     // writing output, because the entry redirect and the remaining blockers are
@@ -975,17 +987,16 @@ pub fn analyze_clean_with_image(
     let mut reintegration = stage("native code reintegration was not attempted");
     let mut reintegrated: Option<Vec<u8>> = None;
     if protection.verdict != DetectionVerdict::NoStrongEvidence {
-        let planned = planning_image.as_deref().and_then(|bytes| {
-            vmpx_rebuild::next_section_rva(bytes)
-                .ok()
-                .map(|rva| (bytes, rva))
+        let planned = planning_image.and_then(|bytes| {
+            let rva = vmpx_rebuild::next_section_rva(bytes).ok()?;
+            let va = pe.optional.image_base.checked_add_rva(rva)?.0;
+            Some((bytes, rva, va))
         });
         let mut emitted = 0_u64;
         let mut total_bytes = 0_u64;
         let mut placed: Vec<(BTreeMap<String, u64>, Rva)> = Vec::new();
         let mut diagnostics = Vec::new();
-        if let Some((image, planned_rva)) = planned {
-            let va = pe.optional.image_base.0 + u64::from(planned_rva.0);
+        if let Some((image, planned_rva, va)) = planned {
             let mut symbol_rewrites: BTreeMap<String, vmpx_vm::Expr> = BTreeMap::new();
             let inputs = match header_entry_candidate.as_ref() {
                 Some(entry) => match replacement_inputs(&pe, entry, &mut symbol_rewrites) {
@@ -1014,15 +1025,15 @@ pub fn analyze_clean_with_image(
                     .or_default()
                     .push((assignments, exit, effects));
             }
-            let mut groups: Vec<(GroupKind, Vec<ExitRefs<'_>>)> = vec![(
+            let mut groups: Vec<(GroupKind, bool, Vec<ExitRefs<'_>>)> = vec![(
                 GroupKind::Header,
+                header_family_complete,
                 exit_states.iter().map(|(a, e, f)| (a, e, f)).collect(),
             )];
-            groups.extend(
-                tls_groups
-                    .into_iter()
-                    .map(|(rva, items)| (GroupKind::Tls(rva), items)),
-            );
+            groups.extend(tls_groups.into_iter().map(|(rva, items)| {
+                let complete = tls_family_complete.get(&rva).copied().unwrap_or(false);
+                (GroupKind::Tls(rva), complete, items)
+            }));
 
             let mut layout_cursor: u32 = 0;
             let mut reintegration_payload: Vec<u8> = Vec::new();
@@ -1031,7 +1042,7 @@ pub fn analyze_clean_with_image(
             let mut dispatcher_count: u64 = 0;
             let mut reintegration_diagnostics: Vec<String> = Vec::new();
 
-            for (kind, items) in &groups {
+            for (kind, family_complete, items) in &groups {
                 let group_label = match kind {
                     GroupKind::Header => "header entry".to_owned(),
                     GroupKind::Tls(rva) => format!("TLS entry {rva}"),
@@ -1113,6 +1124,7 @@ pub fn analyze_clean_with_image(
                     pe.optional.image_base.0,
                     &group_bodies,
                     fallback,
+                    *family_complete,
                 ) {
                     Ok((redirect, dispatcher_used)) => {
                         if dispatcher_used {
@@ -1297,7 +1309,7 @@ pub fn analyze_clean_with_image(
             None,
         )
     } else {
-        match relayout_conventional(&mapped) {
+        match relayout.take().unwrap_or_else(|| relayout_conventional(&mapped)) {
             Ok((bytes, report)) => {
                 let validation = validate_for_loader(&bytes);
                 let (loader_valid, loader_summary, mut layout_diagnostics) = match &validation {
@@ -1559,6 +1571,21 @@ fn layout_reintegration_payload(
     Ok((payload, dispatcher_rva))
 }
 
+/// The `DllMain` reason values (`native_rdx_initial`) the entry paths are enumerated over.
+const NATIVE_RDX_DOMAIN: std::ops::RangeInclusive<u64> = 0..=3;
+
+/// A lone body may replace the entry outright only when the family is proven
+/// complete and that body serves every domain value; otherwise the remaining
+/// values must fall back to the original entry through a dispatcher.
+fn needs_dispatcher(
+    bodies: &[(u64, Vec<u8>)],
+    family_complete: bool,
+    mut domain: std::ops::RangeInclusive<u64>,
+) -> bool {
+    let covers = family_complete && domain.all(|value| bodies.iter().any(|(v, _)| *v == value));
+    bodies.len() > 1 || !covers
+}
+
 /// Lays out one group's already-compiled bodies onto `payload`, starting at
 /// `*cursor` (an offset from `planned_rva`). On success, advances `*cursor`
 /// past the group's dispatcher (if any) and appends the group's bytes. On a
@@ -1573,6 +1600,7 @@ fn commit_group_layout(
     image_base: u64,
     group_bodies: &[(u64, Vec<u8>)],
     fallback: Rva,
+    family_complete: bool,
 ) -> Result<(Rva, bool), String> {
     let group_base = Rva(
         planned_rva
@@ -1580,7 +1608,7 @@ fn commit_group_layout(
             .checked_add(group_start_cursor)
             .unwrap_or(planned_rva.0),
     );
-    let dispatcher_used = group_bodies.len() > 1;
+    let dispatcher_used = needs_dispatcher(group_bodies, family_complete, NATIVE_RDX_DOMAIN);
     let built = if dispatcher_used {
         layout_reintegration_payload(
             group_base,
@@ -1655,6 +1683,42 @@ mod reintegration_tests {
     }
 
     #[test]
+    fn single_body_without_a_complete_domain_gets_a_fallback_dispatcher() {
+        let image_base = 0x1_4000_0000;
+        let planned_rva = Rva(0x2000);
+        let bodies = vec![(1u64, vec![0x90, 0xC3])];
+
+        // Only reason 1 was recovered, so reasons 0/2/3 must reach the original entry.
+        let mut cursor = 2u32;
+        let mut payload = Vec::new();
+        let (redirect, dispatcher_used) = commit_group_layout(
+            &mut cursor, &mut payload, 0, planned_rva, image_base, &bodies, Rva(0x1000), true,
+        ).expect("layout");
+        assert!(dispatcher_used, "a partial domain needs the fallback dispatcher");
+        assert_eq!(redirect, Rva(planned_rva.0 + 2), "redirect targets the dispatcher");
+        assert!(payload.len() > 2, "dispatcher bytes follow the body");
+
+        // An unproven family counts as incomplete even when the values line up.
+        let full: Vec<(u64, Vec<u8>)> = NATIVE_RDX_DOMAIN.map(|v| (v, vec![0xC3])).collect();
+        let mut cursor = 4u32;
+        let mut payload = Vec::new();
+        let (_, used) = commit_group_layout(
+            &mut cursor, &mut payload, 0, planned_rva, image_base, &full, Rva(0x1000), false,
+        ).expect("layout");
+        assert!(used);
+    }
+
+    #[test]
+    fn single_body_redirects_directly_only_when_the_domain_is_provably_complete() {
+        let lone = vec![(1u64, vec![0xC3])];
+        assert!(!needs_dispatcher(&lone, true, 1..=1), "complete one-value domain");
+        assert!(needs_dispatcher(&lone, false, 1..=1), "unproven family");
+        assert!(needs_dispatcher(&lone, true, 0..=3), "body covers only part of the domain");
+        let pair = vec![(0u64, vec![0xC3]), (1u64, vec![0xC3])];
+        assert!(needs_dispatcher(&pair, true, 0..=1), "multi-body always dispatches");
+    }
+
+    #[test]
     fn a_failed_group_leaves_no_gap_for_the_next_group() {
         let image_base = 0x1_4000_0000;
         let planned_rva = Rva(0x2000);
@@ -1673,7 +1737,7 @@ mod reintegration_tests {
         cursor += 5;
         let failed = commit_group_layout(
             &mut cursor, &mut payload, group1_start, planned_rva, image_base,
-            &group1_bodies, Rva(0x1000),
+            &group1_bodies, Rva(0x1000), true,
         );
         assert!(failed.is_err(), "a too-wide domain value must fail dispatcher assembly");
         assert_eq!(cursor, group1_start, "a failed group must roll the cursor back");
@@ -1685,7 +1749,7 @@ mod reintegration_tests {
         cursor += 3;
         let (redirect, dispatcher_used) = commit_group_layout(
             &mut cursor, &mut payload, group2_start, planned_rva, image_base,
-            &group2_bodies, Rva(0x3000),
+            &group2_bodies, Rva(0x3000), true,
         ).expect("group 2 layout");
 
         assert!(dispatcher_used);
