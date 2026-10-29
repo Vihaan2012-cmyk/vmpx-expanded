@@ -177,6 +177,9 @@ pub struct CleanReport {
     pub vm_instances: Vec<vmpx_vm::VmInstance>,
     pub vm_entries: Vec<vmpx_vm::VmEntryCandidate>,
     pub vm_inventory: Vec<VmInventoryEntry>,
+    /// Inventory entries whose single path reaches an input-closed native exit.
+    /// Recovery only; nothing here is reintegrated or affects blockers.
+    pub input_closed_functions: CleanStageReport,
     pub handlers: CleanHandlerMetrics,
     pub unknown_handlers: Vec<Rva>,
     pub virtualized_routines: Vec<CleanVmPathReport>,
@@ -421,7 +424,7 @@ fn handler_metrics(family: &vmpx_vm::RecoveredEntryPathFamily) -> (CleanHandlerM
 /// call site). It is therefore a live architectural value at the stub, not a
 /// fresh root: a replacement that reads the wrong register would compute every
 /// stack-relative address from the wrong base.
-fn replacement_inputs(
+pub(crate) fn replacement_inputs(
     pe: &PeImage<'_>,
     entry: &vmpx_vm::VmEntryCandidate,
     rewrites: &mut BTreeMap<String, vmpx_vm::Expr>,
@@ -897,6 +900,28 @@ pub fn analyze_clean_with_image(
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
     let vm_inventory = build_vm_inventory(&pe, &export_reports, &mut warnings);
+    let input_closed_functions = if protection.verdict == DetectionVerdict::NoStrongEvidence {
+        completed_stage("not required for an input with no strong protection evidence")
+    } else {
+        let (functions, mut diagnostics) =
+            crate::input_closed_functions::recover_input_closed_functions(&pe, &vm_inventory);
+        diagnostics.extend(functions.iter().map(|function| {
+            format!(
+                "{}: input-closed ({} inputs bound, live-in {:?})",
+                function.rva,
+                function.inputs.len(),
+                function.live_in
+            )
+        }));
+        CleanStageReport {
+            complete: false,
+            metrics: BTreeMap::from([(
+                "recovered".to_owned(),
+                u64::try_from(functions.len()).unwrap_or(u64::MAX),
+            )]),
+            diagnostics,
+        }
+    };
     let mut tls_entries = Vec::new();
     let mut tls_family_complete: BTreeMap<Rva, bool> = BTreeMap::new();
     let mut tls_exit_states: Vec<(
@@ -1459,6 +1484,7 @@ pub fn analyze_clean_with_image(
             vm_instances: discovery.instances,
             vm_entries: discovery.entries,
             vm_inventory,
+            input_closed_functions,
             handlers,
             unknown_handlers,
             virtualized_routines: paths,

@@ -18,6 +18,7 @@ mod native_call;
 mod native_call_verify;
 mod native_context;
 mod native_continuation;
+mod input_closed;
 mod native_exit_state;
 mod native_vm_chain;
 mod oep;
@@ -118,6 +119,7 @@ pub use native_continuation::{
     NativeContinuationLimits, NativeContinuationReport, NativeObservedCString, NativeObservedCall,
     NativeObservedValue, analyze_native_continuation,
 };
+pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use native_exit_state::{
     NativeExitState, NativeExitStateError, recover_native_exit_state,
     recover_profile_chain_native_exit_state,
