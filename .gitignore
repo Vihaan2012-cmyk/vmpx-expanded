@@ -2,3 +2,5 @@
 /crates/*/target/
 /artifacts/
 *.pdb
+
+.superpowers/
