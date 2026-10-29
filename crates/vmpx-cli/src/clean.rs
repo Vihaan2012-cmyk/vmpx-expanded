@@ -1064,6 +1064,9 @@ pub fn analyze_clean_with_image(
                     }
                 }
                 let group_start_cursor = layout_cursor;
+                let placed_start_len = placed.len();
+                let emitted_before = emitted;
+                let total_bytes_before = total_bytes;
                 let mut group_bodies: Vec<(u64, Vec<u8>)> = Vec::new();
                 for (domain_value, assignments, exit, effects) in &eligible {
                     let body_va = va + u64::from(layout_cursor);
@@ -1097,38 +1100,20 @@ pub fn analyze_clean_with_image(
                 if group_bodies.is_empty() {
                     continue;
                 }
-                let group_base = Rva(
-                    planned_rva
-                        .0
-                        .checked_add(group_start_cursor)
-                        .unwrap_or(planned_rva.0),
-                );
-                let dispatcher_used = group_bodies.len() > 1;
                 let fallback = match kind {
                     GroupKind::Header => pe.optional.address_of_entry_point,
                     GroupKind::Tls(rva) => *rva,
                 };
-                let built = if dispatcher_used {
-                    layout_reintegration_payload(
-                        group_base,
-                        pe.optional.image_base.0,
-                        &group_bodies,
-                        vmpx_recompile::PhysicalRegister::Rdx,
-                        fallback,
-                    )
-                } else {
-                    Ok((group_bodies[0].1.clone(), group_base))
-                };
-                match built {
-                    Ok((payload, redirect)) => {
-                        let payload_len = u32::try_from(payload.len()).unwrap_or(0);
-                        // `payload` repeats the already-counted body bytes plus,
-                        // for a dispatcher group, the dispatcher itself; only the
-                        // dispatcher part still needs to advance the cursor.
-                        let already_counted = layout_cursor.saturating_sub(group_start_cursor);
-                        layout_cursor = layout_cursor
-                            .saturating_add(payload_len.saturating_sub(already_counted));
-                        reintegration_payload.extend_from_slice(&payload);
+                match commit_group_layout(
+                    &mut layout_cursor,
+                    &mut reintegration_payload,
+                    group_start_cursor,
+                    planned_rva,
+                    pe.optional.image_base.0,
+                    &group_bodies,
+                    fallback,
+                ) {
+                    Ok((redirect, dispatcher_used)) => {
                         if dispatcher_used {
                             dispatcher_count += 1;
                         }
@@ -1143,9 +1128,18 @@ pub fn analyze_clean_with_image(
                             },
                         }
                     }
-                    Err(error) => reintegration_diagnostics.push(format!(
-                        "{group_label} dispatcher assembly failed: {error}"
-                    )),
+                    Err(error) => {
+                        // The cursor is already rolled back by
+                        // `commit_group_layout`; undo this group's other
+                        // contributions too, so a skipped group leaves no gap
+                        // and no phantom bytes or counts behind it.
+                        placed.truncate(placed_start_len);
+                        emitted = emitted_before;
+                        total_bytes = total_bytes_before;
+                        reintegration_diagnostics.push(format!(
+                            "{group_label} dispatcher assembly failed: {error}"
+                        ));
+                    }
                 }
             }
 
@@ -1158,6 +1152,9 @@ pub fn analyze_clean_with_image(
                 match compile_replacement_body(&pe, &inputs, &symbol_rewrites, exit, effects, body_va)
                 {
                     Ok(body) => {
+                        // This RVA is past the real payload (nested bodies are
+                        // never appended, only counted), so it is not a live
+                        // placement; diagnostics should read it that way.
                         let entry_rva =
                             Rva(planned_rva.0.checked_add(layout_cursor).unwrap_or(planned_rva.0));
                         placed.push((assignments.clone(), entry_rva));
@@ -1560,6 +1557,57 @@ fn layout_reintegration_payload(
     Ok((payload, dispatcher_rva))
 }
 
+/// Lays out one group's already-compiled bodies onto `payload`, starting at
+/// `*cursor` (an offset from `planned_rva`). On success, advances `*cursor`
+/// past the group's dispatcher (if any) and appends the group's bytes. On a
+/// dispatcher-assembly failure, `*cursor` is rolled back to
+/// `group_start_cursor` and `payload` is left untouched, so the failed group
+/// contributes nothing and the next group's base is unaffected by it.
+fn commit_group_layout(
+    cursor: &mut u32,
+    payload: &mut Vec<u8>,
+    group_start_cursor: u32,
+    planned_rva: Rva,
+    image_base: u64,
+    group_bodies: &[(u64, Vec<u8>)],
+    fallback: Rva,
+) -> Result<(Rva, bool), String> {
+    let group_base = Rva(
+        planned_rva
+            .0
+            .checked_add(group_start_cursor)
+            .unwrap_or(planned_rva.0),
+    );
+    let dispatcher_used = group_bodies.len() > 1;
+    let built = if dispatcher_used {
+        layout_reintegration_payload(
+            group_base,
+            image_base,
+            group_bodies,
+            vmpx_recompile::PhysicalRegister::Rdx,
+            fallback,
+        )
+    } else {
+        Ok((group_bodies[0].1.clone(), group_base))
+    };
+    match built {
+        Ok((group_payload, redirect)) => {
+            let payload_len = u32::try_from(group_payload.len()).unwrap_or(0);
+            // `group_payload` repeats the already-counted body bytes plus,
+            // for a dispatcher group, the dispatcher itself; only the
+            // dispatcher part still needs to advance the cursor.
+            let already_counted = cursor.saturating_sub(group_start_cursor);
+            *cursor = cursor.saturating_add(payload_len.saturating_sub(already_counted));
+            payload.extend_from_slice(&group_payload);
+            Ok((redirect, dispatcher_used))
+        }
+        Err(error) => {
+            *cursor = group_start_cursor;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod reintegration_tests {
     use super::*;
@@ -1602,5 +1650,47 @@ mod reintegration_tests {
         // The TLS group's own dispatcher sits after only its own bodies (1 + 2
         // bytes), not after the header group's bodies too.
         assert_eq!(tls_dispatcher_rva, Rva(tls_base.0 + 3));
+    }
+
+    #[test]
+    fn a_failed_group_leaves_no_gap_for_the_next_group() {
+        let image_base = 0x1_4000_0000;
+        let planned_rva = Rva(0x2000);
+        let mut cursor = 0u32;
+        let mut payload = Vec::new();
+
+        // Group 1 has a domain value too wide for the dispatcher encoder, so
+        // its dispatcher assembly fails. Its bodies (5 bytes) are "compiled"
+        // first, advancing the cursor exactly as the per-item compile loop in
+        // clean.rs does before calling `commit_group_layout`.
+        let group1_start = cursor;
+        let group1_bodies = vec![
+            (0u64, vec![0x90, 0xC3]),
+            (u64::from(u32::MAX) + 1, vec![0x90, 0x90, 0xC3]),
+        ];
+        cursor += 5;
+        let failed = commit_group_layout(
+            &mut cursor, &mut payload, group1_start, planned_rva, image_base,
+            &group1_bodies, Rva(0x1000),
+        );
+        assert!(failed.is_err(), "a too-wide domain value must fail dispatcher assembly");
+        assert_eq!(cursor, group1_start, "a failed group must roll the cursor back");
+        assert!(payload.is_empty(), "a failed group must not contribute any bytes");
+
+        // Group 2 "compiles" as if group 1 had never been attempted.
+        let group2_start = cursor;
+        let group2_bodies = vec![(0u64, vec![0xC3]), (1u64, vec![0x90, 0xC3])];
+        cursor += 3;
+        let (redirect, dispatcher_used) = commit_group_layout(
+            &mut cursor, &mut payload, group2_start, planned_rva, image_base,
+            &group2_bodies, Rva(0x3000),
+        ).expect("group 2 layout");
+
+        assert!(dispatcher_used);
+        assert_eq!(group2_start, group1_start, "group 2 must start exactly where group 1 would have");
+        assert_eq!(redirect, Rva(planned_rva.0 + group2_start + 3));
+        // The final payload holds only group 2's bytes: no gap and no
+        // phantom bytes left behind by the failed group 1.
+        assert_eq!(u32::try_from(payload.len()).unwrap(), cursor - group1_start);
     }
 }
