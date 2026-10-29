@@ -17,7 +17,10 @@ use vmpx_vm::{
 };
 use vmpx_vmlift::audit_entry_effect_liveness;
 
-use crate::sha256;
+use crate::{
+    sha256,
+    vm_inventory::{VmInventoryEntry, merge_vm_inventory},
+};
 
 pub(crate) const IMAGE_FILE_DLL: u16 = 0x2000;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -173,6 +176,7 @@ pub struct CleanReport {
     pub imports: CleanImportReport,
     pub vm_instances: Vec<vmpx_vm::VmInstance>,
     pub vm_entries: Vec<vmpx_vm::VmEntryCandidate>,
+    pub vm_inventory: Vec<VmInventoryEntry>,
     pub handlers: CleanHandlerMetrics,
     pub unknown_handlers: Vec<Rva>,
     pub virtualized_routines: Vec<CleanVmPathReport>,
@@ -304,6 +308,42 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
         });
     }
     results
+}
+
+/// Unifies executable-stub discovery with the VM entries reachable from exports
+/// into one deduplicated list. Inventory only: nothing here is recovered.
+fn build_vm_inventory(
+    pe: &PeImage<'_>,
+    exports: &[CleanExportReport],
+    warnings: &mut Vec<String>,
+) -> Vec<VmInventoryEntry> {
+    let mut items: Vec<(Rva, u8, &'static str, bool)> = Vec::new();
+    match discover_vm_entries(
+        pe,
+        VmDiscoveryLimits {
+            scan_executable_stubs: true,
+            ..VmDiscoveryLimits::default()
+        },
+    ) {
+        Ok(report) => items.extend(report.entries.iter().map(|entry| {
+            let label = match entry.source {
+                vmpx_vm::VmEntrySource::PeEntryPoint => "header",
+                vmpx_vm::VmEntrySource::TlsCallback => "tls",
+                vmpx_vm::VmEntrySource::ExecutableScan => "scan",
+            };
+            (entry.rva, entry.confidence, label, false)
+        })),
+        Err(error) => warnings.push(format!("VM entry inventory scan failed: {error}")),
+    }
+    let export_rvas: BTreeSet<Rva> = exports
+        .iter()
+        .flat_map(|export| export.vm_entries.iter().copied())
+        .collect();
+    items.extend(export_rvas.into_iter().filter_map(|rva| {
+        analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
+            .map(|candidate| (rva, candidate.confidence, "export_xref", true))
+    }));
+    merge_vm_inventory(items)
 }
 
 fn exception_coverage_for_chain(
@@ -856,6 +896,7 @@ pub fn analyze_clean_with_image(
     // evidence and clears the blocker when every path provably reaches a VM
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
+    let vm_inventory = build_vm_inventory(&pe, &export_reports, &mut warnings);
     let mut tls_entries = Vec::new();
     let mut tls_family_complete: BTreeMap<Rva, bool> = BTreeMap::new();
     let mut tls_exit_states: Vec<(
@@ -1417,6 +1458,7 @@ pub fn analyze_clean_with_image(
             },
             vm_instances: discovery.instances,
             vm_entries: discovery.entries,
+            vm_inventory,
             handlers,
             unknown_handlers,
             virtualized_routines: paths,
