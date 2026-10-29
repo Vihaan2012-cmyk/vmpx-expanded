@@ -6,12 +6,14 @@
 
 mod abi;
 mod compose;
+mod dispatch;
 mod encode;
 mod error;
 mod ir;
 
 pub use abi::{RegisterAssignment, StackFrame, validate_function};
 pub use compose::{ComposeError, Composition, Fragment, compose};
+pub use dispatch::{DispatchArm, DispatchError, emit_domain_dispatcher};
 pub use encode::{CodeAddress, CompiledFunction, compile};
 pub use error::CompileError;
 pub use ir::{
