@@ -188,6 +188,7 @@ pub struct CleanReport {
     pub errors: Vec<String>,
     pub blockers: Vec<String>,
     pub ready_to_write: bool,
+    pub experimental: bool,
 }
 
 fn pe_summary(pe: &PeImage<'_>) -> CleanPeReport {
@@ -1435,6 +1436,7 @@ pub fn analyze_clean_with_image(
             warnings,
             errors,
             ready_to_write: blockers.is_empty(),
+            experimental: false,
             blockers,
         },
         conventional,

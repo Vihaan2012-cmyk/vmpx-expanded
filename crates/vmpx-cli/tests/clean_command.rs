@@ -121,6 +121,30 @@ fn clean_preserves_verified_unprotected_pe_and_reparses_disk_output() {
 }
 
 #[test]
+fn experimental_flag_is_rejected_when_it_aliases_output() {
+    let directory = test_directory("exp-alias");
+    fs::create_dir(&directory).expect("create isolated test directory");
+    let input = directory.join("in.bin");
+    fs::write(&input, minimal_pe64()).expect("write synthetic input");
+    let out = directory.join("out.bin");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["clean"])
+        .arg(&input)
+        .arg(&out)
+        .args(["--experimental"])
+        .arg(&out)
+        .output()
+        .expect("vmpx clean process starts");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("aliases"));
+    assert!(!out.exists());
+
+    fs::remove_file(input).expect("remove isolated input");
+    fs::remove_dir(directory).expect("remove isolated test directory");
+}
+
+#[test]
 #[ignore = "large controlled VMProtect fixture"]
 fn clean_protected_fixture_reports_blockers_without_writing_output() {
     let directory = test_directory("clean-protected");

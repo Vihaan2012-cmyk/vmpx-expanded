@@ -44,6 +44,10 @@ enum Command {
         /// devirtualized: protector sections and VM handlers remain present.
         #[arg(long)]
         reconstructed: Option<PathBuf>,
+        /// Write the unverified reintegrated (devirtualized) image even when
+        /// blockers remain. The sound `output` path is unaffected.
+        #[arg(long)]
+        experimental: Option<PathBuf>,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -684,6 +688,7 @@ fn main() -> Result<()> {
             output,
             report,
             reconstructed,
+            experimental,
         } => {
             if input == output {
                 bail!("refusing to overwrite the input file");
@@ -707,8 +712,18 @@ fn main() -> Result<()> {
             {
                 bail!("reconstructed path aliases an input, output, or report file");
             }
+            if let Some(path) = &experimental
+                && (path == &input
+                    || path == &output
+                    || report.as_ref() == Some(path)
+                    || reconstructed.as_ref() == Some(path)
+                    || (path.exists()
+                        && fs::canonicalize(&input).ok() == fs::canonicalize(path).ok()))
+            {
+                bail!("experimental path aliases an input, output, report, or reconstructed file");
+            }
             let input_data = read_file(&input)?;
-            let (mut clean, conventional, _reintegrated) =
+            let (mut clean, conventional, reintegrated) =
                 clean::analyze_clean_with_image(&input.display().to_string(), &input_data)?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
@@ -760,6 +775,25 @@ fn main() -> Result<()> {
                     path.display()
                 );
                 println!("[verify] reconstructed image reparsed successfully from disk");
+            }
+            clean.experimental = experimental.is_some();
+            if let Some(path) = &experimental {
+                match &reintegrated {
+                    Some(bytes) => {
+                        fs::write(path, bytes)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        eprintln!(
+                            "[experimental] WARNING: unverified devirtualized output written to {}; {} blocker(s) remain",
+                            path.display(),
+                            clean.blockers.len()
+                        );
+                        println!("[experimental] {}", path.display());
+                    }
+                    None => eprintln!(
+                        "[experimental] no reintegrated image was produced; nothing written to {}",
+                        path.display()
+                    ),
+                }
             }
             if !clean.ready_to_write {
                 if let Some(report_path) = report {
