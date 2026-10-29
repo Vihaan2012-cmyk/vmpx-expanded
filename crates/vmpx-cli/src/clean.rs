@@ -860,6 +860,7 @@ pub fn analyze_clean_with_image(
     let export_reports = export_dependency_report(&pe);
     let mut tls_entries = Vec::new();
     let mut tls_exit_states: Vec<(
+        Rva,
         BTreeMap<String, u64>,
         vmpx_vm::NativeExitState,
         vmpx_vmlift::CollectedEffects,
@@ -917,6 +918,7 @@ pub fn analyze_clean_with_image(
                 for path in &family.paths {
                     if let Some(exit) = path.native_exit.as_ref() {
                         tls_exit_states.push((
+                            entry.rva,
                             path.assignments.clone(),
                             exit.clone(),
                             vmpx_vmlift::collect_path_effects(&family, path),
@@ -994,91 +996,174 @@ pub fn analyze_clean_with_image(
                 },
                 None => Vec::new(),
             };
-            // Header-entry bodies are kept apart so they can be laid out as one
-            // dispatcher group below; nested and TLS bodies still compile and
-            // count here but are not yet wired into a redirect.
-            let mut header_bodies: Vec<(u64, Vec<u8>)> = Vec::new();
-            let header_tagged = exit_states.iter().map(|(a, e, f)| (true, a, e, f));
-            let nested_tagged = nested_exits.iter().map(|(a, e, f)| (false, a, e, f));
-            let tls_tagged = tls_exit_states.iter().map(|(a, e, f)| (false, a, e, f));
-            for (is_header, assignments, exit, effects) in
-                header_tagged.chain(nested_tagged).chain(tls_tagged)
-            {
-                // The VM exit transfers to a protector continuation rather than
-                // returning to the caller. Resolve that continuation so the
-                // replacement can tail-jump into it after restoring the exit
-                // state, which is what makes it a drop-in for the VM entry.
-                let continuation = vmpx_vm::recover_modulo_image_targets(
-                    &pe,
-                    &exit.return_address,
-                    vmpx_vm::ModuloImageTargetLimits::default(),
-                )
-                .ok()
-                .filter(|report| report.complete && report.targets.len() == 1)
-                .map(|report| report.targets[0].va)
-                .map(|va| va.0);
-                let config = vmpx_vmlift::ReplacementConfig {
-                    inputs: inputs.clone(),
-                    max_expression_nodes: 200_000,
-                    max_spill_slots: 64,
-                    import_calls: import_calls_for(&pe, exit),
-                    continuation,
-                    effects: effects
-                        .stores
-                        .iter()
-                        .map(|store| vmpx_vmlift::EffectStore {
-                            address: store.address.clone(),
-                            value: store.value.clone(),
-                            width: store.width,
-                        })
-                        .collect(),
-                    rflags: Some(exit.rflags.clone()),
-                    symbol_rewrites: symbol_rewrites.clone(),
-                    effect_calls: effects
-                        .calls
-                        .iter()
-                        .filter_map(|call| {
-                            let iat_va = pe
-                                .optional
-                                .image_base
-                                .checked_add_rva(vmpx_pe::Rva(call.iat_rva))?;
-                            Some(vmpx_vmlift::EffectCall {
-                                result_intrinsic: call.result_intrinsic.clone(),
-                                call: vmpx_vmlift::ImportCall {
-                                    iat_address: iat_va.0,
-                                    argument_count: u8::try_from(call.arguments.len()).ok()?,
-                                },
-                                arguments: call.arguments.clone(),
-                            })
-                        })
-                        .collect(),
+
+            // Groups are laid out in order: the header entry first, then each
+            // loader-reachable TLS callback (sorted by RVA), so each group's own
+            // dispatcher sits right after its own bodies and before the next
+            // group's bodies start.
+            type ExitRefs<'a> = (
+                &'a BTreeMap<String, u64>,
+                &'a vmpx_vm::NativeExitState,
+                &'a vmpx_vmlift::CollectedEffects,
+            );
+            let mut tls_groups: BTreeMap<Rva, Vec<ExitRefs<'_>>> = BTreeMap::new();
+            for (owner, assignments, exit, effects) in &tls_exit_states {
+                tls_groups
+                    .entry(*owner)
+                    .or_default()
+                    .push((assignments, exit, effects));
+            }
+            let mut groups: Vec<(GroupKind, Vec<ExitRefs<'_>>)> = vec![(
+                GroupKind::Header,
+                exit_states.iter().map(|(a, e, f)| (a, e, f)).collect(),
+            )];
+            groups.extend(
+                tls_groups
+                    .into_iter()
+                    .map(|(rva, items)| (GroupKind::Tls(rva), items)),
+            );
+
+            let mut layout_cursor: u32 = 0;
+            let mut reintegration_payload: Vec<u8> = Vec::new();
+            let mut header_redirect: Option<Rva> = None;
+            let mut tls_redirects: Vec<(usize, Rva)> = Vec::new();
+            let mut dispatcher_count: u64 = 0;
+            let mut reintegration_diagnostics: Vec<String> = Vec::new();
+
+            for (kind, items) in &groups {
+                let group_label = match kind {
+                    GroupKind::Header => "header entry".to_owned(),
+                    GroupKind::Tls(rva) => format!("TLS entry {rva}"),
                 };
-                match vmpx_vmlift::build_replacement(
-                    &exit.registers,
-                    &config,
-                    vmpx_recompile::CodeAddress(va + total_bytes),
-                ) {
-                    Ok(replacement) => {
-                        // Record where this body landed so a redirect can target
-                        // it: the entry stub has to jump somewhere specific.
-                        let entry_rva = vmpx_pe::Rva(
-                            u32::try_from(planned_rva.0)
-                                .ok()
-                                .and_then(|base| {
-                                    u32::try_from(total_bytes)
-                                        .ok()
-                                        .and_then(|offset| base.checked_add(offset))
-                                })
-                                .unwrap_or(planned_rva.0),
-                        );
-                        placed.push((assignments.clone(), entry_rva));
-                        let body = replacement.compiled.bytes;
-                        total_bytes += u64::try_from(body.len()).unwrap_or(0);
-                        if is_header
-                            && let Some(&domain_value) = assignments.get("native_rdx_initial")
-                        {
-                            header_bodies.push((domain_value, body));
+                // Eligibility is decided before compiling: a missing or
+                // duplicate domain value must not consume address space that
+                // the real payload below won't contain.
+                let mut eligible: Vec<(
+                    u64,
+                    &BTreeMap<String, u64>,
+                    &vmpx_vm::NativeExitState,
+                    &vmpx_vmlift::CollectedEffects,
+                )> = Vec::new();
+                let mut seen_domain_values = BTreeSet::new();
+                for (assignments, exit, effects) in items {
+                    match assignments.get("native_rdx_initial") {
+                        None => diagnostics.push(format!(
+                            "path {assignments:?} in {group_label} has no native_rdx_initial \
+                             domain value; excluded from reintegration"
+                        )),
+                        Some(&domain_value) => {
+                            if seen_domain_values.insert(domain_value) {
+                                eligible.push((domain_value, assignments, exit, effects));
+                            } else {
+                                diagnostics.push(format!(
+                                    "duplicate native_rdx_initial={domain_value} in \
+                                     {group_label}; keeping the first body and skipping this path"
+                                ));
+                            }
                         }
+                    }
+                }
+                let group_start_cursor = layout_cursor;
+                let mut group_bodies: Vec<(u64, Vec<u8>)> = Vec::new();
+                for (domain_value, assignments, exit, effects) in &eligible {
+                    let body_va = va + u64::from(layout_cursor);
+                    match compile_replacement_body(
+                        &pe,
+                        &inputs,
+                        &symbol_rewrites,
+                        exit,
+                        effects,
+                        body_va,
+                    ) {
+                        Ok(body) => {
+                            // Record where this body landed so a redirect can
+                            // target it: the entry stub has to jump somewhere
+                            // specific.
+                            let entry_rva = Rva(
+                                planned_rva.0.checked_add(layout_cursor).unwrap_or(planned_rva.0),
+                            );
+                            placed.push(((*assignments).clone(), entry_rva));
+                            layout_cursor = layout_cursor
+                                .saturating_add(u32::try_from(body.len()).unwrap_or(0));
+                            total_bytes += u64::try_from(body.len()).unwrap_or(0);
+                            emitted += 1;
+                            group_bodies.push((*domain_value, body));
+                        }
+                        Err(error) => diagnostics.push(format!(
+                            "path {assignments:?} has no native replacement: {error}"
+                        )),
+                    }
+                }
+                if group_bodies.is_empty() {
+                    continue;
+                }
+                let group_base = Rva(
+                    planned_rva
+                        .0
+                        .checked_add(group_start_cursor)
+                        .unwrap_or(planned_rva.0),
+                );
+                let dispatcher_used = group_bodies.len() > 1;
+                let fallback = match kind {
+                    GroupKind::Header => pe.optional.address_of_entry_point,
+                    GroupKind::Tls(rva) => *rva,
+                };
+                let built = if dispatcher_used {
+                    layout_reintegration_payload(
+                        group_base,
+                        pe.optional.image_base.0,
+                        &group_bodies,
+                        vmpx_recompile::PhysicalRegister::Rdx,
+                        fallback,
+                    )
+                } else {
+                    Ok((group_bodies[0].1.clone(), group_base))
+                };
+                match built {
+                    Ok((payload, redirect)) => {
+                        let payload_len = u32::try_from(payload.len()).unwrap_or(0);
+                        // `payload` repeats the already-counted body bytes plus,
+                        // for a dispatcher group, the dispatcher itself; only the
+                        // dispatcher part still needs to advance the cursor.
+                        let already_counted = layout_cursor.saturating_sub(group_start_cursor);
+                        layout_cursor = layout_cursor
+                            .saturating_add(payload_len.saturating_sub(already_counted));
+                        reintegration_payload.extend_from_slice(&payload);
+                        if dispatcher_used {
+                            dispatcher_count += 1;
+                        }
+                        match kind {
+                            GroupKind::Header => header_redirect = Some(redirect),
+                            GroupKind::Tls(rva) => match tls_callback_index(&pe, *rva) {
+                                Some(index) => tls_redirects.push((index, redirect)),
+                                None => reintegration_diagnostics.push(format!(
+                                    "TLS entry {rva} has no resolvable callback-array index; \
+                                     its body is emitted but not redirected"
+                                )),
+                            },
+                        }
+                    }
+                    Err(error) => reintegration_diagnostics.push(format!(
+                        "{group_label} dispatcher assembly failed: {error}"
+                    )),
+                }
+            }
+
+            // Nested-continuation bodies still compile and count here (nothing
+            // is silently dropped), but reintegration is deferred: redirecting
+            // to one means rewriting another body's continuation target, which
+            // is out of scope here.
+            for (assignments, exit, effects) in &nested_exits {
+                let body_va = va + u64::from(layout_cursor);
+                match compile_replacement_body(&pe, &inputs, &symbol_rewrites, exit, effects, body_va)
+                {
+                    Ok(body) => {
+                        let entry_rva =
+                            Rva(planned_rva.0.checked_add(layout_cursor).unwrap_or(planned_rva.0));
+                        placed.push((assignments.clone(), entry_rva));
+                        layout_cursor =
+                            layout_cursor.saturating_add(u32::try_from(body.len()).unwrap_or(0));
+                        total_bytes += u64::try_from(body.len()).unwrap_or(0);
                         emitted += 1;
                     }
                     Err(error) => diagnostics.push(format!(
@@ -1086,52 +1171,62 @@ pub fn analyze_clean_with_image(
                     )),
                 }
             }
-            if !header_bodies.is_empty() {
-                let dispatcher_used = header_bodies.len() > 1;
-                let built = if dispatcher_used {
-                    layout_reintegration_payload(
-                        planned_rva,
-                        pe.optional.image_base.0,
-                        &header_bodies,
-                        vmpx_recompile::PhysicalRegister::Rdx,
-                        pe.optional.address_of_entry_point,
-                    )
-                } else {
-                    Ok((header_bodies[0].1.clone(), planned_rva))
-                };
-                reintegration = match built {
-                    Ok((payload, redirect)) => match vmpx_rebuild::reintegrate(
-                        image,
-                        vmpx_rebuild::ReintegrationRequest {
-                            section_name: *b".vmpx0\0\0",
-                            payload: &payload,
-                            entry_redirect: Some(redirect),
-                            tls_redirects: &[],
-                        },
-                    ) {
-                        Ok((bytes, report)) => {
-                            reintegrated = Some(bytes);
-                            CleanStageReport {
-                                complete: true,
-                                metrics: BTreeMap::from([
-                                    ("section_rva".to_owned(), u64::from(report.section.rva.0)),
-                                    (
-                                        "section_size".to_owned(),
-                                        u64::from(report.section.virtual_size),
-                                    ),
-                                    ("entries_redirected".to_owned(), 1),
-                                    ("dispatchers".to_owned(), u64::from(dispatcher_used)),
-                                ]),
-                                diagnostics: vec![
-                                    "header entry redirected; TLS-callback and \
-                                     nested-continuation redirects are not yet wired"
-                                        .to_owned(),
-                                ],
-                            }
-                        }
-                        Err(error) => stage(format!("reintegrate failed: {error}")),
+
+            if reintegration_payload.is_empty() {
+                if !reintegration_diagnostics.is_empty() {
+                    reintegration = CleanStageReport {
+                        complete: false,
+                        metrics: BTreeMap::new(),
+                        diagnostics: reintegration_diagnostics,
+                    };
+                }
+            } else {
+                reintegration = match vmpx_rebuild::reintegrate(
+                    image,
+                    vmpx_rebuild::ReintegrationRequest {
+                        section_name: *b".vmpx0\0\0",
+                        payload: &reintegration_payload,
+                        entry_redirect: header_redirect,
+                        tls_redirects: &tls_redirects,
                     },
-                    Err(error) => stage(format!("header dispatcher assembly failed: {error}")),
+                ) {
+                    Ok((bytes, report)) => {
+                        reintegrated = Some(bytes);
+                        let entries_redirected = u64::from(report.entry_redirected)
+                            + u64::try_from(report.tls_redirected).unwrap_or(0);
+                        let mut diags = vec![format!(
+                            "{entries_redirected} entry/entries redirected ({} header, {} TLS \
+                             callback(s)); nested-continuation redirects remain deferred",
+                            u64::from(report.entry_redirected),
+                            report.tls_redirected
+                        )];
+                        diags.extend(reintegration_diagnostics);
+                        CleanStageReport {
+                            complete: true,
+                            metrics: BTreeMap::from([
+                                ("section_rva".to_owned(), u64::from(report.section.rva.0)),
+                                (
+                                    "section_size".to_owned(),
+                                    u64::from(report.section.virtual_size),
+                                ),
+                                ("entries_redirected".to_owned(), entries_redirected),
+                                ("dispatchers".to_owned(), dispatcher_count),
+                                (
+                                    "tls_redirected".to_owned(),
+                                    u64::try_from(report.tls_redirected).unwrap_or(0),
+                                ),
+                            ]),
+                            diagnostics: diags,
+                        }
+                    }
+                    Err(error) => {
+                        reintegration_diagnostics.push(format!("reintegrate failed: {error}"));
+                        CleanStageReport {
+                            complete: false,
+                            metrics: BTreeMap::new(),
+                            diagnostics: reintegration_diagnostics,
+                        }
+                    }
                 };
             }
         }
@@ -1350,6 +1445,86 @@ pub fn analyze_clean_with_image(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum GroupKind {
+    Header,
+    Tls(Rva),
+}
+
+/// Builds one replacement body, resolving its continuation target and import
+/// calls from `pe`. Shared by every reintegration group and the
+/// nested-continuation pass so they all use identical codegen.
+fn compile_replacement_body(
+    pe: &PeImage<'_>,
+    inputs: &[(String, vmpx_recompile::PhysicalRegister)],
+    symbol_rewrites: &BTreeMap<String, vmpx_vm::Expr>,
+    exit: &vmpx_vm::NativeExitState,
+    effects: &vmpx_vmlift::CollectedEffects,
+    va: u64,
+) -> Result<Vec<u8>, String> {
+    // The VM exit transfers to a protector continuation rather than returning
+    // to the caller. Resolve that continuation so the replacement can
+    // tail-jump into it after restoring the exit state, which is what makes
+    // it a drop-in for the VM entry.
+    let continuation = vmpx_vm::recover_modulo_image_targets(
+        pe,
+        &exit.return_address,
+        vmpx_vm::ModuloImageTargetLimits::default(),
+    )
+    .ok()
+    .filter(|report| report.complete && report.targets.len() == 1)
+    .map(|report| report.targets[0].va)
+    .map(|va| va.0);
+    let config = vmpx_vmlift::ReplacementConfig {
+        inputs: inputs.to_vec(),
+        max_expression_nodes: 200_000,
+        max_spill_slots: 64,
+        import_calls: import_calls_for(pe, exit),
+        continuation,
+        effects: effects
+            .stores
+            .iter()
+            .map(|store| vmpx_vmlift::EffectStore {
+                address: store.address.clone(),
+                value: store.value.clone(),
+                width: store.width,
+            })
+            .collect(),
+        rflags: Some(exit.rflags.clone()),
+        symbol_rewrites: symbol_rewrites.clone(),
+        effect_calls: effects
+            .calls
+            .iter()
+            .filter_map(|call| {
+                let iat_va = pe
+                    .optional
+                    .image_base
+                    .checked_add_rva(vmpx_pe::Rva(call.iat_rva))?;
+                Some(vmpx_vmlift::EffectCall {
+                    result_intrinsic: call.result_intrinsic.clone(),
+                    call: vmpx_vmlift::ImportCall {
+                        iat_address: iat_va.0,
+                        argument_count: u8::try_from(call.arguments.len()).ok()?,
+                    },
+                    arguments: call.arguments.clone(),
+                })
+            })
+            .collect(),
+    };
+    vmpx_vmlift::build_replacement(&exit.registers, &config, vmpx_recompile::CodeAddress(va))
+        .map(|replacement| replacement.compiled.bytes)
+        .map_err(|error| error.to_string())
+}
+
+/// Resolves a TLS entry's RVA back to its position in the TLS directory's
+/// callback array, which is the index `set_tls_callback`/`reintegrate` need.
+fn tls_callback_index(pe: &PeImage<'_>, entry_rva: Rva) -> Option<usize> {
+    let tls = pe.report().tls?;
+    tls.callbacks
+        .iter()
+        .position(|va| pe.optional.image_base.checked_rva_of(*va) == Some(entry_rva))
+}
+
 // Returns (payload, entry_dispatcher_rva, per-entry dispatcher RVAs). Bodies are
 // placed first at `base`, dispatchers after, so body VAs stay as compiled.
 fn layout_reintegration_payload(
@@ -1403,5 +1578,29 @@ mod reintegration_tests {
         assert_eq!(dispatcher_rva, Rva(0x2005));
         assert_eq!(&payload[..5], &[0x90, 0xC3, 0x90, 0x90, 0xC3]);
         assert!(payload.len() > 5); // dispatcher bytes appended
+    }
+
+    #[test]
+    fn a_second_group_lays_out_after_the_first_groups_full_payload() {
+        let image_base = 0x1_4000_0000;
+        let header_base = Rva(0x2000);
+        let header_bodies = vec![(0u64, vec![0x90, 0xC3]), (1u64, vec![0x90, 0x90, 0xC3])];
+        let (header_payload, header_dispatcher_rva) = layout_reintegration_payload(
+            header_base, image_base, &header_bodies, PhysicalRegister::Rdx, Rva(0x1000),
+        ).expect("header layout");
+
+        // The next group's base, as clean.rs computes it, is the running
+        // cursor right after the header group's full payload (bodies plus its
+        // dispatcher) — not just after the header bodies.
+        let tls_base = Rva(header_base.0 + u32::try_from(header_payload.len()).expect("fits"));
+        let tls_bodies = vec![(0u64, vec![0xC3]), (2u64, vec![0x90, 0xC3])];
+        let (_tls_payload, tls_dispatcher_rva) = layout_reintegration_payload(
+            tls_base, image_base, &tls_bodies, PhysicalRegister::Rdx, Rva(0x3000),
+        ).expect("tls layout");
+
+        assert!(tls_base.0 > header_dispatcher_rva.0, "tls group must start after the header dispatcher");
+        // The TLS group's own dispatcher sits after only its own bodies (1 + 2
+        // bytes), not after the header group's bodies too.
+        assert_eq!(tls_dispatcher_rva, Rva(tls_base.0 + 3));
     }
 }
