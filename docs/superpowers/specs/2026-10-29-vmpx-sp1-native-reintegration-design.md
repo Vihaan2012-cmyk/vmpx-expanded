@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-29
 - **Status:** Draft, pending author review
-- **Scope of this document:** Full design of **SP1 (native reintegration + image emission)**, plus the roadmap (SP2–SP6) that SP1 is the backbone of. Each later sub-project gets its own spec → plan → implementation cycle.
+- **Scope of this document:** Full design of **SP1 (native reintegration + image emission)**, plus the roadmap (SP2–SP5) that SP1 is the backbone of (the egui UI is folded into the current work rather than numbered as a later SP). Each later sub-project gets its own spec → plan → implementation cycle.
 
 ---
 
@@ -42,7 +42,7 @@ Plus conditional gaps — notably finite input-domain recovery for executable (n
 ### Non-goals (and a critical caveat)
 - **"Reversible" means behavior-reversible, not bit-reversible.** VMProtect virtualization is lossy: original instruction encodings, function boundaries, padding, and the pristine `.text` are destroyed. The output reproduces *semantics*, not the original bytes. It will not match a hash of the unprotected original, and a byte/disassembly diff against the original will look nothing alike even when behavior is identical. This caveat must not be silently dropped in later work.
 - **"Any binary" is a direction, not a guarantee.** Correctness is *proven* on synthetic fixtures we construct and *empirically confirmed* on local samples. Coverage is bounded by the VMProtect constructs we have lifted and proved; outside that, sound mode refuses.
-- SP1 does not attempt OEP recovery, import reconstruction, `.vmp` stripping, or optimization — those are SP2/SP3/SP5/SP6.
+- SP1 does not attempt OEP recovery, generalized virtualized-function recovery, import reconstruction, `.vmp` stripping, or optimization — those are SP2/SP3/SP4/SP5.
 
 ### 2.1 Design principles
 
@@ -59,29 +59,29 @@ Plus conditional gaps — notably finite input-domain recovery for executable (n
 
 ---
 
-## 4. Roadmap (SP1–SP6) & definition-of-done ladder
+## 4. Roadmap (SP1–SP5) & definition-of-done ladder
 
 | # | Sub-project | Clears / purpose | Depends on |
 |---|-------------|------------------|------------|
 | **SP1** | **Native reintegration + image emission** (backbone; experimental mode lives here) | blocker 3 ("no replacement image produced") | — |
-| SP2 | OEP recovery (prove the real entry so the redirect is sound) | blocker 1 | SP1 |
+| SP2 | OEP recovery **+ generalized virtualized-function recovery**: prove the original entry, and discover every VM entry (call-site/xref), infer each routine's calling convention + finite input domain (incl. non-DLL executable entries, absorbing the old `clean.rs:624` gap), then lift + reintegrate each | blocker 1 + coverage from entry/TLS to every virtualized routine (precondition for a whole-binary clean) | SP1 |
 | SP3 | Import-set reconstruction (reduce protector-era imports to the proven app set) | blocker 2 | SP1 |
-| SP4 | Executable (non-DLL) entry finite input-domain recovery (`clean.rs:624`) | widens coverage beyond DLL/TLS | SP1 |
-| SP5 | Dangling `.vmp` reference resolution + section stripping | blocker 4 | SP1–SP3 |
-| SP6 | Optimizing recompilation via VTIL + differential verification engine (and anti-debug `--neutralize` passes) | cleanest output; quality, not coverage | SP1; independently sequenceable |
-| SP7 | egui/eframe UI frontend | usability; drives the library/CLI, surfaces reports, blockers, and mode toggles | SP1 (separate track, no core changes) |
+| SP4 | Dangling `.vmp` reference resolution + section stripping | blocker 4 | SP1–SP3 |
+| SP5 | Optimizing recompilation via VTIL + differential verification engine (and anti-debug `--neutralize` passes) | cleanest output; quality, not coverage | SP1; independently sequenceable |
+
+The **egui/eframe UI** is *not* a numbered sub-project: it drives the library and surfaces reports/blockers/mode toggles without touching devirtualization logic, so it is folded into the current work and built this session alongside SP1 (crate `vmpx-ui`).
 
 ### DoD ladder (each rung independently useful and testable)
-- **L1 — SP1 experimental:** produces a loadable PE with replacements spliced into a new section and the entry redirected; reparses, passes `validate_for_loader`, and runs against a local VMP sample. Default/sound mode still refuses. *First rung that yields a testable binary.*
-- **L2 — +SP2:** entry redirect targets a *proven* OEP → sound mode can emit for simple samples.
+- **L1 — SP1 experimental:** produces a loadable PE with the entry/TLS replacements spliced into a new section and the entry redirected; reparses, passes `validate_for_loader`, and runs against a local VMP sample. Default/sound mode still refuses. *First rung that yields a testable binary.*
+- **L2 — +SP2:** a *proven* OEP **and every reachable virtualized routine devirtualized and reintegrated** (not just entry/TLS) → sound mode can emit for whole samples.
 - **L3 — +SP3:** imports reduced to the proven application set.
-- **L4 — +SP4/SP5:** executable entries covered; `.vmp` sections stripped with no dangling references → "clean" in the strong sense (the `clean <in> <out>` command finally writes `<out>`).
-- **L5 — +SP6:** recovered code optimized/normalized to compiler-quality, each pass behavior-verified.
+- **L4 — +SP4:** `.vmp` sections stripped with no dangling references → "clean" in the strong sense (the `clean <in> <out>` command finally writes `<out>`).
+- **L5 — +SP5:** recovered code optimized/normalized to compiler-quality, each pass behavior-verified.
 
 ### Cross-cutting rules for every sub-project
 1. **Soundness default.** The existing proof gate stays; sound emission is unlocked only when a sub-project's proof genuinely passes. Experimental emission is a separate, explicit, labeled flag.
 2. **Fixture-first.** Every component gets synthetic fixtures as the CI oracle; local samples are the out-of-band behavioral check.
-3. **Equivalence-preserving.** No transformation (especially SP6 optimization) may change observable behavior; where a transformation could, it ships with a verification check, not faith.
+3. **Equivalence-preserving.** No transformation (especially SP5 optimization) may change observable behavior; where a transformation could, it ships with a verification check, not faith.
 4. **Static-only.** No sub-project runs the target. This is what keeps anti-debug a non-issue; any proposal that requires execution is out of scope until explicitly re-opened as a separate dynamic track.
 5. **Behavior-changing modes are opt-in and labeled.** `--experimental` (gate-relaxed emission) and `--neutralize` (anti-debug stripping) each weaken a guarantee; both are off by default, loudly labeled in output and report, and never alter the sound-`output` semantics.
 
@@ -183,10 +183,11 @@ Bodies are already compiled assuming they start at `next_section_rva` and pack s
 
 ### 5.6 Scope boundaries (YAGNI — explicitly out of SP1)
 - No OEP recovery (experimental mode assumes the header entry's recovered paths are the entry; SP2 makes it sound).
+- No recovery of virtualized functions beyond the module entry and TLS callbacks; discovering and devirtualizing arbitrary virtualized routines is SP2.
 - No import reconstruction (protector imports left as-is; SP3).
-- No `.vmp` stripping (replacements live in the new section *alongside* the untouched protector sections; SP5).
+- No `.vmp` stripping (replacements live in the new section *alongside* the untouched protector sections; SP4).
 - No header-table rebuild to create section-header room (future enhancement).
-- No optimization of emitted code (SP6).
+- No optimization of emitted code (SP5).
 
 ### 5.7 Testing plan (fixture-first)
 - **Unit:**
@@ -209,18 +210,17 @@ Bodies are already compiled assuming they start at `next_section_rva` and pack s
 
 ---
 
-## 6. SP2–SP6 sketches (each to be fully specified in its own cycle)
+## 6. SP2–SP5 sketches (each to be fully specified in its own cycle) + the folded-in UI
 
-- **SP2 — OEP recovery.** Prove the original entry (e.g. via the first native-transition / VM-exit target reached from the protected header entry) so `redirect_entry`'s target is a proven original-entry semantics rather than an assumption. Clears blocker 1; promotes experimental entry emission to sound.
+- **SP2 — OEP recovery + generalized virtualized-function recovery.** One sub-project, two linked parts. (a) OEP: prove the original entry (e.g. the first native-transition / VM-exit target reached from the protected header entry) so the entry redirect targets proven original-entry semantics, not an assumption — clears blocker 1. (b) Generalized recovery: discover every VM entry across the binary via call-site/xref analysis (the export-dependency walk already finds some), infer each routine's calling convention and finite input domain — including non-DLL executable entries (the old `clean.rs:624` gap) — then lift and reintegrate each with SP1's machinery. This extends coverage from the module entry and TLS callbacks to every virtualized routine, the precondition for stripping `.vmp` (SP4). Per-function input-domain and calling-convention inference is the hard research weight; expect this to be the largest sub-project.
 - **SP3 — Import-set reconstruction.** Reduce the parsed protector-era import set to the application's real imports (resolve indirect/VM-mediated IAT usage to concrete symbols), and rebuild a conventional import directory. Clears blocker 2. Builds on `vmpx-rebuild/src/import_table.rs` and the existing `Imports` analysis.
-- **SP4 — Executable (non-DLL) entry domain recovery.** Implement finite input-domain recovery for executable entry points (currently `clean.rs:624` refuses). Widens coverage beyond the DLL-entry/TLS `rdx` reason domain.
-- **SP5 — Dangling `.vmp` reference resolution + section stripping.** Once entry, TLS, and reachable routines are devirtualized and imports reconstructed, prove no remaining references into `.vmp*` sections, then strip them. Clears blocker 4; produces "clean" output in the strong sense.
-- **SP6 — Optimizing recompilation (VTIL) + differential verification engine.** Wire the already-present VTIL bridge (`native/vtil-bridge/`, `vmpx_vtil_optimize` → `vtil::optimizer::apply_all`) into the lift → recompile path (the stubbed `vtil` stage at `clean.rs:1255`), plus the repo's existing expression simplification. Lower the *optimized* IR to minimal native code so output reads like compiler output.
-  - **Equivalence-preserving requirement:** every pass must preserve observable behavior. SP6 ships with a **differential verification engine** — the "debug engine" — that executes the original VM and the optimized native replacement over the recovered input domain and asserts identical register/memory/effect results. This is the pass validator and the local-sample equivalence oracle.
-  - **Independently sequenceable:** VTIL optimization sits between lift and recompile and can land as a quality improvement before SP5, turned on by default only once its verifier is trusted.
-  - **Open question (carried to SP6 planning):** whether the "debug engine" should *also* emit readable debug artifacts (PDB symbols or a commented annotated disassembly of the output) in addition to being the differential verifier. Default assumption: differential verifier first; readable-symbols as a separate optional deliverable.
+- **SP4 — Dangling `.vmp` reference resolution + section stripping.** Once every reachable virtualized routine is devirtualized (SP2) and imports reconstructed (SP3), prove no remaining references into `.vmp*` sections, then strip them. Clears blocker 4; produces "clean" output in the strong sense.
+- **SP5 — Optimizing recompilation (VTIL) + differential verification engine.** Wire the already-present VTIL bridge (`native/vtil-bridge/`, `vmpx_vtil_optimize` → `vtil::optimizer::apply_all`) into the lift → recompile path (the stubbed `vtil` stage at `clean.rs:1255`), plus the repo's existing expression simplification. Lower the *optimized* IR to minimal native code so output reads like compiler output.
+  - **Equivalence-preserving requirement:** every pass must preserve observable behavior. SP5 ships with a **differential verification engine** — the "debug engine" — that executes the original VM and the optimized native replacement over the recovered input domain and asserts identical register/memory/effect results. This is the pass validator and the local-sample equivalence oracle.
+  - **Independently sequenceable:** VTIL optimization sits between lift and recompile and can land as a quality improvement before SP4, turned on by default only once its verifier is trusted.
+  - **Open question (carried to SP5 planning):** whether the "debug engine" should *also* emit readable debug artifacts (PDB symbols or a commented annotated disassembly of the output) in addition to being the differential verifier. Default assumption: differential verifier first; readable-symbols as a separate optional deliverable.
   - **Anti-debug `--neutralize` passes** live here: identify anti-debug/integrity constructs (via handler classification, building on `checksum_handler.rs`) and, when the flag is set, rewrite their guards to the non-detecting path. Off by default; the differential verifier confirms that *faithful* mode is unchanged and documents exactly what `--neutralize` alters.
-- **SP7 — egui/eframe UI frontend.** A separate crate (e.g. `vmpx-ui`) that drives the `vmpx` library (not a core change): choose an input binary, run detect/unpack/clean, and display the structured reports, the blockers list, recovered VM entries/handlers, and the mode toggles (`--experimental`, `--neutralize`). Immediate-mode egui keeps iteration fast; it consumes the same report structs the CLI serializes. Sequenced after SP1 so there is emission to drive, but it touches no devirtualization logic and can proceed in parallel.
+- **UI — folded into current work (not a deferred sub-project).** An egui/eframe `vmpx-ui` crate that drives the `vmpx` library: choose an input binary, run detect/unpack/clean, and display the structured reports, blockers, recovered VM entries/handlers, and the mode toggles (`--experimental`, and `--neutralize` once SP5 lands). It touches no devirtualization logic and consumes the same report structs the CLI serializes, so it is built alongside SP1 this session rather than scheduled as a later SP. (GUI behavior can be build-verified here but must be run by the author on Windows — there is no display in CI.)
 
 ---
 
@@ -230,9 +230,9 @@ Bodies are already compiled assuming they start at `next_section_rva` and pack s
 - **Dispatcher fallback correctness (SP1).** Falling back to the original (still-protected) entry is only a safety net for inputs outside the recovered domain; if the domain is proven complete, the fallback is unreachable. Experimental mode with an incomplete domain relies on it and must label that.
 - **Soundness of experimental output.** Experimental emission can be confidently wrong; mitigated by quarantine (separate path), loud labeling, and the blockers list in the report. It is a test artifact, not a product.
 - **Behavior-vs-bit reversibility.** Must remain explicit in user-facing docs so "clean/reversible" is not misread as original-file reconstruction.
-- **SP6 verifier scope.** Differential verification over a *finite recovered domain* proves equivalence on that domain, not universally; this bounds the strength of the "cleanest output" claim.
+- **SP5 verifier scope.** Differential verification over a *finite recovered domain* proves equivalence on that domain, not universally; this bounds the strength of the "cleanest output" claim.
 
 ---
 
 ## 8. Immediate next step
-On author approval of this spec, proceed to the **writing-plans** skill to produce the SP1 implementation plan (TDD, task-by-task). SP2–SP6 are not planned until SP1 lands and its lessons are folded back in.
+On author approval of this spec, proceed to the **writing-plans** skill to produce the SP1 implementation plan (TDD, task-by-task). SP2–SP5 are not planned until SP1 lands and its lessons are folded back in.
