@@ -1130,6 +1130,110 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
     assert_eq!(decoded.iter().filter(|m| **m == Mnemonic::Ret).count(), 3);
 }
 
+// An exit value that is exactly the entry flags (`native_rflags_initial`) is
+// readable and flags a prologue `ReadFlags` capture; any other symbol the
+// replacement cannot read fails closed. `prepare` is the sound gate.
+#[test]
+fn the_entry_flags_are_readable_but_a_foreign_symbol_is_not() {
+    let cfg = conditional_cfg();
+    let (frame, exits, calls) = (constant_frame(), exits(), BTreeMap::new());
+    let input = DecodedCfgInput {
+        cfg: &cfg,
+        frame: &frame,
+        top_offset: 0,
+        image_base: 0,
+        exits: &exits,
+        native_calls: &calls,
+        memory: None,
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: VmCfgLimits::default(),
+        max_expanded_blocks: 64,
+    };
+    let mut builder = Builder {
+        input: &input,
+        nested: None,
+        nested_entries: 0,
+        expanded: 0,
+        blocks: BTreeSet::new(),
+        exit_paths: 0,
+        region_exits: 0,
+        retained_bytes: 0,
+        branches: 0,
+        loops: 0,
+        call_sites: 0,
+        read_sites: 0,
+        uses_root: false,
+        return_address_va: None,
+        uses_entry_flags: false,
+        assumptions: Vec::new(),
+        loop_bodies: BTreeMap::new(),
+        loop_phis: 0,
+        phi_widths: Vec::new(),
+        active_phis: BTreeSet::new(),
+        node_base_epoch: 0,
+        node_call_barrier: 0,
+        ancestors: Vec::new(),
+    };
+    let path = Path::default();
+    let mut steps = Vec::new();
+    let flags = Expr::register(BitWidth::W64, "native_rflags_initial");
+    builder
+        .prepare(Va(1), &flags, 0, &path, &mut steps)
+        .expect("entry flags are readable");
+    assert!(builder.uses_entry_flags, "entry-flags use is flagged for a ReadFlags capture");
+    let foreign = Expr::register(BitWidth::W64, "native_flags_of_some_other_frame");
+    assert!(
+        builder.prepare(Va(1), &foreign, 0, &path, &mut steps).is_err(),
+        "a non-entry-flags symbol must fail closed"
+    );
+}
+
+// An exit value that is the entry flags lowers to a single prologue `ReadFlags`
+// that captures the flag state the routine was entered with.
+#[test]
+fn an_entry_flags_exit_value_lowers_to_a_read_flags_capture() {
+    let mut registers: BTreeMap<X64NativeRegister, Expr> = X64NativeRegister::ALL
+        .iter()
+        .map(|register| (*register, entry(*register)))
+        .collect();
+    registers.insert(
+        X64NativeRegister::Rax,
+        Expr::register(BitWidth::W64, "native_rflags_initial"),
+    );
+    let root = Node {
+        steps: Vec::new(),
+        end: End::Exit(ExitLeaf {
+            registers,
+            rflags: None,
+            return_pop: 0,
+        }),
+    };
+    let mut config = tree_config();
+    config
+        .inputs
+        .push(("native_rflags_initial".to_owned(), PhysicalRegister::R10));
+    let replacement = build_tree_replacement(
+        &root,
+        0,
+        0,
+        0,
+        &[],
+        None,
+        None,
+        &config,
+        CodeAddress(ADDRESS),
+    )
+    .expect("entry-flags exit lowers");
+    assert_eq!(
+        count(&replacement.function.operations, |o| matches!(
+            o,
+            Operation::ReadFlags { .. }
+        )),
+        1,
+        "the entry flags are captured once in the prologue"
+    );
+}
+
 // A sub-64-bit loop-carried cell lives in its 64-bit frame slot but is read and
 // written at its own width. Declaring the phi input at that width lets the narrow
 // `next` lower; declaring it at the full 64 bits is rejected by the codegen width
@@ -1270,6 +1374,7 @@ fn prepare_read_in_node(
         read_sites: 0,
         uses_root: false,
         return_address_va: None,
+        uses_entry_flags: false,
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
@@ -1330,6 +1435,7 @@ fn prepare_read_with_ancestor(
         read_sites: 0,
         uses_root: false,
         return_address_va: None,
+        uses_entry_flags: false,
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,

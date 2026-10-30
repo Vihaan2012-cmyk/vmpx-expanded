@@ -339,6 +339,9 @@ struct Builder<'a> {
     /// materialize `native_return_address_initial` as this constant; `None` keeps
     /// the symbol unreadable so the lift fails closed.
     return_address_va: Option<u64>,
+    /// Set once a prepared value reads `native_rflags_initial`; the replacement
+    /// then captures the entry flags with a prologue `ReadFlags` into an input.
+    uses_entry_flags: bool,
     assumptions: Vec<LiftAssumption>,
     /// Natural-loop bodies keyed by header, recovered up front.
     loop_bodies: BTreeMap<Va, BTreeSet<Va>>,
@@ -855,10 +858,15 @@ impl Builder<'_> {
         // constant (see `build_tree_replacement`), which the `PreferredImageBase`
         // label flags as valid only at the preferred image base.
         let allows_return_address = self.return_address_va.is_some();
+        // The flags the routine was entered with are always readable: a prologue
+        // `ReadFlags` captures them, so a value that is (or derives from) exactly
+        // `native_rflags_initial` can be materialized. Only this exact symbol is
+        // allowed; the flags are never synthesized from anything else.
         let allowed: BTreeSet<&str> = X64NativeRegister::ALL
             .iter()
             .map(|register| register.symbolic_name())
             .chain(std::iter::once("vsp_initial"))
+            .chain(std::iter::once("native_rflags_initial"))
             .chain(allows_return_address.then_some("native_return_address_initial"))
             .chain(results.values().map(String::as_str))
             .chain(self.active_phis.iter().map(String::as_str))
@@ -880,6 +888,9 @@ impl Builder<'_> {
         }
         if dependencies.contains("native_return_address_initial") {
             self.assume(LiftAssumption::PreferredImageBase);
+        }
+        if dependencies.contains("native_rflags_initial") {
+            self.uses_entry_flags = true;
         }
         if dependencies.contains("vsp_initial") || captured_uses_root {
             self.uses_root = true;
@@ -1784,6 +1795,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         read_sites: 0,
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
+        uses_entry_flags: false,
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
@@ -1869,6 +1881,7 @@ fn lift_with_nested(
         read_sites: 0,
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
+        uses_entry_flags: false,
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
@@ -1891,11 +1904,18 @@ fn lift_with_nested(
             Expr::constant(BitWidth::W64, va),
         );
     }
+    let mut inputs: Vec<(String, PhysicalRegister)> = X64NativeRegister::ALL
+        .iter()
+        .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+        .collect();
+    // The entry flags are captured once in the prologue (a `ReadFlags` on this
+    // input, keyed in `build_tree_replacement`) so values that read them resolve
+    // to the flags the routine was actually entered with.
+    if builder.uses_entry_flags {
+        inputs.push(("native_rflags_initial".to_owned(), PhysicalRegister::R10));
+    }
     let config = ReplacementConfig {
-        inputs: X64NativeRegister::ALL
-            .iter()
-            .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
-            .collect(),
+        inputs,
         max_expression_nodes: 200_000,
         max_spill_slots: 64,
         import_calls: BTreeMap::new(),
@@ -2469,6 +2489,12 @@ fn build_tree_replacement(
         let source = emitter.register(*physical);
         if name == ENTRY_STACK_POINTER {
             emitter.operations.push(Operation::EntryStackPointer {
+                destination: source,
+            });
+        } else if name == "native_rflags_initial" {
+            // Captured before any flag-affecting op in the prologue, so this is
+            // exactly the flag state the routine was entered with.
+            emitter.operations.push(Operation::ReadFlags {
                 destination: source,
             });
         }
