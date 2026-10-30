@@ -70,13 +70,13 @@ fn main() {
             println!("  STOP: stream does not end at a recovered VM-exit handler");
             continue;
         };
-        let frame = match recover_entry_frame(
+        let (frame, top_offset) = match recover_entry_frame(
             &pe,
             candidate.rva,
             stream.profile.effect_roles.vsp,
             limits.trace,
         ) {
-            Ok(frame) => frame,
+            Ok(result) => result,
             Err(error) => {
                 println!("  STOP: entry frame not recovered: {error}");
                 continue;
@@ -86,6 +86,7 @@ fn main() {
         let input = DecodedLinearInput {
             instructions: &decode.instructions,
             frame: &frame,
+            top_offset,
             exit,
             memory: Some(&pe),
             limits: SymbolicExecutionLimits::default(),

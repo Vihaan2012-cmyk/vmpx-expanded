@@ -133,6 +133,8 @@ pub struct DecodedLinearInput<'a> {
     pub instructions: &'a [DecodedVmInstruction],
     /// Initial VM stack, top first.
     pub frame: &'a [NativeFrameSource],
+    /// VSP-to-top-cell byte offset from [`crate::recover_entry_frame`].
+    pub top_offset: u64,
     pub exit: &'a VmExitReport,
     pub memory: Option<&'a dyn SymbolicMemorySource>,
     pub limits: SymbolicExecutionLimits,
@@ -394,7 +396,7 @@ pub fn lift_decoded_linear(
             reason,
         });
     }
-    let (initial, _) = frame_initial_state(input.frame);
+    let (initial, _) = frame_initial_state(input.frame, input.top_offset);
     let symbolic = execute_symbolic_linear_block_with_initial_state(
         input.instructions,
         Some(VmHandlerSemantic::VmExit),

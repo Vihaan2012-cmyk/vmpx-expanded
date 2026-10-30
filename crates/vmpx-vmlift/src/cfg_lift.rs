@@ -51,6 +51,8 @@ pub struct DecodedCfgInput<'a> {
     pub cfg: &'a VmCfg,
     /// Initial VM stack, top first.
     pub frame: &'a [NativeFrameSource],
+    /// VSP-to-top-cell byte offset from [`crate::recover_entry_frame`].
+    pub top_offset: u64,
     /// Recovered VM-exit layouts, keyed by the exit handler's address.
     pub exits: &'a BTreeMap<Va, VmExitReport>,
     /// Proven call frames, keyed by the key of the block that ends in the call.
@@ -743,7 +745,7 @@ fn compose_nested_state(
             .ok_or_else(|| format!("exit restores no {register:?}"))?;
         replacements.insert(register.symbolic_name().to_owned(), value.clone());
     }
-    let (frame, _) = frame_initial_state(&entry.frame);
+    let (frame, _) = frame_initial_state(&entry.frame, entry.top_offset);
     let mut initial = frame.substitute(&replacements).map_err(error)?;
 
     let mut bytes: Vec<(Expr, Expr)> = Vec::new();
@@ -815,7 +817,7 @@ pub struct CfgProbe {
 /// emitting code.
 #[must_use]
 pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
-    let (initial, _) = frame_initial_state(input.frame);
+    let (initial, _) = frame_initial_state(input.frame, input.top_offset);
     let mut builder = Builder {
         input,
         nested: None,
@@ -890,7 +892,7 @@ fn lift_with_nested(
             ),
         );
     }
-    let (initial, _) = frame_initial_state(input.frame);
+    let (initial, _) = frame_initial_state(input.frame, input.top_offset);
     let mut builder = Builder {
         input,
         nested,

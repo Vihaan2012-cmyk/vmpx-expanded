@@ -19,6 +19,8 @@ pub struct NestedEntry {
     pub bytecode_start: Va,
     /// Initial VM stack of the entry, top first.
     pub frame: Vec<NativeFrameSource>,
+    /// VSP-to-top-cell byte offset from [`recover_entry_frame`].
+    pub top_offset: u64,
     /// Native address the entry's pushed return-address cell holds.
     pub continuation: Option<Va>,
 }
@@ -46,7 +48,7 @@ impl NestedEntryResolver for PeNestedEntries<'_, '_> {
             VmDiscoveryLimits::default(),
         )?;
         let stream = recover_entry_stream(self.pe, &candidate, self.limits).ok()?;
-        let frame = recover_entry_frame(
+        let (frame, top_offset) = recover_entry_frame(
             self.pe,
             candidate.rva,
             stream.profile.effect_roles.vsp,
@@ -62,6 +64,7 @@ impl NestedEntryResolver for PeNestedEntries<'_, '_> {
         Some(NestedEntry {
             bytecode_start: stream.bootstrap.initial_state.vip,
             frame,
+            top_offset,
             continuation,
         })
     }

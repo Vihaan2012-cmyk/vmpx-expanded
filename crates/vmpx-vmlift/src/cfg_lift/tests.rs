@@ -203,6 +203,7 @@ fn lift_with(
     let input = DecodedCfgInput {
         cfg,
         frame,
+        top_offset: 0,
         exits,
         native_calls: calls,
         memory: None,
@@ -615,6 +616,7 @@ fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLif
     let input = DecodedCfgInput {
         cfg: &cfg,
         frame: &frame,
+        top_offset: 0,
         exits: &exits,
         native_calls: &calls,
         memory: None,
@@ -861,6 +863,7 @@ impl NestedEntryResolver for StubResolver {
             NestedEntry {
                 bytecode_start: Va(self.bytecode_start),
                 frame: cells,
+                top_offset: 0,
                 continuation: None,
             }
         })
@@ -903,6 +906,7 @@ fn lift_nested(
     let input = DecodedCfgInput {
         cfg,
         frame,
+        top_offset: 0,
         exits: &exits,
         native_calls: &calls,
         memory: None,

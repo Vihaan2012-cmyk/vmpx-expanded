@@ -67,6 +67,7 @@ fn restore_vm_state(
 fn resolved_imports(
     cfg: &VmCfg,
     frame: &[NativeFrameSource],
+    top_offset: u64,
     memory: &dyn SymbolicMemorySource,
     limits: SymbolicExecutionLimits,
 ) -> BTreeSet<String> {
@@ -74,7 +75,7 @@ fn resolved_imports(
     let mut found = BTreeSet::new();
     let mut budget = MAX_WALK_BLOCKS;
     let mut work: Vec<(Va, SymbolicVmInitialState, Vec<Va>)> =
-        vec![(cfg.entry, frame_initial_state(frame).0, Vec::new())];
+        vec![(cfg.entry, frame_initial_state(frame, top_offset).0, Vec::new())];
     while let Some((mut key, mut state, mut trail)) = work.pop() {
         loop {
             if budget == 0 || trail.contains(&key) {
@@ -161,7 +162,7 @@ pub(crate) fn lift_entry(pe: &PeImage<'_>, rva: Rva, address: u64) -> Result<Spl
     };
     let stream = recover_entry_stream(pe, &candidate, entry_limits)
         .map_err(|error| format!("stream recovery failed: {error}"))?;
-    let frame = recover_entry_frame(
+    let (frame, top_offset) = recover_entry_frame(
         pe,
         candidate.rva,
         stream.profile.effect_roles.vsp,
@@ -182,6 +183,7 @@ pub(crate) fn lift_entry(pe: &PeImage<'_>, rva: Rva, address: u64) -> Result<Spl
             let input = DecodedLinearInput {
                 instructions: &decode.instructions,
                 frame: &frame,
+                top_offset,
                 exit,
                 memory: Some(&image),
                 limits: SymbolicExecutionLimits::default(),
@@ -223,6 +225,7 @@ pub(crate) fn lift_entry(pe: &PeImage<'_>, rva: Rva, address: u64) -> Result<Spl
     let input = DecodedCfgInput {
         cfg: &cfg,
         frame: &frame,
+        top_offset,
         exits: &exits,
         native_calls: &calls,
         memory: Some(&image),
@@ -233,7 +236,7 @@ pub(crate) fn lift_entry(pe: &PeImage<'_>, rva: Rva, address: u64) -> Result<Spl
     let lifted = lift_decoded_cfg(&input, address)
         .map_err(|error| format!("linear: {linear_error}; cfg: {error}"))?;
     let imports = if lifted.native_calls > 0 {
-        resolved_imports(&cfg, &frame, &image, SymbolicExecutionLimits::default())
+        resolved_imports(&cfg, &frame, top_offset, &image, SymbolicExecutionLimits::default())
     } else {
         BTreeSet::new()
     };

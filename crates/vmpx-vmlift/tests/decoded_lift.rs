@@ -76,6 +76,7 @@ fn lift(
         &DecodedLinearInput {
             instructions,
             frame,
+            top_offset: 0,
             exit: &exit,
             memory: None,
             limits: SymbolicExecutionLimits::default(),

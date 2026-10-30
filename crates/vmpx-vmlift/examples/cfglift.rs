@@ -75,13 +75,13 @@ fn main() {
                 continue;
             }
         };
-        let frame = match recover_entry_frame(
+        let (frame, top_offset) = match recover_entry_frame(
             &pe,
             candidate.rva,
             stream.profile.effect_roles.vsp,
             entry_limits.trace,
         ) {
-            Ok(frame) => frame,
+            Ok(result) => result,
             Err(error) => {
                 println!("  STOP: entry frame not recovered: {error}");
                 continue;
@@ -132,6 +132,7 @@ fn main() {
         let input = DecodedCfgInput {
             cfg: &cfg,
             frame: &frame,
+            top_offset,
             exits: &exits,
             native_calls: &calls,
             memory: Some(&pe),

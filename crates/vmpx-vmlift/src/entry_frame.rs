@@ -188,7 +188,39 @@ fn stored_source(
         .map(|value| NativeFrameSource::Constant { value })
 }
 
-/// Proven contents of the VM stack at VM start, top first.
+/// If `instruction` captures RSP into `vsp`, returns the byte offset from the
+/// captured VSP up to the top (last-pushed) frame cell, which sits at the live
+/// RSP. `mov vsp,rsp` sets VSP = RSP (offset 0); `lea vsp,[rsp+disp]` sets
+/// VSP = RSP + disp, so RSP = VSP - disp and the top cell sits at VSP minus the
+/// displacement. Only RSP-based, index-free, 64-bit, non-RSP destinations that
+/// match the profile's VSP register are accepted; anything else fails closed.
+fn vsp_capture_top_offset(instruction: &Instruction, vsp: Register) -> Option<u64> {
+    let vsp = canonical(vsp);
+    if instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Register
+        && instruction.op0_register().size() == 8
+        && canonical(instruction.op0_register()) == vsp
+        && canonical(instruction.op1_register()) == Register::RSP
+    {
+        return Some(0);
+    }
+    if instruction.mnemonic() == Mnemonic::Lea
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op0_register().size() == 8
+        && instruction.op0_register() != Register::RSP
+        && canonical(instruction.op0_register()) == vsp
+        && instruction.memory_base() == Register::RSP
+        && instruction.memory_index() == Register::None
+    {
+        // VSP = RSP + disp => RSP = VSP - disp; the displacement is modular.
+        return Some(0_u64.wrapping_sub(instruction.memory_displacement64()));
+    }
+    None
+}
+
+/// Proven contents of the VM stack at VM start, top first, with the byte offset
+/// from the captured VSP up to the top cell (nonzero for a `lea` capture).
 ///
 /// # Errors
 ///
@@ -199,7 +231,7 @@ pub fn recover_entry_frame(
     entry: Rva,
     vsp: Register,
     limits: DirectJumpTraceLimits,
-) -> Result<Vec<NativeFrameSource>, String> {
+) -> Result<(Vec<NativeFrameSource>, u64), String> {
     let caller = trace_direct_jump_fragments(pe, entry, limits).map_err(|e| e.to_string())?;
     let caller_instructions = caller.instructions().collect::<Vec<_>>();
     let (call_index, call) = caller_instructions
@@ -242,15 +274,9 @@ pub fn recover_entry_frame(
     let mut factory = InstructionInfoFactory::new();
     for decoded in target.instructions() {
         let instruction = &decoded.instruction;
-        if instruction.mnemonic() == Mnemonic::Mov
-            && instruction.op0_kind() == OpKind::Register
-            && instruction.op1_kind() == OpKind::Register
-            && instruction.op0_register().size() == 8
-            && canonical(instruction.op0_register()) == canonical(vsp)
-            && canonical(instruction.op1_register()) == Register::RSP
-        {
+        if let Some(top_offset) = vsp_capture_top_offset(instruction, vsp) {
             stack.reverse();
-            return Ok(stack);
+            return Ok((stack, top_offset));
         }
         match instruction.flow_control() {
             FlowControl::Next | FlowControl::UnconditionalBranch => {}
@@ -329,8 +355,13 @@ fn symbolic_value(source: &NativeFrameSource) -> Option<Expr> {
 
 /// Initial symbolic state for a frame; `usize` counts the cells with a proven
 /// value (an unknown cell stays absent so a read of it fails closed).
+/// `top_offset` is the VSP-to-top-cell offset from [`recover_entry_frame`];
+/// cell `i` lands at `vsp_initial + top_offset + i*8` (modular W64 add).
 #[must_use]
-pub fn frame_initial_state(cells: &[NativeFrameSource]) -> (SymbolicVmInitialState, usize) {
+pub fn frame_initial_state(
+    cells: &[NativeFrameSource],
+    top_offset: u64,
+) -> (SymbolicVmInitialState, usize) {
     let mut initial = SymbolicVmInitialState::default();
     let base = Expr::register(BitWidth::W64, "vsp_initial");
     let mut known = 0;
@@ -338,10 +369,11 @@ pub fn frame_initial_state(cells: &[NativeFrameSource]) -> (SymbolicVmInitialSta
         let Some(value) = symbolic_value(cell) else {
             continue;
         };
+        let offset = top_offset.wrapping_add((index as u64).wrapping_mul(8));
         let Ok(address) = Expr::binary(
             BinaryOp::Add,
             base.clone(),
-            Expr::constant(BitWidth::W64, (index as u64) * 8),
+            Expr::constant(BitWidth::W64, offset),
         ) else {
             continue;
         };
@@ -349,4 +381,63 @@ pub fn frame_initial_state(cells: &[NativeFrameSource]) -> (SymbolicVmInitialSta
         known += 1;
     }
     (initial, known)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_one(bytes: &[u8]) -> Instruction {
+        iced_x86::Decoder::with_ip(64, bytes, 0x1_4000_1000, iced_x86::DecoderOptions::NONE).decode()
+    }
+
+    #[test]
+    fn lea_form_vsp_capture_offsets_frame_and_bad_forms_fail_closed() {
+        // `lea rbp,[rsp-28h]`: VSP = RSP - 0x28, so the top cell is at VSP+0x28.
+        let lea = decode_one(&[0x48, 0x8d, 0x6c, 0x24, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea, Register::RBP), Some(0x28));
+        // `mov rbp,rsp`: VSP = RSP, top cell at VSP+0.
+        let mov = decode_one(&[0x48, 0x89, 0xe5]);
+        assert_eq!(vsp_capture_top_offset(&mov, Register::RBP), Some(0));
+
+        // Fail closed: capture register disagrees with the profile's VSP.
+        assert_eq!(vsp_capture_top_offset(&lea, Register::RSI), None);
+        assert_eq!(vsp_capture_top_offset(&mov, Register::RSI), None);
+        // Fail closed: base is not RSP (`lea rbp,[rbp-28h]`).
+        let lea_rbp = decode_one(&[0x48, 0x8d, 0x6d, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea_rbp, Register::RBP), None);
+        // Fail closed: indexed address (`lea rbp,[rsp+rax-28h]`).
+        let lea_indexed = decode_one(&[0x48, 0x8d, 0x6c, 0x04, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea_indexed, Register::RBP), None);
+
+        // The offset flows into the frame: cell i lands at vsp_initial+0x28+i*8.
+        let cells = vec![
+            NativeFrameSource::Register {
+                register: X64NativeRegister::R13,
+            },
+            NativeFrameSource::Register {
+                register: X64NativeRegister::Rcx,
+            },
+        ];
+        let (state, known) = frame_initial_state(&cells, 0x28);
+        assert_eq!(known, 2);
+        let addresses: Vec<_> = state
+            .memory_values
+            .iter()
+            .map(|(address, _)| format!("{address:?}"))
+            .collect();
+        let want = |offset: u64| {
+            format!(
+                "{:?}",
+                Expr::binary(
+                    BinaryOp::Add,
+                    Expr::register(BitWidth::W64, "vsp_initial"),
+                    Expr::constant(BitWidth::W64, offset),
+                )
+                .unwrap()
+            )
+        };
+        assert!(addresses.contains(&want(0x28)), "missing VSP+0x28: {addresses:?}");
+        assert!(addresses.contains(&want(0x30)), "missing VSP+0x30: {addresses:?}");
+    }
 }
