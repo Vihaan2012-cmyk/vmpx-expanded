@@ -23,6 +23,7 @@ mod clean_wiring;
 mod coverage_gate;
 mod decoded_splice;
 mod input_closed_functions;
+mod strip_wiring;
 mod vm_inventory;
 
 #[derive(Debug, Parser)]
@@ -58,6 +59,13 @@ enum Command {
         /// streams (slow: minutes on large inputs).
         #[arg(long, requires = "experimental")]
         decoded_lift: bool,
+        /// With `--experimental`, attempt to strip protector (non-standard-named)
+        /// sections from the reintegrated image. Only removes them when the sound
+        /// dangling-ref checker approves and the result validates; otherwise it
+        /// refuses cleanly and the written experimental image is unchanged. The
+        /// default proof-gated `output` path is never affected.
+        #[arg(long, requires = "experimental")]
+        strip: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -117,6 +125,20 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Remove named sections, writing the result only when the sound dangling-ref
+    /// checker approves and the rewritten image reparses and validates.
+    Strip {
+        input: PathBuf,
+        output: PathBuf,
+        /// A section name to remove; repeat for several. All sections with the
+        /// name are removed. At least one is required.
+        #[arg(long = "remove", value_name = "SECTION")]
+        remove: Vec<String>,
+        /// A data-directory index to drop; repeat for several. Only a directory
+        /// wholly inside a removed section may be dropped.
+        #[arg(long = "drop-directory", value_name = "INDEX")]
+        drop_directory: Vec<usize>,
     },
 }
 
@@ -737,6 +759,7 @@ fn main() -> Result<()> {
             reconstructed,
             experimental,
             decoded_lift,
+            strip,
         } => {
             if input == output {
                 bail!("refusing to overwrite the input file");
@@ -832,8 +855,53 @@ fn main() -> Result<()> {
             if let Some(path) = &experimental {
                 match &reintegrated {
                     Some(bytes) => {
-                        fs::write(path, bytes)
+                        // Optional final strip stage: additive and non-regressing.
+                        // It only ever runs on this experimental image and can only
+                        // swap in a smaller image the sound checker approved and
+                        // that validated. On refusal (the normal case for a still
+                        // protected image) the original experimental bytes are
+                        // written unchanged. The `output` path below is untouched.
+                        let to_write: std::borrow::Cow<'_, [u8]> = if strip {
+                            match strip_wiring::strip_protector_sections(bytes)? {
+                                strip_wiring::CleanStripStage::Stripped {
+                                    bytes: stripped,
+                                    summary,
+                                } => {
+                                    println!(
+                                        "[strip] removed {} protector section(s): {}",
+                                        summary.removed.len(),
+                                        summary.removed.join(", ")
+                                    );
+                                    println!(
+                                        "[strip] {} file byte(s) removed, {} relocation entry/entries dropped, {} runtime function(s) dropped",
+                                        summary.file_bytes_removed,
+                                        summary.relocation_entries_dropped,
+                                        summary.runtime_functions_dropped
+                                    );
+                                    std::borrow::Cow::Owned(stripped)
+                                }
+                                strip_wiring::CleanStripStage::Refused(failure) => {
+                                    eprintln!(
+                                        "[strip] protector sections retained (nothing removed): {failure}"
+                                    );
+                                    std::borrow::Cow::Borrowed(bytes.as_slice())
+                                }
+                                strip_wiring::CleanStripStage::NoProtectorSections => {
+                                    println!("[strip] no non-standard sections to remove");
+                                    std::borrow::Cow::Borrowed(bytes.as_slice())
+                                }
+                            }
+                        } else {
+                            std::borrow::Cow::Borrowed(bytes.as_slice())
+                        };
+                        fs::write(path, &to_write)
                             .with_context(|| format!("failed to write {}", path.display()))?;
+                        // A stripped image is validated before being offered; the
+                        // unstripped experimental image stays explicitly unverified.
+                        let disk = read_file(path)?;
+                        PeImage::parse(&disk).with_context(|| {
+                            format!("experimental output {} failed disk reparse", path.display())
+                        })?;
                         eprintln!(
                             "[experimental] WARNING: unverified devirtualized output written to {}; {} blocker(s) remain",
                             path.display(),
@@ -1161,6 +1229,14 @@ fn main() -> Result<()> {
                     println!("[oep] warning: {warning}");
                 }
             }
+        }
+        Command::Strip {
+            input,
+            output,
+            remove,
+            drop_directory,
+        } => {
+            strip_wiring::run_strip(&input, &output, &remove, &drop_directory)?;
         }
     }
     Ok(())
