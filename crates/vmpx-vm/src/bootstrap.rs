@@ -263,6 +263,14 @@ impl ConcreteBootstrapMachine {
         if let Some((value, count)) = value {
             let count_mask = if bits == 64 { 63 } else { 31 };
             let count = u32::try_from(count & count_mask).unwrap_or(0);
+            // x86 masks the count to 5 bits for 8/16/32-bit operands, so a narrow
+            // rotate can carry a count wider than the operand. Rather than underflow
+            // `bits - count` and fabricate a value, refuse: drop the destination so
+            // recovery fails closed instead of guessing.
+            if count > bits {
+                self.invalidate_register(destination);
+                return;
+            }
             let truncated = value & bit_mask(bits);
             let value = match instruction.mnemonic() {
                 Mnemonic::Rol | Mnemonic::Ror if count == 0 => truncated,
@@ -713,4 +721,38 @@ pub fn recover_bootstrap_dispatch(
         },
         selected,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::Decoder;
+
+    fn decode(bytes: &[u8]) -> Instruction {
+        Decoder::new(64, bytes, 0).decode()
+    }
+
+    #[test]
+    fn narrow_rotate_count_wider_than_operand_fails_closed() {
+        // `rol ax, 0x14`: 16-bit operand, count masked to 5 bits is 20 > 16. This
+        // previously underflowed `bits - count` and panicked; now the destination
+        // is dropped so recovery refuses the entry rather than fabricating a value.
+        let instruction = decode(&[0x66, 0xC1, 0xC0, 0x14]);
+        assert_eq!(instruction.mnemonic(), Mnemonic::Rol);
+        let mut machine = ConcreteBootstrapMachine::default();
+        machine.write_register(Register::RAX, 0x1234_5678_9abc_def0);
+        machine.execute(&instruction);
+        assert_eq!(machine.read_register(Register::RAX), None);
+    }
+
+    #[test]
+    fn narrow_rotate_count_within_operand_is_unchanged() {
+        // `rol ax, 4`: count 4 <= 16 bits stays on the concrete path (byte-identical).
+        let instruction = decode(&[0x66, 0xC1, 0xC0, 0x04]);
+        assert_eq!(instruction.mnemonic(), Mnemonic::Rol);
+        let mut machine = ConcreteBootstrapMachine::default();
+        machine.write_register(Register::RAX, 0x0000_0000_0000_1234);
+        machine.execute(&instruction);
+        assert_eq!(machine.read_register(Register::AX), Some(0x2341));
+    }
 }
