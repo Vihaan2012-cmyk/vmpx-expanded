@@ -29,7 +29,9 @@ use vmpx_vm::{
     symbolic_pointer_offset,
 };
 
-use crate::decoded_lift::{DecodedLiftError, LiftAssumption, first_unliftable, recover_stub_exit};
+use crate::decoded_lift::{
+    DecodedLiftError, LiftAssumption, RecoveredExit, first_unliftable, recover_exit,
+};
 use crate::entry_frame::frame_initial_state;
 use crate::replacement::{
     ENTRY_STACK_POINTER, Trust, canonical_register, lower_fragment_with, operation_slots,
@@ -88,8 +90,20 @@ struct ExitLeaf {
     return_pop: u32,
 }
 
+/// An exit that returns through a word of the entry frame: control transfers to
+/// `staged[0]` with the remaining words left as the continuation's stack.
+struct RegionLeaf {
+    registers: BTreeMap<X64NativeRegister, Expr>,
+    /// Flags the continuation starts with; `None` is the entry flags.
+    rflags: Option<Expr>,
+    staged: Vec<Expr>,
+    /// Offset of `staged[0]` from the initial VM stack pointer.
+    slot_offset: u32,
+}
+
 enum End {
     Exit(ExitLeaf),
+    Region(RegionLeaf),
     /// Arms are ordered by target value; the last is the fall-through.
     Branch {
         condition: Expr,
@@ -131,6 +145,9 @@ struct Builder<'a> {
     expanded: usize,
     blocks: BTreeSet<Va>,
     exit_paths: usize,
+    region_exits: usize,
+    /// Largest staged continuation stack over all region exits, in bytes.
+    retained_bytes: u32,
     branches: usize,
     call_sites: usize,
     uses_root: bool,
@@ -420,13 +437,54 @@ impl Builder<'_> {
                             format!("no recovered VM-exit layout for handler {handler}"),
                         );
                     };
-                    let exit =
-                        recover_stub_exit(&report, layout, input.frame.len()).map_err(|error| {
+                    let recovered =
+                        recover_exit(&report, layout, input.frame.len()).map_err(|error| {
                             DecodedLiftError::Cfg {
                                 block: key,
                                 reason: error.to_string(),
                             }
                         })?;
+                    let exit = match recovered {
+                        RecoveredExit::Callee(exit) => exit,
+                        RecoveredExit::Region(exit) => {
+                            let rflags = if is_native_rflags_initial(&exit.rflags) {
+                                None
+                            } else {
+                                if symbolic_pointer_offset(&exit.rflags, "vsp_initial").is_some() {
+                                    return refuse(
+                                        key,
+                                        "the region exit flags are a stack pointer",
+                                    );
+                                }
+                                Some(self.prepare(key, &exit.rflags, path.barrier, &path)?)
+                            };
+                            let mut registers = BTreeMap::new();
+                            for (register, value) in &exit.registers {
+                                registers.insert(
+                                    *register,
+                                    self.prepare(key, value, path.barrier, &path)?,
+                                );
+                            }
+                            let mut staged = Vec::with_capacity(exit.staged.len());
+                            for word in &exit.staged {
+                                staged.push(self.prepare(key, word, path.barrier, &path)?);
+                            }
+                            let bytes = u32::try_from(staged.len() * 8).unwrap_or(u32::MAX);
+                            self.retained_bytes = self.retained_bytes.max(bytes);
+                            self.region_exits += 1;
+                            self.exit_paths += 1;
+                            self.uses_root = true;
+                            return Ok(Node {
+                                steps,
+                                end: End::Region(RegionLeaf {
+                                    registers,
+                                    rflags,
+                                    staged,
+                                    slot_offset: exit.slot_offset,
+                                }),
+                            });
+                        }
+                    };
                     if !is_native_rflags_initial(&exit.rflags) {
                         return refuse(
                             key,
@@ -627,6 +685,8 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
+        region_exits: 0,
+        retained_bytes: 0,
         branches: 0,
         call_sites: 0,
         uses_root: false,
@@ -674,6 +734,8 @@ pub fn lift_decoded_cfg(
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
+        region_exits: 0,
+        retained_bytes: 0,
         branches: 0,
         call_sites: 0,
         uses_root: false,
@@ -698,8 +760,15 @@ pub fn lift_decoded_cfg(
     let frame_bytes = builder
         .uses_root
         .then(|| u32::try_from(input.frame.len() * 8).unwrap_or(u32::MAX));
-    let replacement =
-        build_tree_replacement(&root, builder.call_sites, frame_bytes, &config, address)?;
+    let region = (builder.region_exits > 0).then_some(builder.retained_bytes);
+    let replacement = build_tree_replacement(
+        &root,
+        builder.call_sites,
+        frame_bytes,
+        region,
+        &config,
+        address,
+    )?;
     Ok(LiftedCfgFunction {
         replacement,
         blocks: builder.blocks,
@@ -725,6 +794,9 @@ struct Emitter<'c> {
     call_result_base: u16,
     result_base: u16,
     scratch_base: u16,
+    /// Spill slot holding the flags the function was entered with; present
+    /// only when a region exit must hand them to its continuation.
+    flags_slot: Option<SpillSlot>,
 }
 
 impl Emitter<'_> {
@@ -840,14 +912,64 @@ impl Emitter<'_> {
     }
 
     fn emit_exit(&mut self, leaf: &ExitLeaf) -> Result<(), ReplacementError> {
+        self.stash_exit_registers(&leaf.registers)?;
+        self.load_exit_registers();
+        self.operations.push(Operation::ReturnPopping {
+            bytes: leaf.return_pop,
+        });
+        Ok(())
+    }
+
+    /// Stages the continuation's stack in the top of the frame, restores the
+    /// entry flags, loads the exit registers and returns through the staged
+    /// target. The frame keeps those top bytes free of spill slots.
+    fn emit_region(&mut self, leaf: &RegionLeaf) -> Result<(), ReplacementError> {
+        self.stash_exit_registers(&leaf.registers)?;
+        for (index, word) in leaf.staged.iter().enumerate() {
+            let offset = u64::from(leaf.slot_offset) + 8 * index as u64;
+            let address = Expr::binary(
+                BinaryOp::Add,
+                Expr::register(BitWidth::W64, "vsp_initial"),
+                Expr::constant(BitWidth::W64, offset),
+            )
+            .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+            self.emit_store(&EffectStore {
+                address,
+                value: word.clone(),
+                width: BitWidth::W64,
+            })?;
+        }
+        let value = if let Some(rflags) = &leaf.rflags {
+            self.lower(rflags)?
+        } else {
+            let slot = self.flags_slot.ok_or_else(|| {
+                ReplacementError::EffectBindings(
+                    "region exit without a captured flag state".to_owned(),
+                )
+            })?;
+            let value = self.register(PhysicalRegister::R10);
+            self.operations.push(Operation::SpillLoad {
+                destination: value,
+                slot,
+            });
+            value
+        };
+        self.operations.push(Operation::RestoreFlags { value });
+        self.load_exit_registers();
+        let bytes = u32::try_from(leaf.staged.len() * 8).unwrap_or(u32::MAX);
+        self.operations.push(Operation::ReturnRetaining { bytes });
+        Ok(())
+    }
+
+    fn stash_exit_registers(
+        &mut self,
+        registers: &BTreeMap<X64NativeRegister, Expr>,
+    ) -> Result<(), ReplacementError> {
         for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
-            let expression = leaf
-                .registers
-                .get(register)
-                .ok_or(ReplacementError::Lowering {
-                    register: *register,
-                    message: "the exit state has no value for this register".to_owned(),
-                })?;
+            let expression = registers.get(register).ok_or(ReplacementError::Lowering {
+                register: *register,
+                message: "the exit state has no value for this register".to_owned(),
+            })?;
             let value = self.lower(expression).map_err(|error| match error {
                 ReplacementError::Effect(inner) => ReplacementError::Lowering {
                     register: *register,
@@ -861,16 +983,16 @@ impl Emitter<'_> {
                 source: value,
             });
         }
+        Ok(())
+    }
+
+    fn load_exit_registers(&mut self) {
         for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
             let destination = self.register(physical_for(register));
             let slot = SpillSlot(self.result_base + u16::try_from(index).unwrap_or(u16::MAX));
             self.operations
                 .push(Operation::SpillLoad { destination, slot });
         }
-        self.operations.push(Operation::ReturnPopping {
-            bytes: leaf.return_pop,
-        });
-        Ok(())
     }
 
     fn emit_node(&mut self, node: &Node) -> Result<(), ReplacementError> {
@@ -882,6 +1004,7 @@ impl Emitter<'_> {
         }
         match &node.end {
             End::Exit(leaf) => self.emit_exit(leaf),
+            End::Region(leaf) => self.emit_region(leaf),
             End::Branch { condition, arms } => {
                 let Some((last, taken)) = arms.split_last() else {
                     return Err(ReplacementError::EffectBindings(
@@ -936,6 +1059,7 @@ fn build_tree_replacement(
     root: &Node,
     call_count: usize,
     stack_root_bytes: Option<u32>,
+    region_retained: Option<u32>,
     config: &ReplacementConfig,
     address: CodeAddress,
 ) -> Result<Replacement, ReplacementError> {
@@ -970,7 +1094,8 @@ fn build_tree_replacement(
         .ok_or(ReplacementError::TooManyInputs)?;
     let register_count = u16::try_from(X64NativeRegister::ALL.len()).unwrap_or(u16::MAX);
     let scratch_base = result_base + register_count;
-    let shared_end = scratch_base + CALL_SCRATCH_SLOTS;
+    let flags_slot = region_retained.map(|_| SpillSlot(scratch_base + CALL_SCRATCH_SLOTS));
+    let shared_end = scratch_base + CALL_SCRATCH_SLOTS + u16::from(flags_slot.is_some());
 
     let mut inputs = Vec::with_capacity(config.inputs.len() + call_count);
     for (index, (name, _)) in config.inputs.iter().enumerate() {
@@ -1002,6 +1127,7 @@ fn build_tree_replacement(
         call_result_base,
         result_base,
         scratch_base,
+        flags_slot,
     };
     for (index, (name, physical)) in config.inputs.iter().enumerate() {
         let source = emitter.register(*physical);
@@ -1013,6 +1139,16 @@ fn build_tree_replacement(
         emitter.operations.push(Operation::SpillStore {
             slot: SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?),
             source,
+        });
+    }
+    if let Some(slot) = flags_slot {
+        let destination = emitter.register(PhysicalRegister::R10);
+        emitter
+            .operations
+            .push(Operation::ReadFlags { destination });
+        emitter.operations.push(Operation::SpillStore {
+            slot,
+            source: destination,
         });
     }
     emitter.emit_node(root)?;
@@ -1040,11 +1176,16 @@ fn build_tree_replacement(
         .iter()
         .any(|operation| matches!(operation, Operation::Call { .. }));
     let mut stack_allocation = u32::from(highest.saturating_add(1)).saturating_mul(8);
+    let pushes = u32::try_from(preserve.len())
+        .map_err(|_| ReplacementError::TooManyInputs)?
+        .saturating_mul(8);
+    // The staged continuation stack overwrites the frame top, which must hold
+    // no spill slot: the saved registers there are discarded by a tail transfer.
+    if let Some(retained) = region_retained {
+        stack_allocation = stack_allocation.saturating_add(retained.saturating_sub(pushes));
+    }
     if call_ready {
         stack_allocation = stack_allocation.saturating_add(32);
-        let pushes = u32::try_from(preserve.len())
-            .map_err(|_| ReplacementError::TooManyInputs)?
-            .saturating_mul(8);
         let residual = (8_u32.wrapping_sub(pushes.saturating_add(stack_allocation))) & 0xF;
         stack_allocation = stack_allocation.saturating_add(residual);
     }

@@ -361,6 +361,7 @@ impl Renamer {
                 target: self.label(target)?,
             },
             Operation::ReturnPopping { bytes } => Operation::ReturnPopping { bytes },
+            Operation::ReturnRetaining { bytes } => Operation::ReturnRetaining { bytes },
             Operation::Return => Operation::Return,
         })
     }

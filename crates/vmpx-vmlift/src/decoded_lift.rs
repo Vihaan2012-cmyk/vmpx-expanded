@@ -177,25 +177,64 @@ pub struct StubExit {
     pub return_pop: u32,
 }
 
+/// An exit that transfers to a computed target instead of returning to the
+/// caller: the `ret` pops a word the entry frame held, so the continuation runs
+/// on the stack the VM left inside that frame.
+#[derive(Debug)]
+pub struct RegionExit {
+    pub registers: BTreeMap<X64NativeRegister, Expr>,
+    pub rflags: Expr,
+    /// Words from the `ret` slot up to the entry stack pointer, lowest first.
+    /// Word zero is the computed target; the rest are the continuation's stack.
+    pub staged: Vec<Expr>,
+    /// Offset of the `ret` slot from the initial VM stack pointer.
+    pub slot_offset: u32,
+}
+
+#[derive(Debug)]
+pub enum RecoveredExit {
+    Callee(StubExit),
+    Region(RegionExit),
+}
+
 fn add_offset(base: &Expr, offset: u32) -> Result<Expr, DecodedLiftError> {
     Expr::binary(BinaryOp::Add, base.clone(), Expr::constant(BitWidth::W64, u64::from(offset)))
         .map_err(|error| DecodedLiftError::NativeExit(error.to_string()))
 }
 
-/// Reads the exit frame from the symbolic VM stack. The saved registers and
-/// flags must be tracked values; the return address must be a slot the VM never
-/// wrote (untouched caller stack), at or above the entry stack pointer, so a
-/// native `ret` after `add rsp, pop` reads exactly the same word.
+/// Recovers a clean callee-return exit; a region exit is refused.
 ///
 /// # Errors
 ///
-/// Refuses an exit that returns into the protector's own continuation, returns
-/// through a computed or VM-written address, or has an inconsistent layout.
+/// See [`recover_exit`]; additionally refuses a region exit.
 pub fn recover_stub_exit(
     symbolic: &vmpx_vm::SymbolicVmExecutionReport,
     exit: &VmExitReport,
     frame_cells: usize,
 ) -> Result<StubExit, DecodedLiftError> {
+    match recover_exit(symbolic, exit, frame_cells)? {
+        RecoveredExit::Callee(exit) => Ok(exit),
+        RecoveredExit::Region(_) => Err(DecodedLiftError::NotCalleeReturn(
+            "the return address was written by the VM, not read from caller stack".to_owned(),
+        )),
+    }
+}
+
+/// Reads the exit frame from the symbolic VM stack. The saved registers and
+/// flags must be tracked values. A return address the VM never wrote (untouched
+/// caller stack) at or above the entry stack pointer is a callee return, so a
+/// native `ret` after `add rsp, pop` reads exactly the same word. A return
+/// address held in a tracked cell of the entry frame is a region exit.
+///
+/// # Errors
+///
+/// Refuses a return through a VM-written slot outside the entry frame, an
+/// untracked staged word, or an inconsistent layout.
+pub fn recover_exit(
+    symbolic: &vmpx_vm::SymbolicVmExecutionReport,
+    exit: &VmExitReport,
+    frame_cells: usize,
+) -> Result<RecoveredExit, DecodedLiftError> {
     let fail = |message: String| DecodedLiftError::NativeExit(message);
     if exit.status != vmpx_vm::RecoveryStatus::Recovered {
         return Err(fail("VM exit layout is not proven".to_owned()));
@@ -228,17 +267,39 @@ pub fn recover_stub_exit(
     }
     let rflags = read(flags_offset)?;
 
+    let entry_sp = i64::try_from(frame_cells * 8).unwrap_or(i64::MAX);
+    let return_slot = final_offset + i64::from(return_offset);
     match read(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
         Err(error) => return Err(error),
+        Ok(_) if (0..entry_sp).contains(&return_slot) && return_slot % 8 == 0 => {
+            let mut staged = Vec::new();
+            for slot in (return_slot..entry_sp).step_by(8) {
+                let address = Expr::binary(
+                    BinaryOp::Add,
+                    symbolic.final_vsp.clone(),
+                    Expr::constant(BitWidth::W64, (slot - final_offset).cast_unsigned()),
+                )
+                .map_err(|error| fail(error.to_string()))?;
+                staged.push(
+                    symbolic
+                        .read_tracked_memory(address, BitWidth::W64)
+                        .map_err(|error| fail(error.to_string()))?,
+                );
+            }
+            return Ok(RecoveredExit::Region(RegionExit {
+                registers,
+                rflags,
+                staged,
+                slot_offset: u32::try_from(return_slot).map_err(|error| fail(error.to_string()))?,
+            }));
+        }
         Ok(_) => {
             return Err(DecodedLiftError::NotCalleeReturn(
                 "the return address was written by the VM, not read from caller stack".to_owned(),
             ));
         }
     }
-    let entry_sp = i64::try_from(frame_cells * 8).unwrap_or(i64::MAX);
-    let return_slot = final_offset + i64::from(return_offset);
     if return_slot < entry_sp {
         return Err(DecodedLiftError::NotCalleeReturn(
             "the exit returns into the entry frame (the protector's continuation)".to_owned(),
@@ -248,11 +309,11 @@ pub fn recover_stub_exit(
         .ok()
         .filter(|pop| pop % 8 == 0)
         .ok_or_else(|| DecodedLiftError::NotCalleeReturn("unaligned stack unwind".to_owned()))?;
-    Ok(StubExit {
+    Ok(RecoveredExit::Callee(StubExit {
         registers,
         rflags,
         return_pop,
-    })
+    }))
 }
 
 /// First instruction with no verified lowering, if any.

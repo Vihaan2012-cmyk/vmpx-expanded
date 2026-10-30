@@ -262,6 +262,13 @@ pub enum Operation {
     ReturnPopping {
         bytes: u32,
     },
+    /// Releases the frame except its top `bytes` bytes, which the body staged as
+    /// the continuation's stack, then returns through the qword now at the stack
+    /// pointer. The adjustment is a `lea`, so flags are untouched. The retained
+    /// bytes must lie within the frame.
+    ReturnRetaining {
+        bytes: u32,
+    },
     /// Loads the stack pointer the function was entered with (its return-address
     /// slot), undoing the prologue's pushes and allocation.
     EntryStackPointer {

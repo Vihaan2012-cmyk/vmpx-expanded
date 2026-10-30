@@ -1143,6 +1143,7 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
             destination: register(destination),
         },
         Operation::ReturnPopping { bytes } => Operation::ReturnPopping { bytes },
+        Operation::ReturnRetaining { bytes } => Operation::ReturnRetaining { bytes },
         Operation::Return => Operation::Return,
     }
 }

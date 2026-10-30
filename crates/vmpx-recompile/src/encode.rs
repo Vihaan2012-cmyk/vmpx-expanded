@@ -1114,6 +1114,23 @@ pub fn compile(
                 }
                 append_assembled(&mut output, address, operation_index, CodeAssembler::ret)?;
             }
+            Operation::ReturnRetaining { bytes } => {
+                let pushed = u32::try_from(function.frame.preserve.len())
+                    .map_err(|_| CompileError::CodeSizeOverflow)?
+                    .saturating_mul(8);
+                let total = pushed.saturating_add(function.frame.stack_allocation);
+                let release = total
+                    .checked_sub(*bytes)
+                    .ok_or(CompileError::StackAllocationTooLarge { bytes: *bytes })?;
+                if release != 0 {
+                    let release = i32::try_from(release)
+                        .map_err(|_| CompileError::StackAllocationTooLarge { bytes: release })?;
+                    append_assembled(&mut output, address, operation_index, |assembler| {
+                        assembler.lea(rsp, qword_ptr(rsp + release))
+                    })?;
+                }
+                append_assembled(&mut output, address, operation_index, CodeAssembler::ret)?;
+            }
             Operation::Return => {
                 emit_epilogue(&mut output, function, address, operation_index)?;
             }

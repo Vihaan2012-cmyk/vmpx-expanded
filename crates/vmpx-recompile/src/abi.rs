@@ -71,6 +71,7 @@ fn operation_register_accesses(
         | Operation::RestoreFlags { .. }
         | Operation::Cpuid { .. }
         | Operation::ReturnPopping { .. }
+        | Operation::ReturnRetaining { .. }
         | Operation::Return => {}
         Operation::ReadFlags { destination } | Operation::EntryStackPointer { destination } => {
             written.insert(*destination);
@@ -304,6 +305,7 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::RestoreFlags { .. }
         | Operation::Cpuid { .. }
         | Operation::ReturnPopping { .. }
+        | Operation::ReturnRetaining { .. }
         | Operation::Return => Ok(()),
     }
 }
@@ -317,7 +319,10 @@ fn operation_successors(
     match &function.operations[index] {
         // A return and an absolute tail jump both end the block: control leaves
         // the function and never reaches the next operation.
-        Operation::Return | Operation::ReturnPopping { .. } | Operation::JumpToAddress(_) => {}
+        Operation::Return
+        | Operation::ReturnPopping { .. }
+        | Operation::ReturnRetaining { .. }
+        | Operation::JumpToAddress(_) => {}
         Operation::Jump(label) => {
             if let Some(target) = labels.get(label) {
                 successors.push(*target);
@@ -822,7 +827,10 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
                 Operation::BranchIf { target, .. } => {
                     referenced.insert(*target);
                 }
-                Operation::Return | Operation::ReturnPopping { .. } | Operation::JumpToAddress(_) => {
+                Operation::Return
+                | Operation::ReturnPopping { .. }
+                | Operation::ReturnRetaining { .. }
+                | Operation::JumpToAddress(_) => {
                     terminated = true;
                 }
                 _ => {}

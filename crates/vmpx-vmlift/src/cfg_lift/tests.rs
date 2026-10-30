@@ -517,7 +517,8 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
         },
     };
     let replacement =
-        build_tree_replacement(&root, 0, None, &tree_config(), CodeAddress(ADDRESS)).expect("emit");
+        build_tree_replacement(&root, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
+            .expect("emit");
     let operations = &replacement.function.operations;
     assert_eq!(
         count(operations, |o| matches!(o, Operation::BranchIf { .. })),
@@ -591,6 +592,8 @@ fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLif
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
+        region_exits: 0,
+        retained_bytes: 0,
         branches: 0,
         call_sites: 0,
         uses_root: false,
@@ -645,4 +648,123 @@ fn a_read_that_a_native_call_crossed_refuses_but_a_later_store_does_not() {
     assert!(prepare_read(&path, 10, 0xb78).is_err());
     assert!(prepare_read(&path, 15, 0xb78).is_ok());
     assert!(prepare_read(&path_with_store(0xb78, 4), 20, 0xb78).is_ok());
+}
+
+const REGION_TARGET: u64 = 0x4000_1234;
+const REGION_WORD: u64 = 0xAA;
+
+/// The exit's `ret` slot is the entry frame's second-to-last cell: a computed
+/// return into the continuation, with one staged word above it.
+fn region_frame(target: NativeFrameSource, staged: NativeFrameSource) -> Vec<NativeFrameSource> {
+    let mut cells = constant_frame();
+    cells[14] = NativeFrameSource::Rflags;
+    cells[15] = target;
+    cells[16] = staged;
+    cells
+}
+
+fn region_cfg() -> VmCfg {
+    cfg(vec![returns_constant(0xA0, 0x900, 111)], Vec::new(), 0xA0)
+}
+
+#[test]
+fn a_proven_computed_return_lifts_as_a_region_transfer_to_the_target() {
+    let frame = region_frame(
+        NativeFrameSource::Constant {
+            value: REGION_TARGET,
+        },
+        NativeFrameSource::Constant { value: REGION_WORD },
+    );
+    let lifted = lift(&region_cfg(), &frame, &BTreeMap::new()).expect("region exit lifts");
+    assert_eq!(lifted.exit_paths, 1);
+    assert!(lifted.assumptions.is_empty(), "{:?}", lifted.assumptions);
+
+    let function = &lifted.replacement.function;
+    let operations = &function.operations;
+    assert_eq!(
+        count(operations, |o| matches!(
+            o,
+            Operation::ReturnRetaining { bytes: 16 }
+        )),
+        1
+    );
+    assert_eq!(
+        count(operations, |o| matches!(
+            o,
+            Operation::ReturnPopping { .. } | Operation::Return
+        )),
+        0
+    );
+    for word in [REGION_TARGET, REGION_WORD] {
+        assert_eq!(
+            count(operations, |o| matches!(
+                o,
+                Operation::MoveImmediate { value, .. } if *value == word
+            )),
+            1,
+            "staged word {word:#x}"
+        );
+    }
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::Store { .. })),
+        2
+    );
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::ReadFlags { .. })),
+        1
+    );
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::RestoreFlags { .. })),
+        1
+    );
+
+    let instructions: Vec<_> = Decoder::with_ip(
+        64,
+        &lifted.replacement.compiled.bytes,
+        ADDRESS,
+        DecoderOptions::NONE,
+    )
+    .iter()
+    .collect();
+    let [.., release, ret] = &instructions[..] else {
+        panic!("function too short");
+    };
+    let frame_total =
+        function.frame.preserve.len() as u64 * 8 + u64::from(function.frame.stack_allocation);
+    assert!(frame_total >= 16);
+    assert_eq!(ret.mnemonic(), Mnemonic::Ret);
+    assert_eq!(release.mnemonic(), Mnemonic::Lea);
+    assert_eq!(release.op0_register(), iced_x86::Register::RSP);
+    assert_eq!(release.memory_displacement64(), frame_total - 16);
+}
+
+#[test]
+fn an_unproven_computed_return_refuses() {
+    let word = NativeFrameSource::Constant { value: REGION_WORD };
+    let unknown = || NativeFrameSource::Unknown {
+        description: "unproven".to_owned(),
+    };
+    let cases = [
+        // The protector's own return address is not a value the lift can read.
+        region_frame(
+            NativeFrameSource::ReturnAddress {
+                call_site: Rva(0x10),
+                continuation: Rva(0x20),
+            },
+            word.clone(),
+        ),
+        // A staged continuation word the entry frame never proved.
+        region_frame(
+            NativeFrameSource::Constant {
+                value: REGION_TARGET,
+            },
+            unknown(),
+        ),
+        // The ret slot itself is unproven.
+        region_frame(unknown(), word),
+    ];
+    for frame in cases {
+        let error = lift(&region_cfg(), &frame, &BTreeMap::new()).expect_err("must refuse");
+        assert!(matches!(error, DecodedLiftError::Cfg { .. }), "{error}");
+    }
 }
