@@ -8,7 +8,7 @@ use thiserror::Error;
 use vmpx_disasm::{
     DirectJumpTraceLimits, DisasmError, RegisterDispatchProofLimits, trace_direct_jump_fragments,
 };
-use vmpx_pe::{PeImage, Rva, Va};
+use vmpx_pe::{ImageBase, PeImage, Rva, Section, Va};
 
 use crate::{
     BytecodeDirection, HandlerRegisterRoles, HandlerSliceConfig, NativeBackwardSlice,
@@ -535,6 +535,36 @@ fn evaluate_initial_state(
     })
 }
 
+/// True when `anchor` resolves to a byte that the image maps.
+///
+/// The bootstrap dispatch anchor is the first handler's code address (inline
+/// threaded dispatch) or the dispatch table's base (table-indexed dispatch).
+/// Either way a real anchor is a static address inside the image; a null or
+/// out-of-image anchor cannot be dispatched from or indexed, so the role
+/// assignment that produced it is not a real VM.
+fn anchor_maps_into(sections: &[Section], image_base: ImageBase, anchor: Va) -> bool {
+    image_base
+        .checked_rva_of(anchor)
+        .is_some_and(|rva| sections.iter().any(|section| section.contains_mapped_rva(rva)))
+}
+
+fn anchor_is_mapped(pe: &PeImage<'_>, anchor: Va) -> bool {
+    anchor_maps_into(&pe.sections, pe.optional.image_base, anchor)
+}
+
+/// Indices of the behaviorally valid assignments whose dispatch anchor maps
+/// into the image. When exactly one survives, the caller selects it; when two
+/// or more survive the anchor evidence is inconclusive and the caller still
+/// fails closed.
+fn mapped_anchor_indices(anchors: &[Va], is_mapped: impl Fn(Va) -> bool) -> Vec<usize> {
+    anchors
+        .iter()
+        .enumerate()
+        .filter(|(_, anchor)| is_mapped(**anchor))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// Recovers a VM entry bootstrap's dispatch register roles and keyed relative
 /// transform by enumerating architectural role assignments and accepting only
 /// behaviorally valid dispatch slices. No handler bytes, addresses, or fixed
@@ -678,6 +708,41 @@ pub fn recover_bootstrap_dispatch(
             }
         }
     }
+    // Some role enumerations survive the behavioral dispatch checks yet produce
+    // a dispatch anchor the image does not map (e.g. the rolling-key role lands
+    // on the register that actually holds the table base, so the handler falls
+    // back to an uninitialized register and the anchor collapses to null). Such
+    // an assignment cannot be a real VM; drop it. This is sound because a true
+    // anchor is always a static in-image address, so a mapped candidate is
+    // never discarded. If two or more mapped anchors remain the evidence is
+    // inconclusive and recovery still fails closed below.
+    {
+        let anchors: Vec<Va> = recovered
+            .iter()
+            .map(|candidate| candidate.initial_state.handler)
+            .collect();
+        let keep = mapped_anchor_indices(&anchors, |anchor| anchor_is_mapped(pe, anchor));
+        if keep.len() < recovered.len() {
+            let dropped = recovered.len() - keep.len();
+            for index in (0..recovered.len()).rev() {
+                if !keep.contains(&index) {
+                    let candidate = &recovered[index];
+                    if rejection_samples.len() < 64 {
+                        rejection_samples.push(format!(
+                            "VIP {:?}, key {:?}, handler {:?}, direction {:?}: dispatch anchor {} is not a mapped image address",
+                            candidate.roles.vip,
+                            candidate.roles.rolling_key,
+                            candidate.roles.handler,
+                            candidate.bytecode_direction,
+                            candidate.initial_state.handler
+                        ));
+                    }
+                    recovered.remove(index);
+                }
+            }
+            rejected = rejected.saturating_add(dropped);
+        }
+    }
     recovered.sort_by_key(|candidate| {
         (
             format!("{:?}", candidate.roles.vip),
@@ -727,9 +792,66 @@ pub fn recover_bootstrap_dispatch(
 mod tests {
     use super::*;
     use iced_x86::Decoder;
+    use vmpx_pe::FileOffset;
 
     fn decode(bytes: &[u8]) -> Instruction {
         Decoder::new(64, bytes, 0).decode()
+    }
+
+    fn section(virtual_address: u32, span: u32, characteristics: u32) -> Section {
+        Section {
+            index: 0,
+            name: String::new(),
+            name_bytes: [0; 8],
+            virtual_size: span,
+            virtual_address: Rva(virtual_address),
+            size_of_raw_data: span,
+            pointer_to_raw_data: FileOffset(0),
+            pointer_to_relocations: FileOffset(0),
+            pointer_to_linenumbers: FileOffset(0),
+            number_of_relocations: 0,
+            number_of_linenumbers: 0,
+            characteristics,
+        }
+    }
+
+    #[test]
+    fn anchor_mapping_separates_in_image_from_null_or_out_of_image() {
+        let base = ImageBase(0x1_8000_0000);
+        let sections = [section(0x3000, 0xf5e76, 0x6000_0020)];
+        // A static in-image handler/table base maps.
+        assert!(anchor_maps_into(&sections, base, Va(0x1_8006_7B30)));
+        // The spurious null anchor does not map.
+        assert!(!anchor_maps_into(&sections, base, Va(0x0)));
+        // Below the image base and past the last section also fail.
+        assert!(!anchor_maps_into(&sections, base, Va(0x1000)));
+        assert!(!anchor_maps_into(&sections, base, Va(0x1_8020_0000)));
+    }
+
+    #[test]
+    fn two_assignments_with_one_mapped_anchor_select_that_one() {
+        // Models the observed mba/hfnv stall: both role assignments pass the
+        // behavioral dispatch checks, but only one has a mapped dispatch anchor.
+        let anchors = [Va(0x0), Va(0x1_8006_7B30)];
+        let mapped = |anchor: Va| anchor != Va(0x0);
+        assert_eq!(mapped_anchor_indices(&anchors, mapped), vec![1]);
+    }
+
+    #[test]
+    fn two_mapped_anchors_stay_ambiguous_and_fail_closed() {
+        // When the anchor evidence cannot distinguish the assignments, both are
+        // retained; the caller selects only when exactly one survives, so this
+        // keeps failing closed rather than guessing.
+        let anchors = [Va(0x1_8006_7B30), Va(0x1_8007_0000)];
+        let mapped = |_: Va| true;
+        assert_eq!(mapped_anchor_indices(&anchors, mapped), vec![0, 1]);
+    }
+
+    #[test]
+    fn no_mapped_anchor_retains_nothing() {
+        let anchors = [Va(0x0), Va(0x10)];
+        let mapped = |anchor: Va| anchor.0 >= 0x1_8000_0000;
+        assert!(mapped_anchor_indices(&anchors, mapped).is_empty());
     }
 
     #[test]
