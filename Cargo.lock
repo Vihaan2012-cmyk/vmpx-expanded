@@ -2762,6 +2762,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-mutation"
+version = "0.1.0"
+dependencies = [
+ "vmpx-vm",
+]
+
+[[package]]
 name = "vmpx-pe"
 version = "0.1.0"
 dependencies = [
@@ -2788,6 +2795,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-solvers"
+version = "0.1.0"
+dependencies = [
+ "vmpx-mutation",
+ "vmpx-vm",
+]
+
+[[package]]
+name = "vmpx-tournament"
+version = "0.1.0"
+dependencies = [
+ "vmpx-mutation",
+]
+
+[[package]]
 name = "vmpx-ui"
 version = "0.1.0"
 dependencies = [
@@ -2805,6 +2827,14 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "vmpx-pe",
+]
+
+[[package]]
+name = "vmpx-verify"
+version = "0.1.0"
+dependencies = [
+ "vmpx-mutation",
+ "vmpx-vm",
 ]
 
 [[package]]

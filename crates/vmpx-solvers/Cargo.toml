@@ -1,0 +1,13 @@
+[package]
+name = "vmpx-solvers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmpx-mutation = { path = "../vmpx-mutation" }
+vmpx-vm = { path = "../vmpx-vm" }
+
+[lints]
+workspace = true
