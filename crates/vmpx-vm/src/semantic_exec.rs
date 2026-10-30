@@ -567,6 +567,21 @@ impl<'a> SymbolicMachine<'a> {
         self.write_memory_bytes(&address, value)
     }
 
+    /// Sound over-approximation of a store whose address cannot be placed in a
+    /// tracked region: discard the byte-addressed tracked memory it may alias
+    /// and taint it. Loads afterwards return fresh unknowns, never a stale
+    /// cached or image-source byte. The vreg file is untouched.
+    fn havoc_external_store(&mut self, instruction_index: usize) -> Result<(), String> {
+        self.advance_memory_epoch()?;
+        self.memory.clear();
+        self.memory_tainted = true;
+        self.memory_havocs.push(SymbolicMemoryHavoc {
+            instruction_index,
+            cause: "external store address may alias tracked VM memory".to_owned(),
+        });
+        Ok(())
+    }
+
     fn load_external(&mut self, address: Expr, width: BitWidth) -> Result<Expr, String> {
         let address = canonicalize_pointer(address);
         if matches!(address.kind, ExprKind::Const { value: 0 }) {
@@ -585,12 +600,22 @@ impl<'a> SymbolicMachine<'a> {
         value: Expr,
     ) -> Result<(), String> {
         let address = canonicalize_pointer(address);
-        if !is_proven_region_pointer(&address) {
-            return Err(
-                "external store address is not in a proven symbolic memory region".to_owned(),
-            );
+        if is_proven_region_pointer(&address) {
+            // The address provably lies in a tracked region (VM stack / proven
+            // allocation / concrete). Update tracked memory precisely.
+            self.store_memory(&address, &value)?;
+        } else {
+            // The address cannot be placed in a tracked region, so it may alias
+            // any byte-addressed tracked cell. We cannot prove disjointness, so
+            // over-approximate soundly rather than assume no alias: discard the
+            // precise byte-addressed memory and mark it tainted. Tainting
+            // disables image-source reads (so a later load cannot read a stale
+            // original image byte for an address this write may have changed)
+            // and refuses cross-block resumption. The VM-private vreg file is a
+            // separate namespace the store path cannot reach, so it is kept.
+            // The write itself is still recorded below, so the lift preserves it.
+            self.havoc_external_store(instruction_index)?;
         }
-        self.store_memory(&address, &value)?;
         self.external_writes.push(SymbolicMemoryWrite {
             instruction_index,
             address,
@@ -2508,23 +2533,78 @@ mod tests {
         assert!(error.message.contains("initial symbolic memory exceeds"));
     }
 
+    // A store to a proven-region address resolves precisely and is recorded as
+    // a side effect, leaving memory untainted and resumable (no regression of
+    // the tracked-store path DllMain relies on).
     #[test]
-    fn symbolic_store_rejects_unbounded_aliases() {
-        let mut machine = SymbolicMachine::new(
-            &SymbolicVmInitialState::default(),
-            None,
-            SymbolicExecutionLimits::default(),
-        )
-        .expect("default state");
+    fn symbolic_store_to_tracked_region_resolves_precisely() {
+        let mut machine = default_machine();
         machine
             .store_stack(0, &Expr::constant(BitWidth::W64, 9))
             .expect("seed precise VM stack");
-        let address = Expr::register(BitWidth::W64, "unproven_pointer");
-        let error = machine
-            .store_external(0, address, Expr::constant(BitWidth::W64, 7))
-            .expect_err("unproven alias must stop sound symbolic execution");
-        assert!(error.contains("not in a proven symbolic memory region"));
+        machine
+            .store_external(
+                0,
+                stack_address(32),
+                Expr::constant(BitWidth::W64, 0x1234),
+            )
+            .expect("tracked store resolves");
         assert!(!machine.memory_tainted);
+        assert_eq!(machine.external_writes.len(), 1);
+        let loaded = machine
+            .load_memory(stack_address(32), BitWidth::W64)
+            .expect("load");
+        assert!(matches!(loaded.kind, ExprKind::Const { value: 0x1234 }));
+        // The unrelated seeded cell is still precise.
+        let seeded = machine
+            .load_memory(stack_address(0), BitWidth::W64)
+            .expect("load");
+        assert!(matches!(seeded.kind, ExprKind::Const { value: 9 }));
+    }
+
+    // A store whose address cannot be placed in a tracked region may alias any
+    // tracked cell. Rather than assume no alias, the executor over-approximates:
+    // it records the write, discards and taints precise memory, and continues.
+    #[test]
+    fn symbolic_store_that_may_alias_havocs_and_continues() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed precise VM stack");
+        let address = Expr::register(BitWidth::W64, "native_rcx_initial");
+        machine
+            .store_external(7, address.clone(), Expr::constant(BitWidth::W64, 0x55))
+            .expect("unproven store is over-approximated, not refused");
+        assert!(machine.memory_tainted);
+        assert_eq!(machine.memory_havocs.len(), 1);
+        assert_eq!(machine.memory_havocs[0].instruction_index, 7);
+        // The write is preserved for the lift.
+        assert_eq!(machine.external_writes.len(), 1);
+        assert_eq!(machine.external_writes[0].address, address);
+    }
+
+    // After an aliasing store the previously-precise cell must read back as a
+    // fresh unknown, never the stale pre-store value.
+    #[test]
+    fn load_after_aliasing_store_is_a_fresh_unknown() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed precise VM stack");
+        machine
+            .store_external(
+                0,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("over-approximated store");
+        let reloaded = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load");
+        assert!(
+            is_free_read(&reloaded),
+            "stale pre-store value must not survive the havoc: {reloaded:?}"
+        );
     }
 
     #[test]
