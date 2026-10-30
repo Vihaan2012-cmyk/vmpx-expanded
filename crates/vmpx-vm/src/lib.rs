@@ -119,8 +119,9 @@ pub use handler_slice::{
 };
 pub use image_concretize::{
     ImageConcretizationError, ImageConcretizationLimits, ImageConcretizationReport,
-    ModuloImageTargetError, ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
-    concretize_with_immutable_image, recover_modulo_image_targets,
+    ImageTableBranchError, ImageTableBranchLimits, ImageTableBranchReport, ModuloImageTargetError,
+    ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
+    concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
 };
 pub use immutable_image::ReadOnlyImage;
 pub use input_closed::{is_expr_input_closed, is_input_closed};

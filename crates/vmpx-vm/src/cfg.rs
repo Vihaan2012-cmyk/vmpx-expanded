@@ -32,8 +32,8 @@ use crate::{
         observe_target_push, update_provenance,
     },
     native_vm_chain::compose_native_frame,
-    recover_and_decode_linear_vm_stream_cached, recover_modulo_image_targets,
-    recover_native_exit_state, value_range,
+    recover_and_decode_linear_vm_stream_cached, recover_image_table_targets,
+    recover_modulo_image_targets, recover_native_exit_state, value_range, ImageTableBranchLimits,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1430,6 +1430,26 @@ impl Walker<'_, '_> {
         Ok((dispatch.clone(), anchor))
     }
 
+    /// Resolves a computed branch whose next-VIP reads a read-only image
+    /// jump/const table at a proven-finite index, returning the exact concrete
+    /// targets or `None` when no sound read-only table recovery applies.
+    fn resolve_readonly_image_table(&self, bound_target: &Expr) -> Option<Vec<u64>> {
+        let limits = ImageTableBranchLimits {
+            input_domain: self.limits.input_domain,
+            domain: self.limits.domain,
+            ..ImageTableBranchLimits::default()
+        };
+        recover_image_table_targets(self.pe, bound_target, limits)
+            .ok()
+            .filter(|report| {
+                report.complete
+                    && !report.targets.is_empty()
+                    && report.targets.len() <= self.limits.max_targets
+            })
+            .map(|report| report.targets)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn follow_branch(
         &mut self,
         key: Va,
@@ -1470,14 +1490,23 @@ impl Walker<'_, '_> {
                     // A VMProtect CPUID / timestamp-counter anti-analysis gate
                     // stalls here because the environment value is statically
                     // unknown: resolve it by a sound both-target over-approximation.
-                    match resolve_environment_gate(target, &is_image_va, self.limits) {
-                        Some((targets, guarded, gate_registers)) => {
-                            (targets, guarded, gate_registers, true)
-                        }
-                        None => {
-                            self.stall(key, vip, format!("unresolved branch target: {reason}"));
-                            return;
-                        }
+                    if let Some((targets, guarded, gate_registers)) =
+                        resolve_environment_gate(target, &is_image_va, self.limits)
+                    {
+                        (targets, guarded, gate_registers, true)
+                    } else if let Some(targets) = self.resolve_readonly_image_table(&bound_target) {
+                        // A jump/const-table branch whose next-VIP reads a
+                        // read-only image table at a proven-finite index: the
+                        // table bytes are definitive, so enumerate the exact
+                        // concrete targets. Relies on the preferred-base frame
+                        // (the table anchor is image-base relative).
+                        self.cfg
+                            .assumptions
+                            .insert(VmCfgAssumption::PreferredImageBase);
+                        (targets, true, direct_registers.clone(), false)
+                    } else {
+                        self.stall(key, vip, format!("unresolved branch target: {reason}"));
+                        return;
                     }
                 }
             };
