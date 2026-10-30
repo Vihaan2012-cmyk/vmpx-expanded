@@ -1,6 +1,7 @@
 use crate::abi::{ValidatedFunction, spill_displacement, validate};
 use crate::{
-    BinaryOp, BinarySource, CallTarget, CompileError, Condition, Function, Label, NativeAddress,
+    BinaryOp, BinarySource, CallTarget, CompileError, Condition, DoubleShiftDirection, Function,
+    Label, NativeAddress,
     Operation, PhysicalRegister, ResizeOp, ShiftCount, ShiftOp, UnaryOp, VirtualRegister, Width,
 };
 use iced_x86::code_asm::{
@@ -327,6 +328,106 @@ fn emit_restore_flags(
         MachineRegister::W8(source) => assembler.mov(byte_ptr(rsp), source)?,
     }
     assembler.popfq()
+}
+
+/// Reads `rflags` into a qword register. `PUSHFQ` followed by `POP` leaves the
+/// stack pointer where it started.
+fn emit_read_flags(
+    assembler: &mut CodeAssembler,
+    destination: MachineRegister,
+) -> Result<(), iced_x86::IcedError> {
+    let MachineRegister::W64(destination) = destination else {
+        unreachable!("validated flags destination is a qword");
+    };
+    assembler.pushfq()?;
+    assembler.pop(destination)
+}
+
+fn emit_gs_load(
+    assembler: &mut CodeAssembler,
+    destination: MachineRegister,
+    base: AsmRegister64,
+    displacement: i32,
+) -> Result<(), iced_x86::IcedError> {
+    match destination {
+        MachineRegister::W8(destination) => {
+            assembler.mov(destination, byte_ptr(base + displacement).gs())
+        }
+        MachineRegister::W16(destination) => {
+            assembler.mov(destination, word_ptr(base + displacement).gs())
+        }
+        MachineRegister::W32(destination) => {
+            assembler.mov(destination, dword_ptr(base + displacement).gs())
+        }
+        MachineRegister::W64(destination) => {
+            assembler.mov(destination, qword_ptr(base + displacement).gs())
+        }
+    }
+}
+
+fn emit_double_shift(
+    assembler: &mut CodeAssembler,
+    direction: DoubleShiftDirection,
+    destination: MachineRegister,
+    source: MachineRegister,
+    count: ResolvedShiftCount,
+) -> Result<(), iced_x86::IcedError> {
+    macro_rules! emit {
+        ($destination:expr, $source:expr) => {
+            match (direction, count) {
+                (DoubleShiftDirection::Left, ResolvedShiftCount::Immediate(count)) => {
+                    assembler.shld($destination, $source, count)
+                }
+                (DoubleShiftDirection::Right, ResolvedShiftCount::Immediate(count)) => {
+                    assembler.shrd($destination, $source, count)
+                }
+                (DoubleShiftDirection::Left, ResolvedShiftCount::Cl) => {
+                    assembler.shld($destination, $source, cl)
+                }
+                (DoubleShiftDirection::Right, ResolvedShiftCount::Cl) => {
+                    assembler.shrd($destination, $source, cl)
+                }
+            }
+        };
+    }
+    match (destination, source) {
+        (MachineRegister::W16(destination), MachineRegister::W16(source)) => {
+            emit!(destination, source)
+        }
+        (MachineRegister::W32(destination), MachineRegister::W32(source)) => {
+            emit!(destination, source)
+        }
+        (MachineRegister::W64(destination), MachineRegister::W64(source)) => {
+            emit!(destination, source)
+        }
+        _ => unreachable!("validated double-shift widths differ or are byte-sized"),
+    }
+}
+
+/// Emits `CPUID` without disturbing any general register. The four registers it
+/// uses are saved first, so the slot displacements are rebased by their size.
+fn emit_cpuid(
+    assembler: &mut CodeAssembler,
+    leaf: i32,
+    subleaf: i32,
+    outputs: [i32; 4],
+) -> Result<(), iced_x86::IcedError> {
+    const SAVED: i32 = 32;
+    assembler.push(rax)?;
+    assembler.push(rcx)?;
+    assembler.push(rdx)?;
+    assembler.push(rbx)?;
+    assembler.mov(eax, dword_ptr(rsp + (leaf + SAVED)))?;
+    assembler.mov(ecx, dword_ptr(rsp + (subleaf + SAVED)))?;
+    assembler.cpuid()?;
+    assembler.mov(dword_ptr(rsp + (outputs[0] + SAVED)), eax)?;
+    assembler.mov(dword_ptr(rsp + (outputs[1] + SAVED)), ebx)?;
+    assembler.mov(dword_ptr(rsp + (outputs[2] + SAVED)), ecx)?;
+    assembler.mov(dword_ptr(rsp + (outputs[3] + SAVED)), edx)?;
+    assembler.pop(rbx)?;
+    assembler.pop(rdx)?;
+    assembler.pop(rcx)?;
+    assembler.pop(rax)
 }
 
 fn emit_move_immediate(
@@ -932,6 +1033,86 @@ pub fn compile(
                 append_assembled(&mut output, address, operation_index, |assembler| {
                     emit_restore_flags(assembler, source)
                 })?;
+            }
+            Operation::EntryStackPointer { destination } => {
+                let destination = assigned_qword(&validated, *destination)?;
+                let pushed = u32::try_from(function.frame.preserve.len())
+                    .map_err(|_| CompileError::CodeSizeOverflow)?
+                    .saturating_mul(8);
+                let total = pushed.saturating_add(function.frame.stack_allocation);
+                let total = i32::try_from(total)
+                    .map_err(|_| CompileError::StackAllocationTooLarge { bytes: total })?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    assembler.lea(destination, qword_ptr(rsp + total))
+                })?;
+            }
+            Operation::ReadFlags { destination } => {
+                let destination = assigned(&validated, *destination)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_read_flags(assembler, destination)
+                })?;
+            }
+            Operation::DoubleShift {
+                direction,
+                destination,
+                source,
+                count,
+            } => {
+                let destination = assigned(&validated, *destination)?;
+                let source = assigned(&validated, *source)?;
+                let count = match count {
+                    ShiftCount::Immediate(count) => {
+                        ResolvedShiftCount::Immediate(u32::from(*count))
+                    }
+                    ShiftCount::Register(register) => {
+                        let _ = assigned(&validated, *register)?;
+                        ResolvedShiftCount::Cl
+                    }
+                };
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_double_shift(assembler, *direction, destination, source, count)
+                })?;
+            }
+            Operation::GsLoad {
+                destination,
+                address: memory,
+            } => {
+                let destination = assigned(&validated, *destination)?;
+                let base = assigned_qword(&validated, memory.base)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_gs_load(assembler, destination, base, memory.displacement)
+                })?;
+            }
+            Operation::Cpuid {
+                leaf,
+                subleaf,
+                out_eax,
+                out_ebx,
+                out_ecx,
+                out_edx,
+            } => {
+                let leaf = spill_displacement(&function.frame, *leaf)?;
+                let subleaf = spill_displacement(&function.frame, *subleaf)?;
+                let outputs = [
+                    spill_displacement(&function.frame, *out_eax)?,
+                    spill_displacement(&function.frame, *out_ebx)?,
+                    spill_displacement(&function.frame, *out_ecx)?,
+                    spill_displacement(&function.frame, *out_edx)?,
+                ];
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_cpuid(assembler, leaf, subleaf, outputs)
+                })?;
+            }
+            Operation::ReturnPopping { bytes } => {
+                emit_frame_teardown(&mut output, function, address, operation_index)?;
+                if *bytes != 0 {
+                    let bytes = i32::try_from(*bytes)
+                        .map_err(|_| CompileError::StackAllocationTooLarge { bytes: *bytes })?;
+                    append_assembled(&mut output, address, operation_index, |assembler| {
+                        assembler.add(rsp, bytes)
+                    })?;
+                }
+                append_assembled(&mut output, address, operation_index, CodeAssembler::ret)?;
             }
             Operation::Return => {
                 emit_epilogue(&mut output, function, address, operation_index)?;

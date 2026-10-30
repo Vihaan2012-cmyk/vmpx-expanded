@@ -141,6 +141,12 @@ pub enum ShiftOp {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoubleShiftDirection {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShiftCount {
     Immediate(u8),
     Register(VirtualRegister),
@@ -249,6 +255,45 @@ pub enum Operation {
     /// hand a caller the exact condition state a virtualized routine produced.
     RestoreFlags {
         value: VirtualRegister,
+    },
+    /// Releases the frame, then discards `bytes` further stack bytes and returns
+    /// through the qword now at the stack pointer. This is a return that unwinds
+    /// extra caller-owned stack, as a virtualized epilogue does.
+    ReturnPopping {
+        bytes: u32,
+    },
+    /// Loads the stack pointer the function was entered with (its return-address
+    /// slot), undoing the prologue's pushes and allocation.
+    EntryStackPointer {
+        destination: VirtualRegister,
+    },
+    /// Reads `rflags` into a qword register without disturbing the stack.
+    ReadFlags {
+        destination: VirtualRegister,
+    },
+    /// `SHLD`/`SHRD destination, source, count` at 16, 32 or 64 bits. A register
+    /// count must be the byte view of `RCX`.
+    DoubleShift {
+        direction: DoubleShiftDirection,
+        destination: VirtualRegister,
+        source: VirtualRegister,
+        count: ShiftCount,
+    },
+    /// `mov destination, gs:[address]`.
+    GsLoad {
+        destination: VirtualRegister,
+        address: Address,
+    },
+    /// `CPUID` with the dword leaf and subleaf read from frame slots and the four
+    /// dword results written to frame slots. It is register-transparent: every
+    /// register it touches is saved and restored around the instruction.
+    Cpuid {
+        leaf: SpillSlot,
+        subleaf: SpillSlot,
+        out_eax: SpillSlot,
+        out_ebx: SpillSlot,
+        out_ecx: SpillSlot,
+        out_edx: SpillSlot,
     },
 }
 

@@ -314,10 +314,53 @@ impl Renamer {
             Operation::RestoreFlags { value } => Operation::RestoreFlags {
                 value: self.register(value)?,
             },
+            Operation::ReadFlags { destination } => Operation::ReadFlags {
+                destination: self.register(destination)?,
+            },
+            Operation::EntryStackPointer { destination } => Operation::EntryStackPointer {
+                destination: self.register(destination)?,
+            },
+            Operation::DoubleShift {
+                direction,
+                destination,
+                source: from,
+                count,
+            } => Operation::DoubleShift {
+                direction,
+                destination: self.register(destination)?,
+                source: self.register(from)?,
+                count: match count {
+                    ShiftCount::Immediate(v) => ShiftCount::Immediate(v),
+                    ShiftCount::Register(v) => ShiftCount::Register(self.register(v)?),
+                },
+            },
+            Operation::GsLoad {
+                destination,
+                address: at,
+            } => Operation::GsLoad {
+                destination: self.register(destination)?,
+                address: self.address(at)?,
+            },
+            Operation::Cpuid {
+                leaf,
+                subleaf,
+                out_eax,
+                out_ebx,
+                out_ecx,
+                out_edx,
+            } => Operation::Cpuid {
+                leaf: self.slot(leaf)?,
+                subleaf: self.slot(subleaf)?,
+                out_eax: self.slot(out_eax)?,
+                out_ebx: self.slot(out_ebx)?,
+                out_ecx: self.slot(out_ecx)?,
+                out_edx: self.slot(out_edx)?,
+            },
             Operation::BranchIf { condition, target } => Operation::BranchIf {
                 condition,
                 target: self.label(target)?,
             },
+            Operation::ReturnPopping { bytes } => Operation::ReturnPopping { bytes },
             Operation::Return => Operation::Return,
         })
     }

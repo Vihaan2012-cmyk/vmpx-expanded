@@ -6,16 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+iced-x86.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+vmpx-disasm = { path = "../vmpx-disasm" }
+vmpx-pe = { path = "../vmpx-pe" }
 vmpx-vm = { path = "../vmpx-vm" }
 vmpx-recompile = { path = "../vmpx-recompile" }
 
 [dev-dependencies]
-iced-x86.workspace = true
 serde_json.workspace = true
-vmpx-disasm = { path = "../vmpx-disasm" }
-vmpx-pe = { path = "../vmpx-pe" }
 vmpx-rebuild = { path = "../vmpx-rebuild" }
 
 [lints]

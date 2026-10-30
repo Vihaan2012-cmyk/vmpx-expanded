@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use vmpx_recompile::{
     Address, BinaryOp as NativeBinaryOp, BinarySource, CallTarget, CodeAddress, CompileError,
-    CompiledFunction, Function, NativeAddress, Operation, PhysicalRegister, RegisterAssignment,
+    CompiledFunction, DoubleShiftDirection, Function, NativeAddress, Operation, PhysicalRegister, RegisterAssignment,
     ResizeOp as NativeResizeOp, ShiftCount, ShiftOp, SpillSlot, StackFrame,
     UnaryOp as NativeUnaryOp, VirtualRegister, Width, compile, validate_function,
 };
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, ResizeOp, UnaryOp};
+
+use crate::passthrough;
 
 const ACCUMULATOR_ID: u32 = 0;
 const TEMPORARY_ID: u32 = 1;
@@ -108,6 +110,11 @@ pub struct LoweredExpression {
     pub result: VirtualRegister,
     pub expression_nodes: usize,
     pub spill_slots: usize,
+    /// Intrinsics re-emitted as the native instruction they denote.
+    pub passthroughs: BTreeSet<String>,
+    /// The subset of `passthroughs` that reads machine state (`cpuid`, `gs`
+    /// loads): correct by identity, trusted rather than statically provable.
+    pub environment_boundaries: BTreeSet<String>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -136,6 +143,9 @@ pub enum ExpressionCodegenError {
 
     #[error("expression requires unsupported intrinsic {name}")]
     UnsupportedIntrinsic { name: String },
+
+    #[error("native passthrough {name} is malformed: {reason}")]
+    MalformedPassthrough { name: String, reason: &'static str },
 
     #[error("imported call takes {count} arguments, exceeding the four register slots")]
     TooManyCallArguments { count: usize },
@@ -169,9 +179,166 @@ struct LoweringContext<'a> {
     /// Absolute ceiling for `next_slot`: the window start plus the slots the
     /// fragment is allowed to use.
     absolute_slot_limit: usize,
+    passthroughs: BTreeSet<String>,
+}
+
+fn malformed(name: &str, reason: &'static str) -> ExpressionCodegenError {
+    ExpressionCodegenError::MalformedPassthrough {
+        name: name.to_owned(),
+        reason,
+    }
 }
 
 impl LoweringContext<'_> {
+    /// Re-emits the native instruction an opaque intrinsic denotes. The shape
+    /// and every operand width are checked first, and each operand expression is
+    /// lowered by the ordinary expression backend, so an operand that cannot be
+    /// lowered refuses the whole expression.
+    fn lower_passthrough(
+        &mut self,
+        name: &str,
+        kind: passthrough::Passthrough,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        use passthrough::Passthrough;
+        match kind {
+            Passthrough::Cpuid(output) => {
+                let [leaf, subleaf] = arguments else {
+                    return Err(malformed(name, "cpuid takes a leaf and a subleaf"));
+                };
+                if leaf.width != BitWidth::W32
+                    || subleaf.width != BitWidth::W32
+                    || expression.width != BitWidth::W32
+                {
+                    return Err(malformed(name, "cpuid operands and results are 32-bit"));
+                }
+                self.lower(leaf)?;
+                let leaf_slot = self.allocate_slot()?;
+                self.operations.push(Operation::SpillStore {
+                    slot: leaf_slot,
+                    source: accumulator(BitWidth::W32),
+                });
+                self.lower(subleaf)?;
+                let subleaf_slot = self.allocate_slot()?;
+                self.operations.push(Operation::SpillStore {
+                    slot: subleaf_slot,
+                    source: accumulator(BitWidth::W32),
+                });
+                let outputs = [
+                    self.allocate_slot()?,
+                    self.allocate_slot()?,
+                    self.allocate_slot()?,
+                    self.allocate_slot()?,
+                ];
+                self.operations.push(Operation::Cpuid {
+                    leaf: leaf_slot,
+                    subleaf: subleaf_slot,
+                    out_eax: outputs[0],
+                    out_ebx: outputs[1],
+                    out_ecx: outputs[2],
+                    out_edx: outputs[3],
+                });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(BitWidth::W32),
+                    slot: outputs[output.index()],
+                });
+                for _ in 0..6 {
+                    self.release_slot();
+                }
+            }
+            Passthrough::GsLoad => {
+                let [pointer] = arguments else {
+                    return Err(malformed(name, "a gs load takes one pointer"));
+                };
+                if pointer.width != BitWidth::W64 || expression.width != BitWidth::W64 {
+                    return Err(malformed(name, "a gs load is a 64-bit load at a 64-bit offset"));
+                }
+                self.lower(pointer)?;
+                self.operations.push(Operation::GsLoad {
+                    destination: accumulator(BitWidth::W64),
+                    address: Address::new(accumulator(BitWidth::W64), 0),
+                });
+            }
+            Passthrough::PopFlags => {
+                let [value] = arguments else {
+                    return Err(malformed(name, "popfq takes one flags word"));
+                };
+                if value.width != BitWidth::W64 || expression.width != BitWidth::W64 {
+                    return Err(malformed(name, "popfq consumes and yields a 64-bit flags word"));
+                }
+                self.lower(value)?;
+                self.operations.push(Operation::RestoreFlags {
+                    value: accumulator(BitWidth::W64),
+                });
+                self.operations.push(Operation::ReadFlags {
+                    destination: accumulator(BitWidth::W64),
+                });
+            }
+            Passthrough::DoubleShift { left, width, flags } => {
+                let [destination, source, count] = arguments else {
+                    return Err(malformed(name, "a double shift takes destination, source, count"));
+                };
+                if width == BitWidth::W8 {
+                    return Err(malformed(name, "SHLD/SHRD have no 8-bit form"));
+                }
+                if destination.width != width
+                    || source.width != width
+                    || count.width != BitWidth::W8
+                {
+                    return Err(malformed(name, "double-shift operand widths disagree"));
+                }
+                let result_width = if flags { BitWidth::W64 } else { width };
+                if expression.width != result_width {
+                    return Err(malformed(name, "double-shift result width disagrees"));
+                }
+                self.lower(destination)?;
+                let destination_slot = self.allocate_slot()?;
+                self.operations.push(Operation::SpillStore {
+                    slot: destination_slot,
+                    source: accumulator(width),
+                });
+                self.lower(source)?;
+                let source_slot = self.allocate_slot()?;
+                self.operations.push(Operation::SpillStore {
+                    slot: source_slot,
+                    source: accumulator(width),
+                });
+                self.lower(count)?;
+                self.operations.push(Operation::Move {
+                    destination: register(SHIFT_COUNT_ID, BitWidth::W8),
+                    source: accumulator(BitWidth::W8),
+                });
+                self.operations.push(Operation::SpillLoad {
+                    destination: temporary(width),
+                    slot: source_slot,
+                });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(width),
+                    slot: destination_slot,
+                });
+                self.release_slot();
+                self.release_slot();
+                self.operations.push(Operation::DoubleShift {
+                    direction: if left {
+                        DoubleShiftDirection::Left
+                    } else {
+                        DoubleShiftDirection::Right
+                    },
+                    destination: accumulator(width),
+                    source: temporary(width),
+                    count: ShiftCount::Register(register(SHIFT_COUNT_ID, BitWidth::W8)),
+                });
+                if flags {
+                    self.operations.push(Operation::ReadFlags {
+                        destination: accumulator(BitWidth::W64),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Lowers an intrinsic that stands for an imported call's return value.
     ///
     /// The intrinsic's leading arguments become the call arguments, the call is
@@ -344,12 +511,16 @@ impl LoweringContext<'_> {
                 });
             }
             ExprKind::Intrinsic { name, arguments } => {
-                let Some(call) = self.config.import_calls.get(name).cloned() else {
+                if let Some(call) = self.config.import_calls.get(name).cloned() {
+                    self.lower_import_call(expression, &call, arguments)?;
+                } else if let Some(kind) = passthrough::classify(name) {
+                    self.lower_passthrough(name, kind, expression, arguments)?;
+                    self.passthroughs.insert(name.clone());
+                } else {
                     return Err(ExpressionCodegenError::UnsupportedIntrinsic {
                         name: name.clone(),
                     });
-                };
-                self.lower_import_call(expression, &call, arguments)?;
+                }
             }
             ExprKind::Extract { value, lsb } => {
                 self.lower(value)?;
@@ -651,6 +822,7 @@ pub fn lower_expression(
         next_slot: first_slot,
         peak_slot: first_slot,
         absolute_slot_limit,
+        passthroughs: BTreeSet::new(),
     };
     context.lower(expression)?;
     context.operations.push(Operation::Return);
@@ -725,6 +897,13 @@ pub fn lower_expression(
         result: accumulator(expression.width),
         expression_nodes: nodes,
         spill_slots: context.peak_slot,
+        environment_boundaries: context
+            .passthroughs
+            .iter()
+            .filter(|name| passthrough::is_environment_boundary(name))
+            .cloned()
+            .collect(),
+        passthroughs: context.passthroughs,
     })
 }
 
@@ -793,6 +972,156 @@ mod tests {
         };
         compile_expression(&expression, &config, CodeAddress(0))
             .expect("compile complex expression");
+    }
+
+    fn decoded(bytes: &[u8]) -> Vec<iced_x86::Instruction> {
+        let mut decoder = iced_x86::Decoder::with_ip(64, bytes, 0, iced_x86::DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while decoder.can_decode() {
+            out.push(decoder.decode());
+        }
+        out
+    }
+
+    fn passthrough_config() -> ExpressionCodegenConfig {
+        ExpressionCodegenConfig {
+            inputs: vec![
+                input("a", BitWidth::W32, PhysicalRegister::Rdx),
+                input("b", BitWidth::W32, PhysicalRegister::R8),
+                input("p", BitWidth::W64, PhysicalRegister::R9),
+                input("n", BitWidth::W8, PhysicalRegister::Rsi),
+            ],
+            ..ExpressionCodegenConfig::default()
+        }
+    }
+
+    fn lowers_to(expression: &Expr, mnemonic: iced_x86::Mnemonic) -> LoweredExpression {
+        let config = passthrough_config();
+        let lowered = lower_expression(expression, &config).expect("lower passthrough");
+        let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile passthrough");
+        let instructions = decoded(&compiled.bytes);
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.mnemonic() == mnemonic)
+                .count(),
+            1,
+            "{mnemonic:?} is emitted exactly once"
+        );
+        lowered
+    }
+
+    #[test]
+    fn cpuid_lowers_to_the_instruction_and_marks_an_environment_boundary() {
+        let leaf = Expr::register(BitWidth::W32, "a");
+        let subleaf = Expr::register(BitWidth::W32, "b");
+        let expression = Expr::intrinsic(BitWidth::W32, "x86_cpuid_ecx_7", vec![leaf, subleaf]);
+        let lowered = lowers_to(&expression, iced_x86::Mnemonic::Cpuid);
+        assert!(lowered.environment_boundaries.contains("x86_cpuid_ecx_7"));
+    }
+
+    #[test]
+    fn gs_load_lowers_to_a_gs_prefixed_move() {
+        let expression = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_gs_load_2",
+            vec![Expr::register(BitWidth::W64, "p")],
+        );
+        let config = passthrough_config();
+        let lowered = lower_expression(&expression, &config).expect("lower gs load");
+        let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile gs load");
+        assert!(
+            decoded(&compiled.bytes)
+                .iter()
+                .any(|instruction| instruction.segment_prefix() == iced_x86::Register::GS)
+        );
+        assert!(lowered.environment_boundaries.contains("x86_gs_load_2"));
+    }
+
+    #[test]
+    fn double_shifts_and_their_flags_lower_to_shld_and_shrd() {
+        let arguments = vec![
+            Expr::register(BitWidth::W32, "a"),
+            Expr::register(BitWidth::W32, "b"),
+            Expr::register(BitWidth::W8, "n"),
+        ];
+        for (direction, mnemonic) in [
+            ("left", iced_x86::Mnemonic::Shld),
+            ("right", iced_x86::Mnemonic::Shrd),
+        ] {
+            let value = Expr::intrinsic(
+                BitWidth::W32,
+                format!("x86_double_shift_{direction}_w32_1"),
+                arguments.clone(),
+            );
+            let lowered = lowers_to(&value, mnemonic);
+            assert!(lowered.environment_boundaries.is_empty());
+            let flags = Expr::intrinsic(
+                BitWidth::W64,
+                format!("vm_flags_double_shift_{direction}_w32_1"),
+                arguments.clone(),
+            );
+            let lowered = lowers_to(&flags, mnemonic);
+            let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile flags");
+            assert!(
+                decoded(&compiled.bytes)
+                    .iter()
+                    .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Pushfq)
+            );
+        }
+    }
+
+    #[test]
+    fn popfq_lowers_to_a_flag_restore_and_readback() {
+        let expression = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_popfq_5",
+            vec![Expr::register(BitWidth::W64, "p")],
+        );
+        let lowered = lowers_to(&expression, iced_x86::Mnemonic::Popfq);
+        assert!(lowered.passthroughs.contains("x86_popfq_5"));
+        assert!(lowered.environment_boundaries.is_empty());
+    }
+
+    #[test]
+    fn passthroughs_refuse_an_unlowerable_operand_or_a_wrong_shape() {
+        let config = passthrough_config();
+        let unmapped = Expr::register(BitWidth::W64, "not_an_input");
+        for expression in [
+            Expr::intrinsic(BitWidth::W64, "x86_gs_load_1", vec![unmapped.clone()]),
+            Expr::intrinsic(BitWidth::W64, "x86_popfq_1", vec![unmapped]),
+            Expr::intrinsic(
+                BitWidth::W32,
+                "x86_cpuid_eax_1",
+                vec![
+                    Expr::register(BitWidth::W32, "a"),
+                    Expr::register(BitWidth::W32, "missing"),
+                ],
+            ),
+        ] {
+            assert!(matches!(
+                lower_expression(&expression, &config),
+                Err(ExpressionCodegenError::MissingInput { .. })
+            ));
+        }
+        let byte_shift = Expr::intrinsic(
+            BitWidth::W8,
+            "x86_double_shift_left_w8_1",
+            vec![
+                Expr::register(BitWidth::W8, "n"),
+                Expr::register(BitWidth::W8, "n"),
+                Expr::register(BitWidth::W8, "n"),
+            ],
+        );
+        assert!(matches!(
+            lower_expression(&byte_shift, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+        let wrong_arity = Expr::intrinsic(BitWidth::W32, "x86_cpuid_eax_1", vec![]);
+        assert!(matches!(
+            lower_expression(&wrong_arity, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
     }
 
     #[test]

@@ -139,6 +139,13 @@ pub struct Replacement {
     pub compiled: CompiledFunction,
     /// Registers whose value is emitted by the epilogue.
     pub emitted: BTreeSet<X64NativeRegister>,
+    /// Intrinsics re-emitted as the native instruction they denote.
+    pub passthroughs: BTreeSet<String>,
+    /// Passthroughs that read machine state (`cpuid`, `gs` loads). Correct by
+    /// identity re-emission, but trusted boundaries rather than values a static
+    /// equivalence check can prove. A boundary used by several values is
+    /// executed once per use.
+    pub environment_boundaries: BTreeSet<String>,
 }
 
 /// Lowers every register of one native exit state and compiles the result.
@@ -153,6 +160,49 @@ pub fn build_replacement(
     config: &ReplacementConfig,
     address: CodeAddress,
 ) -> Result<Replacement, ReplacementError> {
+    build_replacement_popping(registers, config, address, None, None)
+}
+
+const ENTRY_STACK_POINTER: &str = "__entry_rsp";
+
+/// As [`build_replacement`], but the routine returns through the qword
+/// `return_pop` bytes above the stack pointer it was entered with, discarding the
+/// bytes in between. This is how a virtualized epilogue that unwinds caller stack
+/// returns.
+///
+/// # Errors
+///
+/// As [`build_replacement`].
+pub fn build_replacement_popping(
+    registers: &BTreeMap<X64NativeRegister, Expr>,
+    config: &ReplacementConfig,
+    address: CodeAddress,
+    return_pop: Option<u32>,
+    stack_root_bytes: Option<u32>,
+) -> Result<Replacement, ReplacementError> {
+    // `vsp_initial` is the VM stack root: the native stack pointer `stack_root_bytes`
+    // below the one the routine is entered with. Reading it needs the entry
+    // stack pointer, which is captured with the other inputs.
+    let extended;
+    let config = if let Some(bytes) = stack_root_bytes {
+        let entry = Expr::register(vmpx_vm::BitWidth::W64, ENTRY_STACK_POINTER);
+        let root = Expr::binary(
+            vmpx_vm::BinaryOp::Sub,
+            entry,
+            Expr::constant(vmpx_vm::BitWidth::W64, u64::from(bytes)),
+        )
+        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+        let mut owned = config.clone();
+        owned
+            .inputs
+            .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
+        owned.symbol_rewrites.insert("vsp_initial".to_owned(), root);
+        extended = owned;
+        &extended
+    } else {
+        config
+    };
+    let mut trust = Trust::default();
     let mut ordered: Vec<(&X64NativeRegister, &Expr)> = registers.iter().collect();
     ordered.sort_by_key(|(register, _)| format!("{register:?}"));
 
@@ -205,7 +255,7 @@ pub fn build_replacement(
 
     // 1. Capture block: fill the shared input frame from the entry registers.
     let mut capture_ops: Vec<Operation> = Vec::new();
-    for (index, (_, register)) in config.inputs.iter().enumerate() {
+    for (index, (name, register)) in config.inputs.iter().enumerate() {
         let slot = SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?);
         let source = canonical_register(
             *register,
@@ -213,6 +263,13 @@ pub fn build_replacement(
             &mut assignments,
             &mut next_register,
         );
+        if name == ENTRY_STACK_POINTER {
+            // Registered last, so every entry register is already captured and
+            // this register may be overwritten.
+            capture_ops.push(Operation::EntryStackPointer {
+                destination: source,
+            });
+        }
         capture_ops.push(Operation::SpillStore { slot, source });
     }
     operations.extend(capture_ops);
@@ -281,6 +338,7 @@ pub fn build_replacement(
                 &mut next_register,
                 &mut window_base,
                 &shared_end,
+                &mut trust,
             )?;
             effects_operations.extend(argument_operations);
             // The call ABI requires each argument in its own register, so move
@@ -357,6 +415,7 @@ pub fn build_replacement(
             &mut next_register,
             &mut window_base,
             &shared_end,
+            &mut trust,
         )?;
         effects_operations.extend(address_operations);
         let (value_operations, value) = lower_fragment(
@@ -369,6 +428,7 @@ pub fn build_replacement(
             &mut next_register,
             &mut window_base,
             &shared_end,
+            &mut trust,
         )?;
         effects_operations.extend(value_operations);
         effects_operations.push(Operation::Store {
@@ -436,6 +496,7 @@ pub fn build_replacement(
                 register: **register,
                 message: error.to_string(),
             })?;
+        trust.absorb(&lowered);
         let mut function = lowered.function;
         let result = function
             .assignments
@@ -463,17 +524,14 @@ pub fn build_replacement(
             .ok_or(ReplacementError::TooManyInputs)?;
         let _ = (result_base, value_count);
         for operation in &mut function.operations {
-            match operation {
-                Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
-                    if slot.0 >= shared_end {
-                        slot.0 = slot
-                            .0
-                            .checked_sub(shared_end)
-                            .and_then(|offset| local_base.checked_add(offset))
-                            .ok_or(ReplacementError::TooManyInputs)?;
-                    }
+            for slot in operation_slots_mut(operation) {
+                if slot.0 >= shared_end {
+                    slot.0 = slot
+                        .0
+                        .checked_sub(shared_end)
+                        .and_then(|offset| local_base.checked_add(offset))
+                        .ok_or(ReplacementError::TooManyInputs)?;
                 }
-                _ => {}
             }
         }
 
@@ -561,6 +619,7 @@ pub fn build_replacement(
             &mut next_register,
             &mut window_base,
             &shared_end,
+            &mut trust,
         )?;
         operations.extend(flag_operations);
         operations.push(Operation::RestoreFlags { value: flag_value });
@@ -572,6 +631,11 @@ pub fn build_replacement(
         Some(target) => operations.push(Operation::JumpToAddress(vmpx_recompile::NativeAddress(
             target,
         ))),
+        None if return_pop.is_some() => {
+            operations.push(Operation::ReturnPopping {
+                bytes: return_pop.unwrap_or(0),
+            });
+        }
         None => operations.push(Operation::Return),
     }
 
@@ -587,7 +651,7 @@ pub fn build_replacement(
     // the callee-save convention. A nonvolatile register whose exit value differs
     // from its entry value cannot satisfy both, so it is refused rather than
     // silently discarded.
-    let tail_transfer = config.continuation.is_some();
+    let tail_transfer = config.continuation.is_some() || return_pop.is_some();
     for assignment in &assignments {
         let register = assignment.physical_register;
         if register.is_win64_nonvolatile() && !preserve.contains(&register) {
@@ -613,10 +677,7 @@ pub fn build_replacement(
     // must cover the highest slot actually referenced by the emitted body.
     let highest = operations
         .iter()
-        .filter_map(|operation| match operation {
-            Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => Some(slot.0),
-            _ => None,
-        })
+        .flat_map(operation_slots)
         .max()
         .unwrap_or(0);
     // A body that contains an imported call needs a Win64 call-ready frame.
@@ -664,6 +725,8 @@ pub fn build_replacement(
         function,
         compiled,
         emitted: ordered.iter().map(|(register, _)| **register).collect(),
+        passthroughs: trust.passthroughs,
+        environment_boundaries: trust.environment_boundaries,
     })
 }
 
@@ -750,6 +813,7 @@ fn lower_fragment(
     next_register: &mut u32,
     window_base: &mut u16,
     shared_frame_slots: &u16,
+    trust: &mut Trust,
 ) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
     let mut all_inputs = inputs.to_vec();
     for input in extra_inputs {
@@ -780,6 +844,7 @@ fn lower_fragment(
             first_scratch_slot: Some(*window_base),
         },
     )?;
+    trust.absorb(&lowered);
     let mut map: BTreeMap<u32, VirtualRegister> = BTreeMap::new();
     for assignment in &lowered.function.assignments {
         map.insert(
@@ -806,10 +871,7 @@ fn lower_fragment(
         .function
         .operations
         .iter()
-        .filter_map(|operation| match operation {
-            Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => Some(slot.0),
-            _ => None,
-        })
+        .flat_map(operation_slots)
         .filter(|slot| *slot >= window_start)
         .max()
         .map_or(0, |highest| {
@@ -861,6 +923,54 @@ fn canonical_register(
     canonical.insert(physical, created);
     assignments.push(RegisterAssignment::new(created, physical));
     created
+}
+
+/// Native passthroughs collected across every lowered fragment.
+#[derive(Default)]
+struct Trust {
+    passthroughs: BTreeSet<String>,
+    environment_boundaries: BTreeSet<String>,
+}
+
+impl Trust {
+    fn absorb(&mut self, lowered: &crate::LoweredExpression) {
+        self.passthroughs.extend(lowered.passthroughs.iter().cloned());
+        self.environment_boundaries
+            .extend(lowered.environment_boundaries.iter().cloned());
+    }
+}
+
+fn operation_slots(operation: &Operation) -> Vec<u16> {
+    match operation {
+        Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot.0],
+        Operation::Cpuid {
+            leaf,
+            subleaf,
+            out_eax,
+            out_ebx,
+            out_ecx,
+            out_edx,
+        } => [leaf, subleaf, out_eax, out_ebx, out_ecx, out_edx]
+            .iter()
+            .map(|slot| slot.0)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
+    match operation {
+        Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot],
+        Operation::Cpuid {
+            leaf,
+            subleaf,
+            out_eax,
+            out_ebx,
+            out_ecx,
+            out_edx,
+        } => vec![leaf, subleaf, out_eax, out_ebx, out_ecx, out_edx],
+        _ => Vec::new(),
+    }
 }
 
 /// Rewrites the virtual registers of one operation through `map`.
@@ -965,6 +1075,35 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
             value: register(value),
         },
         Operation::BranchIf { condition, target } => Operation::BranchIf { condition, target },
+        Operation::ReadFlags { destination } => Operation::ReadFlags {
+            destination: register(destination),
+        },
+        Operation::DoubleShift {
+            direction,
+            destination,
+            source,
+            count,
+        } => Operation::DoubleShift {
+            direction,
+            destination: register(destination),
+            source: register(source),
+            count: match count {
+                ShiftCount::Register(value) => ShiftCount::Register(register(value)),
+                ShiftCount::Immediate(value) => ShiftCount::Immediate(value),
+            },
+        },
+        Operation::GsLoad {
+            destination,
+            address,
+        } => Operation::GsLoad {
+            destination: register(destination),
+            address: Address::new(register(address.base), address.displacement),
+        },
+        Operation::Cpuid { .. } => operation.clone(),
+        Operation::EntryStackPointer { destination } => Operation::EntryStackPointer {
+            destination: register(destination),
+        },
+        Operation::ReturnPopping { bytes } => Operation::ReturnPopping { bytes },
         Operation::Return => Operation::Return,
     }
 }

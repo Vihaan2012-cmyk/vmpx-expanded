@@ -69,7 +69,25 @@ fn operation_register_accesses(
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        | Operation::Cpuid { .. }
+        | Operation::ReturnPopping { .. }
         | Operation::Return => {}
+        Operation::ReadFlags { destination } | Operation::EntryStackPointer { destination } => {
+            written.insert(*destination);
+        }
+        Operation::DoubleShift {
+            destination,
+            source,
+            count,
+            ..
+        } => {
+            read.insert(*destination);
+            read.insert(*source);
+            written.insert(*destination);
+            if let crate::ShiftCount::Register(register) = count {
+                read.insert(*register);
+            }
+        }
         Operation::MoveImmediate { destination, .. } | Operation::SpillLoad { destination, .. } => {
             written.insert(*destination);
         }
@@ -108,6 +126,10 @@ fn operation_register_accesses(
             }
         }
         Operation::Load {
+            destination,
+            address,
+        }
+        | Operation::GsLoad {
             destination,
             address,
         } => {
@@ -214,7 +236,42 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
             }
             Ok(())
         }
+        Operation::ReadFlags { destination } | Operation::EntryStackPointer { destination } => {
+            if destination.width == Width::W64 {
+                Ok(())
+            } else {
+                Err(CompileError::RegisterWidthMismatch {
+                    expected: Width::W64,
+                    actual: destination.width,
+                })
+            }
+        }
+        Operation::DoubleShift {
+            destination,
+            source,
+            count,
+            ..
+        } => {
+            require_same_width(*destination, *source)?;
+            if destination.width == Width::W8 {
+                return Err(CompileError::UnsupportedWidth {
+                    width: destination.width,
+                });
+            }
+            if let crate::ShiftCount::Register(register) = count
+                && register.width != Width::W8
+            {
+                return Err(CompileError::ShiftCountNotByte {
+                    register: *register,
+                });
+            }
+            Ok(())
+        }
         Operation::Load {
+            address,
+            destination,
+        }
+        | Operation::GsLoad {
             address,
             destination,
         } => {
@@ -245,6 +302,8 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        | Operation::Cpuid { .. }
+        | Operation::ReturnPopping { .. }
         | Operation::Return => Ok(()),
     }
 }
@@ -258,7 +317,7 @@ fn operation_successors(
     match &function.operations[index] {
         // A return and an absolute tail jump both end the block: control leaves
         // the function and never reaches the next operation.
-        Operation::Return | Operation::JumpToAddress(_) => {}
+        Operation::Return | Operation::ReturnPopping { .. } | Operation::JumpToAddress(_) => {}
         Operation::Jump(label) => {
             if let Some(target) = labels.get(label) {
                 successors.push(*target);
@@ -349,6 +408,30 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
                     }
                 })?;
                 state.insert(*slot, stored_bytes);
+            }
+            Operation::Cpuid {
+                leaf,
+                subleaf,
+                out_eax,
+                out_ebx,
+                out_ecx,
+                out_edx,
+            } => {
+                for slot in [leaf, subleaf] {
+                    let initialized_bytes = state.get(slot).copied().unwrap_or(0);
+                    if initialized_bytes < 4 {
+                        return Err(CompileError::UninitializedSpill {
+                            operation_index: index,
+                            slot: *slot,
+                            initialized_bytes,
+                            required_bytes: 4,
+                        });
+                    }
+                }
+                for slot in [out_eax, out_ebx, out_ecx, out_edx] {
+                    let existing = state.get(slot).copied().unwrap_or(0);
+                    state.insert(*slot, existing.max(4));
+                }
             }
             _ => {}
         }
@@ -599,6 +682,18 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
             Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
                 let _ = spill_displacement(&function.frame, *slot)?;
             }
+            Operation::Cpuid {
+                leaf,
+                subleaf,
+                out_eax,
+                out_ebx,
+                out_ecx,
+                out_edx,
+            } => {
+                for slot in [leaf, subleaf, out_eax, out_ebx, out_ecx, out_edx] {
+                    let _ = spill_displacement(&function.frame, *slot)?;
+                }
+            }
             _ => {}
         }
         let mut read = BTreeSet::new();
@@ -633,6 +728,10 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
     validate_call_abi(function, &registers)?;
     for operation in &function.operations {
         if let Operation::Shift {
+            count: crate::ShiftCount::Register(register),
+            ..
+        }
+        | Operation::DoubleShift {
             count: crate::ShiftCount::Register(register),
             ..
         } = operation
@@ -723,7 +822,9 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
                 Operation::BranchIf { target, .. } => {
                     referenced.insert(*target);
                 }
-                Operation::Return | Operation::JumpToAddress(_) => terminated = true,
+                Operation::Return | Operation::ReturnPopping { .. } | Operation::JumpToAddress(_) => {
+                    terminated = true;
+                }
                 _ => {}
             }
         }

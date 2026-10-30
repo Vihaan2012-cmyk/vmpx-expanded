@@ -6,15 +6,25 @@
 //! ABI, or control-flow dependency is missing.
 
 mod constant_dispatch;
+mod decoded_lift;
 mod effect_liveness;
+mod entry_frame;
 mod equivalence;
 mod expr_codegen;
 mod live_in;
+mod passthrough;
 mod replacement;
+
+pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
 pub use constant_dispatch::{
     ConstantDispatchConfig, ConstantDispatchError, compile_constant_dispatch,
 };
+pub use decoded_lift::{
+    DecodedLiftError, DecodedLinearInput, LiftAssumption, LiftedLinearFunction, SemanticLowering,
+    first_unliftable, lift_decoded_linear, semantic_lowering,
+};
+pub use entry_frame::{frame_initial_state, recover_entry_frame};
 pub use effect_liveness::{
     CollectedCall, CollectedEffects, CollectedStore, EntryEffectLivenessReport,
     PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects,
@@ -33,6 +43,7 @@ pub use live_in::{
 };
 pub use replacement::{
     EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementError, build_replacement,
+    build_replacement_popping,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -505,6 +516,10 @@ fn current_implemented_capabilities() -> BTreeSet<LoweringCapability> {
         LoweringCapability::MemoryBackend,
         LoweringCapability::BranchBackend,
         LoweringCapability::StackSsaLowering,
+        LoweringCapability::DoubleShiftBackend,
+        LoweringCapability::CpuidIntrinsic,
+        LoweringCapability::NativeFlagsRestore,
+        LoweringCapability::SegmentRelativeLoad,
     ]
     .into_iter()
     .collect()

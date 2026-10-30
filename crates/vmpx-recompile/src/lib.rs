@@ -20,7 +20,7 @@ pub use dispatch::{
 pub use encode::{CodeAddress, CompiledFunction, compile};
 pub use error::CompileError;
 pub use ir::{
-    Address, BinaryOp, BinarySource, CallTarget, Condition, Function, Label, NativeAddress,
+    Address, BinaryOp, BinarySource, CallTarget, Condition, DoubleShiftDirection, Function, Label, NativeAddress,
     Operation, PhysicalRegister, ResizeOp, ShiftCount, ShiftOp, SpillSlot, UnaryOp,
     VirtualRegister, Width,
 };
