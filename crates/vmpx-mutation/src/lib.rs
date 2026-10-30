@@ -11,7 +11,10 @@ pub mod cfg_recovery;
 pub mod dead_code;
 pub mod substitution;
 
-pub use cfg_recovery::{VmAlgebra, lift_native_block};
+pub use cfg_recovery::{
+    CfgError, CfgLimits, EdgeKind, NativeBlock, NativeCfg, Terminator, VmAlgebra,
+    lift_native_block, recover_native_cfg, recover_native_cfg_pe, recover_native_cfg_with,
+};
 pub use vmpx_vm::{BitWidth, Expr};
 
 /// Which family of mutation obfuscation a [`Problem`] belongs to. Drives both

@@ -2765,7 +2765,9 @@ dependencies = [
 name = "vmpx-mutation"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "vmpx-disasm",
+ "vmpx-pe",
  "vmpx-vm",
 ]
 

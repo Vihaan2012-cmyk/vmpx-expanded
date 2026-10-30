@@ -6,7 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+iced-x86.workspace = true
 vmpx-disasm = { path = "../vmpx-disasm" }
+vmpx-pe = { path = "../vmpx-pe" }
 vmpx-vm = { path = "../vmpx-vm" }
 
 [lints]
