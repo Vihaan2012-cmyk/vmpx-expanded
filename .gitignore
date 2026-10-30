@@ -4,3 +4,5 @@
 *.pdb
 
 .superpowers/
+
+.claude/settings.local.json
