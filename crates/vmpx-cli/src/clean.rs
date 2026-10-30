@@ -1372,6 +1372,51 @@ pub fn analyze_clean_with_image(
                 }
             }
 
+            // Decoded-stream lifts: every remaining inventory entry whose handler
+            // stream lifts to a clean callee return. A failed lift skips only
+            // that entry and leaves its stub; redirects are not counted as
+            // coverage, so the sound gate is unaffected.
+            let mut decoded_stubs: Vec<(Rva, Rva)> = Vec::new();
+            let mut decoded_bytes: u64 = 0;
+            let mut decoded_failed: u64 = 0;
+            for entry in &vm_inventory {
+                let handled_by_group = (is_dll && entry.rva == pe.optional.address_of_entry_point)
+                    || tls_callback_index(&pe, entry.rva).is_some();
+                if handled_by_group || !seen_stubs.insert(entry.rva) {
+                    continue;
+                }
+                let Some(body_rva) = planned_rva.0.checked_add(layout_cursor).map(Rva) else {
+                    continue;
+                };
+                match crate::decoded_splice::lift_entry(
+                    &pe,
+                    entry.rva,
+                    va + u64::from(layout_cursor),
+                ) {
+                    Ok(body) => {
+                        let len = u64::try_from(body.bytes.len()).unwrap_or(0);
+                        layout_cursor =
+                            layout_cursor.saturating_add(u32::try_from(len).unwrap_or(0));
+                        total_bytes += len;
+                        decoded_bytes += len;
+                        emitted += 1;
+                        reintegration_payload.extend_from_slice(&body.bytes);
+                        decoded_stubs.push((entry.rva, body_rva));
+                        reintegration_diagnostics.push(format!(
+                            "{}: decoded-stream {} lift, {len} byte(s) at {body_rva}",
+                            entry.rva, body.kind
+                        ));
+                    }
+                    Err(error) => {
+                        decoded_failed += 1;
+                        reintegration_diagnostics.push(format!(
+                            "{}: decoded-stream lift skipped: {error}",
+                            entry.rva
+                        ));
+                    }
+                }
+            }
+
             // Nested-continuation bodies still compile and count here (nothing
             // is silently dropped), but reintegration is deferred: redirecting
             // to one means rewriting another body's continuation target, which
@@ -1480,6 +1525,18 @@ pub fn analyze_clean_with_image(
                                 )),
                             }
                         }
+                        let mut decoded_redirected: u64 = 0;
+                        for (stub, body) in &decoded_stubs {
+                            match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *body) {
+                                Ok(redirected) => {
+                                    bytes = redirected;
+                                    decoded_redirected += 1;
+                                }
+                                Err(error) => reintegration_diagnostics.push(format!(
+                                    "{stub}: decoded-stream redirect failed, original stub kept: {error}"
+                                )),
+                            }
+                        }
                         reintegrated = Some(bytes);
                         let entries_redirected = u64::from(report.entry_redirected)
                             + u64::try_from(report.tls_redirected).unwrap_or(0);
@@ -1509,6 +1566,13 @@ pub fn analyze_clean_with_image(
                                 ("branching_built".to_owned(), branching_built),
                                 ("branching_redirected".to_owned(), branching_redirected),
                                 ("branching_bytes".to_owned(), branching_bytes),
+                                (
+                                    "decoded_lifted".to_owned(),
+                                    u64::try_from(decoded_stubs.len()).unwrap_or(0),
+                                ),
+                                ("decoded_redirected".to_owned(), decoded_redirected),
+                                ("decoded_failed".to_owned(), decoded_failed),
+                                ("decoded_bytes".to_owned(), decoded_bytes),
                                 (
                                     "tls_redirected".to_owned(),
                                     u64::try_from(report.tls_redirected).unwrap_or(0),

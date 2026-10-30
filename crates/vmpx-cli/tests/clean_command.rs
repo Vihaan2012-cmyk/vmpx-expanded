@@ -379,3 +379,47 @@ fn conventional_image_maps_identically_to_the_analysis_image() {
     fs::remove_file(report).expect("remove report");
     fs::remove_dir(directory).expect("remove directory");
 }
+
+#[test]
+#[ignore = "large controlled VMProtect fixture; slow"]
+fn experimental_splices_decoded_stream_lifts_and_sound_output_stays_refused() {
+    let input = std::env::var_os("VMPX_COREDLL").map_or_else(
+        || PathBuf::from("E:/VMPX/testcorpus/protected/coredll.vmp.dll"),
+        PathBuf::from,
+    );
+    let directory = test_directory("clean-splice");
+    fs::create_dir(&directory).expect("create isolated test directory");
+    let output = directory.join("out.dll");
+    let experimental = directory.join("out_exp.dll");
+    let report = directory.join("report.json");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["clean"])
+        .arg(&input)
+        .arg(&output)
+        .args(["--experimental"])
+        .arg(&experimental)
+        .args(["--report"])
+        .arg(&report)
+        .output()
+        .expect("vmpx clean process starts");
+    assert!(!result.status.success());
+    assert!(!output.exists());
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read report")).expect("valid JSON");
+    let metrics = &json["reintegration"]["metrics"];
+    assert!(metrics["decoded_redirected"].as_u64().unwrap_or(0) >= 2);
+    assert!(metrics["decoded_bytes"].as_u64().unwrap_or(0) > 0);
+    let info = Command::new(env!("CARGO_BIN_EXE_vmpx"))
+        .args(["info"])
+        .arg(&experimental)
+        .output()
+        .expect("vmpx info starts");
+    let info = String::from_utf8_lossy(&info.stdout);
+    assert!(info.contains(".vmpx0"), "{info}");
+    assert!(info.contains("no structural diagnostics"), "{info}");
+
+    fs::remove_file(experimental).expect("remove experimental image");
+    fs::remove_file(report).expect("remove isolated report");
+    fs::remove_dir(directory).expect("remove isolated test directory");
+}

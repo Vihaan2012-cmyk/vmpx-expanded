@@ -21,6 +21,7 @@ mod clean;
 mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
+mod decoded_splice;
 mod input_closed_functions;
 mod vm_inventory;
 
