@@ -102,12 +102,24 @@ struct Node {
     end: End,
 }
 
+#[derive(Clone)]
+struct PathStore {
+    /// Upper bound on the memory epoch right after this store.
+    end_epoch: u64,
+    address: Expr,
+    bytes: u32,
+}
+
 #[derive(Clone, Default)]
 struct Path {
     trail: Vec<Va>,
     /// Memory epoch at the latest external store or call on this path. A load
     /// from an earlier epoch cannot be re-read natively after that barrier.
     barrier: u64,
+    /// Memory epoch at the latest native call on this path; no read crosses it.
+    call_barrier: u64,
+    /// External stores on this path, in native order.
+    stores: Vec<PathStore>,
     /// A store on this path wrote a value derived from the VM stack pointer.
     root_escaped: bool,
     /// Native-call result intrinsics bound to their frame-slot input names.
@@ -170,6 +182,35 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
     Ok((values, true))
 }
 
+/// Both addresses are fixed offsets from the entry stack pointer and their byte
+/// ranges do not overlap.
+fn provably_disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
+    let (Some(a_start), Some(b_start)) = (
+        symbolic_pointer_offset(a, "vsp_initial"),
+        symbolic_pointer_offset(b, "vsp_initial"),
+    ) else {
+        return false;
+    };
+    let (Some(a_end), Some(b_end)) = (
+        a_start.checked_add(i64::from(a_bytes)),
+        b_start.checked_add(i64::from(b_bytes)),
+    ) else {
+        return false;
+    };
+    a_end <= b_start || b_end <= a_start
+}
+
+/// An earlier read can be re-issued natively at a later point when no native
+/// call intervenes and every store since it is provably disjoint from it.
+fn read_is_stable(path: &Path, epoch: u64, address: &Expr, bytes: u32) -> bool {
+    epoch >= path.call_barrier
+        && path
+            .stores
+            .iter()
+            .filter(|store| store.end_epoch > epoch)
+            .all(|store| provably_disjoint(address, bytes, &store.address, store.bytes))
+}
+
 fn is_native_rflags_initial(expression: &Expr) -> bool {
     matches!(
         &expression.simplify().kind,
@@ -185,8 +226,9 @@ impl Builder<'_> {
         block: Va,
         expression: &Expr,
         barrier: u64,
-        results: &BTreeMap<String, String>,
+        path: &Path,
     ) -> Result<Expr, DecodedLiftError> {
+        let results = &path.results;
         let rewritten = expression
             .rewrite_intrinsics(&mut |width, name, arguments| {
                 if let Some(register) = results.get(name) {
@@ -198,7 +240,11 @@ impl Builder<'_> {
                     .parse::<u64>()
                     .ok()?;
                 match arguments {
-                    [address] if epoch >= barrier && address.width == BitWidth::W64 => {
+                    [address]
+                        if address.width == BitWidth::W64
+                            && (epoch >= barrier
+                                || read_is_stable(path, epoch, address, width.bytes())) =>
+                    {
                         Some(Expr::load(width, address.clone()))
                     }
                     _ => None,
@@ -344,9 +390,14 @@ impl Builder<'_> {
                 if write.value.dependencies().contains("vsp_initial") {
                     path.root_escaped = true;
                 }
-                let address = self.prepare(key, &write.address, barrier, &path.results)?;
-                let value = self.prepare(key, &write.value, barrier, &path.results)?;
+                let address = self.prepare(key, &write.address, barrier, &path)?;
+                let value = self.prepare(key, &write.value, barrier, &path)?;
                 let width = value.width;
+                path.stores.push(PathStore {
+                    end_epoch: report.memory_epoch,
+                    address: write.address.clone(),
+                    bytes: write.value.width.bytes(),
+                });
                 steps.push(Step::Store(EffectStore {
                     address,
                     value,
@@ -385,10 +436,7 @@ impl Builder<'_> {
                     self.assume(LiftAssumption::FlagsVolatileAtReturn);
                     let mut registers = BTreeMap::new();
                     for (register, value) in &exit.registers {
-                        registers.insert(
-                            *register,
-                            self.prepare(key, value, path.barrier, &path.results)?,
-                        );
+                        registers.insert(*register, self.prepare(key, value, path.barrier, &path)?);
                     }
                     self.exit_paths += 1;
                     return Ok(Node {
@@ -423,7 +471,7 @@ impl Builder<'_> {
                         state = next;
                         continue;
                     }
-                    let condition = self.prepare(key, target, path.barrier, &path.results)?;
+                    let condition = self.prepare(key, target, path.barrier, &path)?;
                     self.branches += 1;
                     let mut arms = Vec::with_capacity(successors.len());
                     for (value, successor) in successors {
@@ -480,15 +528,10 @@ impl Builder<'_> {
                         return refuse(key, "native-call result is not 64 bits");
                     }
                     let target =
-                        self.prepare(key, &invocation.target.value, path.barrier, &path.results)?;
+                        self.prepare(key, &invocation.target.value, path.barrier, &path)?;
                     let mut arguments = Vec::with_capacity(invocation.arguments.len());
                     for argument in &invocation.arguments {
-                        arguments.push(self.prepare(
-                            key,
-                            &argument.value,
-                            path.barrier,
-                            &path.results,
-                        )?);
+                        arguments.push(self.prepare(key, &argument.value, path.barrier, &path)?);
                     }
                     let post = match &symbolic_call.applied_effect.memory {
                         NativeCallMemoryDecision::PreserveTracked => call.continuation_state(),
@@ -523,6 +566,7 @@ impl Builder<'_> {
                     path.results
                         .insert(result_name.clone(), call_result_name(index));
                     path.barrier = path.barrier.max(call.memory_epoch);
+                    path.call_barrier = path.barrier;
                     key = self.call_return_block(key)?;
                     state = post;
                 }

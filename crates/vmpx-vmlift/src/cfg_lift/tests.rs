@@ -563,3 +563,86 @@ fn a_missing_exit_layout_refuses() {
     .expect_err("no layout");
     assert!(error.to_string().contains("VM-exit layout"), "{error}");
 }
+
+fn stack_slot(offset: u64) -> Expr {
+    Expr::binary(
+        BinaryOp::Add,
+        Expr::register(BitWidth::W64, "vsp_initial"),
+        Expr::constant(BitWidth::W64, offset),
+    )
+    .expect("slot")
+}
+
+fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLiftError> {
+    let cfg = conditional_cfg();
+    let (frame, exits, calls) = (constant_frame(), exits(), BTreeMap::new());
+    let input = DecodedCfgInput {
+        cfg: &cfg,
+        frame: &frame,
+        exits: &exits,
+        native_calls: &calls,
+        memory: None,
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: VmCfgLimits::default(),
+        max_expanded_blocks: 64,
+    };
+    let mut builder = Builder {
+        input: &input,
+        expanded: 0,
+        blocks: BTreeSet::new(),
+        exit_paths: 0,
+        branches: 0,
+        call_sites: 0,
+        uses_root: false,
+        assumptions: Vec::new(),
+    };
+    let read = Expr::intrinsic(
+        BitWidth::W32,
+        format!("memory_load_epoch_{epoch}"),
+        vec![stack_slot(offset)],
+    );
+    builder.prepare(Va(1), &read, path.barrier, path)
+}
+
+fn path_with_store(store_offset: u64, store_bytes: u32) -> Path {
+    Path {
+        barrier: 20,
+        stores: vec![PathStore {
+            end_epoch: 20,
+            address: stack_slot(store_offset),
+            bytes: store_bytes,
+        }],
+        ..Path::default()
+    }
+}
+
+#[test]
+fn a_read_before_a_disjoint_store_is_hoisted_to_a_native_load() {
+    let prepared = prepare_read(&path_with_store(0xc0, 2), 10, 0xb78).expect("disjoint");
+    assert!(
+        matches!(prepared.kind, ExprKind::Load { .. }),
+        "{prepared:?}"
+    );
+    assert!(prepare_read(&path_with_store(0xb7c, 8), 10, 0xb78).is_ok());
+}
+
+#[test]
+fn a_read_before_an_overlapping_or_unanalyzable_store_refuses() {
+    for (store, bytes) in [(0xb78, 4), (0xb76, 4), (0xb7b, 1)] {
+        let error =
+            prepare_read(&path_with_store(store, bytes), 10, 0xb78).expect_err("overlapping store");
+        assert!(error.to_string().contains("predates"), "{error}");
+    }
+    let mut path = path_with_store(0xc0, 2);
+    path.stores[0].address = entry(X64NativeRegister::Rcx);
+    assert!(prepare_read(&path, 10, 0xb78).is_err());
+}
+
+#[test]
+fn a_read_that_a_native_call_crossed_refuses_but_a_later_store_does_not() {
+    let mut path = path_with_store(0xc0, 2);
+    path.call_barrier = 15;
+    assert!(prepare_read(&path, 10, 0xb78).is_err());
+    assert!(prepare_read(&path, 15, 0xb78).is_ok());
+    assert!(prepare_read(&path_with_store(0xb78, 4), 20, 0xb78).is_ok());
+}

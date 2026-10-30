@@ -7,8 +7,8 @@ use std::{collections::BTreeMap, fs};
 use vmpx_pe::{PeImage, Rva};
 use vmpx_recompile::CodeAddress;
 use vmpx_vm::{
-    BlockExit, EntryProfileRecoveryLimits, SymbolicExecutionLimits, VmCfgLimits, VmDiscoveryLimits,
-    analyze_vm_entry_at, recover_entry_stream, recover_vm_cfg,
+    BlockExit, EntryProfileRecoveryLimits, RecoveryStatus, SymbolicExecutionLimits, VmCfgLimits,
+    VmDiscoveryLimits, analyze_vm_entry_at, analyze_vm_exit, recover_entry_stream, recover_vm_cfg,
 };
 use vmpx_vmlift::{
     DecodedCfgInput, first_unliftable, lift_decoded_cfg, probe_decoded_cfg, recover_entry_frame,
@@ -83,12 +83,37 @@ fn main() {
                 continue;
             }
         };
-        let exits: BTreeMap<_, _> = stream
+        let mut exits: BTreeMap<_, _> = stream
             .decode
             .handler_recoveries
             .iter()
             .filter_map(|(handler, recovery)| Some((*handler, recovery.vm_exit.clone()?)))
             .collect();
+        for block in cfg
+            .blocks
+            .values()
+            .filter(|block| block.exit == BlockExit::VmExit)
+        {
+            let handler = block
+                .instructions
+                .last()
+                .map_or(block.start.handler, |last| last.state_after.handler);
+            if exits.contains_key(&handler) {
+                continue;
+            }
+            let Some(rva) = pe.optional.image_base.checked_rva_of(handler) else {
+                continue;
+            };
+            if let Ok(report) = analyze_vm_exit(
+                &pe,
+                rva,
+                stream.profile.effect_roles.vsp,
+                entry_limits.trace,
+            ) && report.status == RecoveryStatus::Recovered
+            {
+                exits.insert(handler, report);
+            }
+        }
         let calls = BTreeMap::new();
         let exit_blocks = cfg
             .blocks
