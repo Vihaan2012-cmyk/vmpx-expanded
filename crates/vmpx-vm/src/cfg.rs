@@ -215,15 +215,43 @@ impl From<EntryProfileRecoveryError> for CfgError {
     }
 }
 
+/// If `instruction` captures RSP into `vsp`, returns the byte offset from the
+/// captured VSP up to the top (last-pushed) frame cell, which sits at the live
+/// RSP. `mov vsp,rsp` sets VSP = RSP, so that offset is 0. `lea vsp,[rsp+disp]`
+/// sets VSP = RSP + disp, so RSP = VSP - disp and the top cell sits at VSP minus
+/// disp. Only RSP-based, index-free, 64-bit, non-RSP destinations that match the
+/// profile's VSP register are accepted; anything else fails closed (None).
+fn vsp_capture_top_offset(instruction: &iced_x86::Instruction, vsp: Register) -> Option<u64> {
+    let vsp = canonical(vsp);
+    if is_cursor_capture(instruction).is_some_and(|cursor| cursor == vsp) {
+        return Some(0);
+    }
+    if instruction.mnemonic() == Mnemonic::Lea
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op0_register().size() == 8
+        && instruction.op0_register() != Register::RSP
+        && canonical(instruction.op0_register()) == vsp
+        && instruction.memory_base() == Register::RSP
+        && instruction.memory_index() == Register::None
+    {
+        // VSP = RSP + disp  =>  RSP = VSP - disp. The top cell sits at RSP, i.e.
+        // VSP - disp; the displacement is modular, so negate it in u64.
+        return Some(0_u64.wrapping_sub(instruction.memory_displacement64()));
+    }
+    None
+}
+
 /// Proven contents of the VM stack at VM start, top first, recovered by
-/// stepping the native entry up to the VSP capture. Fails closed on anything it
-/// cannot model (nested calls, unknown stack writes, stack-pointer arithmetic).
+/// stepping the native entry up to the VSP capture. Returns the cells and the
+/// byte offset from VSP to the top cell (nonzero when a `lea` capture places VSP
+/// off the frame top). Fails closed on anything it cannot model (nested calls,
+/// unknown stack writes, stack-pointer arithmetic).
 fn recover_entry_frame(
     pe: &PeImage<'_>,
     entry: &VmEntryCandidate,
     vsp: Register,
     limits: DirectJumpTraceLimits,
-) -> Result<Vec<NativeFrameSource>, String> {
+) -> Result<(Vec<NativeFrameSource>, u64), String> {
     let caller = trace_direct_jump_fragments(pe, entry.rva, limits).map_err(|e| e.to_string())?;
     let caller_instructions = caller.instructions().collect::<Vec<_>>();
     let (call_index, call) = caller_instructions
@@ -259,9 +287,9 @@ fn recover_entry_frame(
     let mut factory = InstructionInfoFactory::new();
     for decoded in target.instructions() {
         let instruction = &decoded.instruction;
-        if is_cursor_capture(instruction).is_some_and(|cursor| cursor == canonical(vsp)) {
+        if let Some(top_offset) = vsp_capture_top_offset(instruction, vsp) {
             stack.reverse();
-            return Ok(stack);
+            return Ok((stack, top_offset));
         }
         match instruction.flow_control() {
             FlowControl::Next | FlowControl::UnconditionalBranch => {}
@@ -348,7 +376,10 @@ fn stored_value(
     }
 }
 
-fn frame_initial_state(cells: &[NativeFrameSource]) -> (SymbolicVmInitialState, usize) {
+fn frame_initial_state(
+    cells: &[NativeFrameSource],
+    top_offset: u64,
+) -> (SymbolicVmInitialState, usize) {
     let mut initial = SymbolicVmInitialState::default();
     let base = Expr::register(BitWidth::W64, "vsp_initial");
     let mut known = 0;
@@ -356,10 +387,11 @@ fn frame_initial_state(cells: &[NativeFrameSource]) -> (SymbolicVmInitialState, 
         let Some(value) = cell.symbolic_value() else {
             continue;
         };
+        let offset = top_offset.wrapping_add((index as u64).wrapping_mul(8));
         let Ok(address) = Expr::binary(
             BinaryOp::Add,
             base.clone(),
-            Expr::constant(BitWidth::W64, (index as u64) * 8),
+            Expr::constant(BitWidth::W64, offset),
         ) else {
             continue;
         };
@@ -1060,13 +1092,13 @@ impl Walker<'_, '_> {
             );
             return;
         }
-        let cells = match recover_entry_frame(
+        let (cells, top_offset) = match recover_entry_frame(
             self.pe,
             &candidate,
             setup.profile.effect_roles.vsp,
             self.limits.entry.trace,
         ) {
-            Ok(cells) => cells,
+            Ok(result) => result,
             Err(error) => {
                 self.stall(
                     key,
@@ -1080,7 +1112,7 @@ impl Walker<'_, '_> {
             NativeFrameSource::ReturnAddress { continuation, .. } => Some(*continuation),
             _ => None,
         });
-        let (frame, _) = frame_initial_state(&cells);
+        let (frame, _) = frame_initial_state(&cells, top_offset);
         let initial = match compose_native_frame(
             self.pe,
             symbolic,
@@ -1196,8 +1228,8 @@ pub fn recover_vm_cfg(
         setup.profile.effect_roles.vsp,
         limits.entry.trace,
     ) {
-        Ok(cells) => {
-            let (initial, known) = frame_initial_state(&cells);
+        Ok((cells, top_offset)) => {
+            let (initial, known) = frame_initial_state(&cells, top_offset);
             (initial, known, None)
         }
         Err(note) => (SymbolicVmInitialState::default(), 0, Some(note)),
@@ -1251,6 +1283,67 @@ pub fn recover_vm_cfg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_one(bytes: &[u8]) -> iced_x86::Instruction {
+        iced_x86::Decoder::with_ip(64, bytes, 0x1_4000_1000, iced_x86::DecoderOptions::NONE).decode()
+    }
+
+    #[test]
+    fn lea_form_vsp_capture_offsets_frame_and_bad_forms_fail_closed() {
+        // `lea rbp,[rsp-28h]`: VSP = RSP - 0x28, so the top cell is at VSP+0x28.
+        let lea = decode_one(&[0x48, 0x8d, 0x6c, 0x24, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea, Register::RBP), Some(0x28));
+        // `mov rbp,rsp`: VSP = RSP, top cell at VSP+0.
+        let mov = decode_one(&[0x48, 0x89, 0xe5]);
+        assert_eq!(vsp_capture_top_offset(&mov, Register::RBP), Some(0));
+
+        // Fail closed: capture register disagrees with the profile's VSP.
+        assert_eq!(vsp_capture_top_offset(&lea, Register::RSI), None);
+        assert_eq!(vsp_capture_top_offset(&mov, Register::RSI), None);
+        // Fail closed: base is not RSP (`lea rbp,[rbp-28h]`).
+        let lea_rbp = decode_one(&[0x48, 0x8d, 0x6d, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea_rbp, Register::RBP), None);
+        // Fail closed: indexed address (`lea rbp,[rsp+rax-28h]`).
+        let lea_indexed = decode_one(&[0x48, 0x8d, 0x6c, 0x04, 0xd8]);
+        assert_eq!(vsp_capture_top_offset(&lea_indexed, Register::RBP), None);
+
+        // The offset flows into the frame: cell i lands at vsp_initial+0x28+i*8.
+        let cells = vec![
+            NativeFrameSource::Register {
+                register: crate::X64NativeRegister::R13,
+            },
+            NativeFrameSource::Register {
+                register: crate::X64NativeRegister::Rcx,
+            },
+        ];
+        let (state, known) = frame_initial_state(&cells, 0x28);
+        assert_eq!(known, 2);
+        let addresses: Vec<_> = state
+            .memory_values
+            .iter()
+            .map(|(address, _)| format!("{address:?}"))
+            .collect();
+        let want_top = format!(
+            "{:?}",
+            Expr::binary(
+                BinaryOp::Add,
+                Expr::register(BitWidth::W64, "vsp_initial"),
+                Expr::constant(BitWidth::W64, 0x28),
+            )
+            .unwrap()
+        );
+        let want_next = format!(
+            "{:?}",
+            Expr::binary(
+                BinaryOp::Add,
+                Expr::register(BitWidth::W64, "vsp_initial"),
+                Expr::constant(BitWidth::W64, 0x30),
+            )
+            .unwrap()
+        );
+        assert!(addresses.contains(&want_top), "missing VSP+0x28: {addresses:?}");
+        assert!(addresses.contains(&want_next), "missing VSP+0x30: {addresses:?}");
+    }
 
     fn zf_select(register: &str, compare: u64, if_zero: u64, otherwise: u64) -> Expr {
         let rdx = Expr::register(BitWidth::W64, register);
