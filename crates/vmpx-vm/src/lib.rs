@@ -1,3 +1,4 @@
+mod anti_debug_idioms;
 mod bootstrap;
 mod call_effects;
 mod cfg;
@@ -38,6 +39,10 @@ mod value_flow;
 mod value_range;
 mod vm_exit;
 
+pub use anti_debug_idioms::{
+    AntiDebugIdiom, IdiomAssumption, IdiomClassification, RecognizedIdiom,
+    recognize_anti_debug_idiom,
+};
 pub use bootstrap::{
     BootstrapDispatchCandidateReport, BootstrapDispatchRecovery, BootstrapDispatchReport,
     BootstrapRecoveryError, recover_bootstrap_dispatch,
