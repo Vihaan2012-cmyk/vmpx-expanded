@@ -1,7 +1,12 @@
+mod import_reconstruct;
 mod import_table;
 mod layout;
 mod reintegrate;
 
+pub use import_reconstruct::{
+    ProvenImport, ProvenImportSet, ProvenModule, SlotBinding, SymbolRef, UnresolvedReason,
+    UnresolvedSlot, bindings_from_modules, plan_proven_imports, reduce_to_proven_imports,
+};
 pub use import_table::{
     ImportModuleSpec, ImportReconstructionPlan, ImportSlotRemap, ImportTableError, ImportTarget,
     SerializedDirectoryRange, SerializedImportTable, install_import_directories,
