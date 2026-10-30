@@ -400,6 +400,84 @@ impl LoweringContext<'_> {
         Ok(())
     }
 
+    /// Computes the status-flag word of a VM `nor`/`nand` with the native
+    /// logical instruction that defines it. The VM semantics are
+    /// `nor(a, b) = (~a) & (~b)` and `nand(a, b) = (~a) | (~b)`, so the flags are
+    /// exactly those a real `and`/`or` of the two complemented operands sets:
+    /// CF and OF cleared, SF/ZF/PF taken from the result, and AF left by the
+    /// hardware. The result-derived bits (SF/ZF/PF) and the cleared CF/OF are
+    /// fully defined; AF is architecturally undefined after a logical op but is
+    /// reproduced by identity here — the emitted instruction is the same `and`/
+    /// `or` the VM handler executed, on the same operands, so it yields the same
+    /// AF the original captured (the same trust basis as the double-shift flag
+    /// read, which also pushfqs an ISA-undefined OF/AF). Masking AF out instead
+    /// would force it to zero and could silently diverge from the original, so
+    /// re-emitting the real instruction is the sound choice.
+    fn lower_logical_flags(
+        &mut self,
+        name: &str,
+        or: bool,
+        width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "logical flags take two operands"));
+        };
+        if left.width != width || right.width != width || expression.width != BitWidth::W64 {
+            return Err(malformed(name, "logical-flag operand widths disagree"));
+        }
+        self.lower(left)?;
+        self.operations.push(Operation::Unary {
+            operation: NativeUnaryOp::Not,
+            destination: accumulator(width),
+        });
+        let left_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: left_slot,
+            source: accumulator(width),
+        });
+        self.lower(right)?;
+        self.operations.push(Operation::Unary {
+            operation: NativeUnaryOp::Not,
+            destination: accumulator(width),
+        });
+        self.operations.push(Operation::Move {
+            destination: temporary(width),
+            source: accumulator(width),
+        });
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(width),
+            slot: left_slot,
+        });
+        self.release_slot();
+        // The `and`/`or` is the flag-defining instruction; `not`, `mov` and the
+        // spill traffic above leave the flags untouched until this point.
+        self.operations.push(Operation::Binary {
+            operation: if or {
+                NativeBinaryOp::Or
+            } else {
+                NativeBinaryOp::And
+            },
+            destination: accumulator(width),
+            source: BinarySource::Register(temporary(width)),
+        });
+        self.operations.push(Operation::ReadFlags {
+            destination: accumulator(BitWidth::W64),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::And,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_MASK),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::Or,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_FIXED),
+        });
+        Ok(())
+    }
+
     /// Lowers a wide multiply whose double-width product is packed into a qword.
     ///
     /// The symbolic executor names this `x86_{signed,unsigned}_multiply_wN_K`
@@ -531,6 +609,25 @@ fn status_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
     Some((subtract, width))
 }
 
+/// `vm_flags_nor_wN` / `vm_flags_nand_wN`: whether the native op is `or` (the
+/// NAND form, `(~a) | (~b)`) rather than `and` (the NOR form, `(~a) & (~b)`),
+/// and its width.
+fn logical_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
+    let (or, rest) = if let Some(rest) = name.strip_prefix("vm_flags_nand_") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix("vm_flags_nor_")?)
+    };
+    let width = match rest {
+        "w8" => BitWidth::W8,
+        "w16" => BitWidth::W16,
+        "w32" => BitWidth::W32,
+        "w64" => BitWidth::W64,
+        _ => return None,
+    };
+    Some((or, width))
+}
+
 /// `x86_signed_multiply_wN_K` / `x86_unsigned_multiply_wN_K`: signedness and
 /// operand width of a wide multiply. Only widths up to 32 bits are named this
 /// way; the 64-bit form splits its result into `_low`/`_high` intrinsics.
@@ -654,6 +751,8 @@ impl LoweringContext<'_> {
                     self.passthroughs.insert(name.clone());
                 } else if let Some((subtract, width)) = status_flags_intrinsic(name) {
                     self.lower_status_flags(name, subtract, width, expression, arguments)?;
+                } else if let Some((or, width)) = logical_flags_intrinsic(name) {
+                    self.lower_logical_flags(name, or, width, expression, arguments)?;
                 } else if let Some((signed, width)) = wide_multiply_intrinsic(name) {
                     self.lower_wide_multiply(name, signed, width, expression, arguments)?;
                 } else {
@@ -1243,6 +1342,127 @@ mod tests {
                 .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Movsxd),
             "unsigned wide multiply zero-extends rather than sign-extends"
         );
+    }
+
+    fn mnemonic_count(bytes: &[u8], mnemonic: iced_x86::Mnemonic) -> usize {
+        decoded(bytes)
+            .iter()
+            .filter(|instruction| instruction.mnemonic() == mnemonic)
+            .count()
+    }
+
+    /// Counts register-to-register `and`/`or` instructions, i.e. the
+    /// flag-defining logical op, excluding the immediate-masked tail.
+    fn register_logical_count(bytes: &[u8], mnemonic: iced_x86::Mnemonic) -> usize {
+        decoded(bytes)
+            .iter()
+            .filter(|instruction| {
+                instruction.mnemonic() == mnemonic
+                    && instruction.op_count() == 2
+                    && instruction.op1_kind() == iced_x86::OpKind::Register
+            })
+            .count()
+    }
+
+    #[test]
+    fn logical_flags_lower_to_the_defining_instruction_and_a_flag_read() {
+        // `vm_flags_nor_wN(a, b)` is the flag word of the native `and` of the
+        // two complemented operands (`(~a) & (~b)`); `vm_flags_nand_wN` the
+        // flag word of the matching `or`. The lowering must emit two `not`s,
+        // the real `and`/`or` that sets the flags, and a `pushfq` flag read.
+        let operands = || {
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+            ]
+        };
+        for (name, logical, is_or) in [
+            ("vm_flags_nor_w32", iced_x86::Mnemonic::And, false),
+            ("vm_flags_nand_w32", iced_x86::Mnemonic::Or, true),
+        ] {
+            let expression = Expr::intrinsic(BitWidth::W64, name, operands());
+            let config = passthrough_config();
+            let lowered = lower_expression(&expression, &config).expect("lower logical flags");
+            assert!(lowered.passthroughs.is_empty());
+            assert!(lowered.environment_boundaries.is_empty());
+            let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile flags");
+            assert_eq!(
+                mnemonic_count(&compiled.bytes, iced_x86::Mnemonic::Not),
+                2,
+                "both operands are complemented"
+            );
+            assert_eq!(
+                register_logical_count(&compiled.bytes, logical),
+                1,
+                "the defining register {logical:?} is emitted once"
+            );
+            // The complementary logical op must NOT appear as the defining op:
+            // a nor is an `and` of the operands, never an `or`, and vice versa.
+            // (Both lowerings share the immediate-masked tail, so the tail's
+            // `and`/`or` with immediates are excluded by construction.)
+            let other = if is_or {
+                iced_x86::Mnemonic::And
+            } else {
+                iced_x86::Mnemonic::Or
+            };
+            assert_eq!(
+                register_logical_count(&compiled.bytes, other),
+                0,
+                "no stray defining {other:?}"
+            );
+            assert_eq!(
+                mnemonic_count(&compiled.bytes, iced_x86::Mnemonic::Pushfq),
+                1,
+                "the flag word is read back once"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_flags_refuse_wrong_arity_or_widths() {
+        let config = passthrough_config();
+        let wrong_arity = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_nor_w32",
+            vec![Expr::register(BitWidth::W32, "a")],
+        );
+        assert!(matches!(
+            lower_expression(&wrong_arity, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+        let wrong_width = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_nor_w32",
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W64, "p"),
+            ],
+        );
+        assert!(matches!(
+            lower_expression(&wrong_width, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+    }
+
+    #[test]
+    fn shift_flags_fail_closed_rather_than_emit_approximate_bits() {
+        // VM shift-flag intrinsics (`vm_flags_shiftleft_wN`, etc.) are left
+        // unlowered on purpose: a variable shift's CF is the last bit shifted
+        // out and its OF is ISA-undefined for counts other than one, so there
+        // is no shape we can prove exact here. Fail closed instead of guessing.
+        let expression = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_shiftleft_w32",
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+            ],
+        );
+        let config = passthrough_config();
+        assert!(matches!(
+            lower_expression(&expression, &config),
+            Err(ExpressionCodegenError::UnsupportedIntrinsic { name }) if name == "vm_flags_shiftleft_w32"
+        ));
     }
 
     #[test]
