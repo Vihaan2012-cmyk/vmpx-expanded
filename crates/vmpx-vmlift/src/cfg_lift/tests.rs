@@ -57,6 +57,9 @@ fn block(
             address: address.map(Va),
             instructions,
             exit,
+            boundary_handler: None,
+            native_call: None,
+            vm_exit: None,
         },
     )
 }

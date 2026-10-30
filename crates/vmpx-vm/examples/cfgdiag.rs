@@ -53,6 +53,20 @@ fn main() {
             cfg.all_paths_reach_vm_exit(),
             cfg.limit_hit
         );
+        let carried_calls = cfg.native_calls().len();
+        let carried_exits = cfg.exit_layouts().len();
+        let call_blocks = cfg
+            .blocks
+            .values()
+            .filter(|block| block.exit == BlockExit::NativeCall)
+            .count();
+        println!(
+            "  native_call_blocks={call_blocks} carrying_outcome={carried_calls} exit_blocks_with_layout={} exit_layout_handlers={carried_exits}",
+            cfg.blocks
+                .values()
+                .filter(|block| block.vm_exit.is_some())
+                .count()
+        );
         for stall in &cfg.stalls {
             println!(
                 "  STALL block={} vip={}: {}",

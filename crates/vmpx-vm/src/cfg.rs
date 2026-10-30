@@ -17,9 +17,9 @@ use vmpx_pe::{PeImage, Va};
 use crate::{
     BinaryOp, BitWidth, DecodedVmInstruction, DispatchExtractionCandidate,
     EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprKind, InputDomainLimits,
-    LinearDecodeCache, LinearDecodeStop, NativeFrameSource, RelativeDispatchState,
-    SymbolicDomainLimits, SymbolicVmExecutionReport, SymbolicVmInitialState, VmEntryCandidate,
-    VmHandlerSemantic,
+    LinearDecodeCache, LinearDecodeStop, NativeCallSelectorOutcome, NativeFrameSource,
+    RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits, SymbolicVmExecutionReport,
+    SymbolicVmInitialState, VmEntryCandidate, VmExitReport, VmHandlerSemantic,
     dispatch_extract::canonical,
     entry_profile::{bootstrap_global_table, entry_stream_config, prepare_entry_stream},
     enumerate_symbolic_value, execute_symbolic_linear_block_with_initial_state,
@@ -79,6 +79,12 @@ pub struct VmBasicBlock {
     pub address: Option<Va>,
     pub instructions: Vec<DecodedVmInstruction>,
     pub exit: BlockExit,
+    /// Handler of the control-flow boundary that ends the block.
+    pub boundary_handler: Option<Va>,
+    /// Proven call frame of the selector this `NativeCall` block decoded.
+    pub native_call: Option<NativeCallSelectorOutcome>,
+    /// Recovered exit layout of this `VmExit` block's handler.
+    pub vm_exit: Option<VmExitReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -130,6 +136,32 @@ pub struct VmCfg {
 }
 
 impl VmCfg {
+    /// Proven call frames, keyed by the key of the block that ends in the call.
+    #[must_use]
+    pub fn native_calls(&self) -> BTreeMap<Va, NativeCallSelectorOutcome> {
+        self.blocks
+            .iter()
+            .filter_map(|(key, block)| Some((*key, block.native_call.clone()?)))
+            .collect()
+    }
+
+    /// Recovered exit layouts, keyed by the exit handler's address.
+    #[must_use]
+    pub fn exit_layouts(&self) -> BTreeMap<Va, VmExitReport> {
+        self.blocks
+            .values()
+            .filter_map(|block| Some((block.boundary_handler?, block.vm_exit.clone()?)))
+            .collect()
+    }
+
+    fn record_native_call(&mut self, key: Va, outcome: &NativeCallSelectorOutcome) {
+        if let Some(block) = self.blocks.get_mut(&key)
+            && block.exit == BlockExit::NativeCall
+        {
+            block.native_call = Some(outcome.clone());
+        }
+    }
+
     #[must_use]
     pub fn total_instructions(&self) -> usize {
         self.blocks
@@ -357,6 +389,13 @@ struct Walker<'a, 'p> {
     total_instructions: usize,
 }
 
+/// An exit layout is carried only when its recovery was proven.
+fn proven_exit_layout(report: Option<&VmExitReport>) -> Option<VmExitReport> {
+    report
+        .filter(|report| report.status == RecoveryStatus::Recovered)
+        .cloned()
+}
+
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
 fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
@@ -451,12 +490,21 @@ impl Walker<'_, '_> {
             }
         };
         self.total_instructions += block.instructions.len();
+        let boundary_handler = block.boundary.map(|_| block.final_state.handler);
         let exit = match block.boundary {
             Some(VmHandlerSemantic::VmExit) => BlockExit::VmExit,
             Some(VmHandlerSemantic::UnconditionalBranch) => BlockExit::Branch,
             Some(VmHandlerSemantic::NativeCall) => BlockExit::NativeCall,
             _ => BlockExit::Stalled,
         };
+        let vm_exit = (exit == BlockExit::VmExit)
+            .then(|| {
+                self.cache
+                    .recoveries
+                    .get(&block.final_state.handler)
+                    .and_then(|recovery| proven_exit_layout(recovery.vm_exit.as_ref()))
+            })
+            .flatten();
         self.cfg.blocks.insert(
             key,
             VmBasicBlock {
@@ -464,6 +512,9 @@ impl Walker<'_, '_> {
                 address: item.address,
                 instructions: block.instructions.clone(),
                 exit,
+                boundary_handler,
+                native_call: None,
+                vm_exit,
             },
         );
         self.decoded.insert(key, block);
@@ -727,6 +778,7 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        self.cfg.record_native_call(key, &decoded.outcome);
         self.cfg.edges.push(CfgEdge {
             from: key,
             to: decoded.state_after.vip,
@@ -858,5 +910,86 @@ mod tests {
         );
         let raw = Expr::register(BitWidth::W64, "native_rdx_initial");
         assert!(resolve_targets(&raw, VmCfgLimits::default()).is_err());
+    }
+
+    fn block(exit: BlockExit, handler: Option<Va>) -> VmBasicBlock {
+        VmBasicBlock {
+            start: RelativeDispatchState {
+                vip: Va(0x10),
+                rolling_key: 0,
+                handler: Va(0x20),
+            },
+            address: None,
+            instructions: Vec::new(),
+            exit,
+            boundary_handler: handler,
+            native_call: None,
+            vm_exit: None,
+        }
+    }
+
+    fn cfg_of(blocks: Vec<(u64, VmBasicBlock)>) -> VmCfg {
+        VmCfg {
+            entry: Va(0x10),
+            blocks: blocks.into_iter().map(|(key, b)| (Va(key), b)).collect(),
+            edges: Vec::new(),
+            stalls: Vec::new(),
+            limit_hit: None,
+            visits: 0,
+            frame_cells_known: 0,
+            frame_note: None,
+        }
+    }
+
+    fn exit_report(status: RecoveryStatus) -> VmExitReport {
+        VmExitReport {
+            schema_version: 1,
+            entry: vmpx_pe::Rva(0x1000),
+            status,
+            stack_switch: None,
+            restored_registers: Vec::new(),
+            restore_slots: Vec::new(),
+            flags_restore: None,
+            flags_stack_offset: Some(0x70),
+            native_return: None,
+            return_stack_offset: Some(0x78),
+            frame_size: Some(0x80),
+            confidence: 100,
+            evidence: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cfg_carries_the_native_call_outcome_and_exit_layout() {
+        let outcome = NativeCallSelectorOutcome {
+            selector: 3,
+            vsp_delta: 16,
+            target_stack_offset: 0,
+            register_argument_offsets: vec![8],
+            stack_argument_offsets: Vec::new(),
+        };
+        let mut exit_block = block(BlockExit::VmExit, Some(Va(0x99)));
+        exit_block.vm_exit = proven_exit_layout(Some(&exit_report(RecoveryStatus::Recovered)));
+        let mut cfg = cfg_of(vec![
+            (0x10, block(BlockExit::NativeCall, Some(Va(0x77)))),
+            (0x20, exit_block),
+            (0x30, block(BlockExit::Branch, Some(Va(0x55)))),
+        ]);
+        cfg.record_native_call(Va(0x10), &outcome);
+        cfg.record_native_call(Va(0x30), &outcome);
+        assert_eq!(cfg.native_calls().len(), 1);
+        assert_eq!(cfg.native_calls()[&Va(0x10)], outcome);
+        let layouts = cfg.exit_layouts();
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[&Va(0x99)].frame_size, Some(0x80));
+    }
+
+    #[test]
+    fn unproven_exit_layouts_are_not_carried() {
+        assert!(proven_exit_layout(None).is_none());
+        for status in [RecoveryStatus::PartiallyRecovered, RecoveryStatus::Failed] {
+            assert!(proven_exit_layout(Some(&exit_report(status))).is_none());
+        }
     }
 }

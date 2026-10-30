@@ -391,6 +391,8 @@ fn cfg_walk_of_a_linear_function_is_one_exit_block() {
     let block = cfg.blocks.values().next().expect("block");
     assert_eq!(block.exit, BlockExit::VmExit);
     assert_eq!(block.instructions.len(), 36);
+    assert!(block.vm_exit.is_some(), "{cfg:#?}");
+    assert_eq!(cfg.exit_layouts().len(), 1);
 }
 
 #[test]
