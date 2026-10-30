@@ -11,13 +11,20 @@
 //! the 8-bit 0/1 input `cf_in`/`zf_in`/... ; a flag the block left unmodeled
 //! (`Clobbered`) makes the reader fail closed. `rsp` is tracked as `rsp_in + k`
 //! across push/pop and constant `add`/`sub rsp`; any other write to `rsp` makes
-//! later push/pop fail closed. `div`/`idiv` are undefined where hardware raises #DE.
+//! later push/pop fail closed. `div`/`idiv` are undefined where hardware raises #DE;
+//! `bsf`/`bsr` are undefined (the `bsf`/`bsr` intrinsic does not evaluate) for a zero source.
+//!
+//! A load reads block-entry memory only when every earlier store is provably disjoint
+//! from it (same symbolic base, non-overlapping ranges) and otherwise fails closed.
+//! [`LiftOptions::assume_stack_disjoint`] additionally treats a store into the frame
+//! below block-entry `rsp` and an access through a pointer not derived from `rsp` as
+//! disjoint; the result is then labeled [`BlockSemantics::assumes_stack_disjoint`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use iced_x86::{
-    ConditionCode, Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic,
-    OpKind, Register,
+    ConditionCode, Decoder, DecoderOptions, Formatter, Instruction, InstructionInfoFactory,
+    IntelFormatter, Mnemonic, OpAccess, OpKind, Register,
 };
 use thiserror::Error;
 
@@ -273,7 +280,18 @@ pub struct BlockSemantics<E> {
     pub writes: Vec<MemoryWrite<E>>,
     /// Distinct reads of block-entry memory (`Algebra::load` leaves).
     pub reads: Vec<MemoryRead<E>>,
+    /// The lift skipped a store on the strength of
+    /// [`LiftOptions::assume_stack_disjoint`]; never set by the default options.
+    pub assumes_stack_disjoint: bool,
     pub instruction_count: usize,
+}
+
+/// Opt-in modeling assumptions; the default is assumption-free.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LiftOptions {
+    /// Memory below block-entry `rsp` (the function's own frame) is not addressed
+    /// through any pointer that is not derived from `rsp` in this block.
+    pub assume_stack_disjoint: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -321,7 +339,19 @@ pub fn lift_block<A: Algebra>(
     algebra: &A,
     instructions: &[Instruction],
 ) -> Result<BlockSemantics<A::Expr>, LiftError> {
-    let mut lifter = Lifter::new(algebra);
+    lift_block_with(algebra, instructions, LiftOptions::default())
+}
+
+/// [`lift_block`] with explicit [`LiftOptions`].
+///
+/// # Errors
+/// As [`lift_block`].
+pub fn lift_block_with<A: Algebra>(
+    algebra: &A,
+    instructions: &[Instruction],
+    options: LiftOptions,
+) -> Result<BlockSemantics<A::Expr>, LiftError> {
+    let mut lifter = Lifter::new(algebra, options);
     for (index, instruction) in instructions.iter().enumerate() {
         lifter.exec(instruction).map_err(|reason| {
             let instruction = format_instruction(instruction);
@@ -356,6 +386,19 @@ pub fn lift_bytes<A: Algebra>(
     bytes: &[u8],
     ip: u64,
 ) -> Result<BlockSemantics<A::Expr>, LiftError> {
+    lift_bytes_with(algebra, bytes, ip, LiftOptions::default())
+}
+
+/// [`lift_bytes`] with explicit [`LiftOptions`].
+///
+/// # Errors
+/// As [`lift_bytes`].
+pub fn lift_bytes_with<A: Algebra>(
+    algebra: &A,
+    bytes: &[u8],
+    ip: u64,
+    options: LiftOptions,
+) -> Result<BlockSemantics<A::Expr>, LiftError> {
     let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
     let mut instructions = Vec::new();
     while decoder.can_decode() {
@@ -366,7 +409,7 @@ pub fn lift_bytes<A: Algebra>(
         }
         instructions.push(instruction);
     }
-    lift_block(algebra, &instructions)
+    lift_block_with(algebra, &instructions, options)
 }
 
 fn format_instruction(instruction: &Instruction) -> String {
@@ -378,16 +421,24 @@ fn format_instruction(instruction: &Instruction) -> String {
 struct MemKey<E> {
     sym: Option<E>,
     disp: i64,
+    /// `rsp_in + disp` with `rsp` still tracked.
+    frame: bool,
+    /// Built only from constants and registers not derived from `rsp`.
+    clean: bool,
 }
 
 struct StoreRec<E> {
     key: MemKey<E>,
     write: MemoryWrite<E>,
+    /// The stored value may be derived from `rsp`.
+    derived: bool,
 }
 
 enum Rel {
     Disjoint,
     Exact,
+    /// The load lies wholly inside the store, `shift` bytes above its start.
+    Within(i64),
     Unknown,
 }
 
@@ -401,13 +452,30 @@ fn relate<E: Eq>(a: &MemKey<E>, aw: Width, b: &MemKey<E>, bw: Width) -> Rel {
     let Some(neg) = diff.checked_neg() else {
         return Rel::Unknown;
     };
-    if diff >= i64::from(bw.bytes()) || neg >= i64::from(aw.bytes()) {
+    let (aw, bw) = (i64::from(aw.bytes()), i64::from(bw.bytes()));
+    if diff >= bw || neg >= aw {
         Rel::Disjoint
     } else if diff == 0 && aw == bw {
         Rel::Exact
+    } else if diff >= 0 && diff + aw <= bw {
+        Rel::Within(diff)
     } else {
         Rel::Unknown
     }
+}
+
+/// Entirely inside the frame below block-entry `rsp`.
+fn below_entry_rsp<E>(key: &MemKey<E>, width: Width) -> bool {
+    key.frame
+        && key
+            .disp
+            .checked_add(i64::from(width.bytes()))
+            .is_some_and(|end| end <= 0)
+}
+
+/// Stack-frame slot versus a pointer not derived from `rsp`.
+fn frame_vs_clean<E>(a: &MemKey<E>, aw: Width, b: &MemKey<E>, bw: Width) -> bool {
+    (below_entry_rsp(a, aw) && b.clean) || (below_entry_rsp(b, bw) && a.clean)
 }
 
 fn gpr_info(reg: Register) -> R<(Gpr, Width, bool)> {
@@ -461,10 +529,17 @@ struct Lifter<'a, A: Algebra> {
     reads: Vec<MemoryRead<A::Expr>>,
     /// `Some(k)` while `regs[rsp] == rsp_in + k`.
     rsp_off: Option<i64>,
+    options: LiftOptions,
+    used_assumption: bool,
+    /// GPRs whose value may be derived from `rsp` (only tracked under the assumption).
+    tainted: [bool; 16],
+    /// The instruction being executed reads `rsp` or a tainted register.
+    inst_derived: bool,
+    info: InstructionInfoFactory,
 }
 
 impl<'a, A: Algebra> Lifter<'a, A> {
-    fn new(alg: &'a A) -> Self {
+    fn new(alg: &'a A, options: LiftOptions) -> Self {
         let regs = Gpr::ALL
             .iter()
             .map(|g| alg.input(Width::W64, &g.input_name()))
@@ -477,6 +552,11 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             stores: Vec::new(),
             reads: Vec::new(),
             rsp_off: Some(0),
+            options,
+            used_assumption: false,
+            tainted: [false; 16],
+            inst_derived: false,
+            info: InstructionInfoFactory::new(),
         }
     }
 
@@ -487,6 +567,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             flags: self.flags,
             writes: self.stores.into_iter().map(|s| s.write).collect(),
             reads: self.reads,
+            assumes_stack_disjoint: self.used_assumption,
             instruction_count,
         }
     }
@@ -548,6 +629,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         };
         self.regs[gpr as usize] = new;
         self.written.insert(gpr);
+        let partial = matches!(width, Width::W8 | Width::W16);
+        self.tainted[gpr as usize] = self.inst_derived || (partial && self.tainted[gpr as usize]);
         if gpr == Gpr::Rsp {
             self.rsp_off = None;
         }
@@ -575,15 +658,19 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         }
         let mut sym: Option<A::Expr> = None;
         let mut disp = inst.memory_displacement64().cast_signed();
+        let mut clean = true;
+        let mut frame = false;
         match inst.memory_base() {
             Register::None | Register::RIP => {}
             base if base.is_gpr64() => {
                 sym = Some(self.read_reg(base)?);
+                clean &= !self.derived_reg(base);
                 if base == Register::RSP
                     && let Some(off) = self.rsp_off
                 {
                     sym = Some(self.rsp_entry());
                     disp = disp.wrapping_add(off);
+                    frame = inst.memory_index() == Register::None;
                 }
             }
             other => return unsupported(format!("address base register {other:?}")),
@@ -592,6 +679,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             Register::None => {}
             index if index.is_gpr64() => {
                 let mut value = self.read_reg(index)?;
+                clean &= !self.derived_reg(index);
                 let scale = inst.memory_index_scale();
                 if scale != 1 {
                     value = self.bin(BinOp::Mul, value, self.k(Width::W64, u64::from(scale)))?;
@@ -616,7 +704,21 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             )?,
             None => self.k(Width::W64, disp.cast_unsigned()),
         };
-        Ok((address, MemKey { sym, disp }))
+        let frame = frame && sym.is_some();
+        Ok((
+            address,
+            MemKey {
+                sym,
+                disp,
+                frame,
+                clean,
+            },
+        ))
+    }
+
+    /// `reg` is `rsp` or may hold a value derived from it.
+    fn derived_reg(&self, reg: Register) -> bool {
+        gpr_info(reg).is_ok_and(|(gpr, ..)| gpr == Gpr::Rsp || self.tainted[gpr as usize])
     }
 
     fn rsp_entry(&self) -> A::Expr {
@@ -644,6 +746,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             MemKey {
                 sym: Some(base),
                 disp: off,
+                frame: true,
+                clean: false,
             },
         ))
     }
@@ -677,16 +781,42 @@ impl<'a, A: Algebra> Lifter<'a, A> {
     }
 
     fn load_at(&mut self, address: A::Expr, key: &MemKey<A::Expr>, width: Width) -> R<A::Expr> {
+        let assume = self.options.assume_stack_disjoint;
+        let mut skipped_by_assumption = false;
+        let mut forwarded: Option<(A::Expr, Rel, bool)> = None;
         for store in self.stores.iter().rev() {
-            match relate(key, width, &store.key, store.write.width) {
+            let rel = match relate(key, width, &store.key, store.write.width) {
+                Rel::Unknown
+                    if assume && frame_vs_clean(key, width, &store.key, store.write.width) =>
+                {
+                    skipped_by_assumption = true;
+                    Rel::Disjoint
+                }
+                rel => rel,
+            };
+            match rel {
                 Rel::Disjoint => {}
-                Rel::Exact => return Ok(store.write.value.clone()),
                 Rel::Unknown => {
                     return Err(Reason::Aliasing(
                         "load may alias or partially overlap an earlier store".into(),
                     ));
                 }
+                rel @ (Rel::Exact | Rel::Within(_)) => {
+                    forwarded = Some((store.write.value.clone(), rel, store.derived));
+                    break;
+                }
             }
+        }
+        self.used_assumption |= skipped_by_assumption;
+        if let Some((value, rel, derived)) = forwarded {
+            self.inst_derived |= derived;
+            let Rel::Within(shift) = rel else {
+                return Ok(value);
+            };
+            let store_width = self.alg.width(&value);
+            let bits = shift.cast_unsigned() * 8;
+            let shifted = self.bin(BinOp::Shr, value, self.k(store_width, bits))?;
+            return self.resize(Resize::Truncate, width, shifted);
         }
         let read = MemoryRead {
             address: address.clone(),
@@ -706,8 +836,10 @@ impl<'a, A: Algebra> Lifter<'a, A> {
 
     fn store_at(&mut self, address: A::Expr, key: MemKey<A::Expr>, value: A::Expr) {
         let width = self.alg.width(&value);
+        let derived = self.inst_derived;
         self.stores.push(StoreRec {
             key,
+            derived,
             write: MemoryWrite {
                 address,
                 value,
@@ -874,6 +1006,9 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             return unsupported("lock/rep prefix");
         }
         let mnemonic = inst.mnemonic();
+        if self.options.assume_stack_disjoint {
+            self.inst_derived = self.reads_derived(inst, mnemonic);
+        }
         match mnemonic {
             Mnemonic::Nop => Ok(()),
             Mnemonic::Mov => {
@@ -1090,8 +1225,117 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                     self.write_operand(inst, 0, b)
                 }
             }
+            Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe => {
+                Self::expect_ops(inst, 0)?;
+                let (src, dst) = match mnemonic {
+                    Mnemonic::Cbw => (Register::AL, Register::AX),
+                    Mnemonic::Cwde => (Register::AX, Register::EAX),
+                    _ => (Register::EAX, Register::RAX),
+                };
+                let width = gpr_info(dst)?.1;
+                let value = self.read_reg(src)?;
+                let value = self.resize(Resize::SignExtend, width, value)?;
+                self.write_reg(dst, value)
+            }
+            Mnemonic::Cwd | Mnemonic::Cdq | Mnemonic::Cqo => {
+                Self::expect_ops(inst, 0)?;
+                let (src, dst) = match mnemonic {
+                    Mnemonic::Cwd => (Register::AX, Register::DX),
+                    Mnemonic::Cdq => (Register::EAX, Register::EDX),
+                    _ => (Register::RAX, Register::RDX),
+                };
+                let width = gpr_info(src)?.1;
+                let value = self.read_reg(src)?;
+                let fill = self.bin(
+                    BinOp::Sar,
+                    value,
+                    self.k(width, u64::from(width.bits() - 1)),
+                )?;
+                self.write_reg(dst, fill)
+            }
+            Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+                self.exec_bit_test(inst, mnemonic)
+            }
+            Mnemonic::Bsf | Mnemonic::Bsr => {
+                Self::expect_ops(inst, 2)?;
+                let width = Self::operand_width(inst, 0)?;
+                if width == Width::W8 || inst.op_kind(0) != OpKind::Register {
+                    return unsupported("bsf/bsr destination form");
+                }
+                let src = self.read_operand(inst, 1, width)?;
+                let name = if mnemonic == Mnemonic::Bsf {
+                    "bsf"
+                } else {
+                    "bsr"
+                };
+                let index = self.alg.intrinsic(width, name, vec![src.clone()]);
+                let zf = self.alg.intrinsic(Width::W8, "zf", vec![src]);
+                self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Sf, Flag::Of]);
+                self.set_flag(Flag::Zf, zf);
+                self.write_operand(inst, 0, index)
+            }
             other => unsupported(format!("mnemonic {other:?} is not modeled")),
         }
+    }
+
+    /// `bt`/`bts`/`btr`/`btc` with a register or in-operand bit offset: CF is the old
+    /// bit; a register operand with a register offset reduces it modulo the width.
+    fn exec_bit_test(&mut self, inst: &Instruction, mnemonic: Mnemonic) -> R<()> {
+        Self::expect_ops(inst, 2)?;
+        let width = Self::operand_width(inst, 0)?;
+        if inst.op_kind(0) == OpKind::Memory && inst.op_kind(1) == OpKind::Register {
+            return unsupported("bit offset in a register addresses beyond the memory operand");
+        }
+        let value = self.read_operand(inst, 0, width)?;
+        let raw = self.read_operand(inst, 1, width)?;
+        let offset = self.bin(BinOp::And, raw, self.k(width, u64::from(width.bits() - 1)))?;
+        let shifted = self.bin(BinOp::Shr, value.clone(), offset.clone())?;
+        let bit = self.bin(BinOp::And, shifted, self.k(width, 1))?;
+        let carry = self.resize(Resize::Truncate, Width::W8, bit)?;
+        self.clobber(&[Flag::Pf, Flag::Af, Flag::Sf, Flag::Of]);
+        self.set_flag(Flag::Cf, carry);
+        if mnemonic == Mnemonic::Bt {
+            return Ok(());
+        }
+        let mask = self.bin(BinOp::Shl, self.k(width, 1), offset)?;
+        let result = match mnemonic {
+            Mnemonic::Bts => self.bin(BinOp::Or, value, mask)?,
+            Mnemonic::Btr => {
+                let inverted = self.un(UnOp::Not, mask)?;
+                self.bin(BinOp::And, value, inverted)?
+            }
+            _ => self.bin(BinOp::Xor, value, mask)?,
+        };
+        self.write_operand(inst, 0, result)
+    }
+
+    /// Whether the instruction reads `rsp` or a tainted register as data. The implicit
+    /// `rsp` of a register/immediate push or pop is stack bookkeeping, not data.
+    fn reads_derived(&mut self, inst: &Instruction, mnemonic: Mnemonic) -> bool {
+        let bookkeeping =
+            matches!(mnemonic, Mnemonic::Push | Mnemonic::Pop) && inst.op_kind(0) != OpKind::Memory;
+        let regs: Vec<Register> = self
+            .info
+            .info(inst)
+            .used_registers()
+            .iter()
+            .filter(|used| {
+                matches!(
+                    used.access(),
+                    OpAccess::Read
+                        | OpAccess::CondRead
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+            })
+            .map(iced_x86::UsedRegister::register)
+            .collect();
+        regs.into_iter().any(|reg| {
+            if bookkeeping && reg.full_register() == Register::RSP {
+                return false;
+            }
+            self.derived_reg(reg)
+        })
     }
 
     fn is_cmov(m: Mnemonic) -> bool {
@@ -1207,7 +1451,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         let value = self.read_operand(inst, 0, width)?;
         let count = self.read_operand(inst, 1, Width::W8)?;
         let Some(raw) = self.alg.as_const(&count) else {
-            return unsupported("variable shift/rotate count");
+            return self.exec_variable_shift(inst, mnemonic, width, value, count);
         };
         let bits = u64::from(width.bits());
         let masked = raw & if width == Width::W64 { 63 } else { 31 };
@@ -1236,6 +1480,53 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                     self.bin(op, value, self.k(width, eff))?
                 }
             }
+        };
+        if rotate {
+            self.clobber(&[Flag::Cf, Flag::Of]);
+        } else {
+            self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+        }
+        self.write_operand(inst, 0, result)
+    }
+
+    /// Count unknown at lift time. x86 masks it to 5 bits (6 for 64-bit); the lifted
+    /// count is always below the operand width. Flags are unchanged for a zero count
+    /// and set otherwise, so they are marked clobbered.
+    fn exec_variable_shift(
+        &mut self,
+        inst: &Instruction,
+        mnemonic: Mnemonic,
+        width: Width,
+        value: A::Expr,
+        count: A::Expr,
+    ) -> R<()> {
+        let rotate = matches!(mnemonic, Mnemonic::Rol | Mnemonic::Ror);
+        // 8/16-bit shifts reach counts at or past the width, so run them in 32 bits.
+        let work = if rotate || width.bits() >= 32 {
+            width
+        } else {
+            Width::W32
+        };
+        let count = self.resize(Resize::ZeroExtend, work, count)?;
+        let count = self.bin(BinOp::And, count, self.k(work, u64::from(work.bits() - 1)))?;
+        let result = if work == width {
+            let op = match mnemonic {
+                Mnemonic::Shl => BinOp::Shl,
+                Mnemonic::Shr => BinOp::Shr,
+                Mnemonic::Sar => BinOp::Sar,
+                Mnemonic::Rol => BinOp::Rol,
+                _ => BinOp::Ror,
+            };
+            self.bin(op, value, count)?
+        } else {
+            let (op, ext) = match mnemonic {
+                Mnemonic::Shl => (BinOp::Shl, Resize::ZeroExtend),
+                Mnemonic::Shr => (BinOp::Shr, Resize::ZeroExtend),
+                _ => (BinOp::Sar, Resize::SignExtend),
+            };
+            let wide = self.resize(ext, work, value)?;
+            let shifted = self.bin(op, wide, count)?;
+            self.resize(Resize::Truncate, width, shifted)?
         };
         if rotate {
             self.clobber(&[Flag::Cf, Flag::Of]);

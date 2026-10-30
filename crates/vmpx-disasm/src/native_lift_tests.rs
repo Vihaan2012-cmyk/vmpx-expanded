@@ -8,13 +8,13 @@
 )]
 
 use iced_x86::code_asm::{
-    CodeAssembler, ah, al, ax, bl, bx, byte_ptr, cl, cx, dl, eax, ebx, ecx, edx, ptr, qword_ptr,
-    r8b, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
+    CodeAssembler, ah, al, ax, bl, bx, byte_ptr, cl, cx, dl, dword_ptr, eax, ebx, ecx, edi, edx,
+    esi, ptr, qword_ptr, r8b, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
 };
 
 use crate::{
-    Algebra, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, NativeAlgebra, NativeExpr,
-    Resize, Width, lift_bytes,
+    Algebra, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, LiftOptions, NativeAlgebra,
+    NativeExpr, Resize, Width, lift_bytes, lift_bytes_with,
 };
 
 type Sem = BlockSemantics<NativeExpr>;
@@ -256,10 +256,6 @@ fn shifts_and_rotates_use_hardware_count_semantics() {
 #[test]
 fn shift_forms_that_are_not_safely_modeled_fail_closed() {
     assert!(matches!(
-        lift(|a| a.shl(eax, cl).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
-    assert!(matches!(
         lift(|a| a.shl(eax, 32).unwrap()),
         Err(LiftError::Unsupported { .. })
     ));
@@ -371,13 +367,13 @@ fn memory_store_forwarding_disjointness_and_aliasing() {
         })
         .is_ok()
     );
-    assert!(matches!(
-        lift(|a| {
-            a.mov(qword_ptr(rsp), rcx).unwrap();
-            a.mov(eax, ptr(rsp)).unwrap();
-        }),
-        Err(LiftError::MemoryAliasing { .. })
-    ));
+    let low = ok(|a| {
+        a.mov(qword_ptr(rsp), rcx).unwrap();
+        a.mov(eax, ptr(rsp)).unwrap();
+    });
+    for seed in SEEDS {
+        assert_eq!(reg(&low, seed, Gpr::Rax), inp(seed, Gpr::Rcx) & 0xFFFF_FFFF);
+    }
 }
 
 #[test]
@@ -414,9 +410,6 @@ fn unmodeled_instructions_fail_closed_naming_the_instruction() {
     type Case = (&'static str, Box<dyn FnOnce(&mut CodeAssembler)>);
     let cases: Vec<Case> = vec![
         ("cpuid", Box::new(|a| a.cpuid().unwrap())),
-        ("bsf", Box::new(|a| a.bsf(eax, ecx).unwrap())),
-        ("bsr", Box::new(|a| a.bsr(eax, ecx).unwrap())),
-        ("cqo", Box::new(|a| a.cqo().unwrap())),
         ("pushfq", Box::new(|a| a.pushfq().unwrap())),
     ];
     for (name, build) in cases {
@@ -991,4 +984,353 @@ fn div_is_undefined_where_hardware_faults() {
         eval(&idiv, u64::from((-100i32) as u32), 0xFFFF_FFFF, 7),
         Some(u64::from((-14i32) as u32))
     );
+}
+
+type Case = (&'static str, Box<dyn Fn(&mut CodeAssembler)>);
+
+fn lift_assuming(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftError> {
+    let mut asm = CodeAssembler::new(64).expect("assembler");
+    build(&mut asm);
+    let bytes = asm.assemble(0x1000).expect("assemble");
+    let options = LiftOptions {
+        assume_stack_disjoint: true,
+    };
+    lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, options)
+}
+
+fn shift_ref(m: &str, bits: u32, v: u64, c: u64) -> u64 {
+    let w = w_of(bits);
+    let cnt = c & if bits == 64 { 63 } else { 31 };
+    let v = w.truncate(v);
+    let r = match m {
+        "shl" => v.checked_shl(cnt as u32).unwrap_or(0),
+        "shr" => v.checked_shr(cnt as u32).unwrap_or(0),
+        "sar" => (w.sign_extend(v) as i64 >> cnt.min(63)) as u64,
+        "rol" => {
+            let k = (cnt % u64::from(bits)) as u32;
+            if k == 0 {
+                v
+            } else {
+                (v << k) | (v >> (bits - k))
+            }
+        }
+        _ => {
+            let k = (cnt % u64::from(bits)) as u32;
+            if k == 0 {
+                v
+            } else {
+                (v >> k) | (v << (bits - k))
+            }
+        }
+    };
+    w.truncate(r)
+}
+
+#[test]
+fn variable_count_shifts_and_rotates_match_hardware() {
+    type Build = fn(&mut CodeAssembler);
+    macro_rules! case {
+        ($name:literal, $bits:literal, $m:ident, $dst:expr) => {
+            (
+                $name,
+                $bits,
+                (|a: &mut CodeAssembler| a.$m($dst, cl).unwrap()) as Build,
+            )
+        };
+    }
+    let cases: Vec<(&str, u32, Build)> = vec![
+        case!("shl", 8, shl, bl),
+        case!("shr", 8, shr, bl),
+        case!("sar", 8, sar, bl),
+        case!("rol", 8, rol, bl),
+        case!("ror", 8, ror, bl),
+        case!("shl", 16, shl, bx),
+        case!("shr", 16, shr, bx),
+        case!("sar", 16, sar, bx),
+        case!("rol", 16, rol, bx),
+        case!("ror", 16, ror, bx),
+        case!("shl", 32, shl, ebx),
+        case!("shr", 32, shr, ebx),
+        case!("sar", 32, sar, ebx),
+        case!("rol", 32, rol, ebx),
+        case!("ror", 32, ror, ebx),
+        case!("shl", 64, shl, rbx),
+        case!("shr", 64, shr, rbx),
+        case!("sar", 64, sar, rbx),
+        case!("rol", 64, rol, rbx),
+        case!("ror", 64, ror, rbx),
+    ];
+    for (m, bits, build) in cases {
+        let sem = ok(build);
+        assert!(sem.written.contains(&Gpr::Rbx));
+        let rotate = m == "rol" || m == "ror";
+        for flag in [Flag::Cf, Flag::Of] {
+            assert!(
+                matches!(sem.flags[&flag], FlagState::Clobbered),
+                "{m}{bits}"
+            );
+        }
+        assert_eq!(sem.flags.contains_key(&Flag::Zf), !rotate);
+        for seed in 0..8 {
+            for count in 0..=70u64 {
+                let get = |name: &str| {
+                    if name == "rcx_in" {
+                        (mix(seed) & !0xFF) | count
+                    } else {
+                        input_value(seed, name)
+                    }
+                };
+                let b0 = get("rbx_in");
+                let want = shift_ref(m, bits, b0, count);
+                let want = match bits {
+                    64 | 32 => want,
+                    _ => (b0 & !w_of(bits).mask()) | want,
+                };
+                assert_eq!(
+                    eval_with(&sem.regs[&Gpr::Rbx], &get),
+                    Some(want),
+                    "{m}{bits} count {count}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn loads_forward_from_a_wider_store_and_skip_disjoint_ranges() {
+    let sem = ok(|a| {
+        a.mov(qword_ptr(rcx), rdx).unwrap();
+        a.mov(eax, dword_ptr(rcx + 4)).unwrap();
+        a.mov(bl, byte_ptr(rcx + 1)).unwrap();
+        a.mov(rsi, qword_ptr(rcx + 8)).unwrap();
+        a.mov(edi, dword_ptr(rcx + 2)).unwrap();
+    });
+    for seed in SEEDS {
+        let d = inp(seed, Gpr::Rdx);
+        assert_eq!(reg(&sem, seed, Gpr::Rax), d >> 32);
+        assert_eq!(reg(&sem, seed, Gpr::Rbx) & 0xFF, (d >> 8) & 0xFF);
+        assert_eq!(reg(&sem, seed, Gpr::Rdi), (d >> 16) & 0xFFFF_FFFF);
+    }
+    assert_eq!(sem.reads.len(), 1);
+    assert!(!sem.assumes_stack_disjoint);
+    // straddles the end of the store: still unprovable
+    assert!(matches!(
+        lift(|a| {
+            a.mov(dword_ptr(rcx), edx).unwrap();
+            a.mov(rax, qword_ptr(rcx)).unwrap();
+        }),
+        Err(LiftError::MemoryAliasing { .. })
+    ));
+}
+
+#[test]
+fn stack_frame_versus_foreign_pointer_needs_the_labeled_assumption() {
+    let frame = |a: &mut CodeAssembler| {
+        a.sub(rsp, 0x28).unwrap();
+        a.mov(qword_ptr(rsp + 0x20), rcx).unwrap();
+        a.mov(rax, qword_ptr(rdx)).unwrap();
+        a.mov(rbx, qword_ptr(rsp + 0x20)).unwrap();
+        a.mov(esi, dword_ptr(0x4000)).unwrap();
+    };
+    assert!(matches!(lift(frame), Err(LiftError::MemoryAliasing { .. })));
+    let sem = lift_assuming(frame).expect("lift");
+    assert!(sem.assumes_stack_disjoint);
+    for seed in SEEDS {
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), inp(seed, Gpr::Rcx));
+    }
+    assert_eq!(sem.reads.len(), 2);
+
+    let refused: Vec<Case> = vec![
+        (
+            "two foreign pointers",
+            Box::new(|a| {
+                a.mov(qword_ptr(rcx), rbx).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+        (
+            "frame at or above entry rsp",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp + 8), rcx).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+        (
+            "rsp-derived pointer",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x30), rbx).unwrap();
+                a.lea(rcx, ptr(rsp + rdx)).unwrap();
+                a.mov(rax, qword_ptr(rcx)).unwrap();
+            }),
+        ),
+        (
+            "rsp-derived pointer laundered through memory",
+            Box::new(|a| {
+                a.lea(rax, ptr(rsp - 0x10)).unwrap();
+                a.mov(qword_ptr(rdx), rax).unwrap();
+                a.mov(rcx, qword_ptr(rdx)).unwrap();
+                a.mov(qword_ptr(rsp - 0x10), rbx).unwrap();
+                a.mov(rsi, qword_ptr(rcx + rdi)).unwrap();
+            }),
+        ),
+        (
+            "rsp-derived pointer through a sub-register write",
+            Box::new(|a| {
+                a.mov(rax, rsp).unwrap();
+                a.mov(qword_ptr(rsp - 0x20), rbx).unwrap();
+                a.mov(al, cl).unwrap();
+                a.mov(rsi, qword_ptr(rax + rdi)).unwrap();
+            }),
+        ),
+    ];
+    for (name, build) in refused {
+        assert!(
+            matches!(lift_assuming(&build), Err(LiftError::MemoryAliasing { .. })),
+            "{name}"
+        );
+    }
+    // restoring a pushed register does not make it rsp-derived
+    let sem = lift_assuming(|a| {
+        a.push(rbx).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+        a.pop(rbx).unwrap();
+        a.mov(rax, qword_ptr(rbx)).unwrap();
+    })
+    .expect("lift");
+    assert!(sem.assumes_stack_disjoint);
+}
+
+#[test]
+fn sign_extension_to_the_upper_half() {
+    let cdq = ok(|a| a.cdq().unwrap());
+    let cqo = ok(|a| a.cqo().unwrap());
+    let cwd = ok(|a| a.cwd().unwrap());
+    let chain = ok(|a| {
+        a.cbw().unwrap();
+        a.cwde().unwrap();
+    });
+    let cdqe = ok(|a| a.cdqe().unwrap());
+    for seed in SEEDS {
+        let (a0, d0) = (inp(seed, Gpr::Rax), inp(seed, Gpr::Rdx));
+        assert_eq!(
+            reg(&cdq, seed, Gpr::Rdx),
+            u64::from(((a0 as i32) >> 31) as u32)
+        );
+        assert_eq!(reg(&cdq, seed, Gpr::Rax), a0);
+        assert_eq!(reg(&cqo, seed, Gpr::Rdx), ((a0 as i64) >> 63) as u64);
+        let dx = u64::from(((a0 as i16) >> 15) as u16);
+        assert_eq!(reg(&cwd, seed, Gpr::Rdx), (d0 & !0xFFFF) | dx);
+        let ax1 = u64::from(i16::from(a0 as i8) as u16);
+        let eax1 = u64::from(i32::from(ax1 as u16 as i16) as u32);
+        assert_eq!(reg(&chain, seed, Gpr::Rax), eax1);
+        assert_eq!(reg(&cdqe, seed, Gpr::Rax), i64::from(a0 as i32) as u64);
+    }
+    assert!(cdq.flags.is_empty());
+    assert_eq!(cdq.written.len(), 1);
+}
+
+fn bit_ref(m: &str, bits: u32, v: u64, off: u64) -> (u64, u64) {
+    let k = off % u64::from(bits);
+    let bit = (v >> k) & 1;
+    let new = match m {
+        "bts" => v | (1 << k),
+        "btr" => v & !(1 << k),
+        "btc" => v ^ (1 << k),
+        _ => v,
+    };
+    (bit, w_of(bits).truncate(new))
+}
+
+#[test]
+fn bit_test_family_sets_cf_and_updates_the_operand() {
+    type Build = fn(&mut CodeAssembler);
+    macro_rules! reg_case {
+        ($m:literal, $f:ident, $bits:literal, $dst:expr, $src:expr) => {
+            (
+                $m,
+                $bits,
+                (|a: &mut CodeAssembler| a.$f($dst, $src).unwrap()) as Build,
+            )
+        };
+    }
+    let cases: Vec<(&str, u32, Build)> = vec![
+        reg_case!("bt", bt, 64, rbx, rcx),
+        reg_case!("bts", bts, 64, rbx, rcx),
+        reg_case!("btr", btr, 32, ebx, ecx),
+        reg_case!("btc", btc, 32, ebx, ecx),
+        reg_case!("bts", bts, 16, bx, cx),
+        reg_case!("btc", btc, 16, bx, cx),
+    ];
+    for (m, bits, build) in cases {
+        let sem = ok(build);
+        let FlagState::Value(cf) = &sem.flags[&Flag::Cf] else {
+            panic!("cf {m}{bits}")
+        };
+        assert!(matches!(sem.flags[&Flag::Of], FlagState::Clobbered));
+        assert!(!sem.flags.contains_key(&Flag::Zf));
+        for seed in SEEDS {
+            let (b0, c) = (inp(seed, Gpr::Rbx), inp(seed, Gpr::Rcx));
+            let w = w_of(bits);
+            let (bit, new) = bit_ref(m, bits, w.truncate(b0), w.truncate(c));
+            assert_eq!(eval_expr(cf, seed), bit, "{m}{bits}");
+            let want = match (m, bits) {
+                ("bt", _) => b0,
+                (_, 16) => (b0 & !0xFFFF) | new,
+                _ => new,
+            };
+            assert_eq!(reg(&sem, seed, Gpr::Rbx), want, "{m}{bits}");
+        }
+    }
+    let sem = ok(|a| {
+        a.bts(rbx, 70).unwrap();
+        a.btr(dword_ptr(rcx), 33).unwrap();
+        a.bt(rdx, 3).unwrap();
+    });
+    for seed in SEEDS {
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), inp(seed, Gpr::Rbx) | (1 << 6));
+    }
+    let FlagState::Value(cf) = &sem.flags[&Flag::Cf] else {
+        panic!("cf")
+    };
+    for seed in SEEDS {
+        assert_eq!(eval_expr(cf, seed), (inp(seed, Gpr::Rdx) >> 3) & 1);
+    }
+    assert_eq!(sem.writes.len(), 1);
+    assert_eq!(sem.writes[0].width, Width::W32);
+    for seed in SEEDS {
+        let old = mix(inp(seed, Gpr::Rcx) ^ 0xABCD) & 0xFFFF_FFFF;
+        assert_eq!(eval_expr(&sem.writes[0].value, seed), old & !(1 << 1));
+    }
+    assert!(matches!(
+        lift(|a| a.bts(dword_ptr(rdx), ecx).unwrap()),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn bsf_bsr_are_undefined_for_a_zero_source() {
+    let sem = ok(|a| {
+        a.bsf(ebx, ecx).unwrap();
+        a.bsr(rdx, rsi).unwrap();
+    });
+    let FlagState::Value(zf) = &sem.flags[&Flag::Zf] else {
+        panic!("zf")
+    };
+    assert!(matches!(sem.flags[&Flag::Cf], FlagState::Clobbered));
+    for seed in SEEDS {
+        let (c, s) = (inp(seed, Gpr::Rcx) as u32, inp(seed, Gpr::Rsi));
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), u64::from(c.trailing_zeros()));
+        assert_eq!(reg(&sem, seed, Gpr::Rdx), u64::from(s.ilog2()));
+        assert_eq!(eval_expr(zf, seed), u64::from(s == 0));
+    }
+    let zero = |name: &str| {
+        if name == "rcx_in" {
+            0
+        } else {
+            input_value(1, name)
+        }
+    };
+    assert_eq!(eval_with(&sem.regs[&Gpr::Rbx], &zero), None);
+    let zero_rsi = |name: &str| u64::from(name != "rsi_in");
+    assert_eq!(eval_with(zf, &zero_rsi), Some(1));
 }

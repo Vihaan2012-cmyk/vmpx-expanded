@@ -239,6 +239,14 @@ fn eval_intrinsic(name: &str, args: &[(Width, u64)]) -> Option<u64> {
                 * i128::from(w.sign_extend(*b).cast_signed());
             Some((p >> w.bits()) as u64)
         }
+        ("bsf", [(w, a)]) => {
+            let v = w.truncate(*a);
+            (v != 0).then(|| u64::from(v.trailing_zeros()))
+        }
+        ("bsr", [(w, a)]) => {
+            let v = w.truncate(*a);
+            (v != 0).then(|| u64::from(v.ilog2()))
+        }
         ("udiv_q" | "udiv_r" | "sdiv_q" | "sdiv_r", [(w, hi), (_, lo), (_, d)]) => {
             eval_div(name, *w, *hi, *lo, *d)
         }

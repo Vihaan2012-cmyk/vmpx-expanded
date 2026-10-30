@@ -27,8 +27,9 @@ pub use dispatch_proof::{
 pub use iat_refs::{IatReferenceScan, referenced_iat_slots, scan_iat_references};
 pub use native_expr::{NativeAlgebra, NativeExpr, NativeNode};
 pub use native_lift::{
-    Algebra, AlgebraError, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, MemoryRead,
-    MemoryWrite, Resize, UnOp, Width, lift_block, lift_bytes,
+    Algebra, AlgebraError, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, LiftOptions,
+    MemoryRead, MemoryWrite, Resize, UnOp, Width, lift_block, lift_block_with, lift_bytes,
+    lift_bytes_with,
 };
 pub use trace::{
     DirectJumpFragment, DirectJumpTrace, DirectJumpTraceLimits, DirectJumpTraceStop,
