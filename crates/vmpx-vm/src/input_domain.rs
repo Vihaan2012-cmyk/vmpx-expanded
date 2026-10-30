@@ -8,10 +8,11 @@
 //!
 //! * a low slice of at most [`InputDomainLimits::max_exhaustive_bits`] bits, which
 //!   is covered by enumerating all of its values, or
+//! * a bit field, or a constant mask, of at most that many observed bits, covered
+//!   by enumerating every submask of the observed bits, or
 //! * `vm_flags_add_wN(±reg + c1, c2)` status-flag words of one common width,
 //!   which depend on the register only through the cell it falls in between a
 //!   fixed set of cut points and its residue modulo 256 (see [`add_flags_cover`]).
-//!
 //!
 //! A `memory_load_epoch_N(address)` read that no tracked store covers is an
 //! unconstrained value: it is replaced by a free register named after the read
@@ -19,8 +20,10 @@
 //! address is dropped, so the domain over-approximates the reachable values and
 //! can never omit a target.
 //!
-//! Any other use (direct arithmetic, loads, opaque or logical-flag intrinsics,
-//! flags of two input-dependent operands, mixed use kinds) is refused: the
+//! Logical `vm_flags_nor/nand_wN` words are pure functions of their operands and
+//! add no observation of their own. Any other use (direct arithmetic, loads,
+//! opaque intrinsics, flags of two input-dependent operands, mixed use kinds
+//! beyond the exhaustive width) is refused: the
 //! general case is undecidable here and stays a blocker.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +61,9 @@ pub struct AddFlagsObservation {
 pub enum DomainCertificate {
     /// Every value of the observed low `bits` bits is enumerated.
     Exhaustive { bits: u32 },
+    /// Every submask of `mask` is enumerated: the target depends on the register
+    /// only through its bits in `mask`.
+    MaskedExhaustive { mask: u64 },
     /// Cell/residue cover of add-flag observations of `observations` atoms.
     AddFlagsCover { bits: u32, observations: usize },
 }
@@ -113,6 +119,114 @@ pub fn add_flags_cover(
     observations: &[AddFlagsObservation],
     limits: InputDomainLimits,
 ) -> Option<Vec<u64>> {
+    let atoms: Vec<_> = observations
+        .iter()
+        .copied()
+        .map(FlagsAtom::AddConst)
+        .collect();
+    flags_cover(bits, &atoms, limits)
+}
+
+/// `+x + offset` or `-x + offset` for the register `x`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct View {
+    negate: bool,
+    offset: u64,
+}
+
+impl View {
+    fn at(self, x: u64, bits: u32) -> u64 {
+        let offset = self.offset & mask(bits);
+        let value = if self.negate {
+            offset.wrapping_sub(x)
+        } else {
+            x.wrapping_add(offset)
+        };
+        value & mask(bits)
+    }
+
+    /// The register value at which this view equals `threshold`.
+    fn preimage(self, threshold: u128, bits: u32) -> u128 {
+        let space = 1_u128 << bits;
+        let offset = u128::from(self.offset & mask(bits));
+        if self.negate {
+            (offset + space - threshold) % space
+        } else {
+            (threshold + space - offset) % space
+        }
+    }
+}
+
+/// One status-flag word taken of the register at a fixed width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlagsAtom {
+    /// `vm_flags_add(view, constant)`.
+    AddConst(AddFlagsObservation),
+    /// `vm_flags_sub(left, right)` of two same-direction views of the register:
+    /// the difference is constant, so only the wrap and sign boundaries of the
+    /// two operands and the low nibbles can change a flag.
+    SubPair { left: View, right: View },
+}
+
+impl FlagsAtom {
+    fn tuple_word(self, bits: u32, x: u64) -> Option<u64> {
+        match self {
+            Self::AddConst(observation) => {
+                let operand = View {
+                    negate: observation.negate,
+                    offset: observation.offset,
+                }
+                .at(x, bits);
+                evaluate_vm_flags(
+                    &format!("vm_flags_add_w{bits}"),
+                    &[operand, observation.constant & mask(bits)],
+                )
+            }
+            Self::SubPair { left, right } => evaluate_vm_flags(
+                &format!("vm_flags_sub_w{bits}"),
+                &[left.at(x, bits), right.at(x, bits)],
+            ),
+        }
+    }
+
+    fn cut_points(self, bits: u32, cuts: &mut BTreeSet<u128>) {
+        let space = 1_u128 << bits;
+        let half = space >> 1;
+        let mut insert = |x: u128| {
+            cuts.insert(x);
+            cuts.insert((x + 1) % space);
+        };
+        match self {
+            Self::AddConst(observation) => {
+                let constant = u128::from(observation.constant & mask(bits));
+                let view = View {
+                    negate: observation.negate,
+                    offset: observation.offset,
+                };
+                // Thresholds of `y`: its own sign/zero boundary and where `y + k`
+                // reaches zero, one (ZF cell), and the sign boundary.
+                for threshold in [
+                    0,
+                    half,
+                    (space - constant) % space,
+                    (space + 1 - constant) % space,
+                    (half + space - constant) % space,
+                ] {
+                    insert(view.preimage(threshold, bits));
+                }
+            }
+            Self::SubPair { left, right } => {
+                for view in [left, right] {
+                    for threshold in [0, half] {
+                        insert(view.preimage(threshold, bits));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flags_cover(bits: u32, atoms: &[FlagsAtom], limits: InputDomainLimits) -> Option<Vec<u64>> {
     if !matches!(bits, 8 | 16 | 32 | 64) {
         return None;
     }
@@ -121,34 +235,13 @@ pub fn add_flags_cover(
     if bits <= limits.max_exhaustive_bits {
         return exhaustive(bits, limits);
     }
-    let half = space >> 1;
     let mut cuts: BTreeSet<u128> = BTreeSet::from([0]);
-    for observation in observations {
-        let offset = u128::from(observation.offset & mask(bits));
-        let constant = u128::from(observation.constant & mask(bits));
-        // Thresholds of `y`: its own sign/zero boundary and where `y + k`
-        // reaches zero, one (ZF cell), and the sign boundary.
-        let thresholds = [
-            0,
-            half,
-            (space - constant) % space,
-            (space + 1 - constant) % space,
-            (half + space - constant) % space,
-        ];
-        for threshold in thresholds {
-            let x = if observation.negate {
-                (offset + space - threshold) % space
-            } else {
-                (threshold + space - offset) % space
-            };
-            cuts.insert(x);
-            cuts.insert((x + 1) % space);
-        }
+    for atom in atoms {
+        atom.cut_points(bits, &mut cuts);
     }
     let starts: Vec<u128> = cuts.into_iter().collect();
     // The target depends on `x` only through these flag words, so one value per
     // distinct tuple realizes the same image as the sampled cells.
-    let name = format!("vm_flags_add_w{bits}");
     let mut seen: BTreeSet<Vec<u64>> = BTreeSet::new();
     let mut values = Vec::new();
     for (index, start) in starts.iter().enumerate() {
@@ -156,17 +249,9 @@ pub fn add_flags_cover(
         let take = (end - start).min(256);
         for value in *start..start + take {
             let value = u64::try_from(value).ok()?;
-            let tuple = observations
+            let tuple = atoms
                 .iter()
-                .map(|observation| {
-                    let offset = observation.offset & mask(bits);
-                    let operand = if observation.negate {
-                        offset.wrapping_sub(value)
-                    } else {
-                        value.wrapping_add(offset)
-                    } & mask(bits);
-                    evaluate_vm_flags(&name, &[operand, observation.constant & mask(bits)])
-                })
+                .map(|atom| atom.tuple_word(bits, value))
                 .collect::<Option<Vec<u64>>>()?;
             if seen.insert(tuple) {
                 values.push(value);
@@ -182,6 +267,23 @@ pub fn add_flags_cover(
 fn exhaustive(bits: u32, limits: InputDomainLimits) -> Option<Vec<u64>> {
     let count = 1_u64.checked_shl(bits)?;
     (usize::try_from(count).ok()? <= limits.max_values_per_variable).then(|| (0..count).collect())
+}
+
+/// Every submask of `observed`, ascending; `None` above the value limit.
+fn submasks(observed: u64, limits: InputDomainLimits) -> Option<Vec<u64>> {
+    let count = 1_usize.checked_shl(observed.count_ones())?;
+    if count > limits.max_values_per_variable {
+        return None;
+    }
+    let mut values = Vec::with_capacity(count);
+    let mut current = 0_u64;
+    loop {
+        values.push(current);
+        if current == observed {
+            return Some(values);
+        }
+        current = current.wrapping_sub(observed) & observed;
+    }
 }
 
 /// Replaces every `memory_load_epoch_N(address)` with a free register named by
@@ -323,6 +425,13 @@ fn flags_width(name: &str) -> Option<(u32, bool)> {
     }
 }
 
+fn is_pure_logical_flags(name: &str) -> bool {
+    ["vm_flags_nor_w", "vm_flags_nand_w"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|width| matches!(width, "8" | "16" | "32" | "64"))
+    })
+}
+
 fn add_flags_width(name: &str) -> Option<u32> {
     match name.strip_prefix("vm_flags_add_w")? {
         "8" => Some(8),
@@ -336,10 +445,10 @@ fn add_flags_width(name: &str) -> Option<u32> {
 #[derive(Default)]
 struct Uses {
     width: Option<BitWidth>,
-    /// Widest directly observed low slice.
-    direct_bits: Option<u32>,
+    /// Union of the register bits the target observes directly.
+    direct_mask: u64,
     /// Add-flags observations with the flags width they were taken at.
-    atoms: Vec<(u32, AddFlagsObservation)>,
+    atoms: Vec<(u32, FlagsAtom)>,
 }
 
 struct Scan {
@@ -368,8 +477,14 @@ impl Scan {
             ExprKind::Register { name } => {
                 self.note_width(name, expr.width);
                 let uses = self.uses.entry(name.clone()).or_default();
-                uses.direct_bits = uses.direct_bits.max(Some(expr.width.bits()));
+                uses.direct_mask |= mask(expr.width.bits());
             }
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } if self.visit_masked(expr, left, right) => {}
+            ExprKind::Extract { value, lsb } if self.visit_bit_field(expr, value, *lsb) => {}
             ExprKind::Resize {
                 op: ResizeOp::Truncate,
                 value,
@@ -378,7 +493,7 @@ impl Scan {
                 if let ExprKind::Register { name } = &value.kind {
                     self.note_width(name, value.width);
                     let uses = self.uses.entry(name.clone()).or_default();
-                    uses.direct_bits = uses.direct_bits.max(Some(expr.width.bits()));
+                    uses.direct_mask |= mask(expr.width.bits());
                 } else {
                     self.visit(value);
                 }
@@ -389,6 +504,14 @@ impl Scan {
                     .all(|argument| argument.dependencies().is_empty())
                 {
                     // Input-independent term: evaluation decides whether it folds.
+                    return;
+                }
+                if is_pure_logical_flags(name) {
+                    // A pure function of its operands: the target depends on a
+                    // register only through the bits the operands observe.
+                    for argument in arguments {
+                        self.visit(argument);
+                    }
                     return;
                 }
                 let Some((bits, subtract)) = flags_width(name) else {
@@ -419,6 +542,34 @@ impl Scan {
         }
     }
 
+    /// `register & constant` observes only the constant's bits.
+    fn visit_masked(&mut self, expr: &Expr, left: &Expr, right: &Expr) -> bool {
+        let (register, constant) = match (&left.kind, &right.kind) {
+            (ExprKind::Register { name }, ExprKind::Const { value })
+            | (ExprKind::Const { value }, ExprKind::Register { name }) => (name, *value),
+            _ => return false,
+        };
+        self.note_width(register, expr.width);
+        let uses = self.uses.entry(register.clone()).or_default();
+        uses.direct_mask |= constant & mask(expr.width.bits());
+        true
+    }
+
+    /// `register[lsb .. lsb + width]` observes just those bits.
+    fn visit_bit_field(&mut self, expr: &Expr, value: &Expr, lsb: u32) -> bool {
+        let ExprKind::Register { name } = &value.kind else {
+            return false;
+        };
+        let bits = expr.width.bits();
+        if lsb + bits > value.width.bits() {
+            return false;
+        }
+        self.note_width(name, value.width);
+        let uses = self.uses.entry(name.clone()).or_default();
+        uses.direct_mask |= mask(bits) << lsb;
+        true
+    }
+
     fn visit_add_flags(&mut self, name: &str, bits: u32, subtract: bool, arguments: &[Expr]) {
         let register = arguments
             .iter()
@@ -432,6 +583,10 @@ impl Scan {
             ));
             return;
         };
+        if subtract && constant_of(left).is_none() && constant_of(right).is_none() {
+            self.visit_sub_pair(name, bits, &register, left, right);
+            return;
+        }
         let (symbolic, constant) = match (constant_of(left), constant_of(right)) {
             (None, Some(c)) => (left, c),
             (Some(c), None) if !subtract => (right, c),
@@ -461,12 +616,41 @@ impl Scan {
         self.note_width(&view.register, view.register_width);
         self.uses.entry(view.register).or_default().atoms.push((
             bits,
-            AddFlagsObservation {
+            FlagsAtom::AddConst(AddFlagsObservation {
                 negate: view.negate,
                 offset: view.offset & mask(bits),
                 constant: constant & mask(bits),
-            },
+            }),
         ));
+    }
+
+    /// `sub(s*x + a, s*x + b)` with the same sign on `x`: a pointer-difference
+    /// compare whose result is the constant `a - b`.
+    fn visit_sub_pair(&mut self, name: &str, bits: u32, register: &str, left: &Expr, right: &Expr) {
+        let views = affine(left).zip(affine(right)).filter(|(l, r)| {
+            l.register == r.register && l.negate == r.negate && l.bits >= bits && r.bits >= bits
+        });
+        let Some((l, r)) = views else {
+            self.refuse(unsupported(
+                register,
+                &format!("{name} of two input-dependent operands that are not parallel views of one register"),
+            ));
+            return;
+        };
+        self.note_width(&l.register, l.register_width);
+        let view = |a: &Affine| View {
+            negate: a.negate,
+            offset: a.offset & mask(bits),
+        };
+        let atom = FlagsAtom::SubPair {
+            left: view(&l),
+            right: view(&r),
+        };
+        self.uses
+            .entry(l.register)
+            .or_default()
+            .atoms
+            .push((bits, atom));
     }
 }
 
@@ -509,22 +693,28 @@ pub fn infer_branch_input_domains(
             ));
         }
         let atom_width = atom_bits.first().copied();
-        let (values, certificate) = match (uses.direct_bits, atom_width) {
-            (Some(direct), atom) => {
-                let bits = direct.max(atom.unwrap_or(0));
-                if bits > limits.max_exhaustive_bits {
-                    return Err(unsupported(
-                        &register,
-                        "register is used directly beyond the exhaustive width",
-                    ));
+        let (values, certificate) = match (uses.direct_mask, atom_width) {
+            (direct, atom) if direct != 0 => {
+                let observed = direct | mask(atom.unwrap_or(0));
+                if observed.count_ones() > limits.max_exhaustive_bits {
+                    let reason = if register.contains('@') {
+                        "read is used directly beyond the exhaustive width and memory bounds none of its bits"
+                    } else {
+                        "register is used directly beyond the exhaustive width"
+                    };
+                    return Err(unsupported(&register, reason));
                 }
-                (
-                    exhaustive(bits, limits),
-                    DomainCertificate::Exhaustive { bits },
-                )
+                let certificate = if observed & (observed + 1) == 0 {
+                    DomainCertificate::Exhaustive {
+                        bits: observed.count_ones(),
+                    }
+                } else {
+                    DomainCertificate::MaskedExhaustive { mask: observed }
+                };
+                (submasks(observed, limits), certificate)
             }
-            (None, Some(bits)) => {
-                let observations: Vec<_> = uses.atoms.iter().map(|(_, o)| *o).collect();
+            (_, Some(bits)) => {
+                let observations: Vec<_> = uses.atoms.iter().map(|(_, atom)| *atom).collect();
                 let certificate = if bits <= limits.max_exhaustive_bits {
                     DomainCertificate::Exhaustive { bits }
                 } else {
@@ -533,9 +723,9 @@ pub fn infer_branch_input_domains(
                         observations: observations.len(),
                     }
                 };
-                (add_flags_cover(bits, &observations, limits), certificate)
+                (flags_cover(bits, &observations, limits), certificate)
             }
-            (None, None) => {
+            (_, None) => {
                 return Err(unsupported(&register, "register has no recognized use"));
             }
         };
@@ -941,7 +1131,7 @@ mod tests {
         );
         let (_, reason) = unsupported_reason(&both, limits);
         assert!(reason.contains("two input-dependent"), "{reason}");
-        // Logical (nor) flags need a mask cover, which is not implemented.
+        // Logical flags of a wide operand observe all of its bits.
         let logical = Expr::intrinsic(
             BitWidth::W64,
             "vm_flags_nor_w32",
@@ -951,6 +1141,14 @@ mod tests {
             ],
         );
         let (_, reason) = unsupported_reason(&logical, limits);
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+        // An intrinsic with hidden state is not a function of its operands.
+        let opaque = Expr::intrinsic(
+            BitWidth::W64,
+            "native_call_return_epoch_1",
+            vec![rcx.clone()],
+        );
+        let (_, reason) = unsupported_reason(&opaque, limits);
         assert!(reason.contains("other than add flags"), "{reason}");
         // Flags observed at two widths on one register.
         let mixed = Expr::binary(
@@ -1122,5 +1320,244 @@ mod tests {
         assert_eq!(view.bits, 32);
         // ~x + 10 == -x + 9
         assert_eq!(view.offset, 9);
+    }
+
+    fn enumerate(target: &Expr, inferred: &InferredInputDomains) -> Vec<u64> {
+        let report = crate::enumerate_symbolic_value(
+            target,
+            &inferred.domains,
+            crate::SymbolicDomainLimits {
+                max_values_per_variable: 4_096,
+                ..crate::SymbolicDomainLimits::default()
+            },
+        )
+        .expect("enumerates");
+        assert!(report.complete);
+        report.unique_values
+    }
+
+    fn nor_flags_of_byte(register: &Expr) -> Expr {
+        let low = Expr::resize(ResizeOp::Truncate, BitWidth::W8, register.clone()).expect("t");
+        let flags = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_nor_w8",
+            vec![
+                Expr::unary(UnaryOp::Not, low),
+                Expr::constant(BitWidth::W8, 0),
+            ],
+        );
+        let zero = Expr::binary(
+            BinaryOp::And,
+            Expr::binary(BinaryOp::Shr, flags, Expr::constant(BitWidth::W64, 6)).expect("shr"),
+            Expr::constant(BitWidth::W64, 1),
+        )
+        .expect("and");
+        Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1_4000_1000),
+            Expr::binary(BinaryOp::Mul, zero, Expr::constant(BitWidth::W64, 0x100)).expect("mul"),
+        )
+        .expect("add")
+    }
+
+    #[test]
+    fn logical_flags_of_a_byte_slice_of_a_wide_register_are_proven_exhaustive() {
+        let rbx = Expr::register(BitWidth::W64, "native_rbx_initial");
+        let target = nor_flags_of_byte(&rbx);
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("pure logical flags of a byte");
+        assert_eq!(
+            inferred.certificates["native_rbx_initial"],
+            DomainCertificate::Exhaustive { bits: 8 }
+        );
+        let values = enumerate(&target, &inferred);
+        assert_eq!(values, vec![0x1_4000_1000, 0x1_4000_1100]);
+        // Independent check on values outside the enumerated domain.
+        for x in [
+            0_u64,
+            0xFF,
+            0x100,
+            0xDEAD_BE00,
+            u64::MAX,
+            0x1234_5678_9ABC_DEF0,
+        ] {
+            let concrete = target
+                .substitute(&BTreeMap::from([(
+                    "native_rbx_initial".to_owned(),
+                    Expr::constant(BitWidth::W64, x),
+                )]))
+                .expect("substitute");
+            let ExprKind::Const { value } = concrete.kind else {
+                panic!("not concrete")
+            };
+            assert!(values.contains(&value));
+        }
+    }
+
+    #[test]
+    fn logical_flags_of_a_wide_untracked_read_stay_refused() {
+        let wide = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_nor_w32",
+            vec![stack_load(73, 8), Expr::constant(BitWidth::W32, 0)],
+        );
+        let (register, reason) = unsupported_reason(&wide, InputDomainLimits::default());
+        assert!(register.contains("untracked memory read"), "{register}");
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+    }
+
+    #[test]
+    fn a_raw_untracked_read_as_the_target_is_refused_as_unbounded() {
+        let raw = Expr::intrinsic(
+            BitWidth::W64,
+            "memory_load_epoch_166",
+            vec![Expr::register(BitWidth::W64, "vsp_initial")],
+        );
+        let (register, reason) = unsupported_reason(&raw, InputDomainLimits::default());
+        assert!(register.contains("untracked memory read"), "{register}");
+        assert!(
+            reason.contains("memory bounds none of its bits"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn constant_masks_and_bit_fields_are_enumerated_over_their_observed_bits() {
+        let rcx = Expr::register(BitWidth::W64, "native_rcx_initial");
+        let limits = InputDomainLimits::default();
+        // x & 0xF0F0 observes 8 non-contiguous bits.
+        let masked = Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1000),
+            Expr::binary(
+                BinaryOp::And,
+                rcx.clone(),
+                Expr::constant(BitWidth::W64, 0xF0F0),
+            )
+            .expect("and"),
+        )
+        .expect("add");
+        let inferred = infer_branch_input_domains(&masked, limits).expect("8 observed bits");
+        assert_eq!(
+            inferred.certificates["native_rcx_initial"],
+            DomainCertificate::MaskedExhaustive { mask: 0xF0F0 }
+        );
+        let values = enumerate(&masked, &inferred);
+        let expected: BTreeSet<u64> = (0..=0xFFFF_u64).map(|x| 0x1000 + (x & 0xF0F0)).collect();
+        assert_eq!(values.into_iter().collect::<BTreeSet<_>>(), expected);
+        // Bits 16..24 as a field.
+        let field = Expr::extract(BitWidth::W8, 16, rcx.clone()).expect("extract");
+        let inferred = infer_branch_input_domains(&field, limits).expect("byte field");
+        assert_eq!(
+            inferred.certificates["native_rcx_initial"],
+            DomainCertificate::MaskedExhaustive { mask: 0xFF_0000 }
+        );
+        assert_eq!(inferred.domains["native_rcx_initial"].len(), 256);
+        // Nine observed bits exceed the exhaustive width.
+        let nine =
+            Expr::binary(BinaryOp::And, rcx, Expr::constant(BitWidth::W64, 0x1FF0)).expect("and");
+        let (_, reason) = unsupported_reason(&nine, limits);
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+    }
+
+    fn pair_image(bits: u32, atoms: &[FlagsAtom], xs: &[u64]) -> BTreeSet<Vec<u64>> {
+        xs.iter()
+            .map(|x| {
+                atoms
+                    .iter()
+                    .map(|atom| atom.tuple_word(bits, *x).expect("flags"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn pair(negate: bool, a: u64, b: u64) -> FlagsAtom {
+        FlagsAtom::SubPair {
+            left: View { negate, offset: a },
+            right: View { negate, offset: b },
+        }
+    }
+
+    #[test]
+    fn parallel_view_compare_cover_realizes_the_exact_flag_image() {
+        let all: Vec<u64> = (0..=0xFFFF).collect();
+        let mut state = 0xA076_1D64_78BD_642F_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state & 0xFFFF
+        };
+        let mut cases = vec![
+            vec![pair(false, 0x2A2, 0xA9E)],
+            vec![pair(true, 0, 0x7FFF)],
+            vec![pair(false, 0x8000, 0)],
+            vec![pair(false, 5, 5)],
+            vec![pair(false, 3, 0xFFFD), pair(true, 9, 0x8001)],
+        ];
+        for round in 0..24 {
+            cases.push(vec![pair(round % 2 == 0, next(), next())]);
+        }
+        for atoms in cases {
+            let cover =
+                flags_cover(16, &atoms, InputDomainLimits::default()).expect("bounded cover");
+            assert_eq!(
+                pair_image(16, &atoms, &cover),
+                pair_image(16, &atoms, &all),
+                "{atoms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_view_compare_cover_realizes_sampled_flags_at_64_bits() {
+        let atoms = [pair(false, 0x2A2, 0xA9E)];
+        let cover = flags_cover(64, &atoms, InputDomainLimits::default()).expect("cover");
+        assert!(cover.len() <= 1_024, "{}", cover.len());
+        let mut samples = vec![
+            0_u64,
+            1,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+            u64::MAX,
+        ];
+        for base in [0_u64, 0x8000_0000_0000_0000, 0x7FFF_FFFF_FFFF_FFFF] {
+            for delta in 0..4096_u64 {
+                samples.push(base.wrapping_add(delta).wrapping_sub(0xB00));
+            }
+        }
+        samples.extend((0..20_000_u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        assert!(pair_image(64, &atoms, &samples).is_subset(&pair_image(64, &atoms, &cover)));
+    }
+
+    #[test]
+    fn pointer_difference_compare_on_a_live_in_register_is_covered() {
+        let vsp = Expr::register(BitWidth::W64, "vsp_initial");
+        let at = |c: u64| {
+            Expr::binary(BinaryOp::Add, vsp.clone(), Expr::constant(BitWidth::W64, c)).expect("add")
+        };
+        let flags = Expr::intrinsic(BitWidth::W64, "vm_flags_sub_w64", vec![at(674), at(2718)]);
+        let carry =
+            Expr::binary(BinaryOp::And, flags, Expr::constant(BitWidth::W64, 1)).expect("and");
+        let target = Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1_4000_1000),
+            Expr::binary(BinaryOp::Mul, carry, Expr::constant(BitWidth::W64, 0x100)).expect("mul"),
+        )
+        .expect("add");
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("parallel views");
+        assert!(matches!(
+            inferred.certificates["vsp_initial"],
+            DomainCertificate::AddFlagsCover { bits: 64, .. }
+        ));
+        let values = enumerate(&target, &inferred);
+        assert_eq!(values, vec![0x1_4000_1000, 0x1_4000_1100]);
+        // Opposite directions have a non-constant difference: refused.
+        let neg = Expr::binary(BinaryOp::Sub, Expr::constant(BitWidth::W64, 9), vsp.clone())
+            .expect("sub");
+        let skew = Expr::intrinsic(BitWidth::W64, "vm_flags_sub_w64", vec![at(1), neg]);
+        let (_, reason) = unsupported_reason(&skew, InputDomainLimits::default());
+        assert!(reason.contains("not parallel views"), "{reason}");
     }
 }
