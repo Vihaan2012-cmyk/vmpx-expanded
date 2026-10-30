@@ -8,7 +8,7 @@ use vmpx_pe::{PeImage, Rva};
 use crate::{
     BytecodeDecodeError, BytecodeDirection, HandlerRegisterRoles, NativeCallSelectorOutcome,
     RecoveryStatus, RelativeDispatchState, RelativeThreadedCodec,
-    dispatch_extract::{canonical, has_flat_segment_address, writes_register},
+    dispatch_extract::{canonical, has_flat_segment_address, signed_immediate, writes_register},
     native_call_verify::verify_native_call_outcomes,
 };
 
@@ -735,7 +735,7 @@ pub fn analyze_native_call_handler(
         selector_completion,
         selector_register,
         vsp,
-        roles,
+        &[roles.vip, roles.rolling_key, roles.handler],
         limits.max_instructions.max(1),
     ) {
         Ok(outcomes) => outcomes,
@@ -787,6 +787,284 @@ pub fn analyze_native_call_handler(
             .collect(),
         selector_outcomes,
         cfg_blocks: cfg.blocks.len(),
+        cfg_instructions: instruction_count,
+        confidence: 100,
+        evidence,
+        diagnostics: Vec::new(),
+    };
+    Ok(NativeCallAnalysis {
+        recovered: Some(RecoveredNativeCall {
+            report: report.clone(),
+            resume_rva,
+        }),
+        report,
+    })
+}
+
+/// Proves a keyless native-call bridge: the raw W8 operand read at `entry` is
+/// the Win64 argument count, the target is the qword at `[vsp]`, and every
+/// operand value reaches the shared threaded dispatch with the VIP and table
+/// base preserved. `resolve_dispatch` maps the post-call resume address to the
+/// proven `(dispatch_source, terminal_dispatch, table_register)`.
+///
+/// # Errors
+///
+/// Propagates failure to decode the required native entry. Ordinary ambiguity
+/// and resource limits are returned as a failed report.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub fn analyze_keyless_native_call_handler(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    roles: HandlerRegisterRoles,
+    vsp: Register,
+    selector_register: Register,
+    operand_load: Rva,
+    operand_bytes: i64,
+    limits: CfgLimits,
+    resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Register), String>,
+) -> Result<NativeCallAnalysis, DisasmError> {
+    let cfg = recover_cfg(pe, entry, limits)?;
+    let instruction_count = cfg
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum();
+    let blocks = cfg.blocks.len();
+    let fail = |diagnostic: String| {
+        Ok(failed_report(
+            entry,
+            blocks,
+            instruction_count,
+            vec![diagnostic],
+        ))
+    };
+    if cfg.status != CfgStatus::Complete {
+        return fail(format!("native-call CFG is incomplete: {:?}", cfg.status));
+    }
+    if operand_load != entry {
+        return fail("keyless operand is not the first handler instruction".to_owned());
+    }
+    let mut instructions = BTreeMap::new();
+    for summary in cfg.blocks.iter().flat_map(|block| &block.instructions) {
+        instructions.insert(summary.rva, decode_one(pe, summary.rva)?);
+    }
+    let graph = build_instruction_graph(pe, &instructions);
+    let calls = instructions
+        .iter()
+        .filter(|(_, decoded)| {
+            matches!(
+                decoded.instruction.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            )
+        })
+        .collect::<Vec<_>>();
+    let [(call_site, call)] = calls.as_slice() else {
+        return fail(format!(
+            "expected exactly one modeled call, recovered {}",
+            calls.len()
+        ));
+    };
+    if call.instruction.flow_control() != FlowControl::IndirectCall
+        || call.instruction.op0_kind() != OpKind::Register
+    {
+        return fail("native call target is not an indirect register call".to_owned());
+    }
+    let call_site = **call_site;
+    let call_target = canonical(call.instruction.op0_register());
+    let vip = canonical(roles.vip);
+    let vsp_canonical = canonical(vsp);
+    let Some(resume_rva) = call
+        .next_rva()
+        .filter(|next| instructions.contains_key(next))
+    else {
+        return fail("native call has no recovered fallthrough".to_owned());
+    };
+    let mut advance_factory = iced_x86::InstructionInfoFactory::new();
+    let mut segment = Vec::new();
+    let mut completion = None;
+    let mut cursor = Some(operand_load);
+    while let Some(rva) = cursor
+        && segment.len() < 64
+        && let Some(decoded) = instructions.get(&rva)
+        && decoded.instruction.flow_control() == FlowControl::Next
+    {
+        let instruction = &decoded.instruction;
+        segment.push(rva);
+        if rva != operand_load && writes_register(&mut advance_factory, instruction, vip) {
+            let exact = instruction.mnemonic() == Mnemonic::Add
+                && instruction.op0_kind() == OpKind::Register
+                && instruction.op0_register() == vip
+                && signed_immediate(instruction, 1) == Some(operand_bytes);
+            completion = exact.then_some(rva);
+            break;
+        }
+        cursor = decoded.next_rva();
+    }
+    let Some(completion) = completion else {
+        return fail("operand load is not followed by the exact VIP advance".to_owned());
+    };
+    let (dispatch_source, terminal_dispatch, table_register) = match resolve_dispatch(resume_rva) {
+        Ok(resolved) => resolved,
+        Err(diagnostic) => return fail(diagnostic),
+    };
+    if !instructions.contains_key(&dispatch_source)
+        || !reaches_while_skipping(&graph, resume_rva, dispatch_source, None)
+    {
+        return fail("post-call dispatch source is not on the recovered return path".to_owned());
+    }
+    let table_register = canonical(table_register);
+    if [vip, vsp_canonical, canonical(selector_register)].contains(&table_register) {
+        return fail("table register overlaps a VM role".to_owned());
+    }
+    if segment.iter().any(|rva| {
+        writes_register(
+            &mut advance_factory,
+            &instructions[rva].instruction,
+            table_register,
+        )
+    }) {
+        return fail("table register is written before the operand advance completes".to_owned());
+    }
+    let dispatch_region = reachable(&graph, dispatch_source);
+    if instructions.iter().any(|(rva, decoded)| {
+        *rva != operand_load
+            && !dispatch_region.contains(rva)
+            && (0..decoded.instruction.op_count())
+                .any(|operand| decoded.instruction.op_kind(operand) == OpKind::Memory)
+            && canonical(decoded.instruction.memory_base()) == vip
+    }) {
+        return fail("bridge reads or writes through the VIP beyond the operand".to_owned());
+    }
+
+    let target_loads = instructions
+        .iter()
+        .filter_map(|(rva, decoded)| {
+            let (destination, base, displacement) = exact_load(&decoded.instruction)?;
+            (destination == call_target
+                && base == vsp_canonical
+                && displacement == 0
+                && dominates(&graph, entry, *rva, call_site))
+            .then_some(*rva)
+        })
+        .collect::<Vec<_>>();
+    let [target_load] = target_loads.as_slice() else {
+        return fail(format!(
+            "expected one dominating [vsp] load into the call target, recovered {}",
+            target_loads.len()
+        ));
+    };
+    let rsp_saves = instructions
+        .iter()
+        .filter_map(|(rva, decoded)| {
+            let (base, displacement, source) = exact_store(&decoded.instruction)?;
+            (base == vsp_canonical
+                && source == Register::RSP
+                && dominates(&graph, entry, *rva, call_site))
+            .then_some((*rva, displacement))
+        })
+        .collect::<Vec<_>>();
+    let [(rsp_save, rsp_displacement)] = rsp_saves.as_slice() else {
+        return fail("native RSP is not saved exactly once through the VSP".to_owned());
+    };
+    let rsp_restores = instructions
+        .iter()
+        .filter_map(|(rva, decoded)| {
+            let (destination, base, displacement) = exact_load(&decoded.instruction)?;
+            (destination == Register::RSP
+                && base == vsp_canonical
+                && displacement == *rsp_displacement
+                && dominates(&graph, resume_rva, *rva, dispatch_source))
+            .then_some(*rva)
+        })
+        .collect::<Vec<_>>();
+    let [rsp_restore] = rsp_restores.as_slice() else {
+        return fail("saved native RSP is not restored on every return path".to_owned());
+    };
+    let return_stores = instructions
+        .iter()
+        .filter_map(|(rva, decoded)| {
+            let (base, displacement, source) = exact_store(&decoded.instruction)?;
+            (base == vsp_canonical
+                && displacement == 0
+                && source == Register::RAX
+                && dominates(&graph, resume_rva, *rva, dispatch_source))
+            .then_some(*rva)
+        })
+        .collect::<Vec<_>>();
+    let [return_store] = return_stores.as_slice() else {
+        return fail("native RAX is not returned to the VM stack on every path".to_owned());
+    };
+    let vsp_restores = instructions
+        .iter()
+        .filter_map(|(rva, decoded)| {
+            let (destination, base, _) = exact_load(&decoded.instruction)?;
+            (destination == vsp_canonical
+                && base == vsp_canonical
+                && dominates(&graph, resume_rva, *rva, dispatch_source))
+            .then_some(*rva)
+        })
+        .collect::<Vec<_>>();
+    let [vsp_restore] = vsp_restores.as_slice() else {
+        return fail("post-call VM stack pointer is not restored on every path".to_owned());
+    };
+
+    let selector_outcomes = match verify_native_call_outcomes(
+        pe,
+        &instructions,
+        entry,
+        call_site,
+        dispatch_source,
+        terminal_dispatch,
+        completion,
+        selector_register,
+        vsp,
+        &[roles.vip, table_register],
+        limits.max_instructions.max(1),
+    ) {
+        Ok(outcomes) => outcomes,
+        Err(diagnostic) => return fail(diagnostic),
+    };
+    if let Some(outcome) = selector_outcomes.iter().find(|outcome| {
+        outcome.vsp_delta != 8 * i32::from(outcome.selector.min(4))
+            || outcome.target_stack_offset != 0
+    }) {
+        return fail(format!(
+            "operand {} adjusts the VM stack by {}, expected {}",
+            outcome.selector,
+            outcome.vsp_delta,
+            8 * i32::from(outcome.selector.min(4))
+        ));
+    }
+
+    let evidence = vec![
+        format!("call target is the qword at [vsp], loaded at {target_load}"),
+        format!("native RSP is saved at {rsp_save} and restored at {rsp_restore}"),
+        format!("native RAX is written back to the VM stack at {return_store}"),
+        format!("VIP and table register {table_register:?} are restored before {dispatch_source}"),
+        "all 256 W8 operand values prove argument-count marshalling, result placement, and exact VM/native stack restoration".to_owned(),
+    ];
+    let preserved = vec![format!("{vip:?}"), format!("{table_register:?}")];
+    let report = NativeCallAnalysisReport {
+        schema_version: 2,
+        entry,
+        status: RecoveryStatus::Recovered,
+        call_site: Some(call_site),
+        resume_rva: Some(resume_rva),
+        call_target_register: Some(format!("{call_target:?}")),
+        target_load: Some(*target_load),
+        vsp_alias_register: None,
+        native_rsp_save: Some(*rsp_save),
+        native_rsp_restore: Some(*rsp_restore),
+        return_store: Some(*return_store),
+        vsp_restore: Some(*vsp_restore),
+        selector_register: Some(format!("{:?}", canonical(selector_register))),
+        selector_completion: Some(completion),
+        dispatch_source: Some(dispatch_source),
+        terminal_dispatch: Some(terminal_dispatch),
+        saved_vm_registers: preserved.clone(),
+        restored_vm_registers: preserved,
+        selector_outcomes,
+        cfg_blocks: blocks,
         cfg_instructions: instruction_count,
         confidence: 100,
         evidence,

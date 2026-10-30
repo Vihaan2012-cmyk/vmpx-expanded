@@ -126,7 +126,7 @@ pub use native_api::summarize_known_import;
 pub use native_call::{
     DecodedNativeCallBoundary, NativeCallAnalysis, NativeCallAnalysisReport,
     NativeCallBoundaryDecodeError, NativeCallBoundarySpec, RecoveredNativeCall,
-    analyze_native_call_handler,
+    analyze_keyless_native_call_handler, analyze_native_call_handler,
 };
 pub use native_call_verify::NativeCallSelectorOutcome;
 pub use native_context::{

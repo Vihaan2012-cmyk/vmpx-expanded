@@ -17,7 +17,8 @@ use crate::{
     LinearVmDecodeReport, NativeBackwardSlice, NativeCallAnalysisReport, NativeCallBoundarySpec,
     RecoveryStatus, RelativeDispatchCodec, RelativeDispatchState, RelativeThreadedCodec,
     StackCheckRoles, TableChecksumHandlerReport, VmExitReport, VmHandlerAnalysis,
-    VmHandlerDecodeSpec, VmHandlerSemantic, VmSemanticMetadata, analyze_native_call_handler,
+    VmHandlerDecodeSpec, VmHandlerSemantic, VmSemanticMetadata,
+    analyze_keyless_native_call_handler, analyze_native_call_handler,
     analyze_table_checksum_handler, analyze_vm_exit, backward_slice_handler_trace,
     classify_handler_effects, extract_handler_effects_keyed, extract_operand_codecs_mode,
     extract_relative_dispatch_codecs_with_stack_check, prove_handler_value_flow,
@@ -277,7 +278,7 @@ pub fn recover_handler_codecs(
             .candidates
             .iter()
             .all(|candidate| candidate.codec.table.is_some());
-    let operand_analysis = extract_operand_codecs_mode(
+    let mut operand_analysis = extract_operand_codecs_mode(
         &trace,
         &slice,
         config.roles,
@@ -389,6 +390,107 @@ pub fn recover_handler_codecs(
             native_call = Some(recovered.report);
         } else {
             native_call = Some(analysis.report);
+        }
+    }
+
+    if native_call.is_none()
+        && dispatch_analysis.candidates.is_empty()
+        && trace.stop.kind == DirectJumpTraceStopKind::ConditionalBranch
+        && operand_analysis.candidates.is_empty()
+        && let Some(effect_roles) = config.effect_roles
+    {
+        let raw_operand = extract_operand_codecs_mode(
+            &trace,
+            &slice,
+            config.roles,
+            &BTreeSet::new(),
+            config.bytecode_direction,
+            true,
+        );
+        if let [selector] = raw_operand.candidates.as_slice()
+            && selector.codec.width == BitWidth::W8
+            && selector.full_register_value_proven
+        {
+            let mut resumed = None;
+            let mut resume_error = None;
+            let analysis = analyze_keyless_native_call_handler(
+                pe,
+                entry,
+                config.roles,
+                effect_roles.vsp,
+                selector.decoded_register_id,
+                selector.encoded_load,
+                i64::from(selector.codec.width.bytes()),
+                CfgLimits {
+                    max_blocks: config.trace_limits.max_fragments,
+                    max_instructions: config.trace_limits.max_instructions,
+                    max_instructions_per_block: config.trace_limits.max_instructions_per_fragment,
+                },
+                |resume| {
+                    let extracted = (|| {
+                        let resume_trace =
+                            trace_direct_jump_fragments(pe, resume, config.trace_limits)?;
+                        let resume_slice = backward_slice_handler_trace(
+                            &resume_trace,
+                            &HandlerSliceConfig {
+                                live_out_registers: config.live_out_registers.clone(),
+                                live_out_rflags: config.live_out_rflags,
+                            },
+                        );
+                        extract_relative_dispatch_codecs_with_stack_check(
+                            pe,
+                            &resume_trace,
+                            &resume_slice,
+                            config.roles,
+                            config.bytecode_direction,
+                            config.proof_limits,
+                            None,
+                        )
+                    })();
+                    let report = match extracted {
+                        Ok(report) => report,
+                        Err(error) => {
+                            resume_error = Some(error);
+                            return Err("native-call return path is not decodable".to_owned());
+                        }
+                    };
+                    let resolved = match report.candidates.as_slice() {
+                        [candidate]
+                            if candidate.codec.table.is_some()
+                                && candidate.postlude.is_none()
+                                && !candidate.vip_rebased_before_source =>
+                        {
+                            candidate.table_register.map(|table| {
+                                (candidate.encoded_load, candidate.terminal_dispatch, table)
+                            })
+                        }
+                        _ => None,
+                    };
+                    let Some(resolved) = resolved else {
+                        return Err(format!(
+                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch",
+                            report.candidates.len()
+                        ));
+                    };
+                    resumed = Some(report);
+                    Ok(resolved)
+                },
+            )?;
+            if let Some(error) = resume_error {
+                return Err(error);
+            }
+            match (analysis.recovered, resumed) {
+                (Some(recovered), Some(resume_dispatch)) => {
+                    dispatch_analysis = resume_dispatch;
+                    operand_analysis = raw_operand;
+                    native_call_semantic = true;
+                    native_call = Some(recovered.report);
+                }
+                _ => {
+                    native_call_resume_diagnostic = analysis.report.diagnostics.first().cloned();
+                    native_call = Some(analysis.report);
+                }
+            }
         }
     }
 
@@ -1092,6 +1194,23 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                     });
                 }
             };
+            if let Some(boundary) = recovery.boundary_spec.as_mut()
+                && let Some(table) = boundary.codec.dispatch.table.as_mut()
+                && table.table_base.is_none()
+                && let Some(global) = global_table
+            {
+                if recovery
+                    .table_dispatch
+                    .is_some_and(|facts| facts.register == global.register)
+                {
+                    table.table_base = Some(global.base);
+                } else {
+                    recovery.boundary_spec = None;
+                    recovery.diagnostics.push(
+                        "native-call table register does not match the bootstrap anchor".to_owned(),
+                    );
+                }
+            }
             let spec = match recovery.decode_spec.clone() {
                 Some(spec) => match bind_table_base(spec, recovery.table_dispatch, global_table) {
                     Ok(spec) => Some(spec),

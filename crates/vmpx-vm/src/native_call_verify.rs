@@ -7,10 +7,7 @@ use serde::Serialize;
 use vmpx_disasm::DecodedInstruction;
 use vmpx_pe::{PeImage, Rva};
 
-use crate::{
-    HandlerRegisterRoles,
-    dispatch_extract::{canonical, has_flat_segment_address, signed_immediate},
-};
+use crate::dispatch_extract::{canonical, has_flat_segment_address, signed_immediate};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeCallSelectorOutcome {
@@ -77,12 +74,12 @@ fn bit_mask(bits: u32) -> u64 {
 }
 
 impl Machine {
-    fn new(vsp: Register, roles: HandlerRegisterRoles) -> Self {
+    fn new(vsp: Register, preserved: &[Register]) -> Self {
         let mut registers = BTreeMap::new();
         registers.insert(canonical(vsp), Value::EntryVsp(0));
         registers.insert(Register::RSP, Value::EntryRsp(0));
-        for role in [roles.vip, roles.rolling_key, roles.handler] {
-            registers.insert(canonical(role), Value::RoleState(canonical(role)));
+        for role in preserved {
+            registers.insert(canonical(*role), Value::RoleState(canonical(*role)));
         }
         Self {
             registers,
@@ -480,11 +477,11 @@ fn verify_selector(
     selector_completion: Rva,
     selector_register: Register,
     vsp: Register,
-    roles: HandlerRegisterRoles,
+    preserved: &[Register],
     selector: u8,
     max_steps: usize,
 ) -> Result<NativeCallSelectorOutcome, String> {
-    let mut machine = Machine::new(vsp, roles);
+    let mut machine = Machine::new(vsp, preserved);
     let mut pc = entry;
     for _ in 0..max_steps {
         if pc == dispatch_source {
@@ -494,7 +491,7 @@ fn verify_selector(
                     machine.call_count
                 ));
             }
-            for role in [roles.vip, roles.rolling_key, roles.handler] {
+            for role in preserved.iter().copied() {
                 if machine.read_register(role) != Value::RoleState(canonical(role)) {
                     return Err(format!(
                         "selector {selector} does not restore role {role:?} before dispatch"
@@ -559,7 +556,7 @@ fn verify_selector(
         if pc == selector_completion {
             machine.selector_seeded = true;
             machine.write_register(selector_register, Value::Const(u64::from(selector)));
-            for role in [roles.vip, roles.rolling_key, roles.handler] {
+            for role in preserved.iter().copied() {
                 machine.write_register(role, Value::RoleState(canonical(role)));
             }
         }
@@ -653,11 +650,15 @@ pub(crate) fn verify_native_call_outcomes(
     selector_completion: Rva,
     selector_register: Register,
     vsp: Register,
-    roles: HandlerRegisterRoles,
+    preserved: &[Register],
     max_steps_per_selector: usize,
 ) -> Result<Vec<NativeCallSelectorOutcome>, String> {
-    let role_registers = [roles.vip, roles.rolling_key, roles.handler, vsp].map(canonical);
-    if role_registers.contains(&canonical(selector_register)) {
+    if preserved
+        .iter()
+        .copied()
+        .chain([vsp])
+        .any(|register| canonical(register) == canonical(selector_register))
+    {
         return Err("selector register overlaps a live VM role".to_owned());
     }
     let mut outcomes = Vec::with_capacity(256);
@@ -672,7 +673,7 @@ pub(crate) fn verify_native_call_outcomes(
             selector_completion,
             selector_register,
             vsp,
-            roles,
+            preserved,
             selector,
             max_steps_per_selector,
         )?);
