@@ -47,12 +47,17 @@
 
 mod alu;
 mod cpu;
+mod differential;
 mod emu;
 mod loader;
 mod memory;
 
 pub use alu::{Alu, Flags, Shift};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
+pub use differential::{
+    DiffRecord, DiffReport, Divergence, Incomplete, Limits, Outcome, OutputRegion, RunError,
+    RunResult, Target, differential, edge_values, input_set, run_function,
+};
 pub use emu::{Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, Stop, TraceEntry};
 pub use loader::{LoadError, LoadOptions, LoadedImage, load};
 pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
