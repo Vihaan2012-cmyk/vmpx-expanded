@@ -3,7 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vmpx_pe::{ImportModule, ImportSymbol, PeKind, Rva};
+use vmpx_disasm::referenced_iat_slots;
+use vmpx_pe::{ImportModule, ImportSymbol, PeImage, PeKind, Rva};
 
 use crate::import_table::{ImportReconstructionPlan, ImportTableError, plan_import_reconstruction};
 
@@ -190,6 +191,14 @@ pub fn reduce_to_proven_imports(
         unresolved,
         unreferenced_slots,
     }
+}
+
+/// Reduce the image's parsed import table to the slots native (non-`.vmp`)
+/// code provably references. VM-emulated imports are not visible statically.
+#[must_use]
+pub fn proven_native_imports(pe: &PeImage<'_>) -> ProvenImportSet {
+    let bindings = bindings_from_modules(&pe.report().imports);
+    reduce_to_proven_imports(&bindings, &referenced_iat_slots(pe))
 }
 
 /// Serialize a proven set into a conventional import directory plan. Each
@@ -485,5 +494,123 @@ mod tests {
         assert_eq!(plan.slot_remaps[0].module, "kernel32.dll");
         assert_eq!(plan.slot_remaps[1].module, "user32.dll");
         assert_eq!(plan.slot_remaps[1].source_iat_rva, Rva(0x2008));
+    }
+
+    fn put(data: &mut [u8], at: usize, bytes: &[u8]) {
+        data[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// PE32+: `.text` 0x1000 (`call [A]; call vmp; jmp [B]`), `.idata` 0x2000
+    /// (mod.dll: Alpha 0x2050, Beta 0x2058, Gamma 0x2060), `.vmp0` 0x3000
+    /// (`call [Gamma]`). Gamma is referenced only from `.vmp0`.
+    fn import_pe() -> Vec<u8> {
+        let mut d = vec![0_u8; 0x800];
+        put(&mut d, 0, &0x5A4D_u16.to_le_bytes());
+        put(&mut d, 0x3C, &0x80_u32.to_le_bytes());
+        put(&mut d, 0x80, &0x4550_u32.to_le_bytes());
+        put(&mut d, 0x84, &0x8664_u16.to_le_bytes());
+        put(&mut d, 0x86, &3_u16.to_le_bytes());
+        put(&mut d, 0x94, &0xF0_u16.to_le_bytes());
+        put(&mut d, 0x96, &0x2022_u16.to_le_bytes());
+        let o = 0x98;
+        put(&mut d, o, &0x20B_u16.to_le_bytes());
+        put(&mut d, o + 16, &0x1000_u32.to_le_bytes());
+        put(&mut d, o + 24, &0x1_4000_0000_u64.to_le_bytes());
+        put(&mut d, o + 32, &0x1000_u32.to_le_bytes());
+        put(&mut d, o + 36, &0x200_u32.to_le_bytes());
+        put(&mut d, o + 56, &0x4000_u32.to_le_bytes());
+        put(&mut d, o + 60, &0x200_u32.to_le_bytes());
+        put(&mut d, o + 68, &3_u16.to_le_bytes());
+        put(&mut d, o + 108, &16_u32.to_le_bytes());
+        put(&mut d, o + 112 + 8, &0x2000_u32.to_le_bytes());
+        put(&mut d, o + 112 + 12, &40_u32.to_le_bytes());
+        for (i, (name, rva, raw, flags)) in [
+            (&b".text"[..], 0x1000_u32, 0x200_u32, 0x6000_0020_u32),
+            (b".idata", 0x2000, 0x400, 0xC000_0040),
+            (b".vmp0", 0x3000, 0x600, 0x6000_0020),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 0x188 + i * 40;
+            put(&mut d, at, name);
+            put(&mut d, at + 8, &0x200_u32.to_le_bytes());
+            put(&mut d, at + 12, &rva.to_le_bytes());
+            put(&mut d, at + 16, &0x200_u32.to_le_bytes());
+            put(&mut d, at + 20, &raw.to_le_bytes());
+            put(&mut d, at + 36, &flags.to_le_bytes());
+        }
+        let text = [
+            &[0xFF, 0x15][..],
+            &0x104A_u32.to_le_bytes(),
+            &[0xE8],
+            &0x1FF5_u32.to_le_bytes(),
+            &[0xFF, 0x25],
+            &0x1047_u32.to_le_bytes(),
+        ]
+        .concat();
+        put(&mut d, 0x200, &text);
+        let idata = 0x400;
+        put(&mut d, idata, &0x2030_u32.to_le_bytes());
+        put(&mut d, idata + 12, &0x20C0_u32.to_le_bytes());
+        put(&mut d, idata + 16, &0x2050_u32.to_le_bytes());
+        for (i, name) in ["Alpha", "Beta", "Gamma"].into_iter().enumerate() {
+            let hint_rva = 0x2080 + 0x10 * u64::try_from(i).unwrap();
+            let at = idata + 0x80 + 0x10 * i;
+            put(&mut d, at + 2, name.as_bytes());
+            put(&mut d, idata + 0x30 + 8 * i, &hint_rva.to_le_bytes());
+            put(&mut d, idata + 0x50 + 8 * i, &hint_rva.to_le_bytes());
+        }
+        put(&mut d, idata + 0xC0, b"mod.dll");
+        put(&mut d, 0x600, &[0xFF, 0x15]);
+        put(&mut d, 0x602, &0xFFFF_F05A_u32.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn native_references_prove_imports_and_vmp_references_do_not() {
+        let data = import_pe();
+        let pe = PeImage::parse(&data).unwrap();
+        assert_eq!(pe.report().imports[0].entries.len(), 3);
+        assert_eq!(referenced_iat_slots(&pe), refs(&[0x2050, 0x2058]));
+
+        let set = proven_native_imports(&pe);
+        assert!(set.unresolved.is_empty());
+        assert_eq!(set.unreferenced_slots, 1);
+        assert_eq!(set.modules.len(), 1);
+        assert_eq!(set.modules[0].name, "mod.dll");
+        let got: Vec<_> = set.modules[0]
+            .imports
+            .iter()
+            .map(|i| (i.slot.0, i.symbol.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0x2050, SymbolRef::Name("Alpha".into())),
+                (0x2058, SymbolRef::Name("Beta".into())),
+            ]
+        );
+    }
+
+    /// `VMPX_IAT_SAMPLE=<pe> cargo test -p vmpx-rebuild -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs VMPX_IAT_SAMPLE"]
+    fn sample_native_import_coverage() {
+        let path = std::env::var("VMPX_IAT_SAMPLE").unwrap();
+        let data = std::fs::read(path).unwrap();
+        let pe = PeImage::parse(&data).unwrap();
+        let scan = vmpx_disasm::scan_iat_references(&pe, vmpx_disasm::CfgLimits::default());
+        let set = proven_native_imports(&pe);
+        eprintln!(
+            "slots={} referenced={} roots={} exhaustive={} proven={} unresolved={} modules={}",
+            scan.total_slots,
+            scan.referenced.len(),
+            scan.roots_walked,
+            scan.exhaustive,
+            set.import_count(),
+            set.unresolved.len(),
+            set.modules.len()
+        );
     }
 }

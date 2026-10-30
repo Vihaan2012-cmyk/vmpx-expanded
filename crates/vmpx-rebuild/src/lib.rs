@@ -5,7 +5,8 @@ mod reintegrate;
 
 pub use import_reconstruct::{
     ProvenImport, ProvenImportSet, ProvenModule, SlotBinding, SymbolRef, UnresolvedReason,
-    UnresolvedSlot, bindings_from_modules, plan_proven_imports, reduce_to_proven_imports,
+    UnresolvedSlot, bindings_from_modules, plan_proven_imports, proven_native_imports,
+    reduce_to_proven_imports,
 };
 pub use import_table::{
     ImportModuleSpec, ImportReconstructionPlan, ImportSlotRemap, ImportTableError, ImportTarget,

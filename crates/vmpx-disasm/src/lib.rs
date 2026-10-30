@@ -10,6 +10,7 @@ use vmpx_pe::{FileOffset, PeImage, PeKind, Rva, Va};
 
 mod dangling;
 mod dispatch_proof;
+mod iat_refs;
 mod trace;
 
 pub use dangling::{
@@ -19,6 +20,7 @@ pub use dangling::{
 pub use dispatch_proof::{
     RegisterDispatchProof, RegisterDispatchProofLimits, prove_register_dispatch_postlude,
 };
+pub use iat_refs::{IatReferenceScan, referenced_iat_slots, scan_iat_references};
 pub use trace::{
     DirectJumpFragment, DirectJumpTrace, DirectJumpTraceLimits, DirectJumpTraceStop,
     DirectJumpTraceStopKind, trace_direct_jump_fragments,

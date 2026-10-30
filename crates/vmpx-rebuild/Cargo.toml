@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+vmpx-disasm = { path = "../vmpx-disasm" }
 vmpx-pe = { path = "../vmpx-pe" }
 
 [lints]
