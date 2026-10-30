@@ -70,6 +70,8 @@ pub fn infer_live_in(accesses: &[RegisterAccess]) -> BTreeSet<X64NativeRegister>
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EntryCallingConvention {
     /// Architectural registers the entry's observable effects read as inputs.
+    /// A LOWER BOUND: only store operands and call arguments are inspected, so
+    /// it can under-report. Never use it to drop replacement inputs.
     pub live_in: BTreeSet<X64NativeRegister>,
     /// Register that held the VM stack cursor (native RSP capture), if proven.
     pub stack_cursor: Option<X64NativeRegister>,

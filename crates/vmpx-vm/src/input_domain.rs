@@ -333,15 +333,14 @@ impl Scan {
                 op: ResizeOp::Truncate,
                 value,
             }
-            | ExprKind::Extract { value, lsb: 0 }
-                if matches!(value.kind, ExprKind::Register { .. }) =>
-            {
-                let ExprKind::Register { name } = &value.kind else {
-                    unreachable!("guard checked the operand is a register")
-                };
-                self.note_width(name, value.width);
-                let uses = self.uses.entry(name.clone()).or_default();
-                uses.direct_bits = uses.direct_bits.max(Some(expr.width.bits()));
+            | ExprKind::Extract { value, lsb: 0 } => {
+                if let ExprKind::Register { name } = &value.kind {
+                    self.note_width(name, value.width);
+                    let uses = self.uses.entry(name.clone()).or_default();
+                    uses.direct_bits = uses.direct_bits.max(Some(expr.width.bits()));
+                } else {
+                    self.visit(value);
+                }
             }
             ExprKind::Intrinsic { name, arguments } => {
                 if arguments
@@ -638,6 +637,56 @@ mod tests {
     }
 
     #[test]
+    fn thirty_two_bit_cover_realizes_random_configs_on_random_inputs() {
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..12 {
+            let count = 1 + round % 3;
+            let observations: Vec<_> = (0..count)
+                .map(|i| {
+                    // Arbitrary constants, plus ones on the sign/carry cut points.
+                    let near = [0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF][next() as usize % 5];
+                    let constant = if i == 0 { next() & 0xFFFF_FFFF } else { near };
+                    obs(next() & 1 == 0, next() & 0xFFFF_FFFF, constant)
+                })
+                .collect();
+            let cover = add_flags_cover(32, &observations, InputDomainLimits::default())
+                .expect("bounded cover");
+            let covered = image(32, &observations, &cover);
+            let mut samples: Vec<u64> = (0..3_000).map(|_| next() & 0xFFFF_FFFF).collect();
+            // Rare cells: values whose view lands within 2 of a cut point.
+            for o in &observations {
+                for base in [
+                    0,
+                    0x7FFF_FFFF,
+                    0x8000_0000,
+                    0xFFFF_FFFF,
+                    o.constant.wrapping_neg(),
+                ] {
+                    for delta in 0..5_u64 {
+                        let y = base.wrapping_add(delta).wrapping_sub(2);
+                        let x = if o.negate {
+                            o.offset.wrapping_sub(y)
+                        } else {
+                            y.wrapping_sub(o.offset)
+                        };
+                        samples.push(x & 0xFFFF_FFFF);
+                    }
+                }
+            }
+            assert!(
+                image(32, &observations, &samples).is_subset(&covered),
+                "round {round}: cover misses a flag tuple for {observations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn several_comparison_constants_stay_within_the_default_limit() {
         let observations: Vec<_> = (0..6)
             .map(|i| obs(false, 0, 0u64.wrapping_sub(i * 7 + 1)))
@@ -732,6 +781,52 @@ mod tests {
         );
     }
 
+    fn unsupported_reason(expr: &Expr, limits: InputDomainLimits) -> (String, String) {
+        match infer_branch_input_domains(expr, limits) {
+            Err(InputDomainRefusal::Unsupported { register, reason }) => (register, reason),
+            other => panic!("expected an Unsupported refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_register_used_at_two_widths_is_refused() {
+        let narrow = Expr::register(BitWidth::W32, "native_rcx_initial");
+        let wide = Expr::register(BitWidth::W64, "native_rcx_initial");
+        let widened = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, narrow).expect("zext");
+        let target = Expr::binary(BinaryOp::Add, wide, widened).expect("add");
+        let (register, reason) = unsupported_reason(&target, InputDomainLimits::default());
+        assert_eq!(register, "native_rcx_initial");
+        assert!(reason.contains("two widths"), "{reason}");
+    }
+
+    #[test]
+    fn an_oversized_cover_is_refused_as_too_many_values() {
+        let rcx = Expr::register(BitWidth::W64, "native_rcx_initial");
+        let target = target_on(&rcx, 32, 0xFFFF_FFFB);
+        let limits = InputDomainLimits {
+            max_values_per_variable: 2,
+            ..InputDomainLimits::default()
+        };
+        assert_eq!(
+            infer_branch_input_domains(&target, limits),
+            Err(InputDomainRefusal::TooManyValues {
+                register: "native_rcx_initial".to_owned(),
+                limit: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn truncate_of_a_non_register_recurses_instead_of_panicking() {
+        let rcx = Expr::register(BitWidth::W64, "native_rcx_initial");
+        let loaded = Expr::load(BitWidth::W64, rcx);
+        let truncated = Expr::resize(ResizeOp::Truncate, BitWidth::W8, loaded).expect("t");
+        assert_eq!(
+            infer_branch_input_domains(&truncated, InputDomainLimits::default()),
+            Err(InputDomainRefusal::MemoryDependent)
+        );
+    }
+
     #[test]
     fn undecidable_shapes_are_refused() {
         let rcx = Expr::register(BitWidth::W64, "native_rcx_initial");
@@ -745,7 +840,9 @@ mod tests {
                 .expect("mul"),
         )
         .expect("add");
-        assert!(infer_branch_input_domains(&indexed, limits).is_err());
+        let (register, reason) = unsupported_reason(&indexed, limits);
+        assert_eq!(register, "native_rcx_initial");
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
         // Memory-dependent branch.
         let loaded = Expr::load(BitWidth::W64, rcx.clone());
         assert_eq!(
@@ -761,7 +858,8 @@ mod tests {
                 Expr::resize(ResizeOp::Truncate, BitWidth::W32, rdx.clone()).expect("t"),
             ],
         );
-        assert!(infer_branch_input_domains(&both, limits).is_err());
+        let (_, reason) = unsupported_reason(&both, limits);
+        assert!(reason.contains("two input-dependent"), "{reason}");
         // Logical (nor) flags need a mask cover, which is not implemented.
         let logical = Expr::intrinsic(
             BitWidth::W64,
@@ -771,7 +869,8 @@ mod tests {
                 Expr::constant(BitWidth::W32, 0xFF),
             ],
         );
-        assert!(infer_branch_input_domains(&logical, limits).is_err());
+        let (_, reason) = unsupported_reason(&logical, limits);
+        assert!(reason.contains("other than add flags"), "{reason}");
         // Flags observed at two widths on one register.
         let mixed = Expr::binary(
             BinaryOp::Add,
@@ -779,10 +878,13 @@ mod tests {
             target_on(&rcx, 16, 5),
         )
         .expect("add");
-        assert!(infer_branch_input_domains(&mixed, limits).is_err());
+        let (register, reason) = unsupported_reason(&mixed, limits);
+        assert_eq!(register, "native_rcx_initial");
+        assert!(reason.contains("several widths"), "{reason}");
         // Direct use of a wide register beside a flags observation.
         let direct = Expr::binary(BinaryOp::Add, target_on(&rcx, 32, 5), rcx).expect("add");
-        assert!(infer_branch_input_domains(&direct, limits).is_err());
+        let (_, reason) = unsupported_reason(&direct, limits);
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
     }
 
     #[test]

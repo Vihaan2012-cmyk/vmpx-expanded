@@ -163,6 +163,46 @@ mod tests {
     }
 
     #[test]
+    fn is_input_closed_recurses_through_unary_extract_resize_and_concat() {
+        use crate::{ResizeOp, UnaryOp};
+        let wrappers: [fn(Expr) -> Expr; 4] = [
+            |e| Expr::unary(UnaryOp::Neg, e),
+            |e| Expr::extract(BitWidth::W32, 0, e).expect("extract"),
+            |e| Expr::resize(ResizeOp::Truncate, BitWidth::W32, e).expect("truncate"),
+            |e| {
+                let half = Expr::resize(ResizeOp::Truncate, BitWidth::W32, e).expect("truncate");
+                Expr::concat(half.clone(), half).expect("concat")
+            },
+        ];
+        for wrap in wrappers {
+            let closed = w64("native_rcx_initial");
+            let load = Expr::load(BitWidth::W64, w64("native_rcx_initial"));
+            let unlisted = w64("exit_vsp");
+            assert!(is_input_closed(&exit_with(wrap(closed)), &allowed()));
+            assert!(!is_input_closed(&exit_with(wrap(load)), &allowed()));
+            assert!(!is_input_closed(&exit_with(wrap(unlisted)), &allowed()));
+        }
+    }
+
+    #[test]
+    fn is_input_closed_concat_with_one_unclosed_half_is_not_closed() {
+        use crate::ResizeOp;
+        let low32 = |e: Expr| Expr::resize(ResizeOp::Truncate, BitWidth::W32, e).expect("truncate");
+        let high = low32(w64("native_rcx_initial"));
+        for low in [
+            low32(w64("exit_vsp")),
+            low32(Expr::load(BitWidth::W64, w64("native_rcx_initial"))),
+        ] {
+            let joined = Expr::concat(high.clone(), low.clone()).expect("concat");
+            assert!(!is_input_closed(&exit_with(joined), &allowed()));
+            let swapped = Expr::concat(low, high.clone()).expect("concat");
+            assert!(!is_input_closed(&exit_with(swapped), &allowed()));
+        }
+        let closed = Expr::concat(high.clone(), high).expect("concat");
+        assert!(is_input_closed(&exit_with(closed), &allowed()));
+    }
+
+    #[test]
     fn is_input_closed_rflags_and_return_address_are_checked() {
         let mut exit = exit_with(Expr::constant(BitWidth::W64, 1));
         exit.rflags = Expr::intrinsic(BitWidth::W64, "native_call_flags_epoch_1", vec![]);

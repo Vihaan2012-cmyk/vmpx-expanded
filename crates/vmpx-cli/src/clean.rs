@@ -1471,7 +1471,7 @@ pub fn analyze_clean_with_image(
 
     Ok((
         CleanReport {
-            schema_version: 1,
+            schema_version: 2,
             input: CleanInputReport {
                 path: input_path.to_owned(),
                 sha256: sha256(input),
