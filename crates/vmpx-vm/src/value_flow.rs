@@ -920,7 +920,8 @@ fn unsigned_divide_registers(width: BitWidth) -> Option<(Register, Register, Reg
     match width {
         BitWidth::W16 => Some((Register::DX, Register::AX, Register::DX, Register::AX)),
         BitWidth::W32 => Some((Register::EDX, Register::EAX, Register::EDX, Register::EAX)),
-        BitWidth::W8 | BitWidth::W64 => None,
+        BitWidth::W64 => Some((Register::RDX, Register::RAX, Register::RDX, Register::RAX)),
+        BitWidth::W8 => None,
     }
 }
 
@@ -931,12 +932,28 @@ fn unsigned_divide_flow(
     summary: &HandlerEffectSummary,
 ) -> Option<(Rva, Rva, String)> {
     let (high_input, low_input, remainder, quotient) = unsigned_divide_registers(width)?;
-    let operation_rva = summary.captured_flags_source?;
-    let operation_index = instruction_index(active, operation_rva)?;
+    let flagged = summary.captured_flags_source.is_some();
+    let operation_index = if let Some(rva) = summary.captured_flags_source {
+        instruction_index(active, rva)?
+    } else {
+        let mut divides = (0..active.len())
+            .filter(|index| active[*index].instruction.mnemonic() == Mnemonic::Div);
+        let only = divides.next()?;
+        if divides.next().is_some() || width != BitWidth::W64 {
+            return None;
+        }
+        only
+    };
+    let operation_rva = active[operation_index].rva;
     let operation = &active[operation_index].instruction;
-    if operation.mnemonic() != Mnemonic::Div {
+    if operation.mnemonic() != Mnemonic::Div
+        || operation.op_count() != 1
+        || operation.op0_kind() != OpKind::Register
+        || !register_has_width(operation.op0_register(), width)
+    {
         return None;
     }
+    let remainder_displacement = if flagged { 8 } else { 0 };
     let bytes = width.bytes();
     let high_definition = latest_definition(active, operation_index, high_input)?;
     let low_definition = latest_definition(active, operation_index, low_input)?;
@@ -966,12 +983,18 @@ fn unsigned_divide_flow(
         i64::from(bytes.saturating_mul(2)),
         width,
     );
-    let remainder_store =
-        unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 8, width, false, true)?;
+    let remainder_store = unique_effect_rva(
+        summary,
+        HandlerMemoryRegion::VmStack,
+        remainder_displacement,
+        width,
+        false,
+        true,
+    )?;
     let quotient_store = unique_effect_rva(
         summary,
         HandlerMemoryRegion::VmStack,
-        i64::from(8_u32.saturating_add(bytes)),
+        remainder_displacement.checked_add(i64::from(bytes))?,
         width,
         false,
         true,
@@ -992,17 +1015,19 @@ fn unsigned_divide_flow(
             quotient_store,
             i64::from(bytes.saturating_mul(2)),
         );
-    let flags_store = unique_effect_rva(
-        summary,
-        HandlerMemoryRegion::VmStack,
-        0,
-        BitWidth::W64,
-        false,
-        true,
-    )?;
-    let flags_flow = summary
-        .vsp_delta
-        .is_some_and(|delta| effect_has_entry_displacement(summary, flags_store, i64::from(delta)));
+    let flags_flow = !flagged || {
+        let flags_store = unique_effect_rva(
+            summary,
+            HandlerMemoryRegion::VmStack,
+            0,
+            BitWidth::W64,
+            false,
+            true,
+        )?;
+        summary.vsp_delta.is_some_and(|delta| {
+            effect_has_entry_displacement(summary, flags_store, i64::from(delta))
+        })
+    };
     (high_input_proven && low_input_proven && divisor_proven && result_flow && flags_flow).then(
         || {
             (
@@ -1016,22 +1041,30 @@ fn unsigned_divide_flow(
 }
 
 #[allow(clippy::too_many_lines)]
-fn unsigned_multiply_flow(
+fn multiply_flow(
+    semantic: VmHandlerSemantic,
     width: BitWidth,
     active: &[&DecodedInstruction],
     summary: &HandlerEffectSummary,
 ) -> Option<(Rva, Rva, String)> {
-    let (multiplier, accumulator, high_result, low_result) = unsigned_divide_registers(width)?;
+    let (_, accumulator, high_result, low_result) = unsigned_divide_registers(width)?;
     let operation_rva = summary.captured_flags_source?;
     let operation_index = instruction_index(active, operation_rva)?;
     let operation = &active[operation_index].instruction;
-    if operation.mnemonic() != Mnemonic::Mul
+    let expected = if semantic == VmHandlerSemantic::SignedMultiply {
+        Mnemonic::Imul
+    } else {
+        Mnemonic::Mul
+    };
+    if operation.mnemonic() != expected
+        || operation.op_count() != 1
         || operation.op0_kind() != OpKind::Register
-        || !same_register_value(operation.op0_register(), multiplier, width)
         || !register_has_width(operation.op0_register(), width)
+        || canonical(operation.op0_register()) == Register::RAX
     {
         return None;
     }
+    let multiplier = operation.op0_register();
     let bytes = width.bytes();
     let multiplier_definition = latest_definition(active, operation_index, multiplier)?;
     let accumulator_definition = latest_definition(active, operation_index, accumulator)?;
@@ -1088,6 +1121,399 @@ fn unsigned_multiply_flow(
             operation_rva,
             low_store,
             "two stack operands reach MUL; high/low product and captured flags reach ordered VM-stack cells"
+                .to_owned(),
+        )
+    })
+}
+
+fn narrow_vsp_push_flow(width: BitWidth, summary: &HandlerEffectSummary) -> Option<Rva> {
+    let [push] = summary.narrow_vsp_pushes.as_slice() else {
+        return None;
+    };
+    let store = unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 0, width, false, true)?;
+    let delta = i64::from(width.bytes()).checked_neg()?;
+    (push.rva == store
+        && push.width_bytes == width.bytes()
+        && summary.vsp_delta == i32::try_from(delta).ok()
+        && effect_has_entry_displacement(summary, store, delta))
+    .then_some(store)
+}
+
+fn narrow_vsp_load_flow(width: BitWidth, summary: &HandlerEffectSummary) -> Option<Rva> {
+    let [load] = summary.narrow_vsp_loads.as_slice() else {
+        return None;
+    };
+    let read = unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 0, width, true, false)?;
+    (load.rva == read
+        && load.width_bytes == width.bytes()
+        && effect_has_entry_displacement(summary, read, 0))
+    .then_some(read)
+}
+
+fn no_other_writes_between(
+    active: &[&DecodedInstruction],
+    from: usize,
+    to: usize,
+    register: Register,
+    except: usize,
+) -> bool {
+    let mut factory = InstructionInfoFactory::new();
+    ((from + 1)..to).all(|index| {
+        index == except
+            || !writes_register(
+                &mut factory,
+                &active[index].instruction,
+                canonical(register),
+            )
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn resized_shift_flow(
+    semantic: VmHandlerSemantic,
+    input_width: BitWidth,
+    output_width: BitWidth,
+    resize: crate::ResizeOp,
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+) -> Option<(Rva, Rva, String)> {
+    if resize != crate::ResizeOp::ZeroExtend || input_width.bits() >= output_width.bits() {
+        return None;
+    }
+    let expected = match semantic {
+        VmHandlerSemantic::ShiftLeft => Mnemonic::Shl,
+        VmHandlerSemantic::ShiftRightLogical => Mnemonic::Shr,
+        VmHandlerSemantic::ShiftRightArithmetic => Mnemonic::Sar,
+        VmHandlerSemantic::RotateLeft => Mnemonic::Rol,
+        VmHandlerSemantic::RotateRight => Mnemonic::Ror,
+        _ => return None,
+    };
+    let delta = i64::from(summary.vsp_delta?);
+    let result_store = unique_effect_rva(
+        summary,
+        HandlerMemoryRegion::VmStack,
+        8,
+        output_width,
+        false,
+        true,
+    )?;
+    if !effect_has_entry_displacement(summary, result_store, delta.checked_add(8)?) {
+        return None;
+    }
+    let store_index = instruction_index(active, result_store)?;
+    let result_register = store_source(&active[store_index].instruction)?;
+    if !register_has_width(result_register, output_width) {
+        return None;
+    }
+    let operation_rva = summary.captured_flags_source?;
+    let operation_index = instruction_index(active, operation_rva)?;
+    let operation = &active[operation_index].instruction;
+    if operation.mnemonic() != expected
+        || operation.op0_kind() != OpKind::Register
+        || operation.op1_kind() != OpKind::Register
+        || !register_has_width(operation.op0_register(), input_width)
+        || !same_register_value(operation.op0_register(), result_register, input_width)
+        || latest_definition(active, store_index, result_register) != Some(operation_index)
+    {
+        return None;
+    }
+    let value_register = operation.op0_register();
+    let first_load = latest_definition(active, operation_index, value_register)?;
+    let first_instruction = &active[first_load].instruction;
+    let value_proven = first_instruction.mnemonic() == Mnemonic::Movzx
+        && first_instruction.op0_kind() == OpKind::Register
+        && first_instruction.op0_register().size()
+            >= usize::try_from(output_width.bytes()).unwrap_or(usize::MAX)
+        && definition_is_load(
+            active,
+            summary,
+            first_load,
+            value_register,
+            HandlerMemoryRegion::VmStack,
+            0,
+            input_width,
+        )
+        && summary.resize_operations.iter().any(|effect| {
+            effect.rva == active[first_load].rva
+                && effect.operation == resize
+                && effect.input_width == input_width
+                && effect.output_width.bits() >= output_width.bits()
+        })
+        && no_other_writes_between(
+            active,
+            first_load,
+            store_index,
+            value_register,
+            operation_index,
+        );
+    let count_register = operation.op1_register();
+    let count_proven = canonical(count_register) != canonical(value_register)
+        && latest_definition(active, operation_index, count_register).is_some_and(|definition| {
+            definition_is_load(
+                active,
+                summary,
+                definition,
+                count_register,
+                HandlerMemoryRegion::VmStack,
+                i64::from(output_width.bytes()),
+                BitWidth::W8,
+            )
+        });
+    let flags_store = unique_effect_rva(
+        summary,
+        HandlerMemoryRegion::VmStack,
+        0,
+        BitWidth::W64,
+        false,
+        true,
+    )?;
+    (value_proven && count_proven && effect_has_entry_displacement(summary, flags_store, delta))
+        .then(|| {
+            (
+                operation_rva,
+                result_store,
+                "narrow shift value and count reach the native operation; its zero-extended result and flags reach the VM stack"
+                    .to_owned(),
+            )
+        })
+}
+
+fn double_shift_flow(
+    semantic: VmHandlerSemantic,
+    width: BitWidth,
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+) -> Option<(Rva, Rva, String)> {
+    let expected = match semantic {
+        VmHandlerSemantic::ShiftLeftDouble => Mnemonic::Shld,
+        VmHandlerSemantic::ShiftRightDouble => Mnemonic::Shrd,
+        _ => return None,
+    };
+    let bytes = width.bytes();
+    let delta = i64::from(summary.vsp_delta?);
+    let operation_rva = summary.captured_flags_source?;
+    let operation_index = instruction_index(active, operation_rva)?;
+    let operation = &active[operation_index].instruction;
+    if operation.mnemonic() != expected
+        || operation.op_count() != 3
+        || operation.op0_kind() != OpKind::Register
+        || operation.op1_kind() != OpKind::Register
+        || operation.op2_kind() != OpKind::Register
+        || !register_has_width(operation.op0_register(), width)
+        || !register_has_width(operation.op1_register(), width)
+    {
+        return None;
+    }
+    let destination = operation.op0_register();
+    let source = operation.op1_register();
+    let count = operation.op2_register();
+    if canonical(destination) == canonical(source)
+        || canonical(count) == canonical(destination)
+        || canonical(count) == canonical(source)
+    {
+        return None;
+    }
+    let loaded = |register: Register, displacement: i64, load_width: BitWidth| {
+        latest_definition(active, operation_index, register).is_some_and(|definition| {
+            definition_is_load(
+                active,
+                summary,
+                definition,
+                register,
+                HandlerMemoryRegion::VmStack,
+                displacement,
+                load_width,
+            )
+        })
+    };
+    let inputs_proven = loaded(destination, 0, width)
+        && loaded(source, i64::from(bytes), width)
+        && loaded(count, i64::from(bytes.saturating_mul(2)), BitWidth::W8)
+        && same_register_value(count, Register::CL, BitWidth::W8);
+    let result_store =
+        unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 8, width, false, true)?;
+    let store_index = instruction_index(active, result_store)?;
+    let result_register = store_source(&active[store_index].instruction)?;
+    let result_proven = register_has_width(result_register, width)
+        && same_register_value(result_register, destination, width)
+        && latest_definition(active, store_index, result_register) == Some(operation_index)
+        && effect_has_entry_displacement(summary, result_store, delta.checked_add(8)?);
+    let flags_store = unique_effect_rva(
+        summary,
+        HandlerMemoryRegion::VmStack,
+        0,
+        BitWidth::W64,
+        false,
+        true,
+    )?;
+    (inputs_proven
+        && result_proven
+        && effect_has_entry_displacement(summary, flags_store, delta))
+    .then(|| {
+        (
+            operation_rva,
+            result_store,
+            "destination, source and count stack operands reach the double shift; its result and flags reach the VM stack"
+                .to_owned(),
+        )
+    })
+}
+
+fn cpuid_flow(
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+) -> Option<(Rva, Rva, String)> {
+    let [operation_rva] = summary.cpuid_reads.as_slice() else {
+        return None;
+    };
+    let operation_index = instruction_index(active, *operation_rva)?;
+    if active[operation_index].instruction.mnemonic() != Mnemonic::Cpuid
+        || summary.vsp_delta != Some(-8)
+    {
+        return None;
+    }
+    let leaf_proven =
+        latest_definition(active, operation_index, Register::EAX).is_some_and(|definition| {
+            definition_is_load(
+                active,
+                summary,
+                definition,
+                Register::EAX,
+                HandlerMemoryRegion::VmStack,
+                0,
+                BitWidth::W32,
+            )
+        });
+    let subleaf_proven =
+        latest_definition(active, operation_index, Register::ECX).is_some_and(|definition| {
+            definition_is_load(
+                active,
+                summary,
+                definition,
+                Register::ECX,
+                HandlerMemoryRegion::VmStack,
+                4,
+                BitWidth::W32,
+            )
+        });
+    let mut last_store = None;
+    let outputs = [
+        (12, 4, Register::EAX),
+        (8, 0, Register::EBX),
+        (4, -4, Register::ECX),
+        (0, -8, Register::EDX),
+    ]
+    .into_iter()
+    .all(|(displacement, entry, register)| {
+        let Some(store) = unique_effect_rva(
+            summary,
+            HandlerMemoryRegion::VmStack,
+            displacement,
+            BitWidth::W32,
+            false,
+            true,
+        ) else {
+            return false;
+        };
+        last_store = Some(store);
+        let Some(index) = instruction_index(active, store) else {
+            return false;
+        };
+        store_source(&active[index].instruction).is_some_and(|source| {
+            register_has_width(source, BitWidth::W32)
+                && same_register_value(source, register, BitWidth::W32)
+                && latest_definition(active, index, source) == Some(operation_index)
+        }) && effect_has_entry_displacement(summary, store, entry)
+    });
+    (leaf_proven && subleaf_proven && outputs).then(|| {
+        (
+            *operation_rva,
+            last_store.unwrap_or(*operation_rva),
+            "leaf and sub-leaf stack operands reach CPUID; EAX/EBX/ECX/EDX reach ordered VM-stack cells"
+                .to_owned(),
+        )
+    })
+}
+
+fn pop_flags_flow(
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+) -> Option<(Rva, Rva, String)> {
+    let [restore] = summary.native_flag_restores.as_slice() else {
+        return None;
+    };
+    let restore_index = instruction_index(active, *restore)?;
+    let push_index = restore_index.checked_sub(1)?;
+    let push = &active[push_index].instruction;
+    if active[restore_index].instruction.mnemonic() != Mnemonic::Popfq
+        || push.mnemonic() != Mnemonic::Push
+        || push.op0_kind() != OpKind::Register
+        || push.op0_register().size() != 8
+    {
+        return None;
+    }
+    let register = push.op0_register();
+    let definition = latest_definition(active, push_index, register)?;
+    definition_is_load(
+        active,
+        summary,
+        definition,
+        register,
+        HandlerMemoryRegion::VmStack,
+        0,
+        BitWidth::W64,
+    )
+    .then(|| {
+        (
+            *restore,
+            active[definition].rva,
+            "the qword popped from the VM stack reaches POPFQ through a native push".to_owned(),
+        )
+    })
+}
+
+fn gs_load_flow(
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+) -> Option<(Rva, Rva, String)> {
+    let width = BitWidth::W64;
+    let external_load =
+        unique_effect_rva(summary, HandlerMemoryRegion::Other, 0, width, true, false)?;
+    let result_store =
+        unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 0, width, false, true)?;
+    let load_index = instruction_index(active, external_load)?;
+    let store_index = instruction_index(active, result_store)?;
+    let load = &active[load_index].instruction;
+    let destination = load_destination(load)?;
+    let source = store_source(&active[store_index].instruction)?;
+    if load.mnemonic() != Mnemonic::Mov
+        || load.segment_prefix() != Register::GS
+        || load.memory_base().size() != 8
+        || load.memory_index() != Register::None
+        || !register_has_width(destination, width)
+        || !register_has_width(source, width)
+        || !same_register_value(destination, source, width)
+        || latest_definition(active, store_index, source) != Some(load_index)
+        || summary.vsp_delta != Some(0)
+        || !effect_has_entry_displacement(summary, result_store, 0)
+    {
+        return None;
+    }
+    let pointer_definition = latest_definition(active, load_index, load.memory_base())?;
+    definition_is_load(
+        active,
+        summary,
+        pointer_definition,
+        load.memory_base(),
+        HandlerMemoryRegion::VmStack,
+        0,
+        width,
+    )
+    .then(|| {
+        (
+            external_load,
+            result_store,
+            "VM-stack pointer reaches the GS-relative load and its value reaches the VM stack"
                 .to_owned(),
         )
     })
@@ -1325,6 +1751,22 @@ pub fn prove_handler_value_flow(
                         &active,
                         summary,
                     ),
+                    (
+                        VmHandlerSemantic::ShiftLeft
+                        | VmHandlerSemantic::ShiftRightLogical
+                        | VmHandlerSemantic::ShiftRightArithmetic
+                        | VmHandlerSemantic::RotateLeft
+                        | VmHandlerSemantic::RotateRight,
+                        Some(input_width),
+                        Some(resize),
+                    ) => resized_shift_flow(
+                        analysis.semantic,
+                        input_width,
+                        width,
+                        resize,
+                        &active,
+                        summary,
+                    ),
                     (_, None, None) => arithmetic_flow(analysis.semantic, width, &active, summary),
                     _ => None,
                 };
@@ -1346,8 +1788,40 @@ pub fn prove_handler_value_flow(
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
             VmHandlerSemantic::UnsignedDivide => unsigned_divide_flow(width, &active, summary)
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
-            VmHandlerSemantic::Mul => unsigned_multiply_flow(width, &active, summary)
+            VmHandlerSemantic::Mul | VmHandlerSemantic::SignedMultiply => {
+                multiply_flow(analysis.semantic, width, &active, summary)
+                    .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence))
+            }
+            VmHandlerSemantic::ShiftLeftDouble | VmHandlerSemantic::ShiftRightDouble => {
+                double_shift_flow(analysis.semantic, width, &active, summary)
+                    .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence))
+            }
+            VmHandlerSemantic::GsRelativeLoad => gs_load_flow(&active, summary)
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
+            VmHandlerSemantic::Cpuid => cpuid_flow(&active, summary)
+                .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
+            VmHandlerSemantic::PopFlags => pop_flags_flow(&active, summary)
+                .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
+            VmHandlerSemantic::Push if width != BitWidth::W64 => {
+                narrow_vsp_push_flow(width, summary).map(|consumer| {
+                    (
+                        None,
+                        consumer,
+                        "low bytes of the pre-adjustment VSP reach the unique narrow stack store"
+                            .to_owned(),
+                    )
+                })
+            }
+            VmHandlerSemantic::Pop if width != BitWidth::W64 => {
+                narrow_vsp_load_flow(width, summary).map(|consumer| {
+                    (
+                        None,
+                        consumer,
+                        "low VSP bytes are defined by the unique narrow load from the stack top"
+                            .to_owned(),
+                    )
+                })
+            }
             VmHandlerSemantic::Push
                 if summary.pushes_pre_adjustment_vsp && summary.vsp_delta == Some(-8) =>
             {

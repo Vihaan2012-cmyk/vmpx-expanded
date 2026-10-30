@@ -69,6 +69,18 @@ pub enum VmHandlerSemantic {
     NativeCall,
     VmExit,
     ContextInitialize,
+    /// One-operand signed multiply: `rdx:rax = rax * operand`.
+    SignedMultiply,
+    /// `shld dest, src, count` over three VM-stack operands.
+    ShiftLeftDouble,
+    /// `shrd dest, src, count` over three VM-stack operands.
+    ShiftRightDouble,
+    /// `cpuid` over a leaf/sub-leaf pair on the VM stack.
+    Cpuid,
+    /// Restores native flags from a qword popped off the VM stack.
+    PopFlags,
+    /// Replaces a popped pointer with the qword at `gs:[pointer]`.
+    GsRelativeLoad,
     Unknown,
 }
 

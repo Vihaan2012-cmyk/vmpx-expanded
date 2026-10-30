@@ -66,6 +66,11 @@ pub enum LoweringCapability {
     ImportFixups,
     VirtualCfg,
     NativeExitBridge,
+    WideSignedMultiply,
+    DoubleShiftBackend,
+    CpuidIntrinsic,
+    NativeFlagsRestore,
+    SegmentRelativeLoad,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -442,6 +447,27 @@ fn capabilities_for_semantic(semantic: VmHandlerSemantic) -> &'static [LoweringC
             Capability::StackSsaLowering,
             Capability::WideUnsignedMultiply,
             Capability::FlagsLivenessAndMaterialization,
+        ],
+        Semantic::SignedMultiply => &[
+            Capability::StackSsaLowering,
+            Capability::WideSignedMultiply,
+            Capability::FlagsLivenessAndMaterialization,
+        ],
+        Semantic::ShiftLeftDouble | Semantic::ShiftRightDouble => &[
+            Capability::StackSsaLowering,
+            Capability::DoubleShiftBackend,
+            Capability::FlagsLivenessAndMaterialization,
+        ],
+        Semantic::Cpuid => &[Capability::StackSsaLowering, Capability::CpuidIntrinsic],
+        Semantic::PopFlags => &[
+            Capability::StackSsaLowering,
+            Capability::NativeFlagsRestore,
+            Capability::FlagsLivenessAndMaterialization,
+        ],
+        Semantic::GsRelativeLoad => &[
+            Capability::StackSsaLowering,
+            Capability::MemoryBackend,
+            Capability::SegmentRelativeLoad,
         ],
         Semantic::UnsignedDivide => &[
             Capability::StackSsaLowering,

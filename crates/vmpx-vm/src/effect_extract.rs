@@ -39,12 +39,20 @@ pub struct HandlerMemoryEffect {
     pub width_bytes: u32,
     pub reads: bool,
     pub writes: bool,
+    /// Set for FS/GS-relative accesses, which are never flat addresses.
+    pub segment_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HandlerVspAdjustment {
     pub rva: Rva,
     pub delta: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct HandlerNarrowVspAccess {
+    pub rva: Rva,
+    pub width_bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -73,6 +81,12 @@ pub struct HandlerEffectSummary {
     pub arithmetic_operations: Vec<String>,
     pub resize_operations: Vec<HandlerResizeEffect>,
     pub timestamp_counter_reads: Vec<Rva>,
+    /// Stores of the low bytes of the pre-adjustment VSP to the VM stack top.
+    pub narrow_vsp_pushes: Vec<HandlerNarrowVspAccess>,
+    /// Partial-width loads into the VSP register from the VM stack top.
+    pub narrow_vsp_loads: Vec<HandlerNarrowVspAccess>,
+    pub cpuid_reads: Vec<Rva>,
+    pub native_flag_restores: Vec<Rva>,
     pub diagnostics: Vec<String>,
 }
 
@@ -151,6 +165,8 @@ fn is_semantic_arithmetic(instruction: &Instruction, vsp: Register) -> bool {
             | Mnemonic::Sar
             | Mnemonic::Rol
             | Mnemonic::Ror
+            | Mnemonic::Shld
+            | Mnemonic::Shrd
     ) && !(instruction.op0_kind() == OpKind::Register
         && canonical(instruction.op0_register()) == canonical(vsp))
 }
@@ -168,6 +184,41 @@ fn stores_pre_adjustment_vsp(
         && instruction.op1_kind() == OpKind::Register
         && instruction.op1_register().size() == 8
         && aliases.contains(&canonical(instruction.op1_register()))
+}
+
+fn narrow_vsp_push_width(
+    instruction: &Instruction,
+    vsp: Register,
+    aliases: &BTreeSet<Register>,
+) -> Option<u32> {
+    let width = u32::try_from(instruction.memory_size().size()).ok()?;
+    (instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op0_kind() == OpKind::Memory
+        && canonical(instruction.memory_base()) == canonical(vsp)
+        && instruction.memory_base().size() == 8
+        && instruction.memory_index() == Register::None
+        && signed_displacement(instruction.memory_displacement64()) == 0
+        && matches!(width, 2 | 4)
+        && instruction.op1_kind() == OpKind::Register
+        && u32::try_from(instruction.op1_register().size()).ok() == Some(width)
+        && aliases.contains(&canonical(instruction.op1_register())))
+    .then_some(width)
+}
+
+fn narrow_vsp_load_width(instruction: &Instruction, vsp: Register) -> Option<u32> {
+    let width = u32::try_from(instruction.memory_size().size()).ok()?;
+    (instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op0_kind() == OpKind::Register
+        && canonical(instruction.op0_register()) == canonical(vsp)
+        && matches!(width, 2 | 4)
+        && u32::try_from(instruction.op0_register().size()).ok() == Some(width)
+        && instruction.op1_kind() == OpKind::Memory
+        && canonical(instruction.memory_base()) == canonical(vsp)
+        && instruction.memory_base().size() == 8
+        && instruction.memory_index() == Register::None
+        && signed_displacement(instruction.memory_displacement64()) == 0
+        && crate::dispatch_extract::has_flat_segment_address(instruction))
+    .then_some(width)
 }
 
 fn instruction_loads_vsp_from_top(instruction: &Instruction, vsp: Register) -> bool {
@@ -359,6 +410,10 @@ pub fn extract_handler_effects_keyed(
     let mut arithmetic_operations = Vec::new();
     let mut resize_operations = Vec::new();
     let mut timestamp_counter_reads = Vec::new();
+    let mut narrow_vsp_pushes = Vec::new();
+    let mut narrow_vsp_loads = Vec::new();
+    let mut cpuid_reads = Vec::new();
+    let mut native_flag_restores = Vec::new();
     let mut reached_end = false;
 
     for decoded in trace.instructions() {
@@ -376,6 +431,27 @@ pub fn extract_handler_effects_keyed(
         let instruction = &decoded.instruction;
         if instruction.mnemonic() == Mnemonic::Rdtsc {
             timestamp_counter_reads.push(decoded.rva);
+        }
+        if instruction.mnemonic() == Mnemonic::Cpuid {
+            cpuid_reads.push(decoded.rva);
+        }
+        if instruction.mnemonic() == Mnemonic::Popfq {
+            native_flag_restores.push(decoded.rva);
+        }
+        let narrow_vsp_load = narrow_vsp_load_width(instruction, roles.vsp);
+        if let Some(width_bytes) = narrow_vsp_load {
+            narrow_vsp_loads.push(HandlerNarrowVspAccess {
+                rva: decoded.rva,
+                width_bytes,
+            });
+        }
+        if let Some(width_bytes) =
+            narrow_vsp_push_width(instruction, roles.vsp, &pre_adjustment_vsp_aliases)
+        {
+            narrow_vsp_pushes.push(HandlerNarrowVspAccess {
+                rva: decoded.rva,
+                width_bytes,
+            });
         }
         let vsp_delta_before_instruction = vsp_delta;
         let pops_flags = pending_native_flags_source.is_some()
@@ -410,7 +486,7 @@ pub fn extract_handler_effects_keyed(
         if stores_pre_adjustment_vsp(instruction, roles.vsp, &pre_adjustment_vsp_aliases) {
             pushes_pre_adjustment_vsp = true;
         }
-        if instruction_loads_vsp_from_top(instruction, roles.vsp) {
+        if instruction_loads_vsp_from_top(instruction, roles.vsp) || narrow_vsp_load.is_some() {
             vsp_delta = None;
         }
         let loaded_vsp_value = loads_qword_from_vsp_top(instruction, roles.vsp);
@@ -456,7 +532,7 @@ pub fn extract_handler_effects_keyed(
                 writes_static_handler_base(instruction, dispatch_roles.handler);
         }
 
-        match (!instruction_loads_vsp_from_top(instruction, roles.vsp))
+        match (!instruction_loads_vsp_from_top(instruction, roles.vsp) && narrow_vsp_load.is_none())
             .then(|| vsp_adjustment(instruction, roles.vsp))
             .transpose()
         {
@@ -566,6 +642,8 @@ pub fn extract_handler_effects_keyed(
                 width_bytes: u32::try_from(used.memory_size().size()).unwrap_or(0),
                 reads: access_reads(used.access()),
                 writes: access_writes(used.access()),
+                segment_override: (!flat_address)
+                    .then(|| format!("{:?}", instruction.segment_prefix())),
             };
             memory.push(effect);
         }
@@ -594,7 +672,7 @@ pub fn extract_handler_effects_keyed(
     let resets_key_from_vip = loads_vip_from_vsp
         && vsp_top_value_aliases.contains(&canonical(dispatch_roles.rolling_key));
     HandlerEffectSummary {
-        schema_version: 7,
+        schema_version: 8,
         semantic_end,
         vsp_delta,
         vsp_adjustments,
@@ -609,6 +687,10 @@ pub fn extract_handler_effects_keyed(
         arithmetic_operations,
         resize_operations,
         timestamp_counter_reads,
+        narrow_vsp_pushes,
+        narrow_vsp_loads,
+        cpuid_reads,
+        native_flag_restores,
         diagnostics,
     }
 }
@@ -708,6 +790,9 @@ pub fn classify_handler_effects(
     let is_nand = summary.arithmetic_operations == ["Not", "Not", "Or"];
     let is_unsigned_divide = summary.arithmetic_operations == ["Div"];
     let is_unsigned_multiply = summary.arithmetic_operations == ["Mul"];
+    let is_signed_multiply = summary.arithmetic_operations == ["Imul"];
+    let is_double_shift_left = summary.arithmetic_operations == ["Shld"];
+    let is_double_shift_right = summary.arithmetic_operations == ["Shrd"];
     let context_read_widths = [BitWidth::W8, BitWidth::W16, BitWidth::W32, BitWidth::W64]
         .into_iter()
         .filter(|width| {
@@ -926,7 +1011,7 @@ pub fn classify_handler_effects(
         })
         .collect::<Vec<_>>();
     let division_operation_width = unique_width(&division_operation_widths);
-    let multiplication_operation_widths = [BitWidth::W16, BitWidth::W32]
+    let multiplication_operation_widths = [BitWidth::W16, BitWidth::W32, BitWidth::W64]
         .into_iter()
         .filter(|width| {
             let bytes = width.bytes();
@@ -960,6 +1045,109 @@ pub fn classify_handler_effects(
         })
         .collect::<Vec<_>>();
     let multiplication_operation_width = unique_width(&multiplication_operation_widths);
+    let unflagged_divide_64 = [(0, true, false), (8, true, false), (16, true, false)]
+        .into_iter()
+        .chain([(0, false, true), (8, false, true)])
+        .all(|(displacement, reads, writes)| {
+            has_memory_width(
+                summary,
+                HandlerMemoryRegion::VmStack,
+                displacement,
+                BitWidth::W64.bytes(),
+                reads,
+                writes,
+            )
+        })
+        && summary.vsp_delta == Some(8)
+        && !summary.captures_native_flags_to_vsp;
+    let double_shift_widths = [BitWidth::W16, BitWidth::W32, BitWidth::W64]
+        .into_iter()
+        .filter(|width| {
+            let bytes = width.bytes();
+            has_memory_width(summary, HandlerMemoryRegion::VmStack, 0, bytes, true, false)
+                && has_memory_width(
+                    summary,
+                    HandlerMemoryRegion::VmStack,
+                    i64::from(bytes),
+                    bytes,
+                    true,
+                    false,
+                )
+                && has_memory_width(
+                    summary,
+                    HandlerMemoryRegion::VmStack,
+                    i64::from(bytes.saturating_mul(2)),
+                    1,
+                    true,
+                    false,
+                )
+                && has_memory_width(summary, HandlerMemoryRegion::VmStack, 8, bytes, false, true)
+                && has_memory_width(
+                    summary,
+                    HandlerMemoryRegion::VmStack,
+                    0,
+                    BitWidth::W64.bytes(),
+                    false,
+                    true,
+                )
+                && summary.vsp_delta
+                    == i32::try_from(bytes)
+                        .ok()
+                        .and_then(|bytes| bytes.checked_sub(6))
+        })
+        .collect::<Vec<_>>();
+    let double_shift_width = unique_width(&double_shift_widths);
+    let narrow_vsp_push_width = match summary.narrow_vsp_pushes.as_slice() {
+        [push] => BitWidth::from_bytes(push.width_bytes).filter(|width| {
+            has_memory_width(
+                summary,
+                HandlerMemoryRegion::VmStack,
+                0,
+                width.bytes(),
+                false,
+                true,
+            ) && summary.vsp_delta == i32::try_from(width.bytes()).ok().and_then(i32::checked_neg)
+        }),
+        _ => None,
+    };
+    let narrow_vsp_load_width = match summary.narrow_vsp_loads.as_slice() {
+        [load] => BitWidth::from_bytes(load.width_bytes).filter(|width| {
+            has_memory_width(
+                summary,
+                HandlerMemoryRegion::VmStack,
+                0,
+                width.bytes(),
+                true,
+                false,
+            )
+        }),
+        _ => None,
+    };
+    let is_cpuid = summary.cpuid_reads.len() == 1
+        && summary.vsp_delta == Some(-8)
+        && [(0, true, false), (4, true, false)]
+            .into_iter()
+            .chain((0..4).map(|slot| (slot * 4, false, true)))
+            .all(|(displacement, reads, writes)| {
+                has_memory_width(
+                    summary,
+                    HandlerMemoryRegion::VmStack,
+                    displacement,
+                    BitWidth::W32.bytes(),
+                    reads,
+                    writes,
+                )
+            });
+    let is_pop_flags = summary.native_flag_restores.len() == 1
+        && summary.vsp_delta == Some(8)
+        && has_memory_width(
+            summary,
+            HandlerMemoryRegion::VmStack,
+            0,
+            BitWidth::W64.bytes(),
+            true,
+            false,
+        );
     let resized_binary_operations = summary
         .resize_operations
         .iter()
@@ -1081,6 +1269,14 @@ pub fn classify_handler_effects(
         })
         .collect::<Vec<_>>();
     let memory_load_width = unique_width(&memory_load_widths);
+    let segment_load = summary.memory.iter().any(|effect| {
+        effect.region == HandlerMemoryRegion::Other && effect.segment_override.is_some()
+    });
+    let gs_load = segment_load
+        && summary.memory.iter().all(|effect| {
+            effect.region != HandlerMemoryRegion::Other
+                || effect.segment_override.as_deref() == Some("GS")
+        });
     let resized_memory_loads = summary
         .resize_operations
         .iter()
@@ -1138,7 +1334,8 @@ pub fn classify_handler_effects(
                 width.bytes(),
                 false,
                 true,
-            ) && summary.vsp_delta == i32::try_from(BitWidth::W64.bytes() + width.bytes()).ok()
+            ) && (summary.vsp_delta == i32::try_from(BitWidth::W64.bytes() + width.bytes()).ok()
+                || (*width == BitWidth::W8 && summary.vsp_delta == Some(10)))
         })
         .collect::<Vec<_>>();
     let memory_store_width = unique_width(&memory_store_widths);
@@ -1368,6 +1565,93 @@ pub fn classify_handler_effects(
     {
         add_candidate(VmHandlerSemantic::Mul, multiplication_operation_width);
     }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && summary.captures_native_flags_to_vsp
+        && multiplication_operation_width.is_some()
+        && is_signed_multiply
+        && stack_effect_count == 5
+        && other_effect_count == 0
+    {
+        add_candidate(
+            VmHandlerSemantic::SignedMultiply,
+            multiplication_operation_width,
+        );
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && unflagged_divide_64
+        && is_unsigned_divide
+        && stack_effect_count == 5
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::UnsignedDivide, Some(BitWidth::W64));
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && summary.captures_native_flags_to_vsp
+        && double_shift_width.is_some()
+        && (is_double_shift_left || is_double_shift_right)
+        && stack_effect_count == 5
+        && other_effect_count == 0
+    {
+        add_candidate(
+            if is_double_shift_left {
+                VmHandlerSemantic::ShiftLeftDouble
+            } else {
+                VmHandlerSemantic::ShiftRightDouble
+            },
+            double_shift_width,
+        );
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && !summary.captures_native_flags_to_vsp
+        && summary.arithmetic_operations.is_empty()
+        && is_cpuid
+        && stack_effect_count == 6
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::Cpuid, Some(BitWidth::W32));
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && !summary.captures_native_flags_to_vsp
+        && summary.arithmetic_operations.is_empty()
+        && is_pop_flags
+        && stack_effect_count == 1
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::PopFlags, Some(BitWidth::W64));
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && !summary.captures_native_flags_to_vsp
+        && summary.arithmetic_operations.is_empty()
+        && narrow_vsp_push_width.is_some()
+        && stack_effect_count == 1
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::Push, narrow_vsp_push_width);
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && !summary.captures_native_flags_to_vsp
+        && summary.arithmetic_operations.is_empty()
+        && narrow_vsp_load_width.is_some()
+        && summary.vsp_delta.is_none()
+        && stack_effect_count == 1
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::Pop, narrow_vsp_load_width);
+    }
     let resized_binary_semantic = if is_add {
         Some(VmHandlerSemantic::Add)
     } else if is_sub {
@@ -1377,7 +1661,7 @@ pub fn classify_handler_effects(
     } else if is_nand {
         Some(VmHandlerSemantic::Nand)
     } else {
-        None
+        shift_semantic
     };
     if ordinary_operandless
         && !other_read
@@ -1424,6 +1708,17 @@ pub fn classify_handler_effects(
         add_candidate(semantic, shift_operation_width);
     }
     if ordinary_operandless
+        && gs_load
+        && memory_load_width == Some(BitWidth::W64)
+        && !other_write
+        && other_read
+        && stack_effect_count == 2
+        && other_effect_count == 1
+    {
+        add_candidate(VmHandlerSemantic::GsRelativeLoad, Some(BitWidth::W64));
+    }
+    if ordinary_operandless
+        && !segment_load
         && memory_load_width.is_some()
         && !other_write
         && other_read
@@ -1433,6 +1728,7 @@ pub fn classify_handler_effects(
         add_candidate(VmHandlerSemantic::MemoryLoad, memory_load_width);
     }
     if ordinary_operandless
+        && !segment_load
         && resized_memory_loads.len() == 1
         && !other_write
         && other_read
@@ -1445,6 +1741,7 @@ pub fn classify_handler_effects(
         );
     }
     if ordinary_operandless
+        && !segment_load
         && memory_store_width.is_some()
         && !other_read
         && other_write
@@ -1481,6 +1778,16 @@ pub fn classify_handler_effects(
             }
             _ => (None, None),
         },
+        VmHandlerSemantic::ShiftLeft
+        | VmHandlerSemantic::ShiftRightLogical
+        | VmHandlerSemantic::ShiftRightArithmetic
+        | VmHandlerSemantic::RotateLeft
+        | VmHandlerSemantic::RotateRight => match resized_binary_operations.as_slice() {
+            [resized] if Some(resized.output_width) == operation_width => {
+                (Some(resized.input_width), Some(resized.operation))
+            }
+            _ => (None, None),
+        },
         VmHandlerSemantic::VirtualRegisterRead => match resized_context_reads.as_slice() {
             [(input, output, resize)] if Some(*output) == operation_width => {
                 (Some(*input), Some(*resize))
@@ -1497,7 +1804,11 @@ pub fn classify_handler_effects(
         },
         _ => (None, None),
     };
-    let flags_effect = if summary.captures_native_flags_to_vsp {
+    let flags_effect = if summary.captures_native_flags_to_vsp
+        || matches!(
+            semantic,
+            VmHandlerSemantic::PopFlags | VmHandlerSemantic::UnsignedDivide
+        ) {
         EffectKnowledge::Modified
     } else if semantic == VmHandlerSemantic::Unknown {
         EffectKnowledge::Unknown
@@ -1553,6 +1864,7 @@ pub fn classify_handler_effects(
         || resized_binary_operations.len() > 1
         || resized_context_writes.len() > 1
         || memory_store_widths.len() > 1
+        || double_shift_widths.len() > 1
     {
         evidence.push("multiple operation widths match the normalized effects".to_owned());
     }
@@ -3154,5 +3466,352 @@ mod tests {
             9,
         );
         assert!(analysis.semantic == VmHandlerSemantic::Unknown || !proven);
+    }
+
+    /// Builds a handler body, appends the dispatch tail, and returns the
+    /// classification with the value-flow demotion applied as in recovery.
+    fn classify_body(build: impl FnOnce(&mut CodeAssembler)) -> (VmHandlerAnalysis, bool) {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        build(&mut assembler);
+        assembler.mov(edx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let trace = trace_from_assembler(assembler);
+        let count = trace.instructions().count();
+        let boundary = trace
+            .instructions()
+            .nth(count - 2)
+            .expect("dispatch load")
+            .rva;
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![
+                    Register::R11,
+                    Register::R14,
+                    Register::R15,
+                    Register::RBP,
+                ],
+                live_out_rflags: 0,
+            },
+        );
+        let summary = extract_handler_effects(
+            &trace,
+            &slice,
+            HandlerEffectRoles {
+                vsp: Register::R11,
+                context_base: Register::RSP,
+            },
+            crate::HandlerRegisterRoles {
+                vip: Register::R15,
+                rolling_key: Register::RBP,
+                handler: Register::R14,
+            },
+            boundary,
+        );
+        let mut analysis = classify_handler_effects(trace.entry, &summary, None, Some(4));
+        let proof =
+            crate::prove_handler_value_flow(&trace, &slice, &summary, &analysis, None, None, false);
+        if !proof.proven {
+            analysis.semantic = VmHandlerSemantic::Unknown;
+        }
+        (analysis, proof.proven)
+    }
+
+    fn assert_class(
+        build: impl FnOnce(&mut CodeAssembler),
+        semantic: VmHandlerSemantic,
+        width: BitWidth,
+    ) -> VmHandlerAnalysis {
+        let (analysis, proven) = classify_body(build);
+        assert_eq!(analysis.semantic, semantic);
+        assert_eq!(analysis.operation_width, Some(width));
+        assert!(proven);
+        analysis
+    }
+
+    fn assert_unknown(build: impl FnOnce(&mut CodeAssembler)) {
+        let (analysis, _) = classify_body(build);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+    }
+
+    #[test]
+    fn classifies_narrow_vsp_push_and_rejects_clobbered_copy() {
+        let push = |width16: bool, clobber: bool| {
+            move |a: &mut CodeAssembler| {
+                a.mov(r10, r11).expect("copy VSP");
+                if clobber {
+                    a.mov(r10w, cx).expect("clobber the low word");
+                }
+                if width16 {
+                    a.sub(r11, 2).expect("reserve");
+                    a.mov(word_ptr(r11), r10w).expect("push low word");
+                } else {
+                    a.sub(r11, 4).expect("reserve");
+                    a.mov(dword_ptr(r11), r10d).expect("push low dword");
+                }
+            }
+        };
+        assert_class(push(true, false), VmHandlerSemantic::Push, BitWidth::W16);
+        assert_class(push(false, false), VmHandlerSemantic::Push, BitWidth::W32);
+        assert_unknown(push(true, true));
+    }
+
+    #[test]
+    fn classifies_narrow_vsp_reload_only_from_the_stack_top() {
+        assert_class(
+            |a| a.mov(r11d, dword_ptr(r11)).expect("reload"),
+            VmHandlerSemantic::Pop,
+            BitWidth::W32,
+        );
+        assert_class(
+            |a| a.mov(r11w, word_ptr(r11)).expect("reload"),
+            VmHandlerSemantic::Pop,
+            BitWidth::W16,
+        );
+        assert_unknown(|a| a.mov(r11d, dword_ptr(r11 + 4)).expect("offset reload"));
+        assert_unknown(|a| a.mov(r11d, dword_ptr(r10)).expect("foreign pointer"));
+    }
+
+    fn double_shift(right: bool, swap_operands: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.mov(r9d, dword_ptr(r11)).expect("destination");
+            a.mov(r8d, dword_ptr(r11 + 4)).expect("source");
+            a.mov(cl, byte_ptr(r11 + 8)).expect("count");
+            a.sub(r11, 2).expect("reserve flags cell");
+            match (right, swap_operands) {
+                (false, false) => a.shld(r9d, r8d, cl),
+                (true, false) => a.shrd(r9d, r8d, cl),
+                (false, true) => a.shld(r8d, r9d, cl),
+                (true, true) => a.shrd(r8d, r9d, cl),
+            }
+            .expect("double shift");
+            a.pushfq().expect("capture flags");
+            a.pop(rdi).expect("flags into a register");
+            a.mov(dword_ptr(r11 + 8), r9d).expect("result");
+            a.mov(qword_ptr(r11), rdi).expect("VM flags");
+        }
+    }
+
+    #[test]
+    fn classifies_double_shifts_and_rejects_swapped_operands() {
+        let analysis = assert_class(
+            double_shift(false, false),
+            VmHandlerSemantic::ShiftLeftDouble,
+            BitWidth::W32,
+        );
+        assert_eq!(analysis.stack_delta, Some(-2));
+        assert_class(
+            double_shift(true, false),
+            VmHandlerSemantic::ShiftRightDouble,
+            BitWidth::W32,
+        );
+        assert_unknown(double_shift(false, true));
+        assert_unknown(double_shift(true, true));
+    }
+
+    fn byte_shift(clobber_high_byte: bool, count_slot: i32) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.movzx(ax, byte_ptr(r11)).expect("value");
+            a.mov(cl, byte_ptr(r11 + count_slot)).expect("count");
+            if clobber_high_byte {
+                a.mov(ah, bl).expect("pollute the high byte");
+            }
+            a.sub(r11, 6).expect("reserve flags cell");
+            a.shr(al, cl).expect("byte shift");
+            a.pushfq().expect("capture flags");
+            a.pop(rdi).expect("flags into a register");
+            a.mov(word_ptr(r11 + 8), ax).expect("result");
+            a.mov(qword_ptr(r11), rdi).expect("VM flags");
+        }
+    }
+
+    #[test]
+    fn classifies_byte_shift_in_word_slots_and_rejects_dirty_high_byte() {
+        let analysis = assert_class(
+            byte_shift(false, 2),
+            VmHandlerSemantic::ShiftRightLogical,
+            BitWidth::W16,
+        );
+        assert_eq!(analysis.input_width, Some(BitWidth::W8));
+        assert_eq!(analysis.resize, Some(ResizeOp::ZeroExtend));
+        assert_eq!(analysis.stack_delta, Some(-6));
+        assert_unknown(byte_shift(true, 2));
+        assert_unknown(byte_shift(false, 3));
+    }
+
+    fn wide_multiply(
+        signed: bool,
+        width64: bool,
+        swapped_inputs: bool,
+    ) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            let (first, second) = if swapped_inputs { (4, 0) } else { (0, 4) };
+            if width64 {
+                a.mov(rbx, qword_ptr(r11 + first * 2)).expect("multiplier");
+                a.mov(rax, qword_ptr(r11 + second * 2))
+                    .expect("accumulator");
+            } else {
+                a.mov(ebx, dword_ptr(r11 + first)).expect("multiplier");
+                a.mov(eax, dword_ptr(r11 + second)).expect("accumulator");
+            }
+            a.sub(r11, 8).expect("reserve result and flags cells");
+            match (signed, width64) {
+                (false, false) => a.mul(ebx),
+                (false, true) => a.mul(rbx),
+                (true, false) => a.imul(ebx),
+                (true, true) => a.imul(rbx),
+            }
+            .expect("multiply");
+            a.pushfq().expect("capture flags");
+            a.pop(rdi).expect("flags into a register");
+            if width64 {
+                a.mov(qword_ptr(r11 + 8), rdx).expect("high");
+                a.mov(qword_ptr(r11 + 16), rax).expect("low");
+            } else {
+                a.mov(dword_ptr(r11 + 8), edx).expect("high");
+                a.mov(dword_ptr(r11 + 12), eax).expect("low");
+            }
+            a.mov(qword_ptr(r11), rdi).expect("VM flags");
+        }
+    }
+
+    #[test]
+    fn classifies_multiplies_with_any_multiplier_register() {
+        assert_class(
+            wide_multiply(false, false, false),
+            VmHandlerSemantic::Mul,
+            BitWidth::W32,
+        );
+        assert_class(
+            wide_multiply(false, true, false),
+            VmHandlerSemantic::Mul,
+            BitWidth::W64,
+        );
+        assert_class(
+            wide_multiply(true, false, false),
+            VmHandlerSemantic::SignedMultiply,
+            BitWidth::W32,
+        );
+        assert_class(
+            wide_multiply(true, true, false),
+            VmHandlerSemantic::SignedMultiply,
+            BitWidth::W64,
+        );
+        assert_unknown(wide_multiply(false, false, true));
+        assert_unknown(wide_multiply(true, true, true));
+    }
+
+    #[test]
+    fn rejects_two_operand_imul_as_a_wide_multiply() {
+        assert_unknown(|a| {
+            a.mov(ebx, dword_ptr(r11)).expect("multiplier");
+            a.mov(eax, dword_ptr(r11 + 4)).expect("accumulator");
+            a.sub(r11, 8).expect("reserve");
+            a.imul_2(eax, ebx).expect("two-operand imul");
+            a.pushfq().expect("capture flags");
+            a.pop(rdi).expect("flags");
+            a.mov(dword_ptr(r11 + 8), edx).expect("high");
+            a.mov(dword_ptr(r11 + 12), eax).expect("low");
+            a.mov(qword_ptr(r11), rdi).expect("VM flags");
+        });
+    }
+
+    fn qword_divide(swap_results: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.mov(rdx, qword_ptr(r11)).expect("high dividend");
+            a.mov(rax, qword_ptr(r11 + 8)).expect("low dividend");
+            a.mov(rbx, qword_ptr(r11 + 16)).expect("divisor");
+            a.add(r11, 8).expect("collapse three operands into two");
+            a.div(rbx).expect("divide");
+            if swap_results {
+                a.mov(qword_ptr(r11), rax).expect("quotient");
+                a.mov(qword_ptr(r11 + 8), rdx).expect("remainder");
+            } else {
+                a.mov(qword_ptr(r11), rdx).expect("remainder");
+                a.mov(qword_ptr(r11 + 8), rax).expect("quotient");
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_unflagged_qword_divide() {
+        let analysis = assert_class(
+            qword_divide(false),
+            VmHandlerSemantic::UnsignedDivide,
+            BitWidth::W64,
+        );
+        assert_eq!(analysis.stack_delta, Some(8));
+        assert_unknown(qword_divide(true));
+    }
+
+    fn cpuid_body(swap_outputs: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.mov(eax, dword_ptr(r11)).expect("leaf");
+            a.mov(ecx, dword_ptr(r11 + 4)).expect("sub-leaf");
+            a.sub(r11, 8).expect("reserve");
+            a.cpuid().expect("cpuid");
+            a.mov(dword_ptr(r11 + 12), eax).expect("eax");
+            if swap_outputs {
+                a.mov(dword_ptr(r11 + 8), ecx).expect("ecx in the ebx cell");
+                a.mov(dword_ptr(r11 + 4), ebx).expect("ebx in the ecx cell");
+            } else {
+                a.mov(dword_ptr(r11 + 8), ebx).expect("ebx");
+                a.mov(dword_ptr(r11 + 4), ecx).expect("ecx");
+            }
+            a.mov(dword_ptr(r11), edx).expect("edx");
+        }
+    }
+
+    #[test]
+    fn classifies_cpuid_and_rejects_swapped_output_cells() {
+        assert_class(cpuid_body(false), VmHandlerSemantic::Cpuid, BitWidth::W32);
+        assert_unknown(cpuid_body(true));
+    }
+
+    fn pop_flags(pushed: AsmRegister64) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.mov(rdx, qword_ptr(r11)).expect("flags image");
+            a.add(r11, 8).expect("pop");
+            a.push(pushed).expect("native push");
+            a.popfq().expect("restore flags");
+        }
+    }
+
+    #[test]
+    fn classifies_popfq_only_for_the_popped_value() {
+        let analysis = assert_class(pop_flags(rdx), VmHandlerSemantic::PopFlags, BitWidth::W64);
+        assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
+        assert_unknown(pop_flags(rcx));
+    }
+
+    #[test]
+    fn classifies_only_gs_relative_pointer_loads() {
+        let load = |use_gs: bool| {
+            move |a: &mut CodeAssembler| {
+                a.mov(rcx, qword_ptr(r11)).expect("pointer");
+                if use_gs {
+                    a.mov(rdi, qword_ptr(rcx).gs()).expect("gs load");
+                } else {
+                    a.mov(rdi, qword_ptr(rcx).fs()).expect("fs load");
+                }
+                a.mov(qword_ptr(r11), rdi).expect("result");
+            }
+        };
+        assert_class(load(true), VmHandlerSemantic::GsRelativeLoad, BitWidth::W64);
+        assert_unknown(load(false));
+    }
+
+    #[test]
+    fn classifies_byte_store_through_a_word_value_slot() {
+        let store = |advance: i32| {
+            move |a: &mut CodeAssembler| {
+                a.mov(rdi, qword_ptr(r11)).expect("pointer");
+                a.mov(al, byte_ptr(r11 + 8)).expect("value");
+                a.add(r11, advance).expect("pop pointer and value slot");
+                a.mov(byte_ptr(rdi), al).expect("store");
+            }
+        };
+        assert_class(store(10), VmHandlerSemantic::MemoryStore, BitWidth::W8);
+        assert_unknown(store(11));
     }
 }

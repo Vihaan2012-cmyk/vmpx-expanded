@@ -997,6 +997,26 @@ fn is_proven_region_pointer(expression: &Expr) -> bool {
     }
 }
 
+/// Splits a double-width or wide-operand result into two same-width halves;
+/// 64-bit operations use two independent intrinsics because no 128-bit width exists.
+fn wide_pair(
+    width: BitWidth,
+    name: &str,
+    arguments: &[Expr],
+    labels: (&str, &str),
+) -> Result<(Expr, Expr), String> {
+    if width == BitWidth::W64 {
+        return Ok((
+            Expr::intrinsic(width, format!("{name}_{}", labels.0), arguments.to_vec()),
+            Expr::intrinsic(width, format!("{name}_{}", labels.1), arguments.to_vec()),
+        ));
+    }
+    let packed = Expr::intrinsic(BitWidth::W64, name.to_owned(), arguments.to_vec());
+    let first = Expr::extract(width, 0, packed.clone()).map_err(|error| error.to_string())?;
+    let second = Expr::extract(width, width.bits(), packed).map_err(|error| error.to_string())?;
+    Ok((first, second))
+}
+
 fn resized_to(width: BitWidth, value: Expr) -> Result<Expr, ExprError> {
     if value.width == width {
         Ok(value)
@@ -1360,51 +1380,63 @@ fn execute_instruction(
             let high = machine.load_stack(0, width)?;
             let low = machine.load_stack(i64::from(bytes), width)?;
             let divisor = machine.load_stack(i64::from(bytes.saturating_mul(2)), width)?;
-            let packed_result = Expr::intrinsic(
-                BitWidth::W64,
-                format!("x86_unsigned_divide_{width:?}_{instruction_index}").to_lowercase(),
-                vec![high.clone(), low.clone(), divisor.clone()],
-            );
-            let remainder = Expr::extract(width, width.bits(), packed_result.clone())
-                .map_err(|error| error.to_string())?;
-            let quotient =
-                Expr::extract(width, 0, packed_result).map_err(|error| error.to_string())?;
-            let delta = i32::try_from(bytes)
+            let arguments = vec![high, low, divisor];
+            let (quotient, remainder) = wide_pair(
+                width,
+                &format!("x86_unsigned_divide_{width:?}_{instruction_index}").to_lowercase(),
+                &arguments,
+                ("quotient", "remainder"),
+            )?;
+            let flagged_delta = i32::try_from(bytes)
                 .ok()
                 .and_then(|bytes| bytes.checked_sub(8))
                 .ok_or_else(|| "division width exceeds VSP range".to_owned())?;
-            expected_delta(instruction, delta)?;
-            machine.adjust_vsp(delta)?;
-            machine.store_stack(8, &remainder)?;
-            machine.store_stack(i64::from(8_u32.saturating_add(bytes)), &quotient)?;
             machine.flags = Expr::intrinsic(
                 BitWidth::W64,
                 format!("vm_flags_unsigned_divide_{width:?}_{instruction_index}").to_lowercase(),
-                vec![high, low, divisor],
+                arguments,
             );
-            let flags = machine.flags.clone();
-            machine.store_stack(0, &flags)?;
+            if instruction.vsp_delta == Some(flagged_delta) {
+                machine.adjust_vsp(flagged_delta)?;
+                machine.store_stack(8, &remainder)?;
+                machine.store_stack(i64::from(8_u32.saturating_add(bytes)), &quotient)?;
+                let flags = machine.flags.clone();
+                machine.store_stack(0, &flags)?;
+            } else if width == BitWidth::W64 && instruction.vsp_delta == Some(8) {
+                machine.adjust_vsp(8)?;
+                machine.store_stack(0, &remainder)?;
+                machine.store_stack(8, &quotient)?;
+            } else {
+                return Err(format!(
+                    "recovered VSP delta {:?} does not match a division layout",
+                    instruction.vsp_delta
+                ));
+            }
         }
-        VmHandlerSemantic::Mul => {
+        VmHandlerSemantic::Mul | VmHandlerSemantic::SignedMultiply => {
+            let kind = if instruction.semantic == VmHandlerSemantic::Mul {
+                "unsigned"
+            } else {
+                "signed"
+            };
             let bytes = width.bytes();
             let multiplier = machine.load_stack(0, width)?;
             let accumulator = machine.load_stack(i64::from(bytes), width)?;
-            let packed_result = Expr::intrinsic(
-                BitWidth::W64,
-                format!("x86_unsigned_multiply_{width:?}_{instruction_index}").to_lowercase(),
-                vec![multiplier.clone(), accumulator.clone()],
-            );
-            let high = Expr::extract(width, width.bits(), packed_result.clone())
-                .map_err(|error| error.to_string())?;
-            let low = Expr::extract(width, 0, packed_result).map_err(|error| error.to_string())?;
+            let arguments = vec![multiplier, accumulator];
+            let (low, high) = wide_pair(
+                width,
+                &format!("x86_{kind}_multiply_{width:?}_{instruction_index}").to_lowercase(),
+                &arguments,
+                ("low", "high"),
+            )?;
             expected_delta(instruction, -8)?;
             machine.adjust_vsp(-8)?;
             machine.store_stack(8, &high)?;
             machine.store_stack(i64::from(8_u32.saturating_add(bytes)), &low)?;
             machine.flags = Expr::intrinsic(
                 BitWidth::W64,
-                format!("vm_flags_unsigned_multiply_{width:?}_{instruction_index}").to_lowercase(),
-                vec![multiplier, accumulator],
+                format!("vm_flags_{kind}_multiply_{width:?}_{instruction_index}").to_lowercase(),
+                arguments,
             );
             let flags = machine.flags.clone();
             machine.store_stack(0, &flags)?;
@@ -1445,6 +1477,73 @@ fn execute_instruction(
             let flags = machine.flags.clone();
             machine.store_stack(0, &flags)?;
         }
+        VmHandlerSemantic::ShiftLeftDouble | VmHandlerSemantic::ShiftRightDouble => {
+            let bytes = width.bytes();
+            let delta = i32::try_from(bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_sub(6))
+                .ok_or_else(|| "double-shift width exceeds VSP range".to_owned())?;
+            expected_delta(instruction, delta)?;
+            let destination = machine.load_stack(0, width)?;
+            let source = machine.load_stack(i64::from(bytes), width)?;
+            let count = machine.load_stack(i64::from(bytes.saturating_mul(2)), BitWidth::W8)?;
+            let direction = if instruction.semantic == VmHandlerSemantic::ShiftLeftDouble {
+                "left"
+            } else {
+                "right"
+            };
+            let arguments = vec![destination, source, count];
+            let result = Expr::intrinsic(
+                width,
+                format!("x86_double_shift_{direction}_{width:?}_{instruction_index}")
+                    .to_lowercase(),
+                arguments.clone(),
+            );
+            machine.adjust_vsp(delta)?;
+            machine.store_stack(8, &result)?;
+            machine.flags = Expr::intrinsic(
+                BitWidth::W64,
+                format!("vm_flags_double_shift_{direction}_{width:?}_{instruction_index}")
+                    .to_lowercase(),
+                arguments,
+            );
+            let flags = machine.flags.clone();
+            machine.store_stack(0, &flags)?;
+        }
+        VmHandlerSemantic::Cpuid => {
+            expected_delta(instruction, -8)?;
+            let leaf = machine.load_stack(0, BitWidth::W32)?;
+            let subleaf = machine.load_stack(4, BitWidth::W32)?;
+            machine.adjust_vsp(-8)?;
+            for (displacement, register) in [(12, "eax"), (8, "ebx"), (4, "ecx"), (0, "edx")] {
+                let value = Expr::intrinsic(
+                    BitWidth::W32,
+                    format!("x86_cpuid_{register}_{instruction_index}"),
+                    vec![leaf.clone(), subleaf.clone()],
+                );
+                machine.store_stack(displacement, &value)?;
+            }
+        }
+        VmHandlerSemantic::GsRelativeLoad => {
+            expected_delta(instruction, 0)?;
+            let pointer = machine.load_stack(0, BitWidth::W64)?;
+            let value = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_gs_load_{instruction_index}"),
+                vec![pointer],
+            );
+            machine.store_stack(0, &value)?;
+        }
+        VmHandlerSemantic::PopFlags => {
+            expected_delta(instruction, 8)?;
+            let value = machine.load_stack(0, BitWidth::W64)?;
+            machine.adjust_vsp(8)?;
+            machine.flags = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_popfq_{instruction_index}"),
+                vec![value],
+            );
+        }
         VmHandlerSemantic::ShiftLeft
         | VmHandlerSemantic::ShiftRightLogical
         | VmHandlerSemantic::ShiftRightArithmetic
@@ -1458,9 +1557,18 @@ fn execute_instruction(
                 .and_then(|bytes| u32::try_from(bytes).ok())
                 .and_then(BitWidth::from_bytes)
                 .ok_or_else(|| "shift count slot has unsupported width".to_owned())?;
-            let value = machine.load_stack(0, width)?;
+            let input_width = instruction.input_width.unwrap_or(width);
+            if (input_width != width) != instruction.resize.is_some()
+                || instruction
+                    .resize
+                    .is_some_and(|resize| resize != ResizeOp::ZeroExtend)
+            {
+                return Err("shift input/output widths differ without a proven resize".to_owned());
+            }
+            let value = resized_to(input_width, machine.load_stack(0, width)?)
+                .map_err(|error| error.to_string())?;
             let count = resized_to(
-                width,
+                input_width,
                 machine.load_stack(i64::from(width.bytes()), count_bytes)?,
             )
             .map_err(|error| error.to_string())?;
@@ -1474,11 +1582,17 @@ fn execute_instruction(
             };
             let result = Expr::binary(operation, value.clone(), count.clone())
                 .map_err(|error| error.to_string())?;
+            let result = if input_width == width {
+                result
+            } else {
+                Expr::resize(ResizeOp::ZeroExtend, width, result)
+                    .map_err(|error| error.to_string())?
+            };
             machine.adjust_vsp(delta)?;
             machine.store_stack(8, &result)?;
             machine.flags = Expr::intrinsic(
                 BitWidth::W64,
-                format!("vm_flags_{:?}_{:?}", instruction.semantic, width).to_lowercase(),
+                format!("vm_flags_{:?}_{:?}", instruction.semantic, input_width).to_lowercase(),
                 vec![value, count],
             );
             let flags = machine.flags.clone();
@@ -1508,7 +1622,12 @@ fn execute_instruction(
         VmHandlerSemantic::MemoryStore => {
             let pointer = machine.load_stack(0, BitWidth::W64)?;
             let value = machine.load_stack(8, width)?;
-            let delta = i32::try_from(8_u32.saturating_add(width.bytes()))
+            let slot_bytes = if width == BitWidth::W8 && instruction.vsp_delta == Some(10) {
+                2
+            } else {
+                width.bytes()
+            };
+            let delta = i32::try_from(8_u32.saturating_add(slot_bytes))
                 .map_err(|_| "memory-store width exceeds VSP range".to_owned())?;
             expected_delta(instruction, delta)?;
             machine.store_external(instruction_index, pointer, value)?;
@@ -1523,12 +1642,20 @@ fn execute_instruction(
             execute_table_checksum(machine, instruction, width, metadata)?;
         }
         VmHandlerSemantic::Push => {
-            expected_delta(instruction, -8)?;
+            let delta = i32::try_from(width.bytes())
+                .ok()
+                .and_then(i32::checked_neg)
+                .ok_or_else(|| "push width exceeds VSP range".to_owned())?;
+            expected_delta(instruction, delta)?;
             let prior_vsp = machine.vsp.clone();
-            machine.adjust_vsp(-8)?;
-            machine.store_stack(0, &prior_vsp)?;
+            let pushed = Expr::extract(width, 0, prior_vsp).map_err(|error| error.to_string())?;
+            machine.adjust_vsp(delta)?;
+            machine.store_stack(0, &pushed)?;
         }
         VmHandlerSemantic::Pop => {
+            if width != BitWidth::W64 {
+                return Err("partial-width VSP reload is not modelled symbolically".to_owned());
+            }
             let restored = machine.load_stack(0, BitWidth::W64)?;
             machine.vsp_offset = pointer_offset(&restored);
             machine.vsp = restored;
@@ -2572,5 +2699,175 @@ mod tests {
                 .iter()
                 .any(|(_, value)| format!("{value:?}").contains("57005"))
         );
+    }
+
+    fn run(instructions: &[DecodedVmInstruction]) -> Result<SymbolicVmExecutionReport, String> {
+        execute_symbolic_linear_block(instructions, None, SymbolicExecutionLimits::default())
+            .map_err(|error| error.message)
+    }
+
+    #[test]
+    fn narrow_vsp_push_stores_only_the_low_bytes() {
+        let report = run(&[instruction(
+            VmHandlerSemantic::Push,
+            BitWidth::W16,
+            None,
+            Some(-2),
+        )])
+        .expect("narrow push executes");
+        assert_eq!(report.final_vsp_offset, Some(-2));
+        assert_eq!(report.memory_values.len(), 2);
+
+        let error = run(&[instruction(
+            VmHandlerSemantic::Push,
+            BitWidth::W16,
+            None,
+            Some(-8),
+        )])
+        .expect_err("a qword delta contradicts a word push");
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn narrow_vsp_reload_is_not_executed_symbolically() {
+        let error = run(&[instruction(
+            VmHandlerSemantic::Pop,
+            BitWidth::W32,
+            None,
+            None,
+        )])
+        .expect_err("partial VSP reload must not be guessed");
+        assert!(error.contains("partial-width VSP reload"), "{error}");
+    }
+
+    #[test]
+    fn byte_shift_in_word_slots_computes_a_zero_extended_result() {
+        let mut shift = instruction(
+            VmHandlerSemantic::ShiftRightLogical,
+            BitWidth::W16,
+            None,
+            Some(-6),
+        );
+        shift.input_width = Some(BitWidth::W8);
+        shift.resize = Some(ResizeOp::ZeroExtend);
+        let report = run(&[
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W16,
+                Some(1),
+                Some(-2),
+            ),
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W16,
+                Some(0x1281),
+                Some(-2),
+            ),
+            shift,
+            instruction(
+                VmHandlerSemantic::VirtualRegisterWrite,
+                BitWidth::W64,
+                Some(0x20),
+                Some(8),
+            ),
+            instruction(
+                VmHandlerSemantic::VirtualRegisterWrite,
+                BitWidth::W16,
+                Some(0x10),
+                Some(2),
+            ),
+        ])
+        .expect("byte shift executes");
+        let cell = &report.context_cells[&0x10];
+        let ExprKind::Concat { low, .. } = &cell.kind else {
+            panic!("context cell must keep its untouched upper bytes: {cell:?}");
+        };
+        let ExprKind::Concat { low: word, .. } = &low.kind else {
+            panic!("context cell must keep its untouched upper word: {cell:?}");
+        };
+        assert_eq!(**word, Expr::constant(BitWidth::W16, 0x40));
+        assert_eq!(report.final_vsp_offset, Some(0));
+    }
+
+    #[test]
+    fn wide_multiply_and_unflagged_divide_use_split_qword_results() {
+        let pushes = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    instruction(
+                        VmHandlerSemantic::ConstantPush,
+                        BitWidth::W64,
+                        Some(index as u64 + 3),
+                        Some(-8),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut multiply = pushes(2);
+        multiply.push(instruction(
+            VmHandlerSemantic::SignedMultiply,
+            BitWidth::W64,
+            None,
+            Some(-8),
+        ));
+        let report = run(&multiply).expect("qword signed multiply executes");
+        assert_eq!(report.final_vsp_offset, Some(-24));
+
+        let mut divide = pushes(3);
+        divide.push(instruction(
+            VmHandlerSemantic::UnsignedDivide,
+            BitWidth::W64,
+            None,
+            Some(8),
+        ));
+        let report = run(&divide).expect("unflagged qword divide executes");
+        assert_eq!(report.final_vsp_offset, Some(-16));
+
+        let mut wrong = pushes(3);
+        wrong.push(instruction(
+            VmHandlerSemantic::UnsignedDivide,
+            BitWidth::W64,
+            None,
+            Some(4),
+        ));
+        assert!(run(&wrong).is_err());
+    }
+
+    #[test]
+    fn cpuid_and_popfq_follow_their_stack_layouts() {
+        let mut block = vec![
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W32,
+                Some(1),
+                Some(-4),
+            ),
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W32,
+                Some(0),
+                Some(-4),
+            ),
+            instruction(VmHandlerSemantic::Cpuid, BitWidth::W32, None, Some(-8)),
+        ];
+        let report = run(&block).expect("cpuid executes");
+        assert_eq!(report.final_vsp_offset, Some(-16));
+
+        block.truncate(0);
+        block.push(instruction(
+            VmHandlerSemantic::ConstantPush,
+            BitWidth::W64,
+            Some(0x246),
+            Some(-8),
+        ));
+        block.push(instruction(
+            VmHandlerSemantic::PopFlags,
+            BitWidth::W64,
+            None,
+            Some(8),
+        ));
+        let report = run(&block).expect("popfq executes");
+        assert_eq!(report.final_vsp_offset, Some(0));
+        assert!(format!("{:?}", report.final_flags).contains("x86_popfq_1"));
     }
 }

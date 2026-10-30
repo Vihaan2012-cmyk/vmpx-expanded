@@ -94,6 +94,40 @@ fn main() {
                 r.effects.as_ref().map(|e| e.vsp_delta)
             );
         }
+        if std::env::var("HDIAG_UNK").is_ok()
+            && let (Some(a), Some(e)) = (r.handler_analysis.as_ref(), r.effects.as_ref())
+            && format!("{:?}", a.semantic) == "Unknown"
+        {
+            let mem: Vec<String> = e
+                .memory
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{:?}{:+}/w{}{}{}",
+                        m.region,
+                        m.displacement,
+                        m.width_bytes,
+                        if m.reads { "R" } else { "" },
+                        if m.writes { "W" } else { "" }
+                    )
+                })
+                .collect();
+            println!(
+                "op{op} {handler_rva:#x} opw={:?} vsp={:?} mem={mem:?} ar={:?} fl={} pre={} ldvsp={} rs={:?} tsc={} diag={:?}",
+                a.operand_width,
+                e.vsp_delta,
+                e.arithmetic_operations,
+                e.captures_native_flags_to_vsp,
+                e.pushes_pre_adjustment_vsp,
+                e.loads_vsp_from_top,
+                e.resize_operations
+                    .iter()
+                    .map(|x| (x.input_width.bits(), x.output_width.bits()))
+                    .collect::<Vec<_>>(),
+                e.timestamp_counter_reads.len(),
+                e.diagnostics
+            );
+        }
         let sem = r
             .handler_analysis
             .as_ref()

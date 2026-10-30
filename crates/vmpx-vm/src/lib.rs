@@ -80,8 +80,8 @@ pub use dispatch_extract::{
 };
 pub use effect_extract::{
     HandlerEffectRoles, HandlerEffectSummary, HandlerMemoryEffect, HandlerMemoryRegion,
-    HandlerResizeEffect, HandlerVspAdjustment, classify_handler_effects, extract_handler_effects,
-    extract_handler_effects_keyed,
+    HandlerNarrowVspAccess, HandlerResizeEffect, HandlerVspAdjustment, classify_handler_effects,
+    extract_handler_effects, extract_handler_effects_keyed,
 };
 pub use entry_paths::{
     BranchingRecoveryError, BranchingRecoveryLimits, EntryPathRecoveryError,
