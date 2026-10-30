@@ -35,6 +35,7 @@ mod symbolic_domain;
 mod transform;
 mod transition_extract;
 mod value_flow;
+mod value_range;
 mod vm_exit;
 
 pub use bootstrap::{
@@ -188,6 +189,7 @@ pub use transition_extract::{
     RecoveredVmTransition, VmTransitionAnalysis, VmTransitionReport, analyze_vm_transition,
 };
 pub use value_flow::{HandlerValueFlowProof, prove_handler_value_flow};
+pub use value_range::{RangeContext, ValueRange, value_range};
 pub use vm_exit::{VmExitReport, VmExitRestoreSlot, analyze_vm_exit};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
