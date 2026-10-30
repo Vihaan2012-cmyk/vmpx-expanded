@@ -1045,21 +1045,36 @@ pub fn classify_handler_effects(
         })
         .collect::<Vec<_>>();
     let multiplication_operation_width = unique_width(&multiplication_operation_widths);
-    let unflagged_divide_64 = [(0, true, false), (8, true, false), (16, true, false)]
+    // A divide handler that does not push native flags onto the VM stack: three
+    // same-width operands (high dividend @0, low dividend @bytes, divisor
+    // @2*bytes) reach DIV, and its two results are stored at @0 and @bytes while
+    // the stack nets one freed slot (vsp_delta == +bytes). The flag of which
+    // result is quotient vs remainder is proven at the register level by
+    // value-flow analysis, so the width-level shape alone never commits a lift.
+    // VMProtect emits this shape at 16/32/64 bits; the layout scales by width.
+    let unflagged_divide_widths = [BitWidth::W16, BitWidth::W32, BitWidth::W64]
         .into_iter()
-        .chain([(0, false, true), (8, false, true)])
-        .all(|(displacement, reads, writes)| {
-            has_memory_width(
-                summary,
-                HandlerMemoryRegion::VmStack,
-                displacement,
-                BitWidth::W64.bytes(),
-                reads,
-                writes,
-            )
+        .filter(|width| {
+            let bytes = width.bytes();
+            let b = i64::from(bytes);
+            [(0, true, false), (b, true, false), (b.saturating_mul(2), true, false)]
+                .into_iter()
+                .chain([(0, false, true), (b, false, true)])
+                .all(|(displacement, reads, writes)| {
+                    has_memory_width(
+                        summary,
+                        HandlerMemoryRegion::VmStack,
+                        displacement,
+                        bytes,
+                        reads,
+                        writes,
+                    )
+                })
+                && summary.vsp_delta == i32::try_from(bytes).ok()
+                && !summary.captures_native_flags_to_vsp
         })
-        && summary.vsp_delta == Some(8)
-        && !summary.captures_native_flags_to_vsp;
+        .collect::<Vec<_>>();
+    let unflagged_divide_width = unique_width(&unflagged_divide_widths);
     let double_shift_widths = [BitWidth::W16, BitWidth::W32, BitWidth::W64]
         .into_iter()
         .filter(|width| {
@@ -1582,12 +1597,12 @@ pub fn classify_handler_effects(
     if ordinary_operandless
         && !other_read
         && !other_write
-        && unflagged_divide_64
+        && unflagged_divide_width.is_some()
         && is_unsigned_divide
         && stack_effect_count == 5
         && other_effect_count == 0
     {
-        add_candidate(VmHandlerSemantic::UnsignedDivide, Some(BitWidth::W64));
+        add_candidate(VmHandlerSemantic::UnsignedDivide, unflagged_divide_width);
     }
     if ordinary_operandless
         && !other_read
@@ -1856,6 +1871,7 @@ pub fn classify_handler_effects(
         || context_write_widths.len() > 1
         || binary_operation_widths.len() > 1
         || division_operation_widths.len() > 1
+        || unflagged_divide_widths.len() > 1
         || multiplication_operation_widths.len() > 1
         || shift_operation_widths.len() > 1
         || memory_load_widths.len() > 1
@@ -2288,6 +2304,120 @@ mod tests {
         assert_eq!(analysis.stack_delta, Some(-4));
         assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
         assert!(proof.proven, "{:?}", proof.evidence);
+    }
+
+    /// VMProtect also emits an unsigned divide that does not push native flags:
+    /// the two results occupy the lower stack cells and the stack nets one freed
+    /// slot (vsp_delta == +bytes). value-flow still proves quotient<-EAX and
+    /// remainder<-EDX from the DIV, so the lift is committed only when provably
+    /// correct. This is the shape that stalls `rmath_gcd`/`gsieve_perfect_scan`.
+    #[test]
+    fn recognizes_unflagged_dword_divide_stack_layout() {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(edx, dword_ptr(r11)).expect("dividend high");
+        assembler.mov(eax, dword_ptr(r11 + 4)).expect("dividend low");
+        assembler.mov(ecx, dword_ptr(r11 + 8)).expect("divisor");
+        assembler.add(r11, 4).expect("free one slot");
+        assembler.div(ecx).expect("unsigned divide");
+        assembler.mov(dword_ptr(r11), edx).expect("remainder");
+        assembler.mov(dword_ptr(r11 + 4), eax).expect("quotient");
+        assembler.mov(r10d, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let trace = trace_from_assembler(assembler);
+        let boundary = trace.instructions().nth(7).expect("dispatch load").rva;
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![
+                    Register::R11,
+                    Register::R14,
+                    Register::R15,
+                    Register::RBP,
+                ],
+                live_out_rflags: 0,
+            },
+        );
+        let summary = extract_handler_effects(
+            &trace,
+            &slice,
+            HandlerEffectRoles {
+                vsp: Register::R11,
+                context_base: Register::RSP,
+            },
+            crate::HandlerRegisterRoles {
+                vip: Register::R15,
+                rolling_key: Register::RBP,
+                handler: Register::R14,
+            },
+            boundary,
+        );
+        let analysis = classify_handler_effects(trace.entry, &summary, None, Some(4));
+        let proof =
+            crate::prove_handler_value_flow(&trace, &slice, &summary, &analysis, None, None, false);
+
+        assert_eq!(summary.arithmetic_operations, ["Div"]);
+        assert!(!summary.captures_native_flags_to_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::UnsignedDivide);
+        assert_eq!(analysis.operation_width, Some(BitWidth::W32));
+        assert_eq!(analysis.stack_delta, Some(4));
+        assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
+        assert!(proof.proven, "{:?}", proof.evidence);
+    }
+
+    /// Same divide shape, but the handler stores the quotient and remainder in
+    /// the opposite cells. The width-level shape still looks like a divide, so
+    /// value-flow is what must reject it: it proves the result-register mapping
+    /// and finds EAX/EDX in the wrong slots, so the flow is not proven and the
+    /// pipeline keeps the handler Unknown (fail closed) rather than lift a swap.
+    #[test]
+    fn rejects_unflagged_divide_with_swapped_result_cells() {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(edx, dword_ptr(r11)).expect("dividend high");
+        assembler.mov(eax, dword_ptr(r11 + 4)).expect("dividend low");
+        assembler.mov(ecx, dword_ptr(r11 + 8)).expect("divisor");
+        assembler.add(r11, 4).expect("free one slot");
+        assembler.div(ecx).expect("unsigned divide");
+        assembler.mov(dword_ptr(r11), eax).expect("quotient in remainder cell");
+        assembler.mov(dword_ptr(r11 + 4), edx).expect("remainder in quotient cell");
+        assembler.mov(r10d, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let trace = trace_from_assembler(assembler);
+        let boundary = trace.instructions().nth(7).expect("dispatch load").rva;
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![
+                    Register::R11,
+                    Register::R14,
+                    Register::R15,
+                    Register::RBP,
+                ],
+                live_out_rflags: 0,
+            },
+        );
+        let summary = extract_handler_effects(
+            &trace,
+            &slice,
+            HandlerEffectRoles {
+                vsp: Register::R11,
+                context_base: Register::RSP,
+            },
+            crate::HandlerRegisterRoles {
+                vip: Register::R15,
+                rolling_key: Register::RBP,
+                handler: Register::R14,
+            },
+            boundary,
+        );
+        let analysis = classify_handler_effects(trace.entry, &summary, None, Some(4));
+        let proof =
+            crate::prove_handler_value_flow(&trace, &slice, &summary, &analysis, None, None, false);
+
+        assert_eq!(analysis.semantic, VmHandlerSemantic::UnsignedDivide);
+        assert!(
+            !proof.proven,
+            "swapped quotient/remainder must not prove sound"
+        );
     }
 
     #[test]

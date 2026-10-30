@@ -936,10 +936,14 @@ fn unsigned_divide_flow(
     let operation_index = if let Some(rva) = summary.captured_flags_source {
         instruction_index(active, rva)?
     } else {
+        // Unflagged divide: a single DIV, at any VMProtect divide width. Which
+        // stored cell is the quotient and which is the remainder is still proven
+        // below from the DIV's result registers, so admitting 16/32-bit here
+        // never relaxes the soundness of the result mapping.
         let mut divides = (0..active.len())
             .filter(|index| active[*index].instruction.mnemonic() == Mnemonic::Div);
         let only = divides.next()?;
-        if divides.next().is_some() || width != BitWidth::W64 {
+        if divides.next().is_some() {
             return None;
         }
         only
