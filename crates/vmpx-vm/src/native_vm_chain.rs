@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use thiserror::Error;
-use vmpx_pe::PeImage;
+use vmpx_pe::{PeImage, Rva};
 
 use crate::{
     BinaryOp, BitWidth, EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprError,
@@ -109,10 +109,32 @@ fn compose_replacements(
     prior_exit: &NativeExitState,
     next_profile: &RecoveredEntryProfile,
 ) -> Result<BTreeMap<String, Expr>, NativeVmEntryContinuationError> {
-    let next_frame_size = next_profile
+    let continuation = next_profile
         .native_frame
         .slots
-        .len()
+        .iter()
+        .find_map(|slot| match slot.source {
+            NativeFrameSource::ReturnAddress { continuation, .. } => Some(continuation),
+            _ => None,
+        })
+        .ok_or(NativeVmEntryContinuationError::MissingCallContinuation)?;
+    frame_replacements(
+        pe,
+        prior_symbolic,
+        prior_exit,
+        next_profile.native_frame.slots.len(),
+        Some(continuation),
+    )
+}
+
+fn frame_replacements(
+    pe: &PeImage<'_>,
+    prior_symbolic: &SymbolicVmExecutionReport,
+    prior_exit: &NativeExitState,
+    next_slots: usize,
+    continuation: Option<Rva>,
+) -> Result<BTreeMap<String, Expr>, NativeVmEntryContinuationError> {
+    let next_frame_size = next_slots
         .checked_mul(8)
         .and_then(|value| i64::try_from(value).ok())
         .ok_or(NativeVmEntryContinuationError::FrameSize)?;
@@ -123,27 +145,24 @@ fn compose_replacements(
             .checked_sub(next_frame_size)
             .ok_or(NativeVmEntryContinuationError::StackComposition)?,
     )?;
-    let continuation = next_profile
-        .native_frame
-        .slots
-        .iter()
-        .find_map(|slot| match slot.source {
-            NativeFrameSource::ReturnAddress { continuation, .. } => Some(continuation),
-            _ => None,
-        })
-        .and_then(|rva| pe.optional.image_base.checked_add_rva(rva))
-        .ok_or(NativeVmEntryContinuationError::MissingCallContinuation)?;
     let mut replacements = BTreeMap::from([
         ("vsp_initial".to_owned(), next_vsp),
         (
             "native_rflags_initial".to_owned(),
             prior_exit.rflags.clone(),
         ),
-        (
+    ]);
+    if let Some(continuation) = continuation {
+        let continuation = pe
+            .optional
+            .image_base
+            .checked_add_rva(continuation)
+            .ok_or(NativeVmEntryContinuationError::MissingCallContinuation)?;
+        replacements.insert(
             "native_return_address_initial".to_owned(),
             Expr::constant(BitWidth::W64, continuation.get()),
-        ),
-    ]);
+        );
+    }
     for register in X64NativeRegister::ALL {
         let value = prior_exit
             .registers
@@ -153,6 +172,29 @@ fn compose_replacements(
         replacements.insert(register.symbolic_name().to_owned(), value);
     }
     Ok(replacements)
+}
+
+/// Re-bases a nested entry's recovered native frame (`frame`, with symbolic
+/// stack base, register, flags and return-address inputs) onto the exact state
+/// a proven VM exit left behind.
+///
+/// # Errors
+///
+/// Fails closed on a missing exit register, stack-size overflow, or a
+/// substitution/overlay width error.
+pub(crate) fn compose_native_frame(
+    pe: &PeImage<'_>,
+    prior_symbolic: &SymbolicVmExecutionReport,
+    prior_exit: &NativeExitState,
+    mut frame: SymbolicVmInitialState,
+    next_slots: usize,
+    continuation: Option<Rva>,
+) -> Result<SymbolicVmInitialState, NativeVmEntryContinuationError> {
+    let replacements =
+        frame_replacements(pe, prior_symbolic, prior_exit, next_slots, continuation)?;
+    frame = frame.substitute(&replacements)?;
+    overlay_prior_memory(&mut frame, prior_symbolic)?;
+    Ok(frame)
 }
 
 /// Continues semantic VM exploration across a proven native VM-exit `RET`

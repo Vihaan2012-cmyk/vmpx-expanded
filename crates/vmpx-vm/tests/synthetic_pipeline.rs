@@ -443,3 +443,45 @@ fn cfg_walk_refuses_a_constant_target_outside_the_bytecode_section() {
         "{cfg:#?}"
     );
 }
+
+#[test]
+fn cfg_walk_composes_a_vm_exit_into_a_nested_vm_entry() {
+    let vm = synth_vm::build_nested();
+    let cfg = walk_cfg(&vm);
+    assert!(cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+    assert_eq!(cfg.blocks.len(), 2, "{cfg:#?}");
+    let [edge] = cfg.edges.as_slice() else {
+        panic!("one nested edge expected: {cfg:#?}");
+    };
+    assert_eq!(edge.kind, CfgEdgeKind::NestedEntry);
+    assert_eq!(edge.from, cfg.entry);
+    assert_eq!(cfg.exit_layouts().len(), 1);
+    assert_eq!(cfg.blocks[&edge.to].exit, BlockExit::VmExit);
+}
+
+#[test]
+fn cfg_walk_ends_at_a_vm_exit_whose_target_is_not_a_vm_entry() {
+    let cfg = walk_cfg(&synth_vm::build_linear());
+    assert!(cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+    assert!(
+        cfg.edges
+            .iter()
+            .all(|edge| edge.kind != CfgEdgeKind::NestedEntry),
+        "{cfg:#?}"
+    );
+}
+
+#[test]
+fn cfg_walk_does_not_follow_a_nested_entry_past_the_nesting_limit() {
+    let vm = synth_vm::build_nested();
+    let pe = parse(&vm);
+    let entry = entry_candidate(&pe);
+    let limits = VmCfgLimits {
+        max_nested_entries: 0,
+        ..VmCfgLimits::default()
+    };
+    let cfg = recover_vm_cfg(&pe, &entry, limits).expect("cfg recovery starts");
+    assert_eq!(cfg.blocks.len(), 1, "{cfg:#?}");
+    assert!(cfg.edges.is_empty());
+    assert!(!cfg.is_complete(), "{cfg:#?}");
+}

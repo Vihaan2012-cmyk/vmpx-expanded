@@ -118,6 +118,7 @@ struct Layout {
     branch: u64,
     exit: u64,
     oeps: [u64; 2],
+    nested_entry: Option<u64>,
     bytecode: u64,
 }
 
@@ -152,6 +153,7 @@ pub struct SyntheticVm {
     pub push_handler_rva: u32,
     pub branch_handler_rva: u32,
     pub exit_handler_rva: u32,
+    pub nested_entry_rva: Option<u32>,
 }
 
 fn w8_codec() -> KeyedTransformCodec {
@@ -278,7 +280,11 @@ fn bind(asm: &mut CodeAssembler, label: &mut CodeLabel) -> Result<(), IcedError>
 }
 
 #[allow(clippy::too_many_lines)]
-fn assemble(seed: u32, bytecode: &[u8]) -> Result<(Vec<u8>, Layout), IcedError> {
+fn assemble(
+    seed: u32,
+    nested_seed: Option<u32>,
+    bytecode: &[u8],
+) -> Result<(Vec<u8>, Layout), IcedError> {
     let mut asm = CodeAssembler::new(64)?;
     let mut entry = asm.create_label();
     let mut boot = asm.create_label();
@@ -291,6 +297,7 @@ fn assemble(seed: u32, bytecode: &[u8]) -> Result<(Vec<u8>, Layout), IcedError> 
     let mut exit = asm.create_label();
     let mut oep0 = asm.create_label();
     let mut oep1 = asm.create_label();
+    let mut nested = asm.create_label();
     let mut data = asm.create_label();
     let anchor_ref = anchor;
     let boot_ref = boot;
@@ -367,6 +374,13 @@ fn assemble(seed: u32, bytecode: &[u8]) -> Result<(Vec<u8>, Layout), IcedError> 
     asm.mov(eax, 9)?;
     asm.ret()?;
 
+    if let Some(nested_seed) = nested_seed {
+        bind(&mut asm, &mut nested)?;
+        asm.push(nested_seed.cast_signed())?;
+        asm.call(boot_ref)?;
+        asm.ret()?;
+    }
+
     bind(&mut asm, &mut data)?;
     asm.db(bytecode)?;
 
@@ -384,6 +398,7 @@ fn assemble(seed: u32, bytecode: &[u8]) -> Result<(Vec<u8>, Layout), IcedError> 
         branch: result.label_ip(&branch)?,
         exit: result.label_ip(&exit)?,
         oeps: [result.label_ip(&oep0)?, result.label_ip(&oep1)?],
+        nested_entry: nested_seed.map(|_| result.label_ip(&nested)).transpose()?,
         bytecode: result.label_ip(&data)?,
     };
     Ok((result.inner.code_buffer, layout))
@@ -490,6 +505,7 @@ fn encode_blocks(blocks: &[Block], layout: &Layout) -> (Vec<u8>, Vec<u64>) {
                 Op::Push(_) | Op::PushOep(_) => {
                     let operand = match *op {
                         Op::Push(value) => value,
+                        Op::PushOep(2) => layout.nested_entry.expect("nested stub"),
                         Op::PushOep(which) => layout.oeps[which],
                         _ => unreachable!(),
                     };
@@ -562,13 +578,20 @@ fn rva(va: u64) -> u32 {
 }
 
 fn build(blocks: &[Block]) -> SyntheticVm {
+    build_with(blocks, false)
+}
+
+/// With `nested`, a second entry stub seeds block `1`.
+fn build_with(blocks: &[Block], nested: bool) -> SyntheticVm {
     let placeholder = vec![0_u8; blocks.iter().map(|block| block_len(block)).sum()];
-    let (_, first) = assemble(TEXT_RVA, &placeholder).expect("layout pass");
+    let stub = nested.then_some(TEXT_RVA);
+    let (_, first) = assemble(TEXT_RVA, stub, &placeholder).expect("layout pass");
     let seed = rva(first.bytecode);
-    let (_, layout) = assemble(seed, &placeholder).expect("seed pass");
+    let (_, layout) = assemble(seed, stub, &placeholder).expect("seed pass");
     let (bytecode, block_vas) = encode_blocks(blocks, &layout);
     assert_eq!(bytecode.len(), placeholder.len());
-    let (text, final_layout) = assemble(seed, &bytecode).expect("final pass");
+    let nested_seed = nested.then(|| rva(block_vas[1]));
+    let (text, final_layout) = assemble(seed, nested_seed, &bytecode).expect("final pass");
     assert_eq!(final_layout.bytecode, layout.bytecode);
     SyntheticVm {
         image: wrap_pe(&text, rva(final_layout.entry)),
@@ -584,6 +607,7 @@ fn build(blocks: &[Block]) -> SyntheticVm {
         push_handler_rva: rva(final_layout.push),
         branch_handler_rva: rva(final_layout.branch),
         exit_handler_rva: rva(final_layout.exit),
+        nested_entry_rva: final_layout.nested_entry.map(rva),
     }
 }
 
@@ -607,4 +631,12 @@ pub fn build_const_branch(target: Option<u64>) -> SyntheticVm {
     build(&const_branch_program(
         target.unwrap_or(placeholder.block_vas[1]),
     ))
+}
+
+/// Block `0` exits into a second VM entry stub (`nested_entry_rva`) that seeds
+/// block `1`, which exits to `oep_rvas[0]`.
+pub fn build_nested() -> SyntheticVm {
+    let mut outer = scatter();
+    outer.extend(restore_frame(2, FORCED_RAX));
+    build_with(&[outer, linear_program().remove(0)], true)
 }

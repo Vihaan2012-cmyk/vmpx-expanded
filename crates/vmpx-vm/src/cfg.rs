@@ -17,9 +17,10 @@ use vmpx_pe::{PeImage, Va};
 use crate::{
     BinaryOp, BitWidth, DecodedVmInstruction, DispatchExtractionCandidate,
     EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprKind, InputDomainLimits,
-    LinearDecodeCache, LinearDecodeStop, NativeCallSelectorOutcome, NativeFrameSource,
-    RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits, SymbolicVmExecutionReport,
-    SymbolicVmInitialState, VmEntryCandidate, VmExitReport, VmHandlerSemantic,
+    LinearDecodeCache, LinearDecodeStop, ModuloImageTargetLimits, NativeCallSelectorOutcome,
+    NativeFrameSource, RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits,
+    SymbolicVmExecutionReport, SymbolicVmInitialState, VmDiscoveryLimits, VmEntryCandidate,
+    VmExitReport, VmHandlerSemantic, analyze_vm_entry_at,
     dispatch_extract::canonical,
     entry_profile::{bootstrap_global_table, entry_stream_config, prepare_entry_stream},
     enumerate_symbolic_value, execute_symbolic_linear_block_with_initial_state,
@@ -28,7 +29,9 @@ use crate::{
         Provenance, caller_push_source, defines_flags, initial_provenance, is_cursor_capture,
         observe_target_push, update_provenance,
     },
-    recover_and_decode_linear_vm_stream_cached,
+    native_vm_chain::compose_native_frame,
+    recover_and_decode_linear_vm_stream_cached, recover_modulo_image_targets,
+    recover_native_exit_state,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +48,8 @@ pub struct VmCfgLimits {
     pub max_total_instructions: usize,
     /// Distinct targets one branch may resolve to.
     pub max_targets: usize,
+    /// VM-to-VM re-entries followed across the whole walk.
+    pub max_nested_entries: usize,
 }
 
 impl Default for VmCfgLimits {
@@ -58,6 +63,7 @@ impl Default for VmCfgLimits {
             max_visits_per_block: 16,
             max_total_instructions: 200_000,
             max_targets: 16,
+            max_nested_entries: 8,
         }
     }
 }
@@ -96,6 +102,8 @@ pub enum CfgEdgeKind {
     GuardedBranch,
     /// Control resumes after a proven native call.
     NativeCallReturn,
+    /// A proven VM exit returns into another VM entry of the same VM.
+    NestedEntry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -369,6 +377,8 @@ fn bytecode_section(pe: &PeImage<'_>, vip: Va) -> Option<usize> {
         .map(|section| section.index)
 }
 
+const NESTED_ENTRY_CONFIDENCE: u8 = 60;
+
 struct Item {
     start: RelativeDispatchState,
     address: Option<Va>,
@@ -380,6 +390,8 @@ struct Walker<'a, 'p> {
     limits: VmCfgLimits,
     config: crate::HandlerCodecRecoveryConfig,
     global_table: Option<crate::GlobalTableBase>,
+    profile: crate::VmProfile,
+    nested_followed: usize,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
     cache: LinearDecodeCache,
@@ -600,7 +612,9 @@ impl Walker<'_, '_> {
             }
         };
         match boundary {
-            Some(VmHandlerSemantic::VmExit) => {}
+            Some(VmHandlerSemantic::VmExit) => {
+                self.follow_nested_entry(key, final_state.vip, &symbolic, pending);
+            }
             Some(VmHandlerSemantic::UnconditionalBranch) => {
                 self.follow_branch(key, final_state, &symbolic, pending);
             }
@@ -733,6 +747,130 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// Follows a proven VM exit whose return target is another entry stub of
+    /// the same VM. A target that is not provably such an entry ends the path
+    /// as an ordinary native return; a proven entry that cannot be composed
+    /// stalls.
+    fn follow_nested_entry(
+        &mut self,
+        key: Va,
+        vip: Va,
+        symbolic: &SymbolicVmExecutionReport,
+        pending: &mut Vec<Item>,
+    ) {
+        let Some(layout) = self
+            .cfg
+            .blocks
+            .get(&key)
+            .and_then(|block| block.vm_exit.clone())
+        else {
+            return;
+        };
+        let Ok(exit) = recover_native_exit_state(symbolic, &layout) else {
+            return;
+        };
+        let simplified = exit.return_address.simplify();
+        let target = if let ExprKind::Const { value } = simplified.kind {
+            self.pe.optional.image_base.checked_rva_of(Va(value))
+        } else {
+            recover_modulo_image_targets(
+                self.pe,
+                &exit.return_address,
+                ModuloImageTargetLimits::default(),
+            )
+            .ok()
+            .filter(|report| report.complete && report.targets.len() == 1)
+            .and_then(|report| report.targets[0].rva)
+        };
+        let Some(candidate) = target
+            .and_then(|rva| analyze_vm_entry_at(self.pe, rva, VmDiscoveryLimits::default()))
+            .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)
+        else {
+            return;
+        };
+        let at = candidate.rva;
+        if self.nested_followed >= self.limits.max_nested_entries {
+            self.stall(
+                key,
+                vip,
+                format!("nested VM entry {at} exceeds the nesting limit"),
+            );
+            return;
+        }
+        let setup = match prepare_entry_stream(self.pe, &candidate, self.limits.entry) {
+            Ok(setup) => setup,
+            Err(error) => {
+                self.stall(
+                    key,
+                    vip,
+                    format!("nested VM entry {at} setup failed: {error}"),
+                );
+                return;
+            }
+        };
+        if setup.profile != self.profile
+            || bootstrap_global_table(&setup.bootstrap) != self.global_table
+            || bytecode_section(self.pe, setup.bootstrap.initial_state.vip) != self.section
+        {
+            self.stall(
+                key,
+                vip,
+                format!("nested VM entry {at} is not proven to share this VM's profile"),
+            );
+            return;
+        }
+        let cells = match recover_entry_frame(
+            self.pe,
+            &candidate,
+            setup.profile.effect_roles.vsp,
+            self.limits.entry.trace,
+        ) {
+            Ok(cells) => cells,
+            Err(error) => {
+                self.stall(
+                    key,
+                    vip,
+                    format!("nested VM entry {at} frame unproven: {error}"),
+                );
+                return;
+            }
+        };
+        let continuation = cells.iter().find_map(|cell| match cell {
+            NativeFrameSource::ReturnAddress { continuation, .. } => Some(*continuation),
+            _ => None,
+        });
+        let (frame, _) = frame_initial_state(&cells);
+        let initial = match compose_native_frame(
+            self.pe,
+            symbolic,
+            &exit,
+            frame,
+            cells.len(),
+            continuation,
+        ) {
+            Ok(initial) => initial,
+            Err(error) => {
+                self.stall(
+                    key,
+                    vip,
+                    format!("nested VM entry {at} composition failed: {error}"),
+                );
+                return;
+            }
+        };
+        self.nested_followed += 1;
+        self.cfg.edges.push(CfgEdge {
+            from: key,
+            to: setup.first_state.vip,
+            kind: CfgEdgeKind::NestedEntry,
+        });
+        pending.push(Item {
+            start: setup.first_state,
+            address: Some(setup.bootstrap.initial_state.vip),
+            symbolic: initial,
+        });
+    }
+
     fn follow_native_call(
         &mut self,
         key: Va,
@@ -827,6 +965,8 @@ pub fn recover_vm_cfg(
         limits,
         config: entry_stream_config(&setup.profile, limits.entry),
         global_table: bootstrap_global_table(&setup.bootstrap),
+        profile: setup.profile,
+        nested_followed: 0,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
         cache: LinearDecodeCache::default(),
