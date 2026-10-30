@@ -12,8 +12,10 @@ pub mod dead_code;
 pub mod substitution;
 
 pub use cfg_recovery::{
-    CfgError, CfgLimits, EdgeKind, NativeBlock, NativeCfg, Terminator, VmAlgebra,
-    lift_native_block, recover_native_cfg, recover_native_cfg_pe, recover_native_cfg_with,
+    CfgError, CfgLimits, CfgOptions, EdgeKind, NativeBlock, NativeCfg, Terminator, VmAlgebra,
+    lift_native_block, lift_native_block_with, recover_native_cfg, recover_native_cfg_opts,
+    recover_native_cfg_pe, recover_native_cfg_pe_with, recover_native_cfg_proven,
+    recover_native_cfg_with,
 };
 pub use vmpx_vm::{BitWidth, Expr};
 

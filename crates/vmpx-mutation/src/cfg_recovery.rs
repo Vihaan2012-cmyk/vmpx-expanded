@@ -7,8 +7,8 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic,
 };
 use vmpx_disasm::{
-    Algebra, AlgebraError, BinOp, BlockSemantics, LiftError, Resize, UnOp, Width, lift_block,
-    lift_bytes,
+    Algebra, AlgebraError, BinOp, BlockSemantics, LiftError, LiftOptions, Resize, UnOp, Width,
+    lift_block_with, lift_bytes_with,
 };
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, ResizeOp, UnaryOp};
@@ -102,13 +102,60 @@ impl Algebra for VmAlgebra {
     }
 }
 
+/// Modeling assumptions for native lifting and CFG recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CfgOptions {
+    /// Allow the lifter's labeled stack-disjoint alias relaxation (see
+    /// [`vmpx_disasm::LiftOptions::assume_stack_disjoint`]). Blocks that used it carry
+    /// [`NativeBlock::assumes_stack_disjoint`].
+    pub assume_stack_disjoint: bool,
+}
+
+impl CfgOptions {
+    /// Only proven lifts; no modeling assumption.
+    pub const PROVEN: Self = Self {
+        assume_stack_disjoint: false,
+    };
+    /// Stack-disjoint relaxation on (the default of the recovery entry points).
+    pub const ASSUME_STACK_DISJOINT: Self = Self {
+        assume_stack_disjoint: true,
+    };
+}
+
+impl Default for CfgOptions {
+    fn default() -> Self {
+        Self::ASSUME_STACK_DISJOINT
+    }
+}
+
+impl From<CfgOptions> for LiftOptions {
+    fn from(o: CfgOptions) -> Self {
+        Self {
+            assume_stack_disjoint: o.assume_stack_disjoint,
+        }
+    }
+}
+
 /// Lifts a straight-line native x64 block to [`Expr`] semantics. Registers are
-/// expressed over `<reg>_in` inputs (e.g. `rcx_in`).
+/// expressed over `<reg>_in` inputs (e.g. `rcx_in`). Enables the labeled
+/// stack-disjoint assumption; check [`BlockSemantics::assumes_stack_disjoint`].
 ///
 /// # Errors
 /// See [`vmpx_disasm::lift_bytes`]; fails closed on anything unmodeled.
 pub fn lift_native_block(bytes: &[u8], ip: u64) -> Result<BlockSemantics<Expr>, LiftError> {
-    lift_bytes(&VmAlgebra, bytes, ip)
+    lift_native_block_with(bytes, ip, CfgOptions::default())
+}
+
+/// [`lift_native_block`] with explicit [`CfgOptions`].
+///
+/// # Errors
+/// As [`lift_native_block`].
+pub fn lift_native_block_with(
+    bytes: &[u8],
+    ip: u64,
+    options: CfgOptions,
+) -> Result<BlockSemantics<Expr>, LiftError> {
+    lift_bytes_with(&VmAlgebra, bytes, ip, options.into())
 }
 
 /// How a native basic block ends. Only proven direct targets produce edges.
@@ -146,6 +193,9 @@ pub struct NativeBlock {
     /// Lift of the straight-line body (terminator excluded); `None` if the lifter refused it.
     pub semantics: Option<BlockSemantics<Expr>>,
     pub terminator: Terminator,
+    /// The lift relied on the stack-disjoint assumption (mirrors
+    /// `semantics.assumes_stack_disjoint`; `false` when not lifted).
+    pub assumes_stack_disjoint: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +203,9 @@ pub struct NativeCfg {
     pub blocks: BTreeMap<u64, NativeBlock>,
     pub edges: Vec<(u64, u64, EdgeKind)>,
     pub entry: u64,
+    /// OR of the blocks' [`NativeBlock::assumes_stack_disjoint`]: some block's lift is
+    /// only valid if the function's frame is not reachable via non-`rsp`-derived pointers.
+    pub assumes_stack_disjoint: bool,
 }
 
 impl NativeCfg {
@@ -232,12 +285,32 @@ fn classify(ins: &Instruction) -> Flow {
     }
 }
 
-/// Recovers the CFG of the native function at `entry` in `code` (mapped at `base_ip`).
+/// Recovers the CFG of the native function at `entry` in `code` (mapped at `base_ip`),
+/// with the labeled stack-disjoint assumption on (see [`CfgOptions`]); the label is
+/// surfaced as [`NativeCfg::assumes_stack_disjoint`].
 ///
 /// # Errors
 /// See [`recover_native_cfg_with`].
 pub fn recover_native_cfg(code: &[u8], base_ip: u64, entry: u64) -> Result<NativeCfg, CfgError> {
     recover_native_cfg_with(code, base_ip, entry, CfgLimits::default())
+}
+
+/// [`recover_native_cfg`] with no modeling assumption: only proven lifts.
+///
+/// # Errors
+/// See [`recover_native_cfg_with`].
+pub fn recover_native_cfg_proven(
+    code: &[u8],
+    base_ip: u64,
+    entry: u64,
+) -> Result<NativeCfg, CfgError> {
+    recover_native_cfg_opts(
+        code,
+        base_ip,
+        entry,
+        CfgLimits::default(),
+        CfgOptions::PROVEN,
+    )
 }
 
 /// Like [`recover_native_cfg`] with explicit size limits. Only constant `jmp`/`jcc`
@@ -246,12 +319,26 @@ pub fn recover_native_cfg(code: &[u8], base_ip: u64, entry: u64) -> Result<Nativ
 ///
 /// # Errors
 /// Entry outside `code`, overlapping decodes, or exceeding `limits`.
-#[allow(clippy::too_many_lines)]
 pub fn recover_native_cfg_with(
     code: &[u8],
     base_ip: u64,
     entry: u64,
     limits: CfgLimits,
+) -> Result<NativeCfg, CfgError> {
+    recover_native_cfg_opts(code, base_ip, entry, limits, CfgOptions::default())
+}
+
+/// [`recover_native_cfg_with`] with explicit [`CfgOptions`].
+///
+/// # Errors
+/// As [`recover_native_cfg_with`].
+#[allow(clippy::too_many_lines)]
+pub fn recover_native_cfg_opts(
+    code: &[u8],
+    base_ip: u64,
+    entry: u64,
+    limits: CfgLimits,
+    options: CfgOptions,
 ) -> Result<NativeCfg, CfgError> {
     let end_ip = base_ip.saturating_add(code.len() as u64);
     let in_range = |ip: u64| ip >= base_ip && ip < end_ip;
@@ -362,7 +449,7 @@ pub fn recover_native_cfg_with(
                 }
             }
         };
-        let semantics = match lift_block(&VmAlgebra, &body) {
+        let semantics = match lift_block_with(&VmAlgebra, &body, options.into()) {
             Ok(sem) => Some(sem),
             Err(e) => {
                 terminator = Terminator::Unsupported(e.to_string());
@@ -385,15 +472,20 @@ pub fn recover_native_cfg_with(
             NativeBlock {
                 start,
                 end: ip,
+                assumes_stack_disjoint: semantics
+                    .as_ref()
+                    .is_some_and(|s| s.assumes_stack_disjoint),
                 semantics,
                 terminator,
             },
         );
     }
+    let assumes_stack_disjoint = blocks.values().any(|b| b.assumes_stack_disjoint);
     Ok(NativeCfg {
         blocks,
         edges,
         entry,
+        assumes_stack_disjoint,
     })
 }
 
@@ -404,6 +496,18 @@ pub fn recover_native_cfg_with(
 /// [`CfgError::Pe`] if `entry` is not in a file-backed executable section, else as
 /// [`recover_native_cfg_with`].
 pub fn recover_native_cfg_pe(pe: &PeImage<'_>, entry: Rva) -> Result<NativeCfg, CfgError> {
+    recover_native_cfg_pe_with(pe, entry, CfgOptions::default())
+}
+
+/// [`recover_native_cfg_pe`] with explicit [`CfgOptions`].
+///
+/// # Errors
+/// As [`recover_native_cfg_pe`].
+pub fn recover_native_cfg_pe_with(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    options: CfgOptions,
+) -> Result<NativeCfg, CfgError> {
     if !vmpx_disasm::is_executable_rva(pe, entry) {
         return Err(CfgError::Pe(format!(
             "{entry} is not in an executable section"
@@ -437,7 +541,7 @@ pub fn recover_native_cfg_pe(pe: &PeImage<'_>, entry: Rva) -> Result<NativeCfg, 
         .image_base
         .checked_add_rva(entry)
         .ok_or_else(|| CfgError::Pe("entry VA overflows".to_owned()))?;
-    recover_native_cfg(code, base.0, entry_va.0)
+    recover_native_cfg_opts(code, base.0, entry_va.0, CfgLimits::default(), options)
 }
 
 // WAVE2: WP5 — decode a mutation-protected function to a native CFG (reuse
@@ -585,6 +689,42 @@ mod tests {
             Terminator::FallThrough(0x1002)
         );
         assert!(cfg.edges.contains(&(0x1002, 0x1002, EdgeKind::Taken)));
+    }
+
+    // sub rsp,0x28; mov [rsp+0x20],rcx; mov rax,[rdx]; mov rbx,[rsp+0x20]; ret
+    const FRAME: &[u8] = &[
+        0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0x4C, 0x24, 0x20, 0x48, 0x8B, 0x02, 0x48, 0x8B, 0x5C,
+        0x24, 0x20, 0xC3,
+    ];
+    // mov [rcx],rbx; mov rax,[rdx]; ret
+    const ALIAS: &[u8] = &[0x48, 0x89, 0x19, 0x48, 0x8B, 0x02, 0xC3];
+
+    #[test]
+    fn stack_disjoint_load_lifts_with_label_and_proven_mode_refuses() {
+        let cfg = recover_native_cfg(FRAME, 0x1000, 0x1000).expect("cfg");
+        let b = &cfg.blocks[&0x1000];
+        assert!(b.semantics.is_some() && b.assumes_stack_disjoint);
+        assert!(cfg.assumes_stack_disjoint && cfg.is_complete());
+
+        let cfg = recover_native_cfg_proven(FRAME, 0x1000, 0x1000).expect("cfg");
+        let b = &cfg.blocks[&0x1000];
+        assert!(b.semantics.is_none() && !b.assumes_stack_disjoint);
+        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+
+        assert!(
+            lift_native_block(&FRAME[..FRAME.len() - 1], 0x1000)
+                .is_ok_and(|s| s.assumes_stack_disjoint)
+        );
+        assert!(
+            lift_native_block_with(&FRAME[..FRAME.len() - 1], 0x1000, CfgOptions::PROVEN).is_err()
+        );
+    }
+
+    #[test]
+    fn genuine_alias_fails_closed_even_with_assumption() {
+        let cfg = recover_native_cfg(ALIAS, 0x1000, 0x1000).expect("cfg");
+        assert!(cfg.blocks[&0x1000].semantics.is_none());
+        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
     }
 
     #[test]
