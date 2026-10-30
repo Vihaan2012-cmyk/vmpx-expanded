@@ -400,6 +400,43 @@ impl LoweringContext<'_> {
         Ok(())
     }
 
+    /// Lowers a wide multiply whose double-width product is packed into a qword.
+    ///
+    /// The symbolic executor names this `x86_{signed,unsigned}_multiply_wN_K`
+    /// only for operand widths up to 32 bits, where the full `N x N` product
+    /// fits in 64 bits and both halves are read back with `extract`. Widening
+    /// each operand to 64 bits (sign-extended for the signed form, zero-extended
+    /// otherwise) and taking the low 64 bits of a 64-bit multiply yields exactly
+    /// that packed product, so a single two-operand `imul` is a faithful lowering.
+    fn lower_wide_multiply(
+        &mut self,
+        name: &str,
+        signed: bool,
+        operand_width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "a wide multiply takes two operands"));
+        };
+        if left.width != operand_width
+            || right.width != operand_width
+            || expression.width != BitWidth::W64
+        {
+            return Err(malformed(name, "wide-multiply operand widths disagree"));
+        }
+        let extend = if signed {
+            ResizeOp::SignExtend
+        } else {
+            ResizeOp::ZeroExtend
+        };
+        let widen = |value: &Expr| Expr::resize(extend, BitWidth::W64, value.clone());
+        let product = widen(left)
+            .and_then(|left| widen(right).and_then(|right| Expr::binary(BinaryOp::Mul, left, right)))
+            .map_err(|_| malformed(name, "wide-multiply widening failed"))?;
+        self.lower(&product)
+    }
+
     /// Lowers an intrinsic that stands for an imported call's return value.
     ///
     /// The intrinsic's leading arguments become the call arguments, the call is
@@ -492,6 +529,24 @@ fn status_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
         _ => return None,
     };
     Some((subtract, width))
+}
+
+/// `x86_signed_multiply_wN_K` / `x86_unsigned_multiply_wN_K`: signedness and
+/// operand width of a wide multiply. Only widths up to 32 bits are named this
+/// way; the 64-bit form splits its result into `_low`/`_high` intrinsics.
+fn wide_multiply_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
+    let (signed, rest) = if let Some(rest) = name.strip_prefix("x86_signed_multiply_w") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix("x86_unsigned_multiply_w")?)
+    };
+    let width = match rest.split('_').next()? {
+        "8" => BitWidth::W8,
+        "16" => BitWidth::W16,
+        "32" => BitWidth::W32,
+        _ => return None,
+    };
+    Some((signed, width))
 }
 
 fn native_width(width: BitWidth) -> Width {
@@ -599,6 +654,8 @@ impl LoweringContext<'_> {
                     self.passthroughs.insert(name.clone());
                 } else if let Some((subtract, width)) = status_flags_intrinsic(name) {
                     self.lower_status_flags(name, subtract, width, expression, arguments)?;
+                } else if let Some((signed, width)) = wide_multiply_intrinsic(name) {
+                    self.lower_wide_multiply(name, signed, width, expression, arguments)?;
                 } else {
                     return Err(ExpressionCodegenError::UnsupportedIntrinsic {
                         name: name.clone(),
@@ -1152,6 +1209,40 @@ mod tests {
                     .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Pushfq)
             );
         }
+    }
+
+    #[test]
+    fn wide_multiply_lowers_to_an_extend_and_sixty_four_bit_imul() {
+        // The packed double-width product is the low 64 bits of a 64-bit
+        // multiply of the widened operands: sign-extended (movsxd) for the
+        // signed form, zero-extended (32-bit mov) for the unsigned form.
+        let operands = || {
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+            ]
+        };
+        let signed = Expr::intrinsic(BitWidth::W64, "x86_signed_multiply_w32_1", operands());
+        let lowered = lowers_to(&signed, iced_x86::Mnemonic::Imul);
+        assert_eq!(lowered.result, VirtualRegister::qword(ACCUMULATOR_ID));
+        let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile signed multiply");
+        assert!(
+            decoded(&compiled.bytes)
+                .iter()
+                .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Movsxd),
+            "signed wide multiply sign-extends its operands"
+        );
+
+        let unsigned = Expr::intrinsic(BitWidth::W64, "x86_unsigned_multiply_w32_2", operands());
+        let lowered = lowers_to(&unsigned, iced_x86::Mnemonic::Imul);
+        let compiled =
+            compile(&lowered.function, CodeAddress(0)).expect("compile unsigned multiply");
+        assert!(
+            !decoded(&compiled.bytes)
+                .iter()
+                .any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Movsxd),
+            "unsigned wide multiply zero-extends rather than sign-extends"
+        );
     }
 
     #[test]

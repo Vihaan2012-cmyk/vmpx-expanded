@@ -527,6 +527,8 @@ fn current_implemented_capabilities() -> BTreeSet<LoweringCapability> {
         LoweringCapability::CpuidIntrinsic,
         LoweringCapability::NativeFlagsRestore,
         LoweringCapability::SegmentRelativeLoad,
+        LoweringCapability::WideUnsignedMultiply,
+        LoweringCapability::WideSignedMultiply,
     ]
     .into_iter()
     .collect()

@@ -154,7 +154,7 @@ fn a_gs_load_lifts_as_a_passthrough_environment_boundary() {
 fn an_unliftable_semantic_stops_the_lift_at_its_index() {
     let frame = [NativeFrameSource::Rflags];
     for semantic in [
-        VmHandlerSemantic::Mul,
+        VmHandlerSemantic::UnsignedDivide,
         VmHandlerSemantic::TableChecksum,
         VmHandlerSemantic::ReadTimestampCounter,
         VmHandlerSemantic::ConditionalBranch,
