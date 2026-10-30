@@ -420,6 +420,19 @@ fn affine(expr: &Expr) -> Option<Affine> {
                 ..inner
             })
         }
+        // `value[lsb .. lsb + bits]` of a pure view is `value >> lsb` kept to
+        // `bits` bits: a shifted view by `lsb`, exactly like `Shr` below. Only a
+        // pure, unshifted inner view stays affine once shifted (an offset or a
+        // reflection does not survive a right shift).
+        ExprKind::Extract { value, lsb } => {
+            let inner = affine(value)?;
+            (inner.is_pure() && inner.shift == 0 && *lsb < inner.span).then_some(Affine {
+                bits,
+                shift: *lsb,
+                span: (inner.span - *lsb).min(bits),
+                ..inner
+            })
+        }
         ExprKind::Resize { value, .. }
         | ExprKind::Concat {
             high: _,
@@ -1773,6 +1786,61 @@ mod tests {
         assert_eq!(view.bits, 32);
         // ~x + 10 == -x + 9
         assert_eq!(view.offset, 9);
+    }
+
+    #[test]
+    fn an_extract_above_the_low_bits_is_a_right_shifted_view() {
+        // `r14[32..64]` is `r14 >> 32` kept to 32 bits: a pure view shifted by 32.
+        let r14 = Expr::register(BitWidth::W64, "native_r14_initial");
+        let high = Expr::extract(BitWidth::W32, 32, r14).expect("extract");
+        let view = affine(&high).expect("affine");
+        assert_eq!(view.register, "native_r14_initial");
+        assert!(view.is_pure());
+        assert_eq!((view.shift, view.span, view.bits), (32, 32, 32));
+        // `rdi[16..48]` is `rdi >> 16` kept to 32 bits: shift 16, span 32.
+        let rdi = Expr::register(BitWidth::W64, "native_rdi_initial");
+        let mid = Expr::extract(BitWidth::W32, 16, rdi).expect("extract");
+        let view = affine(&mid).expect("affine");
+        assert_eq!((view.register.as_str(), view.shift, view.span, view.bits), ("native_rdi_initial", 16, 32, 32));
+    }
+
+    #[test]
+    fn a_high_word_flag_view_resolves_through_a_shifted_cover() {
+        // The first-branch shape seen in the corpus: `vm_flags_sub_w32(rdi[16..48], c)`.
+        let rdi = Expr::register(BitWidth::W64, "native_rdi_initial");
+        let view = Expr::extract(BitWidth::W32, 16, rdi).expect("extract");
+        let target = branch_on_sub_flags(view, 5);
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("a high-word view is an affine view of one register");
+        assert!(matches!(
+            inferred.certificates["native_rdi_initial"],
+            DomainCertificate::AddFlagsCover { bits: 32, .. }
+        ));
+        let domain = &inferred.domains["native_rdi_initial"];
+        assert!(!domain.is_empty());
+        for value in domain {
+            let ExprKind::Const { value } = value.kind else {
+                panic!("domain must be constants")
+            };
+            // The view observes only `rdi[16..48]`: the cover fixes the bits
+            // below and above it, so no out-of-view bit varies.
+            assert_eq!(value & 0xFFFF, 0, "low bits are below the view");
+            assert_eq!(value >> 48, 0, "bits above the view stay zero");
+        }
+    }
+
+    #[test]
+    fn a_shifted_reflected_view_is_not_affine_and_stays_refused() {
+        // `(~rdi)[16..48]` shifts a reflected view; a reflection does not survive
+        // a logical right shift, so it is not an affine view of one register and
+        // must fail closed rather than resolve the branch on an unproven domain.
+        let rdi = Expr::register(BitWidth::W64, "native_rdi_initial");
+        let reflected = Expr::unary(UnaryOp::Not, rdi);
+        let shifted = Expr::extract(BitWidth::W32, 16, reflected).expect("extract");
+        assert!(affine(&shifted).is_none());
+        let (_, reason) =
+            unsupported_reason(&branch_on_sub_flags(shifted, 5), InputDomainLimits::default());
+        assert!(reason.contains("not an affine view"), "{reason}");
     }
 
     fn enumerate(target: &Expr, inferred: &InferredInputDomains) -> Vec<u64> {
