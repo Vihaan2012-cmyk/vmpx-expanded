@@ -1175,6 +1175,7 @@ fn prepare_read_in_node(
         active_phis: BTreeSet::new(),
         node_base_epoch: node_base,
         node_call_barrier,
+        ancestors: Vec::new(),
     };
     let read = Expr::intrinsic(
         BitWidth::W32,
@@ -1182,6 +1183,75 @@ fn prepare_read_in_node(
         vec![stack_slot(offset)],
     );
     builder.prepare(Va(1), &read, path.barrier, path, steps)
+}
+
+/// Prepares a W64 read of `address` at memory epoch `epoch` under a descendant
+/// node whose steps began at `node_base`, with `ancestor` (base epoch
+/// `ancestor_base`, call barrier 0) open above it. Returns the prepared
+/// expression together with the ancestor's steps after any cross-node capture,
+/// so a test can check the load was placed in the ancestor and threaded by slot.
+fn prepare_read_with_ancestor(
+    path: &Path,
+    epoch: u64,
+    address: Expr,
+    node_base: u64,
+    ancestor_base: u64,
+    ancestor_steps: Vec<Step>,
+    ancestor_calls: BTreeSet<String>,
+) -> (Result<Expr, DecodedLiftError>, Vec<Step>) {
+    let cfg = conditional_cfg();
+    let (frame, exits, calls) = (constant_frame(), exits(), BTreeMap::new());
+    let input = DecodedCfgInput {
+        cfg: &cfg,
+        frame: &frame,
+        top_offset: 0,
+        exits: &exits,
+        native_calls: &calls,
+        memory: None,
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: VmCfgLimits::default(),
+        max_expanded_blocks: 64,
+    };
+    let mut builder = Builder {
+        input: &input,
+        nested: None,
+        nested_entries: 0,
+        expanded: 0,
+        blocks: BTreeSet::new(),
+        exit_paths: 0,
+        region_exits: 0,
+        retained_bytes: 0,
+        branches: 0,
+        loops: 0,
+        call_sites: 0,
+        read_sites: 0,
+        uses_root: false,
+        assumptions: Vec::new(),
+        loop_bodies: BTreeMap::new(),
+        loop_phis: 0,
+        active_phis: BTreeSet::new(),
+        node_base_epoch: node_base,
+        node_call_barrier: 0,
+        ancestors: vec![OpenNode {
+            base_epoch: ancestor_base,
+            available_calls: ancestor_calls,
+            steps: ancestor_steps,
+        }],
+    };
+    let read = Expr::intrinsic(BitWidth::W64, format!("memory_load_epoch_{epoch}"), vec![address]);
+    let mut steps = Vec::new();
+    let prepared = builder.prepare(Va(1), &read, path.barrier, path, &mut steps);
+    let ancestor = builder.ancestors.pop().expect("ancestor").steps;
+    (prepared, ancestor)
+}
+
+fn global_slot(offset: u64) -> Expr {
+    Expr::binary(
+        BinaryOp::Add,
+        entry(X64NativeRegister::R13),
+        Expr::constant(BitWidth::W64, offset),
+    )
+    .expect("global")
 }
 
 /// A store step at `epoch` over `[vsp + offset]`, used to order a kept-in-place
@@ -1314,6 +1384,95 @@ fn a_read_that_a_native_call_crossed_refuses_but_a_later_read_does_not() {
     // A read at or after the store's epoch observes it and re-issues cleanly.
     let mut steps = Vec::new();
     assert!(prepare_read_in_node(&path_with_store(0xb78, 4), 20, 0xb78, 0, 0, &mut steps).is_ok());
+}
+
+#[test]
+fn a_read_blocked_in_its_own_node_is_eagerly_captured_in_the_owning_ancestor() {
+    // Block B (node_base 100) reads [r13 + const] at epoch 10, which an
+    // ancestor store to [vsp + 0xb78] (same base, not provably disjoint from an
+    // r13-relative address) has crossed by the time B runs. The read cannot be
+    // re-issued in B, so it is captured in the ancestor node that owns epoch 10
+    // (base 0), ordered before that store, and B reads the spill slot.
+    let path = Path {
+        barrier: 20,
+        stores: vec![PathStore {
+            end_epoch: 20,
+            address: stack_slot(0xb78),
+            bytes: 4,
+        }],
+        ..Path::default()
+    };
+    let ancestor_steps = vec![store_step(20, 0xb78, BitWidth::W64)];
+    let (prepared, ancestor) = prepare_read_with_ancestor(
+        &path,
+        10,
+        global_slot(0x200),
+        100,
+        0,
+        ancestor_steps,
+        BTreeSet::new(),
+    );
+    let prepared = prepared.expect("captured across the node boundary");
+    assert!(
+        prepared
+            .dependencies()
+            .iter()
+            .any(|name| name.starts_with(READ_RESULT_PREFIX)),
+        "use site reads the threaded spill slot, not a fresh load: {prepared:?}"
+    );
+    let epochs: Vec<u64> = ancestor.iter().map(|step| step.epoch).collect();
+    assert_eq!(epochs, vec![10, 20], "capture placed before the store it precedes");
+    assert!(
+        matches!(ancestor[0].kind, StepKind::Load(_)),
+        "the ancestor hosts the captured load"
+    );
+}
+
+#[test]
+fn a_cross_node_capture_whose_address_is_unavailable_in_the_ancestor_fails_closed() {
+    // The read's address depends on a call result produced only after the owning
+    // ancestor (not in its available set), so the capture cannot be placed
+    // soundly there: fail closed rather than observe the wrong memory.
+    let path = Path {
+        barrier: 20,
+        stores: vec![PathStore {
+            end_epoch: 20,
+            address: stack_slot(0xb78),
+            bytes: 4,
+        }],
+        ..Path::default()
+    };
+    let later_call = Expr::binary(
+        BinaryOp::Add,
+        Expr::register(BitWidth::W64, call_result_name(0)),
+        Expr::constant(BitWidth::W64, 0x10),
+    )
+    .expect("addr");
+    let (prepared, ancestor) = prepare_read_with_ancestor(
+        &path,
+        10,
+        later_call,
+        100,
+        0,
+        vec![store_step(20, 0xb78, BitWidth::W64)],
+        BTreeSet::new(), // the ancestor knows of no call result
+    );
+    assert!(prepared.is_err(), "unavailable address must fail closed");
+    assert!(
+        !ancestor.iter().any(|step| matches!(step.kind, StepKind::Load(_))),
+        "nothing captured on a failed-closed read"
+    );
+}
+
+#[test]
+fn a_cross_node_read_with_no_owning_ancestor_fails_closed() {
+    // No open ancestor owns the read's epoch, so there is nowhere sound to host
+    // the capture: fail closed (this is the pre-existing ancestor-store refusal).
+    let mut steps = Vec::new();
+    let error = prepare_read_in_node(&path_with_store(0xb78, 4), 10, 0xb78, 20, 0, &mut steps)
+        .expect_err("no ancestor to capture into");
+    assert!(error.to_string().contains("predates"), "{error}");
+    assert!(steps.is_empty(), "nothing captured on a refusal");
 }
 
 const REGION_TARGET: u64 = 0x4000_1234;
