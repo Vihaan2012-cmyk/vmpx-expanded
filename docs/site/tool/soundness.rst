@@ -15,12 +15,22 @@ Fail closed
     a blocker": "no unknown value is invented", "it never guesses a missing
     operation", "shape agreement alone is not sufficient".
 
-Static only
-    The input is never executed. This is a design choice with a loud consequence:
-    runtime anti-debug and anti-tamper never fire against the analysis, because
-    there is no process, no PEB, no timing source and no breakpoint. A dynamic
-    dumper would be a different architecture that reintroduces the whole
-    anti-debug problem; it is explicitly out of scope.
+Static by default
+    The core devirtualizer never executes the input. This has a loud
+    consequence: runtime anti-debug and anti-tamper never fire against the
+    analysis, because there is no process, no PEB, no timing source and no
+    breakpoint. The flip side is that anything that only exists at runtime — a
+    self-unpacked OEP image, an on-demand import table, a PEB-dependent branch —
+    is invisible to a purely static pass.
+
+    Dynamic assist (SP7) is a *separate, opt-in* architecture that closes that
+    gap: the sample is detonated inside a contained pure-Rust emulator, allowed
+    to self-unpack, and the resulting image is dumped and handed back to the
+    static pipeline. It deliberately reintroduces the anti-debug and containment
+    problem — which is exactly why it runs under emulation with a fail-closed
+    device model, not on the host. Its results carry an ``observed-not-proven``
+    trust tier, kept distinct from the proven static output; it never relaxes
+    the fail-closed rules above.
 
 Behaviour, not bytes
     "Reversible" means *behaviour-reversible*. Virtualization is lossy:

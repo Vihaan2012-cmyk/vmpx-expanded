@@ -135,8 +135,14 @@ Protectors also defend against taking a memory image of the unpacked program:
   demand, a dump taken early is incomplete (:doc:`imports`).
 * **Erasing the unpacker.** After restoring, the packer's own code can overwrite itself.
 
-Static unpacking is immune by construction: it never relies on a process to have
-unpacked itself.
+Static devirtualization of the VM is immune to these by construction: it never
+relies on a process to have unpacked itself. The catch is that when the OEP image
+*only* exists after the program unpacks itself at runtime, there is nothing static
+to devirtualize in the first place. Recovering that image is the job of the
+optional dynamic-assist path (:doc:`devirtualization/dynamic-assist`), which detonates the sample
+inside a contained emulator and dumps the restored image — meeting header erasure,
+on-demand imports and self-erasing unpackers on their own ground rather than
+claiming immunity to them.
 
 Integrating the checks into the protected code
 ----------------------------------------------
