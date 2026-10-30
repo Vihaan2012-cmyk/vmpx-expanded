@@ -198,6 +198,8 @@ pub fn enumerate_symbolic_value(
     domains: &BTreeMap<String, Vec<Expr>>,
     limits: SymbolicDomainLimits,
 ) -> Result<SymbolicDomainReport, SymbolicDomainError> {
+    let abstracted = crate::abstract_epoch_loads(expression)?;
+    let expression = &abstracted;
     let actual_nodes = expression.node_count_bounded(limits.max_expression_nodes);
     if actual_nodes > limits.max_expression_nodes {
         return Err(SymbolicDomainError::ExpressionLimit {

@@ -12,6 +12,13 @@
 //!   which depend on the register only through the cell it falls in between a
 //!   fixed set of cut points and its residue modulo 256 (see [`add_flags_cover`]).
 //!
+//!
+//! A `memory_load_epoch_N(address)` read that no tracked store covers is an
+//! unconstrained value: it is replaced by a free register named after the read
+//! (see [`abstract_epoch_loads`]) and then covered like any other register. The
+//! address is dropped, so the domain over-approximates the reachable values and
+//! can never omit a target.
+//!
 //! Any other use (direct arithmetic, loads, opaque or logical-flag intrinsics,
 //! flags of two input-dependent operands, mixed use kinds) is refused: the
 //! general case is undecidable here and stays a blocker.
@@ -72,8 +79,12 @@ pub enum InputDomainRefusal {
 }
 
 fn unsupported(register: &str, reason: &str) -> InputDomainRefusal {
+    let register = match register.split_once('@') {
+        Some((load, _)) => format!("{load} (untracked memory read)"),
+        None => register.to_owned(),
+    };
     InputDomainRefusal::Unsupported {
-        register: register.to_owned(),
+        register,
         reason: reason.to_owned(),
     }
 }
@@ -171,6 +182,21 @@ pub fn add_flags_cover(
 fn exhaustive(bits: u32, limits: InputDomainLimits) -> Option<Vec<u64>> {
     let count = 1_u64.checked_shl(bits)?;
     (usize::try_from(count).ok()? <= limits.max_values_per_variable).then(|| (0..count).collect())
+}
+
+/// Replaces every `memory_load_epoch_N(address)` with a free register named by
+/// the read, so equal reads share one variable and the address no longer
+/// constrains the expression. Reads of untracked memory can hold any value, so
+/// the free variable's domain is a superset of the reachable ones.
+///
+/// # Errors
+///
+/// Propagates expression rebuild failures.
+pub fn abstract_epoch_loads(expr: &Expr) -> Result<Expr, crate::ExprError> {
+    expr.rewrite_intrinsics(&mut |width, name, arguments| {
+        (name.starts_with("memory_load_epoch_") && arguments.len() == 1)
+            .then(|| Expr::register(width, format!("{name}@{arguments:?}")))
+    })
 }
 
 /// `expr == (±register + offset) mod 2^bits`.
@@ -455,6 +481,8 @@ pub fn infer_branch_input_domains(
     target: &Expr,
     limits: InputDomainLimits,
 ) -> Result<InferredInputDomains, InputDomainRefusal> {
+    let target = &abstract_epoch_loads(target)
+        .map_err(|error| unsupported("<expression>", &error.to_string()))?;
     let mut scan = Scan {
         uses: BTreeMap::new(),
         refusal: None,
@@ -938,6 +966,137 @@ mod tests {
         let direct = Expr::binary(BinaryOp::Add, target_on(&rcx, 32, 5), rcx).expect("add");
         let (_, reason) = unsupported_reason(&direct, limits);
         assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+    }
+
+    fn stack_load(epoch: u64, offset: u64) -> Expr {
+        let address = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "vsp_initial"),
+            Expr::constant(BitWidth::W64, offset),
+        )
+        .expect("add");
+        Expr::intrinsic(
+            BitWidth::W32,
+            format!("memory_load_epoch_{epoch}"),
+            vec![address],
+        )
+    }
+
+    fn branch_on_sub_flags(operand: Expr, constant: u64) -> Expr {
+        let flags = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_sub_w32",
+            vec![operand, Expr::constant(BitWidth::W32, constant)],
+        );
+        let zero = Expr::binary(
+            BinaryOp::And,
+            Expr::binary(BinaryOp::Shr, flags, Expr::constant(BitWidth::W64, 6)).expect("shr"),
+            Expr::constant(BitWidth::W64, 1),
+        )
+        .expect("and");
+        let delta =
+            Expr::binary(BinaryOp::Mul, zero, Expr::constant(BitWidth::W64, 0x100)).expect("mul");
+        Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1_4000_1000),
+            delta,
+        )
+        .expect("add")
+    }
+
+    #[test]
+    fn compare_of_an_untracked_stack_read_is_covered_without_the_address() {
+        let target = branch_on_sub_flags(stack_load(73, 2936), 5);
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("a read of untracked memory is a free 32-bit value");
+        assert_eq!(inferred.domains.len(), 1);
+        let (name, certificate) = inferred.certificates.iter().next().expect("one");
+        assert!(name.starts_with("memory_load_epoch_73@"), "{name}");
+        assert!(matches!(
+            certificate,
+            DomainCertificate::AddFlagsCover { bits: 32, .. }
+        ));
+        let report = crate::enumerate_symbolic_value(
+            &target,
+            &inferred.domains,
+            crate::SymbolicDomainLimits {
+                max_values_per_variable: 4_096,
+                ..crate::SymbolicDomainLimits::default()
+            },
+        )
+        .expect("enumerates");
+        assert!(report.complete);
+        assert_eq!(report.unique_values, vec![0x1_4000_1000, 0x1_4000_1100]);
+        // The free variable ranges over everything the read could hold.
+        let abstracted = abstract_epoch_loads(&target).expect("abstract");
+        let variable = name.clone();
+        for x in [0_u64, 4, 5, 6, 0x8000_0000, 0xFFFF_FFFF] {
+            let concrete = abstracted
+                .substitute(&BTreeMap::from([(
+                    variable.clone(),
+                    Expr::constant(BitWidth::W32, x),
+                )]))
+                .expect("substitute");
+            let ExprKind::Const { value } = concrete.kind else {
+                panic!("not concrete")
+            };
+            assert!(report.unique_values.contains(&value));
+            assert_eq!(value == 0x1_4000_1100, x == 5);
+        }
+    }
+
+    #[test]
+    fn repeated_reads_share_one_variable_and_distinct_reads_stay_apart() {
+        let same = Expr::binary(
+            BinaryOp::Add,
+            branch_on_sub_flags(stack_load(73, 2936), 5),
+            branch_on_sub_flags(stack_load(73, 2936), 9),
+        )
+        .expect("add");
+        let inferred = infer_branch_input_domains(&same, InputDomainLimits::default())
+            .expect("same read twice");
+        assert_eq!(inferred.domains.len(), 1);
+        let different = Expr::binary(
+            BinaryOp::Add,
+            branch_on_sub_flags(stack_load(73, 2936), 5),
+            branch_on_sub_flags(stack_load(73, 2944), 5),
+        )
+        .expect("add");
+        let inferred = infer_branch_input_domains(&different, InputDomainLimits::default())
+            .expect("two reads");
+        assert_eq!(inferred.domains.len(), 2);
+    }
+
+    #[test]
+    fn untracked_reads_that_are_not_provably_covered_are_refused() {
+        let limits = InputDomainLimits::default();
+        // The read's value is used directly (jump-table index).
+        let indexed = Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1000),
+            Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, stack_load(73, 8)).expect("zext"),
+        )
+        .expect("add");
+        let (register, reason) = unsupported_reason(&indexed, limits);
+        assert!(register.contains("untracked memory read"), "{register}");
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+        // Flags of two unconstrained reads.
+        let both = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_sub_w32",
+            vec![stack_load(73, 8), stack_load(73, 16)],
+        );
+        let (_, reason) = unsupported_reason(&both, limits);
+        assert!(reason.contains("two input-dependent"), "{reason}");
+        // Flags of a non-affine function of the read.
+        let masked = Expr::binary(
+            BinaryOp::And,
+            stack_load(73, 8),
+            Expr::constant(BitWidth::W32, 0xF0F0),
+        )
+        .expect("and");
+        let (_, reason) = unsupported_reason(&branch_on_sub_flags(masked, 5), limits);
+        assert!(reason.contains("not an affine view"), "{reason}");
     }
 
     #[test]

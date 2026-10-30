@@ -118,7 +118,7 @@ pub use image_concretize::{
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
-    InputDomainRefusal, add_flags_cover, infer_branch_input_domains,
+    InputDomainRefusal, abstract_epoch_loads, add_flags_cover, infer_branch_input_domains,
 };
 pub use model::{
     BytecodeDirection, EffectKnowledge, RecoveryStatus, StateValue, VmContextLayout, VmDecodeState,
