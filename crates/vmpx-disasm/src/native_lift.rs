@@ -1209,9 +1209,12 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 self.set_flags(kind, &value, &one, &result, true);
                 self.write_operand(inst, 0, result)
             }
-            Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror => {
-                self.exec_shift(inst, mnemonic)
-            }
+            Mnemonic::Shl
+            | Mnemonic::Sal
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Rol
+            | Mnemonic::Ror => self.exec_shift(inst, mnemonic),
             Mnemonic::Xchg => {
                 Self::expect_ops(inst, 2)?;
                 let width = Self::operand_width(inst, 0)?;
@@ -1273,6 +1276,57 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Sf, Flag::Of]);
                 self.set_flag(Flag::Zf, zf);
                 self.write_operand(inst, 0, index)
+            }
+            Mnemonic::Shld | Mnemonic::Shrd => {
+                self.exec_double_shift(inst, mnemonic == Mnemonic::Shld)
+            }
+            Mnemonic::Rcl | Mnemonic::Rcr => {
+                self.exec_rotate_carry(inst, mnemonic == Mnemonic::Rcl)
+            }
+            Mnemonic::Bswap => {
+                Self::expect_ops(inst, 1)?;
+                if inst.op_kind(0) != OpKind::Register {
+                    return unsupported("bswap non-register operand");
+                }
+                let width = Self::operand_width(inst, 0)?;
+                if !matches!(width, Width::W32 | Width::W64) {
+                    return unsupported("bswap operand size (16-bit result is undefined)");
+                }
+                let value = self.read_operand(inst, 0, width)?;
+                let result = self.byte_reverse(width, value)?;
+                self.write_operand(inst, 0, result)
+            }
+            Mnemonic::Xadd => {
+                Self::expect_ops(inst, 2)?;
+                let width = Self::operand_width(inst, 0)?;
+                let dst = self.read_operand(inst, 0, width)?;
+                let src = self.read_operand(inst, 1, width)?;
+                let sum = self.bin(BinOp::Add, dst.clone(), src.clone())?;
+                self.set_flags(Arith::Add, &dst, &src, &sum, false);
+                // src (always a register) takes the old destination; dest takes the sum.
+                // When dest is memory its address is formed from pre-write registers, so
+                // store first; a register dest may alias src, so write src first.
+                if inst.op_kind(0) == OpKind::Memory {
+                    self.write_operand(inst, 0, sum)?;
+                    self.write_operand(inst, 1, dst)
+                } else {
+                    self.write_operand(inst, 1, dst)?;
+                    self.write_operand(inst, 0, sum)
+                }
+            }
+            Mnemonic::Stc | Mnemonic::Clc | Mnemonic::Cmc => {
+                Self::expect_ops(inst, 0)?;
+                let cf = match mnemonic {
+                    Mnemonic::Stc => self.k(Width::W8, 1),
+                    Mnemonic::Clc => self.k(Width::W8, 0),
+                    // cmc complements the entry/current carry; fails closed if CF is clobbered.
+                    _ => {
+                        let cur = self.flag_value(Flag::Cf)?;
+                        self.bin(BinOp::Xor, cur, self.k(Width::W8, 1))?
+                    }
+                };
+                self.set_flag(Flag::Cf, cf);
+                Ok(())
             }
             other => unsupported(format!("mnemonic {other:?} is not modeled")),
         }
@@ -1463,8 +1517,9 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         }
         let rotate = matches!(mnemonic, Mnemonic::Rol | Mnemonic::Ror);
         let result = match mnemonic {
-            Mnemonic::Shl | Mnemonic::Shr if masked >= bits => self.k(width, 0),
-            Mnemonic::Shl => self.bin(BinOp::Shl, value, self.k(width, masked))?,
+            Mnemonic::Shl | Mnemonic::Sal | Mnemonic::Shr if masked >= bits => self.k(width, 0),
+            // `sal` is encodingwise identical to `shl`.
+            Mnemonic::Shl | Mnemonic::Sal => self.bin(BinOp::Shl, value, self.k(width, masked))?,
             Mnemonic::Shr => self.bin(BinOp::Shr, value, self.k(width, masked))?,
             Mnemonic::Sar => self.bin(BinOp::Sar, value, self.k(width, masked.min(bits - 1)))?,
             _ => {
@@ -1511,7 +1566,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         let count = self.bin(BinOp::And, count, self.k(work, u64::from(work.bits() - 1)))?;
         let result = if work == width {
             let op = match mnemonic {
-                Mnemonic::Shl => BinOp::Shl,
+                Mnemonic::Shl | Mnemonic::Sal => BinOp::Shl,
                 Mnemonic::Shr => BinOp::Shr,
                 Mnemonic::Sar => BinOp::Sar,
                 Mnemonic::Rol => BinOp::Rol,
@@ -1520,7 +1575,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             self.bin(op, value, count)?
         } else {
             let (op, ext) = match mnemonic {
-                Mnemonic::Shl => (BinOp::Shl, Resize::ZeroExtend),
+                Mnemonic::Shl | Mnemonic::Sal => (BinOp::Shl, Resize::ZeroExtend),
                 Mnemonic::Shr => (BinOp::Shr, Resize::ZeroExtend),
                 _ => (BinOp::Sar, Resize::SignExtend),
             };
@@ -1533,6 +1588,136 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         } else {
             self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
         }
+        self.write_operand(inst, 0, result)
+    }
+
+    /// Byte-reverses a W32/W64 value using width-correct shifts and masks.
+    fn byte_reverse(&self, width: Width, value: A::Expr) -> R<A::Expr> {
+        let n = width.bytes();
+        let byte = self.k(width, 0xFF);
+        let mut acc: Option<A::Expr> = None;
+        for i in 0..n {
+            let src_shift = 8 * i;
+            let dst_shift = 8 * (n - 1 - i);
+            let extracted = if src_shift == 0 {
+                value.clone()
+            } else {
+                self.bin(BinOp::Shr, value.clone(), self.k(width, u64::from(src_shift)))?
+            };
+            let mut piece = self.bin(BinOp::And, extracted, byte.clone())?;
+            if dst_shift != 0 {
+                piece = self.bin(BinOp::Shl, piece, self.k(width, u64::from(dst_shift)))?;
+            }
+            acc = Some(match acc {
+                Some(prev) => self.bin(BinOp::Or, prev, piece)?,
+                None => piece,
+            });
+        }
+        acc.ok_or(Reason::Unsupported("bswap zero-width operand".into()))
+    }
+
+    /// `shld`/`shrd dst, src, count`: `dst` shifts in the open direction while the
+    /// vacated bits are filled from `src` shifted the other way. The count is masked
+    /// (5 bits, 6 for 64-bit) exactly as hardware does. A count of 0 is a true no-op
+    /// (flags unchanged). A masked count at or beyond the operand size is undefined on
+    /// hardware (only reachable for a 16-bit operand, whose mask is 5 bits) and fails
+    /// closed. The result flags are always marked clobbered: at count 0 the flags are
+    /// untouched and otherwise they are set, and the two cases are indistinguishable for
+    /// a symbolic count, so the conservative (clobbered) state is the only sound one.
+    fn exec_double_shift(&mut self, inst: &Instruction, left: bool) -> R<()> {
+        Self::expect_ops(inst, 3)?;
+        let width = Self::operand_width(inst, 0)?;
+        let dst = self.read_operand(inst, 0, width)?;
+        let src = self.read_operand(inst, 1, width)?;
+        let count = self.read_operand(inst, 2, Width::W8)?;
+        let bits = u64::from(width.bits());
+        let mask = if width == Width::W64 { 63 } else { 31 };
+        let (main_op, fill_op) = if left {
+            (BinOp::Shl, BinOp::Shr)
+        } else {
+            (BinOp::Shr, BinOp::Shl)
+        };
+        let result = if let Some(raw) = self.alg.as_const(&count) {
+            let n = raw & mask;
+            if n == 0 {
+                return Ok(());
+            }
+            if n >= bits {
+                return unsupported("shld/shrd count at or beyond operand size (undefined)");
+            }
+            let main = self.bin(main_op, dst, self.k(width, n))?;
+            let fill = self.bin(fill_op, src, self.k(width, bits - n))?;
+            self.bin(BinOp::Or, main, fill)?
+        } else {
+            if width == Width::W16 {
+                // The 5-bit mask admits counts 16..=31, which are undefined on a 16-bit
+                // operand; a symbolic count cannot be proven to avoid them.
+                return unsupported("shld/shrd by a variable count on a 16-bit operand");
+            }
+            // For 32/64-bit the masked count is strictly below the width, so the fill
+            // shift `bits - n` lands in `1..=bits`; a shift equal to the width yields 0,
+            // which is exactly the "nothing shifted in" behavior at count 0.
+            let n = self.resize(Resize::ZeroExtend, width, count)?;
+            let n = self.bin(BinOp::And, n, self.k(width, mask))?;
+            let comp = self.bin(BinOp::Sub, self.k(width, bits), n.clone())?;
+            let main = self.bin(main_op, dst, n)?;
+            let fill = self.bin(fill_op, src, comp)?;
+            self.bin(BinOp::Or, main, fill)?
+        };
+        self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+        self.write_operand(inst, 0, result)
+    }
+
+    /// `rcl`/`rcr dst, count`: rotate the `(width + 1)`-bit value `CF:dst` through carry.
+    /// The carry-in must be a modelable `Expr` (fails closed if CF was clobbered). Only a
+    /// constant count is modeled, in a scratch width one step up so the carry bit fits;
+    /// a 64-bit operand has no wider native width for the carry bit and fails closed, as
+    /// does a variable count. OF is defined only for a 1-bit rotate, so it is clobbered;
+    /// SF/ZF/AF/PF are architecturally unaffected.
+    fn exec_rotate_carry(&mut self, inst: &Instruction, left: bool) -> R<()> {
+        Self::expect_ops(inst, 2)?;
+        let width = Self::operand_width(inst, 0)?;
+        let count = self.read_operand(inst, 1, Width::W8)?;
+        let Some(raw) = self.alg.as_const(&count) else {
+            return unsupported("rcl/rcr by a variable count");
+        };
+        let bits = width.bits();
+        let mask = if bits == 64 { 63 } else { 31 };
+        let modulus = bits + 1;
+        let k = (raw & mask) as u32 % modulus;
+        if k == 0 {
+            return Ok(());
+        }
+        let wide = match width {
+            Width::W8 => Width::W16,
+            Width::W16 => Width::W32,
+            Width::W32 => Width::W64,
+            Width::W64 => {
+                return unsupported("rcl/rcr on a 64-bit operand (carry bit exceeds 64 bits)");
+            }
+        };
+        let cin = self.flag_value(Flag::Cf)?;
+        let value = self.read_operand(inst, 0, width)?;
+        let dst_wide = self.resize(Resize::ZeroExtend, wide, value)?;
+        let cin_wide = self.resize(Resize::ZeroExtend, wide, cin)?;
+        let carry_bit = self.bin(BinOp::Shl, cin_wide, self.k(wide, u64::from(bits)))?;
+        let v = self.bin(BinOp::Or, dst_wide, carry_bit)?;
+        let (a_op, b_op) = if left {
+            (BinOp::Shl, BinOp::Shr)
+        } else {
+            (BinOp::Shr, BinOp::Shl)
+        };
+        let hi = self.bin(a_op, v.clone(), self.k(wide, u64::from(k)))?;
+        let lo = self.bin(b_op, v, self.k(wide, u64::from(modulus - k)))?;
+        let rotated = self.bin(BinOp::Or, hi, lo)?;
+        let full_mask = (1u64 << modulus) - 1;
+        let rotated = self.bin(BinOp::And, rotated, self.k(wide, full_mask))?;
+        let result = self.resize(Resize::Truncate, width, rotated.clone())?;
+        let cf_shifted = self.bin(BinOp::Shr, rotated, self.k(wide, u64::from(bits)))?;
+        let cf_bit = self.bin(BinOp::And, cf_shifted, self.k(wide, 1))?;
+        let cf_out = self.resize(Resize::Truncate, Width::W8, cf_bit)?;
+        self.set_flag(Flag::Cf, cf_out);
+        self.clobber(&[Flag::Of]);
         self.write_operand(inst, 0, result)
     }
 }

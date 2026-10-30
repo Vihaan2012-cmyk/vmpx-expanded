@@ -1334,3 +1334,237 @@ fn bsf_bsr_are_undefined_for_a_zero_source() {
     let zero_rsi = |name: &str| u64::from(name != "rsi_in");
     assert_eq!(eval_with(zf, &zero_rsi), Some(1));
 }
+
+#[test]
+fn bswap_reverses_bytes() {
+    let sem = ok(|a| {
+        a.bswap(ebx).unwrap();
+        a.bswap(rsi).unwrap();
+    });
+    for seed in SEEDS {
+        let b0 = inp(seed, Gpr::Rbx);
+        let s0 = inp(seed, Gpr::Rsi);
+        // 32-bit bswap reverses the low 4 bytes and zero-extends.
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), u64::from((b0 as u32).swap_bytes()));
+        assert_eq!(reg(&sem, seed, Gpr::Rsi), s0.swap_bytes());
+    }
+    // bswap leaves flags untouched.
+    assert!(sem.flags.is_empty());
+}
+
+#[test]
+fn xadd_exchanges_then_adds_and_sets_add_flags() {
+    let sem = ok(|a| a.xadd(ebx, ecx).unwrap());
+    let FlagState::Value(zf) = &sem.flags[&Flag::Zf] else {
+        panic!("zf")
+    };
+    let FlagState::Value(cf) = &sem.flags[&Flag::Cf] else {
+        panic!("cf")
+    };
+    for seed in SEEDS {
+        let (b0, c0) = (inp(seed, Gpr::Rbx) as u32, inp(seed, Gpr::Rcx) as u32);
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), u64::from(b0.wrapping_add(c0)));
+        assert_eq!(reg(&sem, seed, Gpr::Rcx), u64::from(b0)); // old dst -> src
+        assert_eq!(eval_expr(zf, seed), u64::from(b0.wrapping_add(c0) == 0));
+        let carry = u64::from((u64::from(b0) + u64::from(c0)) > 0xFFFF_FFFF);
+        assert_eq!(eval_expr(cf, seed), carry);
+    }
+    // Memory destination: one store of the sum, the register takes the old memory value.
+    let mem = ok(|a| a.xadd(qword_ptr(rax), rcx).unwrap());
+    assert_eq!(mem.writes.len(), 1);
+    for seed in SEEDS {
+        let old = mix(inp(seed, Gpr::Rax) ^ 0xABCD);
+        assert_eq!(reg(&mem, seed, Gpr::Rcx), old);
+        assert_eq!(
+            eval_expr(&mem.writes[0].value, seed),
+            old.wrapping_add(inp(seed, Gpr::Rcx))
+        );
+    }
+}
+
+#[test]
+fn flag_ops_set_clear_and_complement_carry() {
+    let stc = ok(|a| a.stc().unwrap());
+    let FlagState::Value(cf) = &stc.flags[&Flag::Cf] else {
+        panic!("stc cf")
+    };
+    assert_eq!(cf.as_const(), Some(1));
+    let clc = ok(|a| a.clc().unwrap());
+    let FlagState::Value(cf) = &clc.flags[&Flag::Cf] else {
+        panic!("clc cf")
+    };
+    assert_eq!(cf.as_const(), Some(0));
+    // cmc complements the entry carry; only CF is touched.
+    let cmc = ok(|a| a.cmc().unwrap());
+    let FlagState::Value(cf) = &cmc.flags[&Flag::Cf] else {
+        panic!("cmc cf")
+    };
+    assert_eq!(cmc.flags.len(), 1);
+    for seed in SEEDS {
+        assert_eq!(eval_expr(cf, seed), input_value(seed, "cf_in") ^ 1);
+    }
+    // cmc fails closed when CF is not modeled at that point (imul clobbers it).
+    assert!(matches!(
+        lift(|a| {
+            a.imul_2(eax, ecx).unwrap();
+            a.cmc().unwrap();
+        }),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
+
+fn dbl_shift_ref(left: bool, bits: u32, dst: u64, src: u64, count: u64) -> u64 {
+    let w = w_of(bits);
+    let mask = if bits == 64 { 63 } else { 31 };
+    let n = count & mask;
+    let (dst, src) = (w.truncate(dst), w.truncate(src));
+    if n == 0 {
+        return dst;
+    }
+    let b = u64::from(bits);
+    let r = if left {
+        (dst << n) | (src >> (b - n))
+    } else {
+        (dst >> n) | (src << (b - n))
+    };
+    w.truncate(r)
+}
+
+#[test]
+fn shld_shrd_shift_in_bits_from_the_source() {
+    // Constant counts at 32 and 64 bits.
+    let sem = ok(|a| {
+        a.shld(ebx, ecx, 5u32).unwrap();
+        a.shrd(rsi, rdi, 9u32).unwrap();
+    });
+    for seed in SEEDS {
+        let (b0, c0) = (inp(seed, Gpr::Rbx), inp(seed, Gpr::Rcx));
+        let (s0, d0) = (inp(seed, Gpr::Rsi), inp(seed, Gpr::Rdi));
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), dbl_shift_ref(true, 32, b0, c0, 5));
+        assert_eq!(reg(&sem, seed, Gpr::Rsi), dbl_shift_ref(false, 64, s0, d0, 9));
+    }
+    // A zero count is a true no-op.
+    let noop = ok(|a| a.shld(ebx, ecx, 0u32).unwrap());
+    assert!(noop.written.is_empty());
+
+    // Variable (CL) counts at 32 and 64 bits, swept across the masked range.
+    for (left, bits) in [(true, 32u32), (false, 32), (true, 64), (false, 64)] {
+        let sem = if bits == 32 {
+            if left {
+                ok(|a| a.shld(ebx, ecx, cl).unwrap())
+            } else {
+                ok(|a| a.shrd(ebx, ecx, cl).unwrap())
+            }
+        } else if left {
+            ok(|a| a.shld(rbx, rcx, cl).unwrap())
+        } else {
+            ok(|a| a.shrd(rbx, rcx, cl).unwrap())
+        };
+        for seed in 0..8 {
+            for count in 0..=70u64 {
+                let get = |name: &str| {
+                    if name == "rcx_in" {
+                        (mix(seed) & !0xFF) | count
+                    } else {
+                        input_value(seed, name)
+                    }
+                };
+                let b0 = get("rbx_in");
+                let c0 = get("rcx_in");
+                let want = dbl_shift_ref(left, bits, b0, c0, count);
+                assert_eq!(
+                    eval_with(&sem.regs[&Gpr::Rbx], &get),
+                    Some(want),
+                    "{}{bits} count {count}",
+                    if left { "shld" } else { "shrd" }
+                );
+            }
+        }
+    }
+
+    // A variable count on a 16-bit operand is undefined (mask admits 16..=31).
+    assert!(matches!(
+        lift(|a| a.shld(bx, cx, cl).unwrap()),
+        Err(LiftError::Unsupported { .. })
+    ));
+    // A constant count at/over the operand size on a 16-bit operand is undefined.
+    assert!(matches!(
+        lift(|a| a.shld(bx, cx, 20u32).unwrap()),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
+
+fn rotate_carry_ref(left: bool, bits: u32, dst: u64, cin: u64, count: u64) -> (u64, u64) {
+    let w = w_of(bits);
+    let modulus = u64::from(bits) + 1;
+    let mask = if bits == 64 { 63 } else { 31 };
+    let k = (count & mask) % modulus;
+    let dst = w.truncate(dst);
+    if k == 0 {
+        return (dst, cin & 1);
+    }
+    let v = dst | ((cin & 1) << bits);
+    let full = (1u64 << modulus) - 1;
+    let r = if left {
+        ((v << k) | (v >> (modulus - k))) & full
+    } else {
+        ((v >> k) | (v << (modulus - k))) & full
+    };
+    (r & w.mask(), (r >> bits) & 1)
+}
+
+#[test]
+fn rcl_rcr_rotate_the_operand_through_carry() {
+    type Build = fn(&mut CodeAssembler);
+    let cases: Vec<(&str, bool, u32, u64, Build)> = vec![
+        ("rcl", true, 8, 3, |a| a.rcl(bl, 3u32).unwrap()),
+        ("rcr", false, 8, 1, |a| a.rcr(bl, 1u32).unwrap()),
+        ("rcl", true, 16, 7, |a| a.rcl(bx, 7u32).unwrap()),
+        ("rcr", false, 16, 5, |a| a.rcr(bx, 5u32).unwrap()),
+        ("rcl", true, 32, 1, |a| a.rcl(ebx, 1u32).unwrap()),
+        ("rcr", false, 32, 13, |a| a.rcr(ebx, 13u32).unwrap()),
+        ("rcl", true, 32, 20, |a| a.rcl(ebx, 20u32).unwrap()),
+    ];
+    for (name, left, bits, count, build) in cases {
+        let sem = ok(build);
+        let FlagState::Value(cf) = &sem.flags[&Flag::Cf] else {
+            panic!("{name}{bits} cf")
+        };
+        assert!(matches!(sem.flags[&Flag::Of], FlagState::Clobbered));
+        // SF/ZF/AF/PF are architecturally unaffected.
+        assert!(!sem.flags.contains_key(&Flag::Zf));
+        let w = w_of(bits);
+        for seed in SEEDS {
+            let b0 = inp(seed, Gpr::Rbx);
+            let cin = input_value(seed, "cf_in");
+            let (want_dst, want_cf) = rotate_carry_ref(left, bits, b0, cin, count);
+            let want_reg = match bits {
+                32 => want_dst,
+                _ => (b0 & !w.mask()) | want_dst,
+            };
+            assert_eq!(reg(&sem, seed, Gpr::Rbx), want_reg, "{name}{bits} dst");
+            assert_eq!(eval_expr(cf, seed), want_cf, "{name}{bits} cf");
+        }
+    }
+    // A zero count changes nothing.
+    let noop = ok(|a| a.rcl(ebx, 0u32).unwrap());
+    assert!(noop.written.is_empty());
+
+    // Fail closed: 64-bit (carry bit has no wider native width) and variable counts.
+    assert!(matches!(
+        lift(|a| a.rcl(rbx, 3u32).unwrap()),
+        Err(LiftError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        lift(|a| a.rcr(ebx, cl).unwrap()),
+        Err(LiftError::Unsupported { .. })
+    ));
+    // Fail closed when the carry-in is not modeled (imul clobbers CF).
+    assert!(matches!(
+        lift(|a| {
+            a.imul_2(eax, ecx).unwrap();
+            a.rcl(ebx, 1u32).unwrap();
+        }),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
