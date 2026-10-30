@@ -13,25 +13,37 @@
 //!
 //! Each stream is a header-less LZMA1 stream with the standard VMProtect
 //! properties `lc=3, lp=0, pb=2` and an end-of-stream marker. A stream's
-//! decompressed length equals the destination section's `VirtualSize` rounded
-//! up to `FileAlignment` (the original on-disk section size). Streams are not
-//! stored in section order and carry no self-identifying metadata, so they are
-//! located structurally: every zero-initialised offset in the protector's
-//! raw-data sections is probed, and an offset is accepted as a stream for a
-//! destination only when it decodes to *exactly* that destination's rounded
-//! size and is immediately followed by a clean EOS marker (validated with three
-//! independent `lzma-rs` decodes — see [`section_stream_matches`]).
+//! decompressed length is the destination's original `SizeOfRawData`: usually
+//! `VirtualSize` rounded up to `FileAlignment`, but *smaller* for a section with
+//! a zero-initialised tail (e.g. `.data`), whose tail the loader zero-fills.
+//! Streams are not stored in section order and carry no self-identifying
+//! metadata, so they are recovered in two steps ([`enumerate_streams`],
+//! [`bind_streams`]):
+//!
+//! 1. **Enumerate** — every zero-initialised offset in the protector's raw-data
+//!    sections is probed, and each genuine EOS-terminated stream's exact length
+//!    is found by [`stream_length`] (a monotone EOS-boundary binary search
+//!    confirmed by [`section_stream_matches`]). `lzma-rs` decodes in multi-byte
+//!    packets and buffers internally, so a prefix of a longer stream also
+//!    decodes a shorter section's size cleanly; the EOS-boundary test is what
+//!    pins each stream to its *one* true length.
+//! 2. **Bind** — destinations are served smallest-rounded-size first (ties by
+//!    RVA) and each claims the largest unclaimed stream that fits (ties by lowest
+//!    file offset). This recovers the unique matching when sizes are distinct and
+//!    keeps a section's own stream with it when a larger section stores fewer
+//!    initialized bytes.
 //!
 //! # Soundness
 //!
-//! A stream is bound to a destination only when its decompressed size matches
-//! exactly. When several destinations share one rounded size, the located
-//! streams for that size must number *exactly* as many as those destinations
-//! (otherwise the file is rejected as ambiguous); they are then paired in
-//! ascending file-offset / ascending-RVA order, which is the sole residual
-//! assumption and is surfaced as a report warning. The rebuilt image must
-//! reparse in memory, and (via `--conventional`) pass loader validation.
-//! Any count/size/range/decode mismatch fails closed with a precise error.
+//! The number of genuine streams must equal the number of destinations, and
+//! every destination must receive a stream no larger than its rounded size, or
+//! the file is rejected. Each placed stream is a validated EOS-terminated LZMA1
+//! stream, and the rebuilt image must reparse in memory and (via
+//! `--conventional`) pass loader validation. The only residual, non-provable
+//! choices — pairing equal-sized sections, and which shorter stream fills a
+//! section with a zero-initialised tail — are surfaced as report warnings rather
+//! than guessed silently. Any count/size/range/decode mismatch fails closed with
+//! a precise error.
 
 #![allow(clippy::doc_markdown)]
 
@@ -48,8 +60,12 @@ const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 /// Standard VMProtect packer LZMA properties: `lc=3, lp=0, pb=2`, 64 MiB dict.
 const VMPROTECT_LZMA_PROPERTIES: [u8; 5] = [0x5D, 0x00, 0x00, 0x00, 0x04];
 const MAX_PACKED_SECTIONS: usize = 256;
-/// Upper bound on located streams per distinct size before declaring ambiguity.
-const MAX_STREAMS_PER_SIZE: usize = 64;
+/// Upper bound on genuine streams enumerated before declaring the layout
+/// unrecoverable.
+const MAX_STREAMS: usize = 1024;
+/// A single LZMA match emits at most 273 bytes; sinks get this slack so a final
+/// packet overshoot never trips a spurious cap error.
+const LZMA_PACKET_SLACK: usize = 512;
 
 #[derive(Clone, Copy, Debug)]
 pub struct UnpackLimits {
@@ -256,46 +272,42 @@ fn decode_into<W: Write>(
     lzma_rs::lzma_decompress_with_options(&mut input, output, &options).map_err(|e| e.to_string())
 }
 
-/// Decode exactly `size` bytes of a header-less raw LZMA1 stream at `payload`
-/// into a counting sink; succeeds only when exactly `size` bytes are produced.
-fn decode_counted(properties: [u8; 5], size: usize, payload: &[u8]) -> Result<(), String> {
-    let mut sink = CountingWriter {
-        written: 0,
-        cap: size,
-    };
-    decode_into(properties, size as u64, payload, &mut sink)?;
-    (sink.written == size)
-        .then_some(())
-        .ok_or_else(|| format!("produced {:#X} bytes, expected {size:#X}", sink.written))
+/// Decode a header-less raw LZMA1 stream at `payload` under an explicit
+/// `declared` size, returning the number of bytes produced (output is bounded
+/// by `cap`).
+fn decode_measured(
+    properties: [u8; 5],
+    declared: u64,
+    payload: &[u8],
+    cap: usize,
+) -> Result<usize, String> {
+    let mut sink = CountingWriter { written: 0, cap };
+    decode_into(properties, declared, payload, &mut sink).map(|()| sink.written)
 }
 
-/// Structural test: does `payload` begin a valid raw LZMA1 stream that
-/// decompresses to *exactly* `size` bytes and ends on a clean EOS marker?
+/// Structural test: does `payload` begin a raw LZMA1 stream whose EOS marker
+/// sits *exactly* at `size` bytes, i.e. a stream that reconstructs a section of
+/// exactly that size?
 ///
-/// Three independent `lzma-rs` decodes make this sound against `lzma-rs`'s
-/// lenient range decoder:
-/// 1. exact-size decode yields exactly `size` bytes (so `len >= size`);
-/// 2. a `size + 1` decode fails (the EOS marker sits exactly at `size`, so
-///    `len <= size`);
-/// 3. an unknown-size decode trips over trailing file bytes *after* a valid EOS
-///    (`"end-of-stream marker"`), rejecting mis-decodes that merely tolerate
-///    `size` garbage bytes before faulting on an LZ distance.
+/// `lzma-rs` emits output in multi-byte packets and accumulates it internally,
+/// so an output cap cannot bound a decode and a *prefix* of a larger stream
+/// still decodes `size` bytes cleanly. The EOS boundary is pinned with two
+/// decodes:
+/// 1. a `size`-byte decode produces exactly `size` bytes — the final data
+///    packet lands on `size` (so the stream is at least `size` long);
+/// 2. a `size + 1` decode fails *reporting the end-of-stream marker* — proving
+///    the stream ends at `size`. A prefix of a longer stream instead decodes
+///    further (succeeds, or overshoots with a size-mismatch error) and a
+///    non-stream faults on an LZ distance; none of these name the EOS marker.
 fn section_stream_matches(properties: [u8; 5], payload: &[u8], size: usize) -> bool {
     if payload.first() != Some(&0) {
         return false;
     }
-    if decode_counted(properties, size, payload).is_err() {
+    if decode_measured(properties, size as u64, payload, size) != Ok(size) {
         return false;
     }
-    if decode_counted(properties, size + 1, payload).is_ok() {
-        return false;
-    }
-    let mut sink = CountingWriter {
-        written: 0,
-        cap: size + 64,
-    };
     matches!(
-        decode_into(properties, u64::MAX, payload, &mut sink),
+        decode_measured(properties, size as u64 + 1, payload, size + 512),
         Err(message) if message.contains("end-of-stream marker")
     )
 }
@@ -354,14 +366,195 @@ fn destination_capacity(pe: &PeImage<'_>, section: &Section) -> Option<u32> {
     next.checked_sub(section.virtual_address.0)
 }
 
+/// Natural decompressed length of the raw LZMA1 stream at `payload` — the file
+/// offset of its EOS marker, always a `file_alignment` multiple — or `None` when
+/// `payload` does not begin a clean EOS-terminated stream no longer than `max`.
+///
+/// `lzma-rs` decodes in multi-byte packets and buffers internally, so output
+/// caps cannot bound a decode and a prefix of a longer stream still decodes
+/// cleanly. The length is found from a monotone oracle: `decode(declared=n)`
+/// reports the EOS marker (`"end-of-stream marker"`) exactly when `n` exceeds the
+/// stream's true length, so the boundary is binary-searched and then confirmed
+/// with [`section_stream_matches`].
+fn stream_length(payload: &[u8], file_alignment: usize, max: usize) -> Option<usize> {
+    if payload.first() != Some(&0) || file_alignment == 0 {
+        return None;
+    }
+    let props = VMPROTECT_LZMA_PROPERTIES;
+    // Cheap prune: decoding the first `file_alignment` bytes must not fault on a
+    // corrupt LZ operation. Ok, a size overshoot, or an EOS all mark a real
+    // stream; only a distance/corruption fault rejects.
+    match decode_measured(props, file_alignment as u64, payload, file_alignment + LZMA_PACKET_SLACK)
+    {
+        Ok(_) => {}
+        Err(message)
+            if message.contains("decompressed to") || message.contains("end-of-stream marker") => {}
+        Err(_) => return None,
+    }
+    let past_end = |n: usize| {
+        matches!(
+            decode_measured(props, n as u64, payload, n + LZMA_PACKET_SLACK),
+            Err(message) if message.contains("end-of-stream marker")
+        )
+    };
+    if !past_end(max) {
+        // No EOS within `max`: either a full `max`-length stream, or not a stream.
+        return (decode_measured(props, max as u64, payload, max) == Ok(max)).then_some(max);
+    }
+    let (mut lo, mut hi) = (1usize, max / file_alignment);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if past_end(mid * file_alignment) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let length = lo.checked_sub(1)?.checked_mul(file_alignment)?;
+    (length > 0 && section_stream_matches(props, payload, length)).then_some(length)
+}
+
+/// Enumerates every genuine EOS-terminated raw LZMA1 stream (with its exact
+/// decompressed length) in the protector's raw-data sections.
+fn enumerate_streams(
+    pe: &PeImage<'_>,
+    file_alignment: usize,
+    max: usize,
+) -> Result<Vec<(usize, u32)>, UnpackError> {
+    let data = pe.data();
+    let mut streams = Vec::new();
+    for (start, end) in raw_data_ranges(pe) {
+        for offset in start..end {
+            if data[offset] != 0 {
+                continue;
+            }
+            if let Some(length) = stream_length(&data[offset..], file_alignment, max) {
+                let length = u32::try_from(length)
+                    .map_err(|_| UnpackError::Locate("stream length exceeds 32 bits".to_owned()))?;
+                streams.push((offset, length));
+                if streams.len() > MAX_STREAMS {
+                    return Err(UnpackError::Locate(
+                        "too many candidate LZMA1 streams - layout is unrecoverable".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(streams)
+}
+
+/// Binds enumerated streams to destinations. Destinations are served in
+/// ascending rounded-size order (ties by ascending RVA) and each claims the
+/// largest unclaimed stream that fits (ties by lowest file offset) — the greedy
+/// that recovers the unique matching when sizes are distinct, and that keeps a
+/// section's own stream with it when a larger section stores fewer initialized
+/// bytes. Residual ambiguity (equal-sized sections, or a zero-initialised tail
+/// making a stream smaller than its section) is surfaced as a warning; an
+/// unfitting or unequal count fails closed.
+fn bind_streams(
+    pe: &PeImage<'_>,
+    destinations: &[Section],
+    targets: &[u32],
+    streams: &[(usize, u32)],
+) -> Result<(Vec<PackerEntry>, Vec<String>), UnpackError> {
+    if streams.len() != destinations.len() {
+        return Err(UnpackError::Locate(format!(
+            "found {} raw LZMA1 stream(s) for {} destination section(s) - layout is ambiguous",
+            streams.len(),
+            destinations.len()
+        )));
+    }
+    let mut order: Vec<usize> = (0..destinations.len()).collect();
+    order.sort_by_key(|&i| (targets[i], destinations[i].virtual_address.0));
+
+    let mut claimed = vec![false; streams.len()];
+    let mut assigned: Vec<Option<usize>> = vec![None; destinations.len()];
+    for &di in &order {
+        let target = targets[di];
+        let mut best: Option<usize> = None;
+        for (si, &(_, length)) in streams.iter().enumerate() {
+            if claimed[si] || length > target {
+                continue;
+            }
+            // Prefer the largest length; break ties by the lowest file offset.
+            best = Some(match best {
+                Some(b) if (streams[b].1, streams[si].0) >= (length, streams[b].0) => b,
+                _ => si,
+            });
+        }
+        let si = best.ok_or_else(|| {
+            UnpackError::Locate(format!(
+                "destination {} (rounded size {target:#X}) has no fitting LZMA1 stream",
+                destinations[di].name
+            ))
+        })?;
+        claimed[si] = true;
+        assigned[di] = Some(si);
+    }
+
+    // Warnings: equal-sized section groups (ordering heuristic) and any section
+    // whose stream is shorter than its rounded size (zero-initialised tail).
+    let mut warnings = Vec::new();
+    let mut shared: Vec<(u32, Vec<String>)> = Vec::new();
+    for (di, section) in destinations.iter().enumerate() {
+        let target = targets[di];
+        if destinations
+            .iter()
+            .zip(targets)
+            .filter(|(_, t)| **t == target)
+            .count()
+            > 1
+        {
+            match shared.iter_mut().find(|(t, _)| *t == target) {
+                Some((_, names)) => names.push(section.name.clone()),
+                None => shared.push((target, vec![section.name.clone()])),
+            }
+        }
+    }
+    for (target, names) in shared {
+        warnings.push(format!(
+            "sections {names:?} share rounded size {target:#X}; streams assigned by ascending \
+             file offset to ascending section RVA"
+        ));
+    }
+    let bss: Vec<String> = destinations
+        .iter()
+        .enumerate()
+        .filter_map(|(di, section)| {
+            let si = assigned[di]?;
+            (streams[si].1 < targets[di]).then(|| section.name.clone())
+        })
+        .collect();
+    if !bss.is_empty() {
+        warnings.push(format!(
+            "sections {bss:?} reconstruct fewer bytes than their rounded size (zero-initialised \
+             tail); bound to their stream by best fit"
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(destinations.len());
+    for (di, section) in destinations.iter().enumerate() {
+        let (offset, length) = streams[assigned[di].expect("every destination assigned")];
+        let source_rva = pe
+            .file_offset_to_rva(FileOffset(u64::try_from(offset).unwrap_or(u64::MAX)))
+            .map_err(UnpackError::from)?;
+        entries.push(PackerEntry {
+            source_rva,
+            destination_rva: section.virtual_address,
+            decompressed_size: length,
+        });
+    }
+    Ok((entries, warnings))
+}
+
 /// Locates the per-section raw LZMA1 streams and binds each to its destination.
 ///
 /// # Errors
 ///
 /// Returns an error when destinations are absent, a destination's rounded size
-/// does not fit its capacity, the number of located streams for any size does
-/// not match the number of same-sized destinations, or limits are exceeded.
-#[allow(clippy::too_many_lines)]
+/// does not fit its capacity, the count of genuine streams differs from the
+/// destination count, a destination has no fitting stream, or limits are
+/// exceeded.
 pub fn locate_packer_table(
     pe: &PeImage<'_>,
     limits: UnpackLimits,
@@ -369,104 +562,40 @@ pub fn locate_packer_table(
     let destinations = packed_sections(pe, limits.max_packed_sections)?;
     let file_alignment = pe.optional.file_alignment;
 
-    // Each destination's expected decompressed size = VirtualSize rounded up to
-    // FileAlignment, which must fit the section's capacity.
+    // Each destination holds up to VirtualSize rounded to FileAlignment, which
+    // must fit before the next section; its stored stream is no larger.
     let mut targets = Vec::with_capacity(destinations.len());
+    let mut max_target = 0usize;
     for section in &destinations {
-        let size = round_up(section.virtual_size, file_alignment).ok_or_else(|| {
+        let rounded = round_up(section.virtual_size, file_alignment).ok_or_else(|| {
             UnpackError::Locate(format!("section {} rounded size overflows", section.name))
         })?;
         let capacity = destination_capacity(pe, section).ok_or_else(|| {
             UnpackError::Locate(format!("section {} capacity underflows", section.name))
         })?;
-        if size > capacity {
+        if rounded > capacity {
             return Err(UnpackError::Locate(format!(
-                "section {} rounded size {size:#X} exceeds capacity {capacity:#X}",
+                "section {} rounded size {rounded:#X} exceeds capacity {capacity:#X}",
                 section.name
             )));
         }
-        if usize::try_from(size).unwrap_or(usize::MAX) > limits.max_image_size {
+        let rounded_usize = usize::try_from(rounded).unwrap_or(usize::MAX);
+        if rounded_usize > limits.max_image_size {
             return Err(UnpackError::Locate(format!(
-                "section {} rounded size {size:#X} exceeds image limit",
+                "section {} rounded size {rounded:#X} exceeds image limit",
                 section.name
             )));
         }
-        targets.push(size);
+        targets.push(rounded);
+        max_target = max_target.max(rounded_usize);
     }
 
-    let ranges = raw_data_ranges(pe);
-    let data = pe.data();
-    let mut distinct: Vec<u32> = targets.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-
-    // Structurally locate every stream of each distinct target size.
-    let mut candidates: HashMap<u32, Vec<usize>> = HashMap::new();
-    for &size in &distinct {
-        let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
-        let mut offsets = Vec::new();
-        'ranges: for &(start, end) in &ranges {
-            for offset in start..end {
-                if data[offset] != 0 {
-                    continue;
-                }
-                if section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &data[offset..], size_usize) {
-                    offsets.push(offset);
-                    if offsets.len() > MAX_STREAMS_PER_SIZE {
-                        break 'ranges;
-                    }
-                }
-            }
-        }
-        candidates.insert(size, offsets);
-    }
-
-    // Bind streams to destinations: exact per-size count match (fail closed on
-    // ambiguity), paired in ascending file-offset / ascending-RVA order.
-    let mut warnings = Vec::new();
-    for &size in &distinct {
-        let dest_count = targets.iter().filter(|&&t| t == size).count();
-        let found = candidates.get(&size).map_or(0, Vec::len);
-        if found != dest_count {
-            return Err(UnpackError::Locate(format!(
-                "{found} raw LZMA1 stream(s) of decompressed size {size:#X} found for \
-                 {dest_count} destination section(s) of that size - layout is ambiguous"
-            )));
-        }
-        if dest_count > 1 {
-            let names: Vec<_> = destinations
-                .iter()
-                .zip(&targets)
-                .filter(|(_, t)| **t == size)
-                .map(|(s, _)| s.name.clone())
-                .collect();
-            warnings.push(format!(
-                "sections {names:?} share decompressed size {size:#X}; streams assigned by \
-                 ascending file offset to ascending section RVA"
-            ));
-        }
-    }
-    for offsets in candidates.values_mut() {
-        offsets.sort_unstable();
-    }
-
-    // Destinations are already in section (ascending-RVA) order; assign each the
-    // next unused stream of its size.
-    let mut cursor: HashMap<u32, usize> = HashMap::new();
-    let mut entries = Vec::with_capacity(destinations.len());
-    for (section, &size) in destinations.iter().zip(&targets) {
-        let index = cursor.entry(size).or_insert(0);
-        let offset = candidates[&size][*index];
-        *index += 1;
-        let source_rva = pe
-            .file_offset_to_rva(FileOffset(u64::try_from(offset).unwrap_or(u64::MAX)))
-            .map_err(UnpackError::from)?;
-        entries.push(PackerEntry {
-            source_rva,
-            destination_rva: section.virtual_address,
-            decompressed_size: size,
-        });
-    }
+    let file_alignment = usize::try_from(file_alignment)
+        .ok()
+        .filter(|&a| a != 0)
+        .ok_or_else(|| UnpackError::Locate("invalid file alignment".to_owned()))?;
+    let streams = enumerate_streams(pe, file_alignment, max_target)?;
+    let (entries, warnings) = bind_streams(pe, &destinations, &targets, &streams)?;
 
     let file_offset = entries
         .iter()
@@ -720,10 +849,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_counted_round_trips_raw_lzma1() {
+    fn decode_measured_round_trips_raw_lzma1() {
         let plain: Vec<u8> = (0..0x400_u32).map(|i| (i ^ (i >> 3)) as u8).collect();
         let stream = raw_lzma1(&plain);
-        assert!(decode_counted(VMPROTECT_LZMA_PROPERTIES, plain.len(), &stream).is_ok());
+        assert_eq!(
+            decode_measured(VMPROTECT_LZMA_PROPERTIES, plain.len() as u64, &stream, plain.len()),
+            Ok(plain.len())
+        );
+    }
+
+    #[test]
+    fn rejects_prefix_of_a_longer_stream() {
+        // A single long stream must match ONLY its true decompressed size, never
+        // a shorter prefix — the real-world multi-section false positive where a
+        // big section's stream also "decoded" to a smaller section's size.
+        let plain: Vec<u8> = (0..0x2000_u32).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+        let mut stream = raw_lzma1(&plain);
+        stream.extend_from_slice(&[0x90; 8]); // trailing bytes after the EOS
+        assert!(section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &stream, plain.len()));
+        for prefix in [0x200_usize, 0x1000, plain.len() - 1, plain.len() + 1] {
+            assert!(
+                !section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &stream, prefix),
+                "prefix size {prefix:#X} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -736,7 +885,7 @@ mod tests {
         let payload = vec![0xCD_u8; 0x200];
         let mut stream = raw_lzma1(&payload);
         stream.truncate(stream.len() / 2);
-        assert!(decode_counted(VMPROTECT_LZMA_PROPERTIES, 0x200, &stream).is_err());
+        assert!(!section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &stream, 0x200));
     }
 
     #[test]
