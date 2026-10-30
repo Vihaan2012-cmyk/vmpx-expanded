@@ -2641,6 +2641,112 @@ mod tests {
         assert_ne!(before, after);
     }
 
+    fn default_machine() -> SymbolicMachine<'static> {
+        SymbolicMachine::new(
+            &SymbolicVmInitialState::default(),
+            None,
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("default state")
+    }
+
+    fn is_free_read(value: &Expr) -> bool {
+        value
+            .intrinsic_dependencies()
+            .iter()
+            .any(|name| name.starts_with("memory_load_epoch_"))
+    }
+
+    #[test]
+    fn exact_and_narrower_reads_resolve_to_the_prior_store() {
+        let mut machine = default_machine();
+        let stored = Expr::constant(BitWidth::W64, 0x1122_3344_5566_7788);
+        machine
+            .store_memory(&stack_address(16), &stored)
+            .expect("store");
+        machine
+            .store_memory(&stack_address(64), &Expr::constant(BitWidth::W64, 9))
+            .expect("unrelated store");
+        let exact = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load");
+        assert!(matches!(
+            exact.kind,
+            ExprKind::Const {
+                value: 0x1122_3344_5566_7788
+            }
+        ));
+        let high = machine
+            .load_memory(stack_address(20), BitWidth::W32)
+            .expect("load");
+        assert!(matches!(high.kind, ExprKind::Const { value: 0x1122_3344 }));
+    }
+
+    #[test]
+    fn non_matching_or_partially_overlapping_reads_stay_free() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(
+                &stack_address(16),
+                &Expr::constant(BitWidth::W32, 0xAABB_CCDD),
+            )
+            .expect("store");
+        let other_base =
+            add_pointer_offset(Expr::register(BitWidth::W64, "other"), 16).expect("add");
+        assert!(is_free_read(
+            &machine
+                .load_memory(other_base, BitWidth::W32)
+                .expect("load")
+        ));
+        assert!(is_free_read(
+            &machine
+                .load_memory(stack_address(24), BitWidth::W64)
+                .expect("load")
+        ));
+        let straddle = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load");
+        assert!(is_free_read(&straddle));
+        assert!(!matches!(straddle.kind, ExprKind::Const { .. }));
+    }
+
+    #[test]
+    fn reads_after_a_havocing_native_call_do_not_see_prior_stores() {
+        let initial = SymbolicVmInitialState {
+            memory_values: vec![
+                (stack_address(0), Expr::constant(BitWidth::W64, 0x1000)),
+                (stack_address(8), Expr::constant(BitWidth::W64, 0x2000)),
+                (stack_address(128), Expr::constant(BitWidth::W64, 0xDEAD)),
+            ],
+            ..SymbolicVmInitialState::default()
+        };
+        let report = execute_symbolic_native_call_boundary_with_initial_state(
+            Va(0x1000),
+            &NativeCallSelectorOutcome {
+                selector: 2,
+                vsp_delta: 8,
+                target_stack_offset: 0,
+                register_argument_offsets: vec![8],
+                stack_argument_offsets: Vec::new(),
+            },
+            SymbolicExecutionLimits::default(),
+            &initial,
+            None,
+        )
+        .expect("native call");
+        let mut machine = SymbolicMachine::new(
+            &report.continuation_state(),
+            None,
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("continuation");
+        assert!(is_free_read(
+            &machine
+                .load_memory(stack_address(128), BitWidth::W64)
+                .expect("load")
+        ));
+    }
+
     #[test]
     fn opaque_native_call_havocs_state_and_places_a_fresh_result() {
         let base = Expr::register(BitWidth::W64, "vsp_initial");
