@@ -37,9 +37,10 @@ use std::collections::BTreeMap;
 use vmpx_disasm::{decode_one, is_executable_rva};
 use vmpx_pe::{PeImage, Rva, Va};
 use vmpx_vm::{
-    BitWidth, EntryPathRecoveryLimits, Expr, ExprKind, NativeExitState, RecoveryStatus,
-    VmDiscoveryLimits, VmEntryReachability, VmEntrySource, X64NativeRegister, analyze_vm_entry_at,
-    discover_vm_entries, recover_bootstrap_dispatch, recover_entry_paths,
+    BitWidth, BlockExit, CfgEdgeKind, EntryPathRecoveryLimits, Expr, ExprKind, NativeExitState,
+    RecoveryStatus, VmCfgLimits, VmDiscoveryLimits, VmEntryReachability, VmEntrySource,
+    X64NativeRegister, analyze_vm_entry_at, discover_vm_entries, recover_bootstrap_dispatch,
+    recover_entry_paths, recover_vm_cfg,
 };
 
 use synth_vm::SyntheticVm;
@@ -373,4 +374,70 @@ fn unprovable_vm_exit_handler_is_not_reported_as_an_exit() {
         vm.oep_rvas[0],
         &BTreeMap::new()
     ));
+}
+
+fn walk_cfg(vm: &SyntheticVm) -> vmpx_vm::VmCfg {
+    let pe = parse(vm);
+    let entry = entry_candidate(&pe);
+    recover_vm_cfg(&pe, &entry, VmCfgLimits::default()).expect("cfg recovery starts")
+}
+
+#[test]
+fn cfg_walk_of_a_linear_function_is_one_exit_block() {
+    let cfg = walk_cfg(&synth_vm::build_linear());
+    assert_eq!(cfg.blocks.len(), 1, "{cfg:#?}");
+    assert!(cfg.edges.is_empty());
+    assert!(cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+    let block = cfg.blocks.values().next().expect("block");
+    assert_eq!(block.exit, BlockExit::VmExit);
+    assert_eq!(block.instructions.len(), 36);
+}
+
+#[test]
+fn cfg_walk_follows_a_branch_through_a_pushed_constant_to_both_blocks() {
+    let vm = synth_vm::build_const_branch(None);
+    let cfg = walk_cfg(&vm);
+    assert_eq!(cfg.blocks.len(), 2, "{cfg:#?}");
+    assert!(cfg.stalls.is_empty(), "{cfg:#?}");
+    assert!(cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+    let [edge] = cfg.edges.as_slice() else {
+        panic!("one proven edge expected: {cfg:#?}");
+    };
+    assert_eq!(edge.kind, CfgEdgeKind::Branch);
+    assert_eq!(edge.from, cfg.entry);
+    let exits: Vec<_> = cfg.blocks.values().map(|block| block.exit).collect();
+    assert!(exits.contains(&BlockExit::Branch) && exits.contains(&BlockExit::VmExit));
+    let successor = &cfg.blocks[&edge.to];
+    assert_eq!(successor.address, Some(Va(vm.block_vas[1])));
+    assert_eq!(successor.exit, BlockExit::VmExit);
+}
+
+#[test]
+fn cfg_walk_stops_at_a_branch_target_it_cannot_prove() {
+    // The target is the saved native RDX itself: no finite proven domain.
+    let cfg = walk_cfg(&synth_vm::build_branching());
+    assert_eq!(cfg.blocks.len(), 1, "{cfg:#?}");
+    assert!(cfg.edges.is_empty(), "no edge may be invented: {cfg:#?}");
+    let [stall] = cfg.stalls.as_slice() else {
+        panic!("one stall expected: {cfg:#?}");
+    };
+    assert!(
+        stall.reason.contains("unresolved branch target"),
+        "{}",
+        stall.reason
+    );
+    assert!(!cfg.is_complete() && !cfg.all_paths_reach_vm_exit());
+}
+
+#[test]
+fn cfg_walk_refuses_a_constant_target_outside_the_bytecode_section() {
+    let cfg = walk_cfg(&synth_vm::build_const_branch(Some(0x1234)));
+    assert_eq!(cfg.blocks.len(), 1, "{cfg:#?}");
+    assert!(cfg.edges.is_empty());
+    assert!(
+        cfg.stalls
+            .iter()
+            .any(|stall| stall.reason.contains("outside the bytecode section")),
+        "{cfg:#?}"
+    );
 }

@@ -431,6 +431,15 @@ fn branching_program() -> Vec<Block> {
     ]
 }
 
+/// Scatter, push a constant target, then a virtual branch to a restore-and-exit
+/// block. The branch target is the pushed constant, not a native input.
+fn const_branch_program(target: u64) -> Vec<Block> {
+    let mut dispatcher = scatter();
+    dispatcher.push(Op::Push(target));
+    dispatcher.push(Op::Branch);
+    vec![dispatcher, restore_frame(0, FORCED_RAX)]
+}
+
 fn block_len(block: &[Op]) -> usize {
     4 + block
         .iter()
@@ -589,4 +598,13 @@ pub fn build_linear() -> SyntheticVm {
 /// `oep_rvas[1]` (RAX `[1]`). `block_vas[1..]` are the RDX values selecting them.
 pub fn build_branching() -> SyntheticVm {
     build(&branching_program())
+}
+
+/// A virtual branch to a constant. With `target` unset it is block `1`
+/// (`block_vas[1]`); otherwise the given VA, which may be invalid.
+pub fn build_const_branch(target: Option<u64>) -> SyntheticVm {
+    let placeholder = build(&const_branch_program(0));
+    build(&const_branch_program(
+        target.unwrap_or(placeholder.block_vas[1]),
+    ))
 }

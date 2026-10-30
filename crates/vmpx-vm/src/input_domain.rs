@@ -282,6 +282,21 @@ fn affine(expr: &Expr) -> Option<Affine> {
     }
 }
 
+/// Width of a `vm_flags_add_wN` or `vm_flags_sub_wN` intrinsic, and whether it
+/// is the subtracting form.
+fn flags_width(name: &str) -> Option<(u32, bool)> {
+    if let Some(bits) = add_flags_width(name) {
+        return Some((bits, false));
+    }
+    match name.strip_prefix("vm_flags_sub_w")? {
+        "8" => Some((8, true)),
+        "16" => Some((16, true)),
+        "32" => Some((32, true)),
+        "64" => Some((64, true)),
+        _ => None,
+    }
+}
+
 fn add_flags_width(name: &str) -> Option<u32> {
     match name.strip_prefix("vm_flags_add_w")? {
         "8" => Some(8),
@@ -350,7 +365,7 @@ impl Scan {
                     // Input-independent term: evaluation decides whether it folds.
                     return;
                 }
-                let Some(bits) = add_flags_width(name) else {
+                let Some((bits, subtract)) = flags_width(name) else {
                     let register = arguments
                         .iter()
                         .flat_map(Expr::dependencies)
@@ -362,7 +377,7 @@ impl Scan {
                     ));
                     return;
                 };
-                self.visit_add_flags(name, bits, arguments);
+                self.visit_add_flags(name, bits, subtract, arguments);
             }
             ExprKind::Unary { value, .. }
             | ExprKind::Extract { value, .. }
@@ -378,7 +393,7 @@ impl Scan {
         }
     }
 
-    fn visit_add_flags(&mut self, name: &str, bits: u32, arguments: &[Expr]) {
+    fn visit_add_flags(&mut self, name: &str, bits: u32, subtract: bool, arguments: &[Expr]) {
         let register = arguments
             .iter()
             .flat_map(Expr::dependencies)
@@ -393,7 +408,7 @@ impl Scan {
         };
         let (symbolic, constant) = match (constant_of(left), constant_of(right)) {
             (None, Some(c)) => (left, c),
-            (Some(c), None) => (right, c),
+            (Some(c), None) if !subtract => (right, c),
             _ => {
                 self.refuse(unsupported(
                     &register,
@@ -401,6 +416,14 @@ impl Scan {
                 ));
                 return;
             }
+        };
+        // `sub(a, c)` flags equal `add(a, -c)` flags up to a fixed complement of
+        // some of CF, AF and OF for each constant `c`, so the partition of inputs
+        // by flag tuple is the add partition at the constant `-c`.
+        let constant = if subtract {
+            (constant & mask(bits)).wrapping_neg() & mask(bits)
+        } else {
+            constant
         };
         let Some(view) = affine(symbolic).filter(|view| view.bits >= bits) else {
             self.refuse(unsupported(
@@ -547,6 +570,36 @@ mod tests {
             negate,
             offset,
             constant,
+        }
+    }
+
+    #[test]
+    fn subtract_flags_partition_inputs_like_add_flags_of_the_negated_constant() {
+        let eval = |name: &str, bits: u32, x: u64, c: u64| {
+            evaluate_vm_flags(&format!("{name}_w{bits}"), &[x, c]).expect("flags")
+        };
+        for (bits, constants) in [
+            (8, (0..=255).collect::<Vec<u64>>()),
+            (
+                16,
+                vec![0, 1, 2, 0x10, 0xFF, 0x100, 0x7FFF, 0x8000, 0x8001, 0xFFFF],
+            ),
+        ] {
+            for c in constants {
+                let negated = c.wrapping_neg() & mask(bits);
+                let mut pairs = BTreeSet::new();
+                let mut subs = BTreeSet::new();
+                let mut adds = BTreeSet::new();
+                for x in 0..=mask(bits) {
+                    let sub = eval("vm_flags_sub", bits, x, c);
+                    let add = eval("vm_flags_add", bits, x, negated);
+                    pairs.insert((sub, add));
+                    subs.insert(sub);
+                    adds.insert(add);
+                }
+                assert_eq!(subs.len(), adds.len(), "w{bits} c={c:#x}");
+                assert_eq!(pairs.len(), subs.len(), "w{bits} c={c:#x}");
+            }
         }
     }
 

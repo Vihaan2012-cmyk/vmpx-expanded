@@ -932,7 +932,6 @@ fn bind_table_base(
 /// # Errors
 ///
 /// Returns structured native-disassembly, address, or bytecode errors.
-#[allow(clippy::too_many_lines)]
 pub fn recover_and_decode_linear_vm_stream_with_table(
     pe: &PeImage<'_>,
     initial_state: RelativeDispatchState,
@@ -940,11 +939,46 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
     max_instructions: usize,
     global_table: Option<GlobalTableBase>,
 ) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
+    recover_and_decode_linear_vm_stream_cached(
+        pe,
+        initial_state,
+        config,
+        max_instructions,
+        global_table,
+        &mut LinearDecodeCache::default(),
+    )
+}
+
+/// Handler recoveries shared across the blocks of one function, so each native
+/// handler is analyzed once. A handler recovered by an earlier call is absent
+/// from later reports' `handler_recoveries`; look it up in `recoveries`.
+#[derive(Clone, Debug, Default)]
+pub struct LinearDecodeCache {
+    specs: BTreeMap<Va, VmHandlerDecodeSpec>,
+    /// Handlers without a decode spec, mapped to whether they are a proven boundary.
+    unspecced: BTreeMap<Va, bool>,
+    pub recoveries: BTreeMap<Va, HandlerCodecRecoveryReport>,
+}
+
+/// Like [`recover_and_decode_linear_vm_stream_with_table`], reusing handler
+/// recoveries from `cache` and adding newly recovered ones to it.
+///
+/// # Errors
+///
+/// Returns structured native-disassembly, address, or bytecode errors.
+#[allow(clippy::too_many_lines)]
+pub fn recover_and_decode_linear_vm_stream_cached(
+    pe: &PeImage<'_>,
+    initial_state: RelativeDispatchState,
+    config: &HandlerCodecRecoveryConfig,
+    max_instructions: usize,
+    global_table: Option<GlobalTableBase>,
+    cache: &mut LinearDecodeCache,
+) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
     let mut instructions = Vec::new();
     let mut seen = BTreeSet::new();
     let mut state = initial_state;
     let mut cumulative_vsp_delta = Some(0_i64);
-    let mut specs: BTreeMap<Va, VmHandlerDecodeSpec> = BTreeMap::new();
     let mut handler_recoveries = BTreeMap::new();
     // Protector bytecode is fetched from an executable section. Containment is
     // only meaningful when the stream starts in one: a stream whose initial VIP
@@ -1010,8 +1044,21 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
                 ));
             }
         }
-        let spec = if let Some(spec) = specs.get(&state.handler) {
+        let spec = if let Some(spec) = cache.specs.get(&state.handler) {
             spec.clone()
+        } else if let Some(&control_boundary) = cache.unspecced.get(&state.handler) {
+            return Ok(linear_report(
+                instructions,
+                state,
+                cumulative_vsp_delta,
+                if control_boundary {
+                    LinearDecodeStop::ControlFlowBoundary
+                } else {
+                    LinearDecodeStop::MissingHandlerSpec
+                },
+                (!control_boundary).then_some(state.handler),
+                handler_recoveries,
+            ));
         } else {
             let Some(handler_rva) = pe.optional.image_base.checked_rva_of(state.handler) else {
                 let partial = linear_report(
@@ -1086,8 +1133,10 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
                     .handler_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.semantic.ends_linear_block());
+            cache.recoveries.insert(state.handler, recovery.clone());
             handler_recoveries.insert(state.handler, recovery);
             let Some(spec) = spec else {
+                cache.unspecced.insert(state.handler, control_boundary);
                 return Ok(linear_report(
                     instructions,
                     state,
@@ -1101,7 +1150,7 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
                     handler_recoveries,
                 ));
             };
-            specs.insert(state.handler, spec.clone());
+            cache.specs.insert(state.handler, spec.clone());
             spec
         };
         let instruction = match spec.decode_direction(pe, state, config.bytecode_direction) {

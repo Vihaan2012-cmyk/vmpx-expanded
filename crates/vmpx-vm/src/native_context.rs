@@ -149,7 +149,7 @@ pub enum NativeFrameSource {
 }
 
 impl NativeFrameSource {
-    fn symbolic_value(&self) -> Option<Expr> {
+    pub(crate) fn symbolic_value(&self) -> Option<Expr> {
         match self {
             Self::Register { register } => {
                 Some(Expr::register(BitWidth::W64, register.symbolic_name()))
@@ -240,26 +240,26 @@ impl NativeContextMappingReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Provenance {
+pub(crate) enum Provenance {
     Native(X64NativeRegister),
     Constant(u64),
     Unknown,
 }
 
 #[derive(Clone, Debug)]
-struct ObservedPush {
-    source: NativeFrameSource,
+pub(crate) struct ObservedPush {
+    pub(crate) source: NativeFrameSource,
     at: Rva,
 }
 
-fn initial_provenance() -> BTreeMap<Register, Provenance> {
+pub(crate) fn initial_provenance() -> BTreeMap<Register, Provenance> {
     X64NativeRegister::ALL
         .into_iter()
         .map(|register| (register.iced(), Provenance::Native(register)))
         .collect()
 }
 
-fn defines_flags(instruction: &Instruction) -> bool {
+pub(crate) fn defines_flags(instruction: &Instruction) -> bool {
     instruction.rflags_written()
         | instruction.rflags_cleared()
         | instruction.rflags_set()
@@ -306,7 +306,7 @@ fn exact_zero(instruction: &Instruction) -> Option<Register> {
     .then(|| canonical(instruction.op0_register()))
 }
 
-fn update_provenance(
+pub(crate) fn update_provenance(
     factory: &mut InstructionInfoFactory,
     instruction: &Instruction,
     provenance: &mut BTreeMap<Register, Provenance>,
@@ -336,6 +336,22 @@ fn update_provenance(
         provenance.insert(destination, Provenance::Constant(0));
         return;
     }
+    if instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op0_kind() == OpKind::Register
+        && matches!(instruction.op0_register().size(), 4 | 8)
+        && let Some(value) = signed_immediate(instruction, 1)
+    {
+        let value = if instruction.op0_register().size() == 4 {
+            u64::from(value.cast_unsigned() as u32)
+        } else {
+            value.cast_unsigned()
+        };
+        provenance.insert(
+            canonical(instruction.op0_register()),
+            Provenance::Constant(value),
+        );
+        return;
+    }
     for register in X64NativeRegister::ALL {
         let iced = register.iced();
         if writes_register(factory, instruction, iced) {
@@ -344,7 +360,7 @@ fn update_provenance(
     }
 }
 
-fn observe_target_push(
+pub(crate) fn observe_target_push(
     decoded: &DecodedInstruction,
     provenance: &BTreeMap<Register, Provenance>,
     original_flags: bool,
@@ -382,7 +398,7 @@ fn observe_target_push(
     })
 }
 
-fn caller_push_source(decoded: &DecodedInstruction, ordinal: u32) -> NativeFrameSource {
+pub(crate) fn caller_push_source(decoded: &DecodedInstruction, ordinal: u32) -> NativeFrameSource {
     let instruction = &decoded.instruction;
     if instruction.mnemonic() == Mnemonic::Push
         && let Some(value) = signed_immediate(instruction, 0)
@@ -397,7 +413,7 @@ fn caller_push_source(decoded: &DecodedInstruction, ordinal: u32) -> NativeFrame
     }
 }
 
-fn is_cursor_capture(instruction: &Instruction) -> Option<Register> {
+pub(crate) fn is_cursor_capture(instruction: &Instruction) -> Option<Register> {
     (instruction.mnemonic() == Mnemonic::Mov
         && instruction.op0_kind() == OpKind::Register
         && instruction.op1_kind() == OpKind::Register

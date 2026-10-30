@@ -101,6 +101,37 @@ impl From<SymbolicExecutionError> for EntryProfileRecoveryError {
     }
 }
 
+pub(crate) fn bootstrap_global_table(
+    bootstrap: &BootstrapDispatchRecovery,
+) -> Option<GlobalTableBase> {
+    bootstrap
+        .codec
+        .table
+        .and_then(|table| table.table_base)
+        .zip(bootstrap.table_register)
+        .map(|(base, register)| GlobalTableBase { register, base })
+}
+
+pub(crate) fn entry_stream_config(
+    profile: &VmProfile,
+    limits: EntryProfileRecoveryLimits,
+) -> HandlerCodecRecoveryConfig {
+    HandlerCodecRecoveryConfig {
+        roles: profile.handler_roles,
+        bytecode_direction: profile.bytecode_direction,
+        effect_roles: Some(profile.effect_roles),
+        live_out_registers: vec![
+            profile.effect_roles.vsp,
+            profile.handler_roles.handler,
+            profile.handler_roles.vip,
+            profile.handler_roles.rolling_key,
+        ],
+        live_out_rflags: 0,
+        trace_limits: limits.trace,
+        proof_limits: limits.dispatch_proof,
+    }
+}
+
 /// Walks the linear VM stream from `state`, threading the bootstrap-proven table
 /// anchor (when the dispatch is table-indexed) into every handler.
 fn decode_entry_stream(
@@ -110,31 +141,12 @@ fn decode_entry_stream(
     profile: &VmProfile,
     limits: EntryProfileRecoveryLimits,
 ) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
-    let global_table = bootstrap
-        .codec
-        .table
-        .and_then(|table| table.table_base)
-        .zip(bootstrap.table_register)
-        .map(|(base, register)| GlobalTableBase { register, base });
     recover_and_decode_linear_vm_stream_with_table(
         pe,
         state,
-        &HandlerCodecRecoveryConfig {
-            roles: profile.handler_roles,
-            bytecode_direction: profile.bytecode_direction,
-            effect_roles: Some(profile.effect_roles),
-            live_out_registers: vec![
-                profile.effect_roles.vsp,
-                profile.handler_roles.handler,
-                profile.handler_roles.vip,
-                profile.handler_roles.rolling_key,
-            ],
-            live_out_rflags: 0,
-            trace_limits: limits.trace,
-            proof_limits: limits.dispatch_proof,
-        },
+        &entry_stream_config(profile, limits),
         limits.instruction_limit,
-        global_table,
+        bootstrap_global_table(bootstrap),
     )
 }
 
@@ -189,6 +201,37 @@ pub fn recover_entry_stream(
     entry: &VmEntryCandidate,
     limits: EntryProfileRecoveryLimits,
 ) -> Result<RecoveredEntryStream, EntryProfileRecoveryError> {
+    let setup = prepare_entry_stream(pe, entry, limits)?;
+    let decode = decode_entry_stream(
+        pe,
+        &setup.bootstrap,
+        setup.first_state,
+        &setup.profile,
+        limits,
+    )?;
+    Ok(RecoveredEntryStream {
+        bootstrap_report: setup.bootstrap_report,
+        bootstrap: setup.bootstrap,
+        native_frame: setup.native_frame,
+        profile: setup.profile,
+        decode,
+    })
+}
+
+/// Bootstrap-derived roles and the first dispatched decoder state of an entry.
+pub(crate) struct EntryStreamSetup {
+    pub bootstrap_report: BootstrapDispatchReport,
+    pub bootstrap: BootstrapDispatchRecovery,
+    pub native_frame: X64NativeFrameReport,
+    pub profile: VmProfile,
+    pub first_state: RelativeDispatchState,
+}
+
+pub(crate) fn prepare_entry_stream(
+    pe: &PeImage<'_>,
+    entry: &VmEntryCandidate,
+    limits: EntryProfileRecoveryLimits,
+) -> Result<EntryStreamSetup, EntryProfileRecoveryError> {
     let (bootstrap_report, bootstrap) = recover_bootstrap_dispatch(pe, entry, limits.trace)?;
     let bootstrap = bootstrap.ok_or_else(|| EntryProfileRecoveryError::AmbiguousBootstrap {
         message: bootstrap_report.diagnostics.join("; "),
@@ -216,13 +259,12 @@ pub fn recover_entry_stream(
         },
         bytecode_direction: bootstrap.bytecode_direction,
     };
-    let decode = decode_entry_stream(pe, &bootstrap, first.state_after, &profile, limits)?;
-    Ok(RecoveredEntryStream {
+    Ok(EntryStreamSetup {
         bootstrap_report,
         bootstrap,
         native_frame,
         profile,
-        decode,
+        first_state: first.state_after,
     })
 }
 

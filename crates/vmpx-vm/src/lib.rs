@@ -1,5 +1,6 @@
 mod bootstrap;
 mod call_effects;
+mod cfg;
 mod checksum;
 mod checksum_handler;
 mod codec_recovery;
@@ -49,6 +50,10 @@ pub use call_effects::{
     apply_native_call_effect, fresh_allocation_return_intrinsic_name,
     opaque_call_return_intrinsic_name, resolve_native_call_import,
 };
+pub use cfg::{
+    BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, VmBasicBlock, VmCfg,
+    VmCfgLimits, recover_vm_cfg,
+};
 pub use checksum::{
     ChecksumAccumulatorSource, ChecksumCombine, ChecksumShift, ChecksumTableIndex,
     TableChecksumMetadata, TableChecksumMetadataError, VmSemanticMetadata,
@@ -58,12 +63,13 @@ pub use checksum_handler::{
     analyze_table_checksum_handler,
 };
 pub use codec_recovery::{
-    GlobalTableBase, HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport,
+    GlobalTableBase, HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport, LinearDecodeCache,
     LinearHandlerRecoveryError, LinearHandlerRecoveryReport, ResolvedVmProfileRoles,
     TableDispatchFacts, VmProfileRoleCandidateReport, VmProfileRoleResolution,
     VmProfileRoleResolutionConfig, VmProfileRoleResolutionReport,
-    recover_and_decode_linear_vm_stream, recover_and_decode_linear_vm_stream_with_table,
-    recover_handler_codecs, resolve_vm_profile_roles,
+    recover_and_decode_linear_vm_stream, recover_and_decode_linear_vm_stream_cached,
+    recover_and_decode_linear_vm_stream_with_table, recover_handler_codecs,
+    resolve_vm_profile_roles,
 };
 pub use decoder::{
     BytecodeDecodeError, DecodedDispatch, DecodedOperandDispatch, DecodedVmInstruction,

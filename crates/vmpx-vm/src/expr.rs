@@ -680,6 +680,10 @@ pub(crate) fn evaluate_vm_flags(name: &str, arguments: &[u64]) -> Option<u64> {
         "vm_flags_add_w16" => (BinaryOp::Add, BitWidth::W16),
         "vm_flags_add_w32" => (BinaryOp::Add, BitWidth::W32),
         "vm_flags_add_w64" => (BinaryOp::Add, BitWidth::W64),
+        "vm_flags_sub_w8" => (BinaryOp::Sub, BitWidth::W8),
+        "vm_flags_sub_w16" => (BinaryOp::Sub, BitWidth::W16),
+        "vm_flags_sub_w32" => (BinaryOp::Sub, BitWidth::W32),
+        "vm_flags_sub_w64" => (BinaryOp::Sub, BitWidth::W64),
         "vm_flags_nor_w8" => (BinaryOp::And, BitWidth::W8),
         "vm_flags_nor_w16" => (BinaryOp::And, BitWidth::W16),
         "vm_flags_nor_w32" => (BinaryOp::And, BitWidth::W32),
@@ -697,6 +701,8 @@ pub(crate) fn evaluate_vm_flags(name: &str, arguments: &[u64]) -> Option<u64> {
     let right = width.truncate(*right);
     if semantic == BinaryOp::Add {
         Some(add_status_flags(width, left, right))
+    } else if semantic == BinaryOp::Sub {
+        Some(sub_status_flags(width, left, right))
     } else {
         let result = match semantic {
             BinaryOp::And => (!left & !right) & width.mask(),
@@ -746,6 +752,26 @@ fn add_status_flags(width: BitWidth, left: u64, right: u64) -> u64 {
     }
     let sign = 1_u64 << (width.bits() - 1);
     if (!(left ^ right) & (left ^ result) & sign) != 0 {
+        flags |= OVERFLOW;
+    }
+    flags
+}
+
+fn sub_status_flags(width: BitWidth, left: u64, right: u64) -> u64 {
+    const CARRY: u64 = 1;
+    const AUXILIARY: u64 = 1 << 4;
+    const OVERFLOW: u64 = 1 << 11;
+
+    let result = width.truncate(left.wrapping_sub(right));
+    let mut flags = common_status_flags(width, result);
+    if left < right {
+        flags |= CARRY;
+    }
+    if (left ^ right ^ result) & 0x10 != 0 {
+        flags |= AUXILIARY;
+    }
+    let sign = 1_u64 << (width.bits() - 1);
+    if ((left ^ right) & (left ^ result) & sign) != 0 {
         flags |= OVERFLOW;
     }
     flags
