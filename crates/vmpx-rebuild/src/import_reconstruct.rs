@@ -242,10 +242,269 @@ pub fn plan_proven_imports(
     plan_import_reconstruction(kind, table_rva, &modules)
 }
 
+/// A clean import directory built only from proven-referenced IAT slots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanImportDirectory {
+    pub proven: ProvenImportSet,
+    /// `None` when no slot was proven: nothing is serialized and the caller
+    /// must keep the "import set not proven" blocker.
+    pub plan: Option<ImportReconstructionPlan>,
+}
+
+impl CleanImportDirectory {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_none()
+    }
+
+    /// True when every referenced slot was proven (none left unresolved).
+    #[must_use]
+    pub fn fully_resolved(&self) -> bool {
+        self.proven.unresolved.is_empty()
+    }
+}
+
+/// Build a clean import directory containing exactly the imports whose IAT
+/// slot is in `proven_slots`. Unresolvable slots are reported in
+/// `proven.unresolved`, never fabricated into the table. An empty result is
+/// not an error. Completeness of `proven_slots` is the caller's burden.
+///
+/// # Errors
+/// Propagates [`ImportTableError`] from serialization of a non-empty set.
+pub fn reconstruct_clean_imports(
+    kind: PeKind,
+    table_rva: Rva,
+    modules: &[ImportModule],
+    proven_slots: &BTreeSet<Rva>,
+) -> Result<CleanImportDirectory, ImportTableError> {
+    let proven = reduce_to_proven_imports(&bindings_from_modules(modules), proven_slots);
+    let plan = if proven.import_count() == 0 {
+        None
+    } else {
+        Some(plan_proven_imports(kind, table_rva, &proven)?)
+    };
+    Ok(CleanImportDirectory { proven, plan })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::import_table::ImportTarget;
+
+    fn sym(rva: u32, name: Option<&str>, ordinal: Option<u16>, hint: Option<u16>) -> ImportSymbol {
+        ImportSymbol {
+            iat_rva: Rva(rva),
+            lookup_value: 0,
+            name: name.map(str::to_owned),
+            hint,
+            ordinal,
+        }
+    }
+
+    fn two_modules() -> Vec<ImportModule> {
+        let module = |name: &str, entries| ImportModule {
+            name: name.to_owned(),
+            descriptor_rva: Rva(0),
+            original_first_thunk: Rva(0),
+            first_thunk: Rva(0),
+            entries,
+        };
+        vec![
+            module(
+                "kernel32.dll",
+                vec![
+                    sym(0x2000, Some("ExitProcess"), None, Some(0x11)),
+                    sym(0x2008, Some("Sleep"), None, Some(0x22)),
+                    sym(0x2010, Some("GetTickCount"), None, Some(0x33)),
+                ],
+            ),
+            module(
+                "ws2_32.dll",
+                vec![
+                    sym(0x2020, None, Some(115), None),
+                    sym(0x2028, Some("socket"), None, Some(0x44)),
+                    sym(0x2030, None, Some(3), None),
+                ],
+            ),
+        ]
+    }
+
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+    }
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+    fn u64_at(b: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+    }
+    fn cstr(b: &[u8], at: usize) -> String {
+        let end = b[at..].iter().position(|&x| x == 0).unwrap();
+        String::from_utf8(b[at..at + end].to_vec()).unwrap()
+    }
+
+    /// Independent byte-level walk of a PE32+ import blob based at `base`.
+    /// Returns per module `(dll, [(ilt_value, iat_value, name_or_ordinal)])`.
+    fn walk(bytes: &[u8], base: u32) -> Vec<(String, Vec<(u64, u64, Result<(u16, String), u16>)>)> {
+        let off = |rva: u32| (rva - base) as usize;
+        let mut out = Vec::new();
+        let mut d = 0;
+        loop {
+            let desc = &bytes[d..d + 20];
+            if desc.iter().all(|&x| x == 0) {
+                break;
+            }
+            // TimeDateStamp and ForwarderChain must be zero.
+            assert_eq!(u32_at(desc, 4), 0);
+            assert_eq!(u32_at(desc, 8), 0);
+            let ilt = off(u32_at(desc, 0));
+            let iat = off(u32_at(desc, 16));
+            assert_eq!(ilt % 8, 0);
+            assert_eq!(iat % 8, 0);
+            let dll = cstr(bytes, off(u32_at(desc, 12)));
+            let mut entries = Vec::new();
+            let mut i = 0;
+            loop {
+                let l = u64_at(bytes, ilt + 8 * i);
+                let a = u64_at(bytes, iat + 8 * i);
+                if l == 0 {
+                    assert_eq!(a, 0, "IAT terminator");
+                    break;
+                }
+                assert_eq!(l, a, "unbound IAT mirrors ILT");
+                let id = if l >> 63 == 1 {
+                    Err(u16::try_from(l & 0xFFFF).unwrap())
+                } else {
+                    let n = off(u32::try_from(l).unwrap());
+                    assert_eq!(n % 2, 0, "hint/name 2-aligned");
+                    Ok((u16_at(bytes, n), cstr(bytes, n + 2)))
+                };
+                entries.push((l, a, id));
+                i += 1;
+            }
+            out.push((dll, entries));
+            d += 20;
+        }
+        out
+    }
+
+    #[test]
+    fn reconstruct_emits_exactly_proven_symbols_grouped_per_module() {
+        let modules = two_modules();
+        let proven = refs(&[0x2008, 0x2020, 0x2028]);
+        let dir =
+            reconstruct_clean_imports(PeKind::Pe32Plus, Rva(0x6000), &modules, &proven).unwrap();
+        assert!(dir.fully_resolved());
+        assert!(!dir.is_empty());
+        let plan = dir.plan.as_ref().unwrap();
+        let t = &plan.table;
+
+        let parsed = walk(&t.bytes, 0x6000);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "kernel32.dll");
+        assert_eq!(parsed[0].1.len(), 1);
+        assert_eq!(parsed[0].1[0].2, Ok((0x22, "Sleep".to_owned())));
+        assert_eq!(parsed[1].0, "ws2_32.dll");
+        let ws: Vec<_> = parsed[1].1.iter().map(|e| e.2.clone()).collect();
+        assert_eq!(ws, [Ok((0x44, "socket".to_owned())), Err(115)]);
+        assert_eq!(parsed[1].1[1].0, 0x8000_0000_0000_0000 | 115);
+
+        // Dropped symbols never appear anywhere in the blob.
+        for dropped in [&b"ExitProcess"[..], b"GetTickCount"] {
+            assert!(!t.bytes.windows(dropped.len()).any(|w| w == dropped));
+        }
+
+        // Directory ranges: descriptors incl. terminator; IAT incl. terminators.
+        assert_eq!(t.import_directory.rva, Rva(0x6000));
+        assert_eq!(t.import_directory.size, 3 * 20);
+        assert_eq!(t.iat_directory.size, (2 + 3) * 8);
+        let iat_off = (t.iat_directory.rva.0 - 0x6000) as usize;
+        assert_eq!(u32_at(&t.bytes, 16), t.iat_directory.rva.0);
+        assert_eq!(iat_off % 8, 0);
+
+        // Remaps cover exactly the proven slots to in-table IAT slots.
+        let remapped: Vec<_> = plan
+            .slot_remaps
+            .iter()
+            .map(|r| r.source_iat_rva.0)
+            .collect();
+        assert_eq!(remapped, [0x2008, 0x2028, 0x2020]);
+        for r in &plan.slot_remaps {
+            let at = r.rebuilt_iat_rva.0;
+            assert!(
+                at >= t.iat_directory.rva.0 && at < t.iat_directory.rva.0 + t.iat_directory.size
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruct_empty_proven_set_yields_empty_table_without_error() {
+        let modules = two_modules();
+        let dir = reconstruct_clean_imports(PeKind::Pe32, Rva(0x6000), &modules, &BTreeSet::new())
+            .unwrap();
+        assert!(dir.is_empty());
+        assert!(dir.plan.is_none());
+        assert_eq!(dir.proven.import_count(), 0);
+        assert_eq!(dir.proven.unreferenced_slots, 6);
+        assert!(dir.fully_resolved());
+
+        let none = reconstruct_clean_imports(PeKind::Pe32, Rva(0), &[], &BTreeSet::new()).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn reconstruct_never_fabricates_unbound_slots() {
+        let modules = two_modules();
+        let dir = reconstruct_clean_imports(
+            PeKind::Pe32Plus,
+            Rva(0x6000),
+            &modules,
+            &refs(&[0x2000, 0x9000]),
+        )
+        .unwrap();
+        assert!(!dir.fully_resolved());
+        assert_eq!(dir.proven.unresolved[0].slot, Rva(0x9000));
+        let parsed = walk(&dir.plan.unwrap().table.bytes, 0x6000);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1.len(), 1);
+        assert_eq!(parsed[0].1[0].2, Ok((0x11, "ExitProcess".to_owned())));
+
+        let only_unbound =
+            reconstruct_clean_imports(PeKind::Pe32Plus, Rva(0x6000), &modules, &refs(&[0x9000]))
+                .unwrap();
+        assert!(only_unbound.is_empty());
+        assert!(!only_unbound.fully_resolved());
+    }
+
+    #[test]
+    fn reconstruct_pe32_uses_32bit_thunks_and_ordinal_flag() {
+        let modules = two_modules();
+        let dir = reconstruct_clean_imports(
+            PeKind::Pe32,
+            Rva(0x6000),
+            &modules,
+            &refs(&[0x2030, 0x2008]),
+        )
+        .unwrap();
+        let t = &dir.plan.unwrap().table;
+        // Two descriptors + terminator = 60 bytes, ILT aligned to 4.
+        assert_eq!(t.import_directory.size, 60);
+        assert_eq!(t.iat_directory.size, (2 + 2) * 4);
+        let ilt = |d: usize| (u32_at(&t.bytes, d) - 0x6000) as usize;
+        let iat = |d: usize| (u32_at(&t.bytes, d + 16) - 0x6000) as usize;
+        // ws2_32 (descriptor 1): ordinal 3 only.
+        assert_eq!(u32_at(&t.bytes, ilt(20)), 0x8000_0003);
+        assert_eq!(u32_at(&t.bytes, ilt(20) + 4), 0);
+        assert_eq!(u32_at(&t.bytes, iat(20)), 0x8000_0003);
+        assert_eq!(u32_at(&t.bytes, iat(20) + 4), 0);
+        // kernel32 (descriptor 0): Sleep by name.
+        let n = (u32_at(&t.bytes, ilt(0)) - 0x6000) as usize;
+        assert_eq!(u16_at(&t.bytes, n), 0x22);
+        assert_eq!(cstr(&t.bytes, n + 2), "Sleep");
+        assert_eq!(u32_at(&t.bytes, ilt(0) + 4), 0);
+        // Terminating descriptor is all zero.
+        assert!(t.bytes[40..60].iter().all(|&b| b == 0));
+    }
 
     fn named(slot: u32, module: &str, name: &str) -> SlotBinding {
         SlotBinding {
