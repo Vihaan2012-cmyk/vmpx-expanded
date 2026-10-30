@@ -20,7 +20,7 @@ use vmpx_recompile::{
     PhysicalRegister, RegisterAssignment, SpillSlot, StackFrame, VirtualRegister, Width, compile,
 };
 use vmpx_vm::{
-    BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeCallMemoryDecision,
+    BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeCallMemoryDecision, ResizeOp,
     NativeCallSelectorOutcome, NativeExitState, NativeFrameSource, SymbolicExecutionLimits,
     SymbolicMemorySource, SymbolicVmExecutionReport, SymbolicVmInitialState, VmCfg, VmCfgAssumption,
     VmCfgLimits, VmExitReport, VmHandlerSemantic, X64NativeRegister, canonicalize_symbolic_pointer,
@@ -87,9 +87,27 @@ struct CallSite {
     arguments: Vec<Expr>,
 }
 
-enum Step {
+/// A memory read captured at its native-order position because it could not be
+/// safely re-issued where its value is used (a store or native call that may
+/// affect it runs in between). The load is emitted here and spilled; later uses
+/// read the spill slot. See [`Builder::capture_read`].
+struct LoadRead {
+    index: usize,
+    address: Expr,
+    width: BitWidth,
+}
+
+enum StepKind {
     Store(EffectStore),
     Call(CallSite),
+    Load(LoadRead),
+}
+
+/// A side effect emitted at a point on the path, tagged with the memory epoch at
+/// which it commits so reads can be ordered against it.
+struct Step {
+    epoch: u64,
+    kind: StepKind,
 }
 
 struct ExitLeaf {
@@ -269,6 +287,8 @@ struct Builder<'a> {
     branches: usize,
     loops: usize,
     call_sites: usize,
+    /// In-place captured reads allocated so far; also the next slot id.
+    read_sites: usize,
     uses_root: bool,
     assumptions: Vec<LiftAssumption>,
     /// Natural-loop bodies keyed by header, recovered up front.
@@ -277,6 +297,11 @@ struct Builder<'a> {
     loop_phis: u16,
     /// Active `phi` input names a prepared expression may legitimately read.
     active_phis: BTreeSet<String>,
+    /// Memory epoch at which the current node's steps began; stores/calls below
+    /// it live in ancestor nodes. Set at the top of [`Builder::walk`].
+    node_base_epoch: u64,
+    /// Native-call barrier inherited by the current node (ancestor calls only).
+    node_call_barrier: u64,
 }
 
 /// Forward (non-back-edge) predecessors of each block. A `(from, to)` pair that
@@ -492,6 +517,23 @@ fn call_result_name(index: usize) -> String {
     format!("__call_result_{index}")
 }
 
+const READ_RESULT_PREFIX: &str = "__read_result_";
+
+fn read_result_name(index: usize) -> String {
+    format!("{READ_RESULT_PREFIX}{index}")
+}
+
+/// Reference to a captured read's spill slot (held 64-bit), narrowed to the
+/// read's own width.
+fn read_result_ref(width: BitWidth, index: usize) -> Option<Expr> {
+    let register = Expr::register(BitWidth::W64, read_result_name(index));
+    if width == BitWidth::W64 {
+        Some(register)
+    } else {
+        Expr::extract(width, 0, register).ok()
+    }
+}
+
 /// Both addresses are fixed offsets from the entry stack pointer and their byte
 /// ranges do not overlap.
 fn provably_disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
@@ -521,6 +563,36 @@ fn read_is_stable(path: &Path, epoch: u64, address: &Expr, bytes: u32) -> bool {
             .all(|store| provably_disjoint(address, bytes, &store.address, store.bytes))
 }
 
+/// Whether a read that cannot be re-issued at the use site can instead be kept
+/// in place: emitted at the start of the current node (just after the state it
+/// inherits) and spilled, with later uses reading the spill.
+///
+/// This is sound only when every store or native call that could affect the
+/// read and runs *before* the current node already preserves the read's value
+/// up to the node's entry — those steps are emitted in ancestor nodes and cannot
+/// be reordered against. A store or call that runs *within* this node (epoch past
+/// `node_base`) is handled by positioning the emitted load ahead of it in
+/// [`Builder::capture_read`], so it is not an obstacle here.
+///
+/// Concretely the read must not have been crossed by an ancestor native call
+/// (`epoch >= node_call_barrier`) and every ancestor store committed after the
+/// read (`node_base >= store.end_epoch > epoch`) must be provably disjoint.
+fn read_fits_in_node(
+    path: &Path,
+    epoch: u64,
+    address: &Expr,
+    bytes: u32,
+    node_base: u64,
+    node_call_barrier: u64,
+) -> bool {
+    epoch >= node_call_barrier
+        && path
+            .stores
+            .iter()
+            .filter(|store| store.end_epoch > epoch && store.end_epoch <= node_base)
+            .all(|store| provably_disjoint(address, bytes, &store.address, store.bytes))
+}
+
 fn is_native_rflags_initial(expression: &Expr) -> bool {
     matches!(
         &expression.simplify().kind,
@@ -531,14 +603,26 @@ fn is_native_rflags_initial(expression: &Expr) -> bool {
 impl Builder<'_> {
     /// Rewrites an expression into what the native function can evaluate at the
     /// current point, or refuses.
+    ///
+    /// A memory read is re-issued as a native load inline when it is provably
+    /// unaffected by anything between it and this point (`epoch >= barrier` or
+    /// [`read_is_stable`]). Otherwise, rather than refusing, the read is kept in
+    /// its original program order: captured at its native-order position in
+    /// `steps` and referenced here through its spill slot (see
+    /// [`Builder::capture_read`]). Only a read that cannot even be ordered
+    /// correctly within this node still refuses.
     fn prepare(
         &mut self,
         block: Va,
         expression: &Expr,
         barrier: u64,
         path: &Path,
+        steps: &mut Vec<Step>,
     ) -> Result<Expr, DecodedLiftError> {
         let results = &path.results;
+        let node_base = self.node_base_epoch;
+        let node_call_barrier = self.node_call_barrier;
+        let read_sites = &mut self.read_sites;
         let rewritten = expression
             .rewrite_intrinsics(&mut |width, name, arguments| {
                 if let Some(register) = results.get(name) {
@@ -549,16 +633,24 @@ impl Builder<'_> {
                     .strip_prefix("memory_load_epoch_")?
                     .parse::<u64>()
                     .ok()?;
-                match arguments {
-                    [address]
-                        if address.width == BitWidth::W64
-                            && (epoch >= barrier
-                                || read_is_stable(path, epoch, address, width.bytes())) =>
-                    {
-                        Some(Expr::load(width, address.clone()))
-                    }
-                    _ => None,
+                let [address] = arguments else { return None };
+                if address.width != BitWidth::W64 {
+                    return None;
                 }
+                if epoch >= barrier || read_is_stable(path, epoch, address, width.bytes()) {
+                    return Some(Expr::load(width, address.clone()));
+                }
+                // Cannot re-issue the read here. Keep it in place if ordering
+                // permits; otherwise leave it for the refusal below.
+                if !read_fits_in_node(path, epoch, address, width.bytes(), node_base, node_call_barrier)
+                {
+                    return None;
+                }
+                let index = *read_sites;
+                let reference = read_result_ref(width, index)?;
+                *read_sites = index + 1;
+                Self::place_captured_read(steps, index, epoch, address.clone(), width);
+                Some(reference)
             })
             .map_err(|error| DecodedLiftError::Cfg {
                 block,
@@ -584,7 +676,9 @@ impl Builder<'_> {
         let dependencies = rewritten.dependencies();
         let foreign: Vec<&String> = dependencies
             .iter()
-            .filter(|name| !allowed.contains(name.as_str()))
+            .filter(|name| {
+                !allowed.contains(name.as_str()) && !name.starts_with(READ_RESULT_PREFIX)
+            })
             .collect();
         if !foreign.is_empty() {
             return refuse(
@@ -598,6 +692,35 @@ impl Builder<'_> {
             self.uses_root = true;
         }
         Ok(rewritten)
+    }
+
+    /// Inserts a captured read's load into `steps` at its native-order position:
+    /// after every step that commits at or before the read's epoch and before the
+    /// first step that commits after it. Steps stay ordered by epoch, so the load
+    /// runs after any store/call the read must observe and before any that must
+    /// not reach it.
+    fn place_captured_read(
+        steps: &mut Vec<Step>,
+        index: usize,
+        epoch: u64,
+        address: Expr,
+        width: BitWidth,
+    ) {
+        let position = steps
+            .iter()
+            .position(|step| step.epoch > epoch)
+            .unwrap_or(steps.len());
+        steps.insert(
+            position,
+            Step {
+                epoch,
+                kind: StepKind::Load(LoadRead {
+                    index,
+                    address,
+                    width,
+                }),
+            },
+        );
     }
 
     /// The branch's proven successors, taken straight from the walk's CFG edges
@@ -667,6 +790,12 @@ impl Builder<'_> {
         mut steps: Vec<Step>,
     ) -> Result<Node, DecodedLiftError> {
         let input = self.input;
+        // This node's steps begin from the state it inherits: any store or call
+        // below these epochs was emitted in an ancestor node and cannot be
+        // reordered against. Captured reads must respect that (see
+        // `read_fits_in_node`).
+        self.node_base_epoch = state.memory_epoch;
+        self.node_call_barrier = path.call_barrier;
         loop {
             if self.expanded >= input.max_expanded_blocks {
                 return refuse(key, "block expansion budget exhausted");
@@ -721,19 +850,22 @@ impl Builder<'_> {
                 if write.value.dependencies().contains("vsp_initial") {
                     path.root_escaped = true;
                 }
-                let address = self.prepare(key, &write.address, barrier, &path)?;
-                let value = self.prepare(key, &write.value, barrier, &path)?;
+                let address = self.prepare(key, &write.address, barrier, &path, &mut steps)?;
+                let value = self.prepare(key, &write.value, barrier, &path, &mut steps)?;
                 let width = value.width;
                 path.stores.push(PathStore {
-                    end_epoch: report.memory_epoch,
+                    end_epoch: write.epoch,
                     address: write.address.clone(),
                     bytes: write.value.width.bytes(),
                 });
-                steps.push(Step::Store(EffectStore {
-                    address,
-                    value,
-                    width,
-                }));
+                steps.push(Step {
+                    epoch: write.epoch,
+                    kind: StepKind::Store(EffectStore {
+                        address,
+                        value,
+                        width,
+                    }),
+                });
             }
             if !report.external_writes.is_empty() {
                 path.barrier = path.barrier.max(report.memory_epoch);
@@ -784,18 +916,18 @@ impl Builder<'_> {
                                         "the region exit flags are a stack pointer",
                                     );
                                 }
-                                Some(self.prepare(key, &exit.rflags, path.barrier, &path)?)
+                                Some(self.prepare(key, &exit.rflags, path.barrier, &path, &mut steps)?)
                             };
                             let mut registers = BTreeMap::new();
                             for (register, value) in &exit.registers {
                                 registers.insert(
                                     *register,
-                                    self.prepare(key, value, path.barrier, &path)?,
+                                    self.prepare(key, value, path.barrier, &path, &mut steps)?,
                                 );
                             }
                             let mut staged = Vec::with_capacity(exit.staged.len());
                             for word in &exit.staged {
-                                staged.push(self.prepare(key, word, path.barrier, &path)?);
+                                staged.push(self.prepare(key, word, path.barrier, &path, &mut steps)?);
                             }
                             let bytes = u32::try_from(staged.len() * 8).unwrap_or(u32::MAX);
                             self.retained_bytes = self.retained_bytes.max(bytes);
@@ -824,11 +956,11 @@ impl Builder<'_> {
                         if symbolic_pointer_offset(&exit.rflags, "vsp_initial").is_some() {
                             return refuse(key, "the exit flags are a stack pointer");
                         }
-                        Some(self.prepare(key, &exit.rflags, path.barrier, &path)?)
+                        Some(self.prepare(key, &exit.rflags, path.barrier, &path, &mut steps)?)
                     };
                     let mut registers = BTreeMap::new();
                     for (register, value) in &exit.registers {
-                        registers.insert(*register, self.prepare(key, value, path.barrier, &path)?);
+                        registers.insert(*register, self.prepare(key, value, path.barrier, &path, &mut steps)?);
                     }
                     self.exit_paths += 1;
                     return Ok(Node {
@@ -865,7 +997,7 @@ impl Builder<'_> {
                     {
                         self.assume(LiftAssumption::PreferredImageBase);
                     }
-                    let condition = self.prepare(key, target, path.barrier, &path)?;
+                    let condition = self.prepare(key, target, path.barrier, &path, &mut steps)?;
                     self.branches += 1;
                     let mut arms = Vec::with_capacity(successors.len());
                     for (value, successor) in successors {
@@ -926,10 +1058,10 @@ impl Builder<'_> {
                         return refuse(key, "native-call result is not 64 bits");
                     }
                     let target =
-                        self.prepare(key, &invocation.target.value, path.barrier, &path)?;
+                        self.prepare(key, &invocation.target.value, path.barrier, &path, &mut steps)?;
                     let mut arguments = Vec::with_capacity(invocation.arguments.len());
                     for argument in &invocation.arguments {
-                        arguments.push(self.prepare(key, &argument.value, path.barrier, &path)?);
+                        arguments.push(self.prepare(key, &argument.value, path.barrier, &path, &mut steps)?);
                     }
                     let post = match &symbolic_call.applied_effect.memory {
                         NativeCallMemoryDecision::PreserveTracked => call.continuation_state(),
@@ -956,11 +1088,14 @@ impl Builder<'_> {
                     };
                     let index = self.call_sites;
                     self.call_sites += 1;
-                    steps.push(Step::Call(CallSite {
-                        index,
-                        target,
-                        arguments,
-                    }));
+                    steps.push(Step {
+                        epoch: call.memory_epoch,
+                        kind: StepKind::Call(CallSite {
+                            index,
+                            target,
+                            arguments,
+                        }),
+                    });
                     path.results
                         .insert(result_name.clone(), call_result_name(index));
                     path.barrier = path.barrier.max(call.memory_epoch);
@@ -984,7 +1119,7 @@ impl Builder<'_> {
         header: Va,
         pre_state: SymbolicVmInitialState,
         path: Path,
-        steps: Vec<Step>,
+        mut steps: Vec<Step>,
         body_set: &BTreeSet<Va>,
     ) -> Result<Node, DecodedLiftError> {
         for &node in body_set {
@@ -1035,7 +1170,7 @@ impl Builder<'_> {
                 block: header,
                 reason: "loop-carried cell has no pre-loop value".to_owned(),
             })?;
-            let init = self.prepare(header, init_value, path.barrier, &path)?;
+            let init = self.prepare(header, init_value, path.barrier, &path, &mut steps)?;
             let next_value = get_cell(&run.reentry, cell).ok_or_else(|| DecodedLiftError::Cfg {
                 block: header,
                 reason: "loop-carried cell has no re-entry value".to_owned(),
@@ -1043,14 +1178,14 @@ impl Builder<'_> {
             if next_value.width != *width {
                 return refuse(header, "a loop-carried cell changes width");
             }
-            let next = self.prepare(header, next_value, path.barrier, &path)?;
+            let next = self.prepare(header, next_value, path.barrier, &path, &mut steps)?;
             phis.push(LoopPhi {
                 id: *id,
                 init,
                 next,
             });
         }
-        let condition = self.prepare(header, &run.condition, path.barrier, &path)?;
+        let condition = self.prepare(header, &run.condition, path.barrier, &path, &mut steps)?;
         self.branches += 1;
         self.loops += 1;
         let exit = self.walk(run.exit_key, run.exit_state, path.clone(), Vec::new())?;
@@ -1335,11 +1470,14 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         branches: 0,
         loops: 0,
         call_sites: 0,
+        read_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
         active_phis: BTreeSet::new(),
+        node_base_epoch: 0,
+        node_call_barrier: 0,
     };
     let stop = builder
         .walk(input.cfg.entry, initial, Path::default(), Vec::new())
@@ -1414,11 +1552,14 @@ fn lift_with_nested(
         branches: 0,
         loops: 0,
         call_sites: 0,
+        read_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
         active_phis: BTreeSet::new(),
+        node_base_epoch: 0,
+        node_call_barrier: 0,
     };
     let root = builder.walk(cfg.entry, initial, Path::default(), Vec::new())?;
 
@@ -1443,6 +1584,7 @@ fn lift_with_nested(
     let replacement = build_tree_replacement(
         &root,
         builder.call_sites,
+        builder.read_sites,
         builder.loop_phis,
         frame_bytes,
         region,
@@ -1474,6 +1616,8 @@ struct Emitter<'c> {
     operations: Vec<Operation>,
     next_label: u32,
     call_result_base: u16,
+    /// Base slot of the in-place captured-read results.
+    read_result_base: u16,
     result_base: u16,
     scratch_base: u16,
     /// Spill slot holding the flags the function was entered with; present
@@ -1541,6 +1685,26 @@ impl Emitter<'_> {
         self.operations.push(Operation::Store {
             address: Address::new(base, 0),
             source: VirtualRegister::new(value.id, width),
+        });
+        Ok(())
+    }
+
+    /// Emits a captured read: loads memory at its native-order position and
+    /// spills the (zero-extended) value into the read's result slot for a later
+    /// use to read back. See [`Builder::capture_read`].
+    fn emit_load(&mut self, read: &LoadRead) -> Result<(), ReplacementError> {
+        let load = Expr::load(read.width, read.address.clone());
+        let widened = if read.width == BitWidth::W64 {
+            load
+        } else {
+            Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, load)
+                .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?
+        };
+        let value = self.lower(&widened)?;
+        let index = u16::try_from(read.index).map_err(|_| ReplacementError::TooManyInputs)?;
+        self.operations.push(Operation::SpillStore {
+            slot: SpillSlot(self.read_result_base + index),
+            source: value,
         });
         Ok(())
     }
@@ -1689,9 +1853,10 @@ impl Emitter<'_> {
 
     fn emit_node(&mut self, node: &Node) -> Result<(), ReplacementError> {
         for step in &node.steps {
-            match step {
-                Step::Store(store) => self.emit_store(store)?,
-                Step::Call(call) => self.emit_call(call)?,
+            match &step.kind {
+                StepKind::Store(store) => self.emit_store(store)?,
+                StepKind::Call(call) => self.emit_call(call)?,
+                StepKind::Load(read) => self.emit_load(read)?,
             }
         }
         match &node.end {
@@ -1819,6 +1984,7 @@ impl Emitter<'_> {
 fn build_tree_replacement(
     root: &Node,
     call_count: usize,
+    read_count: usize,
     loop_phis: u16,
     stack_root_bytes: Option<u32>,
     region_retained: Option<u32>,
@@ -1861,11 +2027,16 @@ fn build_tree_replacement(
     let phi_temp_base = phi_base
         .checked_add(loop_phis)
         .ok_or(ReplacementError::TooManyInputs)?;
-    let shared_end = phi_temp_base
+    let read_result_base = phi_temp_base
         .checked_add(loop_phis)
         .ok_or(ReplacementError::TooManyInputs)?;
+    let read_slots = u16::try_from(read_count).map_err(|_| ReplacementError::TooManyInputs)?;
+    let shared_end = read_result_base
+        .checked_add(read_slots)
+        .ok_or(ReplacementError::TooManyInputs)?;
 
-    let mut inputs = Vec::with_capacity(config.inputs.len() + call_count + usize::from(loop_phis));
+    let mut inputs =
+        Vec::with_capacity(config.inputs.len() + call_count + usize::from(loop_phis) + read_count);
     for (index, (name, _)) in config.inputs.iter().enumerate() {
         inputs.push(ExpressionInput::slot(
             name.clone(),
@@ -1887,6 +2058,13 @@ fn build_tree_replacement(
             SpillSlot(phi_base + id),
         ));
     }
+    for index in 0..read_count {
+        inputs.push(ExpressionInput::slot(
+            read_result_name(index),
+            BitWidth::W64,
+            SpillSlot(read_result_base + u16::try_from(index).unwrap_or(u16::MAX)),
+        ));
+    }
 
     let mut emitter = Emitter {
         config,
@@ -1900,6 +2078,7 @@ fn build_tree_replacement(
         operations: Vec::new(),
         next_label: 0,
         call_result_base,
+        read_result_base,
         result_base,
         scratch_base,
         flags_slot,

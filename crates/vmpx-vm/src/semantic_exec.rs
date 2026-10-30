@@ -46,6 +46,9 @@ pub struct SymbolicMemoryWrite {
     pub instruction_index: usize,
     pub address: Expr,
     pub value: Expr,
+    /// Memory epoch immediately after this store committed. Reads whose epoch is
+    /// at least this value observe the store; reads below it precede it.
+    pub epoch: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -678,6 +681,7 @@ impl<'a> SymbolicMachine<'a> {
             instruction_index,
             address,
             value,
+            epoch: self.memory_epoch,
         });
         Ok(())
     }

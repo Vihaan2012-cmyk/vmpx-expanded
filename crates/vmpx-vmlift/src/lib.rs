@@ -769,6 +769,7 @@ mod tests {
                 instruction_index: 2,
                 address: address.clone(),
                 value: value.clone(),
+                epoch: 1,
             }],
             memory_havocs: vec![SymbolicMemoryHavoc {
                 instruction_index: 1,

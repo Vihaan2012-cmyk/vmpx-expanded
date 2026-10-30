@@ -850,11 +850,14 @@ fn tree_config() -> ReplacementConfig {
 fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
     let narrow = Expr::extract(BitWidth::W32, 0, entry(X64NativeRegister::Rdx)).expect("extract");
     let mut first = identity_exit();
-    first.steps.push(Step::Store(EffectStore {
-        address: entry(X64NativeRegister::Rcx),
-        value: narrow,
-        width: BitWidth::W32,
-    }));
+    first.steps.push(Step {
+        epoch: 1,
+        kind: StepKind::Store(EffectStore {
+            address: entry(X64NativeRegister::Rcx),
+            value: narrow,
+            width: BitWidth::W32,
+        }),
+    });
     let root = Node {
         steps: Vec::new(),
         end: End::Branch {
@@ -863,7 +866,7 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
         },
     };
     let replacement =
-        build_tree_replacement(&root, 0, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
+        build_tree_replacement(&root, 0, 0, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
             .expect("emit");
     let operations = &replacement.function.operations;
     assert_eq!(
@@ -920,7 +923,18 @@ fn stack_slot(offset: u64) -> Expr {
     .expect("slot")
 }
 
-fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLiftError> {
+/// Prepares a W32 read of `[vsp + offset]` at memory epoch `epoch` under a node
+/// whose steps began at `node_base` (ancestor call barrier `node_call_barrier`).
+/// `steps` are the current node's already-emitted side effects; a kept-in-place
+/// read inserts its load into them.
+fn prepare_read_in_node(
+    path: &Path,
+    epoch: u64,
+    offset: u64,
+    node_base: u64,
+    node_call_barrier: u64,
+    steps: &mut Vec<Step>,
+) -> Result<Expr, DecodedLiftError> {
     let cfg = conditional_cfg();
     let (frame, exits, calls) = (constant_frame(), exits(), BTreeMap::new());
     let input = DecodedCfgInput {
@@ -946,18 +960,34 @@ fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLif
         branches: 0,
         loops: 0,
         call_sites: 0,
+        read_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
         active_phis: BTreeSet::new(),
+        node_base_epoch: node_base,
+        node_call_barrier,
     };
     let read = Expr::intrinsic(
         BitWidth::W32,
         format!("memory_load_epoch_{epoch}"),
         vec![stack_slot(offset)],
     );
-    builder.prepare(Va(1), &read, path.barrier, path)
+    builder.prepare(Va(1), &read, path.barrier, path, steps)
+}
+
+/// A store step at `epoch` over `[vsp + offset]`, used to order a kept-in-place
+/// read against.
+fn store_step(epoch: u64, offset: u64, width: BitWidth) -> Step {
+    Step {
+        epoch,
+        kind: StepKind::Store(EffectStore {
+            address: stack_slot(offset),
+            value: Expr::constant(width, 0),
+            width,
+        }),
+    }
 }
 
 fn path_with_store(store_offset: u64, store_bytes: u32) -> Path {
@@ -974,33 +1004,109 @@ fn path_with_store(store_offset: u64, store_bytes: u32) -> Path {
 
 #[test]
 fn a_read_before_a_disjoint_store_is_hoisted_to_a_native_load() {
-    let prepared = prepare_read(&path_with_store(0xc0, 2), 10, 0xb78).expect("disjoint");
-    assert!(
-        matches!(prepared.kind, ExprKind::Load { .. }),
-        "{prepared:?}"
-    );
-    assert!(prepare_read(&path_with_store(0xb7c, 8), 10, 0xb78).is_ok());
+    // A provably disjoint store does not block re-issuing the read: it stays a
+    // direct native load, with nothing captured.
+    let mut steps = Vec::new();
+    let prepared =
+        prepare_read_in_node(&path_with_store(0xc0, 2), 10, 0xb78, 0, 0, &mut steps).expect("disjoint");
+    assert!(matches!(prepared.kind, ExprKind::Load { .. }), "{prepared:?}");
+    assert!(steps.is_empty(), "no capture needed");
+    let mut abutting = Vec::new();
+    let prepared =
+        prepare_read_in_node(&path_with_store(0xb7c, 8), 10, 0xb78, 0, 0, &mut abutting).expect("abuts");
+    assert!(matches!(prepared.kind, ExprKind::Load { .. }), "{prepared:?}");
+    assert!(abutting.is_empty());
 }
 
 #[test]
-fn a_read_before_an_overlapping_or_unanalyzable_store_refuses() {
+fn a_read_blocked_by_an_in_node_store_is_kept_in_place_not_refused() {
+    // The store runs in this node (epoch above `node_base`) and may alias the
+    // read, so the read cannot be re-issued after it. Rather than refusing, the
+    // read is captured at its native-order position and referenced by slot.
     for (store, bytes) in [(0xb78, 4), (0xb76, 4), (0xb7b, 1)] {
-        let error =
-            prepare_read(&path_with_store(store, bytes), 10, 0xb78).expect_err("overlapping store");
-        assert!(error.to_string().contains("predates"), "{error}");
+        let mut steps = vec![store_step(20, store, BitWidth::W32)];
+        let prepared = prepare_read_in_node(&path_with_store(store, bytes), 10, 0xb78, 0, 0, &mut steps)
+            .expect("kept in place");
+        assert!(
+            prepared
+                .dependencies()
+                .iter()
+                .any(|name| name.starts_with(READ_RESULT_PREFIX)),
+            "{prepared:?}"
+        );
+        let load_at = steps
+            .iter()
+            .position(|step| matches!(step.kind, StepKind::Load(_)))
+            .expect("load inserted");
+        let store_at = steps
+            .iter()
+            .position(|step| matches!(step.kind, StepKind::Store(_)))
+            .expect("store present");
+        assert!(load_at < store_at, "read kept ahead of the store it must not cross");
     }
+}
+
+#[test]
+fn a_read_blocked_by_an_ancestor_store_refuses() {
+    // The store was emitted in an ancestor node (epoch at or below `node_base`)
+    // and cannot be reordered against, so a may-alias read fails closed.
+    let mut steps = Vec::new();
+    let error = prepare_read_in_node(&path_with_store(0xb78, 4), 10, 0xb78, 20, 0, &mut steps)
+        .expect_err("ancestor overlap");
+    assert!(error.to_string().contains("predates"), "{error}");
+    assert!(steps.is_empty(), "nothing captured on a refusal");
     let mut path = path_with_store(0xc0, 2);
     path.stores[0].address = entry(X64NativeRegister::Rcx);
-    assert!(prepare_read(&path, 10, 0xb78).is_err());
+    let mut steps = Vec::new();
+    assert!(prepare_read_in_node(&path, 10, 0xb78, 20, 0, &mut steps).is_err());
 }
 
 #[test]
-fn a_read_that_a_native_call_crossed_refuses_but_a_later_store_does_not() {
+fn a_captured_read_sits_after_the_store_it_observes_and_before_the_one_it_must_not() {
+    // Two in-node stores to the same cell straddle the read (epoch 15): it must
+    // observe the earlier store (epoch 10) and not the later one (epoch 20).
+    let path = Path {
+        barrier: 20,
+        stores: vec![
+            PathStore {
+                end_epoch: 10,
+                address: stack_slot(0xb78),
+                bytes: 4,
+            },
+            PathStore {
+                end_epoch: 20,
+                address: stack_slot(0xb78),
+                bytes: 4,
+            },
+        ],
+        ..Path::default()
+    };
+    let mut steps = vec![store_step(10, 0xb78, BitWidth::W32), store_step(20, 0xb78, BitWidth::W32)];
+    let prepared = prepare_read_in_node(&path, 15, 0xb78, 0, 0, &mut steps).expect("kept in place");
+    assert!(
+        prepared
+            .dependencies()
+            .iter()
+            .any(|name| name.starts_with(READ_RESULT_PREFIX)),
+        "{prepared:?}"
+    );
+    let epochs: Vec<u64> = steps.iter().map(|step| step.epoch).collect();
+    assert_eq!(epochs, vec![10, 15, 20], "load ordered between the two stores");
+}
+
+#[test]
+fn a_read_that_a_native_call_crossed_refuses_but_a_later_read_does_not() {
+    // An ancestor native call at barrier 15 cannot be reordered against: a read
+    // from before it fails closed, a read at or after it stays a direct load.
     let mut path = path_with_store(0xc0, 2);
     path.call_barrier = 15;
-    assert!(prepare_read(&path, 10, 0xb78).is_err());
-    assert!(prepare_read(&path, 15, 0xb78).is_ok());
-    assert!(prepare_read(&path_with_store(0xb78, 4), 20, 0xb78).is_ok());
+    let mut steps = Vec::new();
+    assert!(prepare_read_in_node(&path, 10, 0xb78, 0, 15, &mut steps).is_err());
+    let mut steps = Vec::new();
+    assert!(prepare_read_in_node(&path, 15, 0xb78, 0, 15, &mut steps).is_ok());
+    // A read at or after the store's epoch observes it and re-issues cleanly.
+    let mut steps = Vec::new();
+    assert!(prepare_read_in_node(&path_with_store(0xb78, 4), 20, 0xb78, 0, 0, &mut steps).is_ok());
 }
 
 const REGION_TARGET: u64 = 0x4000_1234;
