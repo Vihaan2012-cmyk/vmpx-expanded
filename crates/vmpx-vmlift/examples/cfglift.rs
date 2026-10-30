@@ -11,7 +11,8 @@ use vmpx_vm::{
     VmDiscoveryLimits, analyze_vm_entry_at, analyze_vm_exit, recover_entry_stream, recover_vm_cfg,
 };
 use vmpx_vmlift::{
-    DecodedCfgInput, first_unliftable, lift_decoded_cfg, probe_decoded_cfg, recover_entry_frame,
+    DecodedCfgInput, PeNestedEntries, first_unliftable, lift_decoded_cfg_with_nested,
+    probe_decoded_cfg, recover_entry_frame,
 };
 
 fn main() {
@@ -60,6 +61,9 @@ fn main() {
                 block.instructions.len(),
                 block.exit
             );
+        }
+        for edge in &cfg.edges {
+            println!("  edge {} -> {} {:?}", edge.from, edge.to, edge.kind);
         }
         for stall in &cfg.stalls {
             println!("  STALL {}: {}", stall.block, stall.reason);
@@ -121,8 +125,9 @@ fn main() {
             .filter(|block| block.exit == BlockExit::VmExit)
             .count();
         println!(
-            "  exit layouts known for {} handler(s); {exit_blocks} VM-exit block(s); call frames not exposed by the CFG",
-            exits.len()
+            "  exit layouts known for {} handler(s); {exit_blocks} VM-exit block(s); call frames carried by {} block(s)",
+            exits.len(),
+            cfg.native_calls().len()
         );
         let input = DecodedCfgInput {
             cfg: &cfg,
@@ -147,16 +152,21 @@ fn main() {
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), ToString::to_string)
         );
-        match lift_decoded_cfg(&input, address) {
+        let nested = PeNestedEntries {
+            pe: &pe,
+            limits: entry_limits,
+        };
+        match lift_decoded_cfg_with_nested(&input, &nested, address) {
             Ok(lifted) => {
                 let replacement = &lifted.replacement;
                 println!(
-                    "  LIFTED {} blocks ({} expansions), {} exit paths, {} branches, {} calls -> {} IR operations, {} native bytes",
+                    "  LIFTED {} blocks ({} expansions), {} exit paths, {} branches, {} calls, {} nested -> {} IR operations, {} native bytes",
                     lifted.blocks.len(),
                     lifted.expanded_blocks,
                     lifted.exit_paths,
                     lifted.conditional_branches,
                     lifted.native_calls,
+                    lifted.nested_entries,
                     replacement.function.operations.len(),
                     replacement.compiled.bytes.len()
                 );

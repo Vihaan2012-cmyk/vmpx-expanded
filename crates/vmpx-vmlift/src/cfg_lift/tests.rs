@@ -589,6 +589,8 @@ fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLif
     };
     let mut builder = Builder {
         input: &input,
+        nested: None,
+        nested_entries: 0,
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
@@ -767,4 +769,167 @@ fn an_unproven_computed_return_refuses() {
         let error = lift(&region_cfg(), &frame, &BTreeMap::new()).expect_err("must refuse");
         assert!(matches!(error, DecodedLiftError::Cfg { .. }), "{error}");
     }
+}
+
+#[test]
+fn a_native_call_lifts_from_the_outcome_the_cfg_carries() {
+    let (mut cfg, calls) = call_frame_cfg();
+    let outcome = calls[&Va(0xA0)].clone();
+    cfg.blocks
+        .get_mut(&Va(0xA0))
+        .expect("call block")
+        .native_call = Some(outcome);
+    let mut layouts = exits();
+    cfg.blocks.get_mut(&Va(0xB0)).expect("exit block").vm_exit = layouts.remove(&EXIT_HANDLER);
+    let rcx = frame(NativeFrameSource::Register {
+        register: X64NativeRegister::Rcx,
+    });
+    let lifted = lift_with(&cfg, &rcx, &BTreeMap::new(), &BTreeMap::new())
+        .expect("carried call frame and exit layout lift");
+    assert_eq!(lifted.native_calls, 1);
+    assert!(mnemonics(&lifted).contains(&Mnemonic::Call));
+
+    let (bare, _) = call_frame_cfg();
+    let error = lift_with(&bare, &rcx, &exits(), &BTreeMap::new())
+        .expect_err("a call with no proven frame must refuse");
+    assert!(
+        error.to_string().contains("no proven call frame"),
+        "{error}"
+    );
+}
+
+const NESTED_STUB: u64 = 0x4000_5678;
+const NESTED_CONTINUATION: u64 = 0x4000_9ABC;
+const NESTED_START: u64 = 0x950;
+
+/// A resolver that proves exactly one return address.
+struct StubResolver {
+    bytecode_start: u64,
+}
+
+impl NestedEntryResolver for StubResolver {
+    fn resolve(&self, return_address: &Expr) -> Option<NestedEntry> {
+        let ExprKind::Const { value } = return_address.simplify().kind else {
+            return None;
+        };
+        (value == NESTED_STUB).then(|| {
+            let mut cells: Vec<_> = X64NativeRegister::ALL[1..]
+                .iter()
+                .map(|register| NativeFrameSource::Register {
+                    register: *register,
+                })
+                .collect();
+            cells.push(NativeFrameSource::Rflags);
+            cells.push(NativeFrameSource::Constant {
+                value: NESTED_CONTINUATION,
+            });
+            NestedEntry {
+                bytecode_start: Va(self.bytecode_start),
+                frame: cells,
+                continuation: None,
+            }
+        })
+    }
+}
+
+/// The outer exit returns into a stub; the nested block exits with its own RAX.
+fn nested_cfg() -> VmCfg {
+    cfg(
+        vec![
+            returns_constant(0xA0, 0x900, 111),
+            returns_constant(0xB0, NESTED_START, 222),
+        ],
+        vec![edge(0xA0, 0xB0, CfgEdgeKind::NestedEntry)],
+        0xA0,
+    )
+}
+
+fn stub_frame(target: u64) -> Vec<NativeFrameSource> {
+    region_frame(
+        NativeFrameSource::Constant { value: target },
+        NativeFrameSource::Constant { value: REGION_WORD },
+    )
+}
+
+fn immediates(lifted: &LiftedCfgFunction, wanted: u64) -> usize {
+    count(
+        &lifted.replacement.function.operations,
+        |o| matches!(o, Operation::MoveImmediate { value, .. } if *value == wanted),
+    )
+}
+
+fn lift_nested(
+    cfg: &VmCfg,
+    resolver: &dyn NestedEntryResolver,
+    frame: &[NativeFrameSource],
+) -> Result<LiftedCfgFunction, DecodedLiftError> {
+    let exits = exits();
+    let calls = BTreeMap::new();
+    let input = DecodedCfgInput {
+        cfg,
+        frame,
+        exits: &exits,
+        native_calls: &calls,
+        memory: None,
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: VmCfgLimits::default(),
+        max_expanded_blocks: 64,
+    };
+    lift_decoded_cfg_with_nested(&input, resolver, CodeAddress(ADDRESS))
+}
+
+#[test]
+fn a_proven_nested_entry_is_lowered_inline_instead_of_returning_into_its_stub() {
+    let resolver = StubResolver {
+        bytecode_start: NESTED_START,
+    };
+    let lifted =
+        lift_nested(&nested_cfg(), &resolver, &stub_frame(NESTED_STUB)).expect("nested lifts");
+    assert_eq!(lifted.nested_entries, 1);
+    assert_eq!(lifted.exit_paths, 1);
+    assert_eq!(lifted.blocks, BTreeSet::from([Va(0xA0), Va(0xB0)]));
+    // The nested exit's own register and continuation are emitted; the outer
+    // exit's register and the stub it would have returned into are not.
+    assert_eq!(immediates(&lifted, 222), 1);
+    assert_eq!(immediates(&lifted, NESTED_CONTINUATION), 1);
+    assert_eq!(immediates(&lifted, REGION_WORD), 1);
+    assert_eq!(immediates(&lifted, 111), 0);
+    assert_eq!(immediates(&lifted, NESTED_STUB), 0);
+    assert_eq!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::ReturnRetaining { bytes: 16 }
+        )),
+        1
+    );
+}
+
+#[test]
+fn an_unproven_nested_entry_keeps_the_ordinary_region_exit() {
+    let resolver = StubResolver {
+        bytecode_start: NESTED_START,
+    };
+    let lifted = lift_nested(&nested_cfg(), &resolver, &stub_frame(0x4000_0001))
+        .expect("an unresolved entry lowers as a plain region exit");
+    assert_eq!(lifted.nested_entries, 0);
+    assert_eq!(lifted.blocks, BTreeSet::from([Va(0xA0)]));
+    assert_eq!(immediates(&lifted, 111), 1);
+
+    let plain = lift(&nested_cfg(), &stub_frame(NESTED_STUB), &BTreeMap::new())
+        .expect("without a resolver the exit is a region transfer into the stub");
+    assert_eq!(plain.nested_entries, 0);
+    assert_eq!(immediates(&plain, NESTED_STUB), 1);
+}
+
+#[test]
+fn a_resolved_entry_that_is_not_the_cfgs_nested_block_refuses() {
+    let resolver = StubResolver {
+        bytecode_start: NESTED_START + 8,
+    };
+    let error = lift_nested(&nested_cfg(), &resolver, &stub_frame(NESTED_STUB))
+        .expect_err("mismatched entry must refuse");
+    assert!(
+        error.to_string().contains("not the CFG's nested block"),
+        "{error}"
+    );
 }

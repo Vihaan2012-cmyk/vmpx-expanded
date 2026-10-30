@@ -21,18 +21,20 @@ use vmpx_recompile::{
 };
 use vmpx_vm::{
     BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeCallMemoryDecision,
-    NativeCallSelectorOutcome, NativeFrameSource, SymbolicDomainLimits, SymbolicExecutionLimits,
-    SymbolicMemorySource, SymbolicVmExecutionReport, SymbolicVmInitialState, VmCfg, VmCfgLimits,
-    VmExitReport, VmHandlerSemantic, X64NativeRegister, enumerate_symbolic_value,
+    NativeCallSelectorOutcome, NativeExitState, NativeFrameSource, SymbolicDomainLimits,
+    SymbolicExecutionLimits, SymbolicMemorySource, SymbolicVmExecutionReport,
+    SymbolicVmInitialState, VmCfg, VmCfgLimits, VmExitReport, VmHandlerSemantic, X64NativeRegister,
+    canonicalize_symbolic_pointer, enumerate_symbolic_value,
     execute_symbolic_linear_block_with_initial_state,
     execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
-    symbolic_pointer_offset,
+    recover_native_exit_state, symbolic_pointer_offset,
 };
 
 use crate::decoded_lift::{
     DecodedLiftError, LiftAssumption, RecoveredExit, first_unliftable, recover_exit,
 };
 use crate::entry_frame::frame_initial_state;
+use crate::nested_entry::{NestedEntry, NestedEntryResolver};
 use crate::replacement::{
     ENTRY_STACK_POINTER, Trust, canonical_register, lower_fragment_with, operation_slots,
     physical_for, rewrite_symbols,
@@ -71,6 +73,8 @@ pub struct LiftedCfgFunction {
     pub exit_paths: usize,
     pub conditional_branches: usize,
     pub native_calls: usize,
+    /// Nested VM entries inlined into the function.
+    pub nested_entries: usize,
     pub assumptions: Vec<LiftAssumption>,
 }
 
@@ -142,6 +146,8 @@ struct Path {
 
 struct Builder<'a> {
     input: &'a DecodedCfgInput<'a>,
+    nested: Option<&'a dyn NestedEntryResolver>,
+    nested_entries: usize,
     expanded: usize,
     blocks: BTreeSet<Va>,
     exit_paths: usize,
@@ -431,12 +437,26 @@ impl Builder<'_> {
                         .instructions
                         .last()
                         .map_or(block.start.handler, |last| last.state_after.handler);
-                    let Some(layout) = input.exits.get(&handler) else {
+                    let Some(layout) = block.vm_exit.as_ref().or_else(|| input.exits.get(&handler))
+                    else {
                         return refuse(
                             key,
                             format!("no recovered VM-exit layout for handler {handler}"),
                         );
                     };
+                    if let Some(resolver) = self.nested
+                        && let Some(to) = input.cfg.edges.iter().find_map(|edge| {
+                            (edge.from == key && edge.kind == CfgEdgeKind::NestedEntry)
+                                .then_some(edge.to)
+                        })
+                        && let Some(composed) =
+                            self.compose_nested(key, to, &report, layout, resolver)?
+                    {
+                        self.nested_entries += 1;
+                        key = to;
+                        state = composed;
+                        continue;
+                    }
                     let recovered =
                         recover_exit(&report, layout, input.frame.len()).map_err(|error| {
                             DecodedLiftError::Cfg {
@@ -542,7 +562,11 @@ impl Builder<'_> {
                     });
                 }
                 BlockExit::NativeCall => {
-                    let Some(outcome) = input.native_calls.get(&key) else {
+                    let Some(outcome) = block
+                        .native_call
+                        .as_ref()
+                        .or_else(|| input.native_calls.get(&key))
+                    else {
                         return refuse(key, "no proven call frame for this native call");
                     };
                     if !outcome.stack_argument_offsets.is_empty() {
@@ -633,11 +657,113 @@ impl Builder<'_> {
         }
     }
 
+    /// The state the nested entry starts from after the exit at `key` returns
+    /// into it, or `None` when the resolver cannot prove the entry (the exit is
+    /// then lowered as an ordinary exit).
+    fn compose_nested(
+        &self,
+        key: Va,
+        to: Va,
+        report: &SymbolicVmExecutionReport,
+        layout: &VmExitReport,
+        resolver: &dyn NestedEntryResolver,
+    ) -> Result<Option<SymbolicVmInitialState>, DecodedLiftError> {
+        let fail = |reason: String| DecodedLiftError::Cfg { block: key, reason };
+        let exit = recover_native_exit_state(report, layout)
+            .map_err(|error| fail(format!("nested exit state unrecovered: {error}")))?;
+        let Some(entry) = resolver.resolve(&exit.return_address) else {
+            return Ok(None);
+        };
+        if self
+            .input
+            .cfg
+            .blocks
+            .get(&to)
+            .and_then(|nested| nested.address)
+            != Some(entry.bytecode_start)
+        {
+            return refuse(
+                key,
+                "the resolved nested entry is not the CFG's nested block",
+            );
+        }
+        compose_nested_state(report, &exit, &entry)
+            .map(Some)
+            .map_err(|error| fail(format!("nested entry composition failed: {error}")))
+    }
+
     fn assume(&mut self, assumption: LiftAssumption) {
         if !self.assumptions.contains(&assumption) {
             self.assumptions.push(assumption);
         }
     }
+}
+
+/// Re-bases the nested entry's frame onto the exact state the exit left: its
+/// stack sits where the exit's `ret` leaves the stack pointer, its registers and
+/// flags are what the exit restored, and the outer memory carries over.
+fn compose_nested_state(
+    prior: &SymbolicVmExecutionReport,
+    exit: &NativeExitState,
+    entry: &NestedEntry,
+) -> Result<SymbolicVmInitialState, String> {
+    let error = |error: vmpx_vm::ExprError| error.to_string();
+    let frame_bytes = i64::try_from(entry.frame.len() * 8).map_err(|e| e.to_string())?;
+    let delta = i64::from(exit.frame_size) - frame_bytes;
+    let vsp = Expr::binary(
+        BinaryOp::Add,
+        prior.final_vsp.clone(),
+        Expr::constant(BitWidth::W64, delta.cast_unsigned()),
+    )
+    .map_err(error)?;
+    let mut replacements = BTreeMap::from([
+        ("vsp_initial".to_owned(), vsp),
+        ("native_rflags_initial".to_owned(), exit.rflags.clone()),
+    ]);
+    if let Some(continuation) = entry.continuation {
+        replacements.insert(
+            "native_return_address_initial".to_owned(),
+            Expr::constant(BitWidth::W64, continuation.0),
+        );
+    }
+    for register in X64NativeRegister::ALL {
+        let value = exit
+            .registers
+            .get(&register)
+            .ok_or_else(|| format!("exit restores no {register:?}"))?;
+        replacements.insert(register.symbolic_name().to_owned(), value.clone());
+    }
+    let (frame, _) = frame_initial_state(&entry.frame);
+    let mut initial = frame.substitute(&replacements).map_err(error)?;
+
+    let mut bytes: Vec<(Expr, Expr)> = Vec::new();
+    let mut index = HashMap::<Expr, usize>::new();
+    for (address, value) in prior.memory_values.iter().chain(&initial.memory_values) {
+        for byte in 0..value.width.bytes() {
+            let offset = Expr::binary(
+                BinaryOp::Add,
+                address.clone(),
+                Expr::constant(BitWidth::W64, u64::from(byte)),
+            )
+            .map_err(error)?;
+            let address = canonicalize_symbolic_pointer(&offset);
+            let value = Expr::extract(BitWidth::W8, byte * 8, value.clone()).map_err(error)?;
+            if let Some(&slot) = index.get(&address) {
+                bytes[slot].1 = value;
+            } else {
+                index.insert(address.clone(), bytes.len());
+                bytes.push((address, value));
+            }
+        }
+    }
+    initial.memory_values = bytes;
+    initial.memory_epoch = prior.memory_epoch;
+    initial.memory_tainted = prior.memory_tainted;
+    initial.next_native_call_epoch = prior.next_native_call_epoch;
+    initial
+        .fresh_allocations
+        .clone_from(&prior.fresh_allocations);
+    Ok(initial)
 }
 
 /// State after an opaque native call that cannot reach the VM stack: the
@@ -682,6 +808,8 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
     let (initial, _) = frame_initial_state(input.frame);
     let mut builder = Builder {
         input,
+        nested: None,
+        nested_entries: 0,
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
@@ -717,6 +845,30 @@ pub fn lift_decoded_cfg(
     input: &DecodedCfgInput<'_>,
     address: CodeAddress,
 ) -> Result<LiftedCfgFunction, DecodedLiftError> {
+    lift_with_nested(input, None, address)
+}
+
+/// [`lift_decoded_cfg`] that also follows `NestedEntry` edges the resolver
+/// proves, lowering the nested region inline instead of returning into its
+/// entry stub. An edge the resolver cannot prove keeps the ordinary exit.
+///
+/// # Errors
+///
+/// As [`lift_decoded_cfg`]; additionally refuses a resolved entry that is not
+/// the CFG's nested block or whose state cannot be composed.
+pub fn lift_decoded_cfg_with_nested(
+    input: &DecodedCfgInput<'_>,
+    resolver: &dyn NestedEntryResolver,
+    address: CodeAddress,
+) -> Result<LiftedCfgFunction, DecodedLiftError> {
+    lift_with_nested(input, Some(resolver), address)
+}
+
+fn lift_with_nested(
+    input: &DecodedCfgInput<'_>,
+    nested: Option<&dyn NestedEntryResolver>,
+    address: CodeAddress,
+) -> Result<LiftedCfgFunction, DecodedLiftError> {
     let cfg = input.cfg;
     if !cfg.is_complete() {
         return refuse(
@@ -731,6 +883,8 @@ pub fn lift_decoded_cfg(
     let (initial, _) = frame_initial_state(input.frame);
     let mut builder = Builder {
         input,
+        nested,
+        nested_entries: 0,
         expanded: 0,
         blocks: BTreeSet::new(),
         exit_paths: 0,
@@ -776,6 +930,7 @@ pub fn lift_decoded_cfg(
         exit_paths: builder.exit_paths,
         conditional_branches: builder.branches,
         native_calls: builder.call_sites,
+        nested_entries: builder.nested_entries,
         assumptions: builder.assumptions,
     })
 }

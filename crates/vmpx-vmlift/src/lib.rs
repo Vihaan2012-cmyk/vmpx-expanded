@@ -13,12 +13,17 @@ mod entry_frame;
 mod equivalence;
 mod expr_codegen;
 mod live_in;
+mod nested_entry;
 mod passthrough;
 mod replacement;
 
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
-pub use cfg_lift::{CfgProbe, DecodedCfgInput, LiftedCfgFunction, lift_decoded_cfg, probe_decoded_cfg};
+pub use cfg_lift::{
+    CfgProbe, DecodedCfgInput, LiftedCfgFunction, lift_decoded_cfg, lift_decoded_cfg_with_nested,
+    probe_decoded_cfg,
+};
+pub use nested_entry::{NestedEntry, NestedEntryResolver, PeNestedEntries};
 pub use constant_dispatch::{
     ConstantDispatchConfig, ConstantDispatchError, compile_constant_dispatch,
 };
