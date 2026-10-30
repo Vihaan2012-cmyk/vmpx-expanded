@@ -13,6 +13,7 @@ mod exception_flow;
 mod expr;
 mod handler_slice;
 mod image_concretize;
+mod immutable_image;
 mod input_closed;
 mod input_domain;
 mod model;
@@ -115,6 +116,7 @@ pub use image_concretize::{
     ModuloImageTargetError, ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
     concretize_with_immutable_image, recover_modulo_image_targets,
 };
+pub use immutable_image::ReadOnlyImage;
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,

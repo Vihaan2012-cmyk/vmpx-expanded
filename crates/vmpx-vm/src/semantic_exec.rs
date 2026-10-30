@@ -2864,4 +2864,74 @@ mod tests {
         assert_eq!(report.final_vsp_offset, Some(0));
         assert!(format!("{:?}", report.final_flags).contains("x86_popfq_1"));
     }
+
+    fn read_only_image_machine(source: &dyn SymbolicMemorySource) -> SymbolicMachine<'_> {
+        SymbolicMachine::new(
+            &SymbolicVmInitialState::default(),
+            Some(source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("default state")
+    }
+
+    #[test]
+    fn constant_read_only_load_folds_to_image_bytes() {
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = crate::ReadOnlyImage(&pe);
+        let mut machine = read_only_image_machine(&source);
+        let address = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let value = machine.load_memory(address, BitWidth::W32).expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+    }
+
+    #[test]
+    fn writable_section_and_unknown_address_loads_do_not_fold() {
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = crate::ReadOnlyImage(&pe);
+        let mut machine = read_only_image_machine(&source);
+        for address in [
+            Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA),
+            Expr::register(BitWidth::W64, "unknown_pointer"),
+        ] {
+            let value = machine.load_memory(address, BitWidth::W32).expect("load");
+            assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+            assert!(
+                value
+                    .intrinsic_dependencies()
+                    .iter()
+                    .any(|name| name.starts_with("memory_load_epoch_"))
+            );
+        }
+    }
+
+    #[test]
+    fn teb_relative_loads_stay_symbolic() {
+        for offset in [0x30_u64, 0x60] {
+            let initial = SymbolicVmInitialState {
+                memory_values: vec![(stack_address(0), Expr::constant(BitWidth::W64, offset))],
+                ..SymbolicVmInitialState::default()
+            };
+            let mut machine =
+                SymbolicMachine::new(&initial, None, SymbolicExecutionLimits::default())
+                    .expect("initial state");
+            execute_instruction(
+                &mut machine,
+                7,
+                &instruction(
+                    VmHandlerSemantic::GsRelativeLoad,
+                    BitWidth::W64,
+                    None,
+                    Some(0),
+                ),
+            )
+            .expect("gs load");
+            let value = machine.load_stack(0, BitWidth::W64).expect("result");
+            assert!(
+                value.intrinsic_dependencies().contains("x86_gs_load_7"),
+                "gs:[{offset:#x}] must not fold: {value:?}"
+            );
+        }
+    }
 }
