@@ -1405,9 +1405,15 @@ fn match_stack_check(
     {
         return None;
     }
+    // `tmp` is scratch for the guard comparison. It must not alias VIP or VSP:
+    // both are live VM state that has to survive the postlude into the dispatch
+    // head. It MAY alias the handler register: the handler is dead across the
+    // postlude because the proven table-indexed head re-establishes it (and the
+    // fall-through relocation path is likewise allowed to clobber it); a
+    // protector that reuses the handler register as the guard scratch is sound.
     let tmp = cmp.op1_register();
     if tmp != canonical(tmp)
-        || [check.vsp, roles.vip, roles.handler]
+        || [check.vsp, roles.vip]
             .into_iter()
             .any(|register| canonical(register) == tmp)
     {
@@ -1883,6 +1889,39 @@ mod tests {
         a.ja(0x1_4000_2000_u64).expect("stack-check branch");
         let bytes = a.assemble(0x1_4000_1000).expect("assemble");
         assert!(match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK).is_none());
+    }
+
+    #[test]
+    fn stack_check_allows_handler_register_as_guard_scratch() {
+        // VMProtect may reuse the handler register as the guard scratch: the
+        // handler is dead across the postlude (the table-indexed head reloads
+        // it), so `lea handler,[ctx+disp]; cmp vsp,handler; ja head` is sound.
+        let mut a = CodeAssembler::new(64).expect("x64 assembler");
+        a.lea(r14, qword_ptr(rsp + 0x180)).expect("guard lea into handler");
+        a.cmp(rbp, r14).expect("vsp vs guard compare");
+        a.ja(0x1_4000_2000_u64).expect("stack-check branch");
+        let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+        let shape = match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
+            .expect("handler-register guard scratch is accepted");
+        assert_eq!(shape.head, Rva(0x2000));
+    }
+
+    #[test]
+    fn stack_check_rejects_vip_or_vsp_as_guard_scratch() {
+        // The guard scratch must never alias VIP or VSP: both are live VM state
+        // that has to survive the postlude into the dispatch head.
+        for scratch in [r15, rbp] {
+            let mut a = CodeAssembler::new(64).expect("x64 assembler");
+            a.lea(scratch, qword_ptr(rsp + 0x180)).expect("guard lea");
+            a.cmp(rbp, scratch).expect("vsp vs guard compare");
+            a.ja(0x1_4000_2000_u64).expect("stack-check branch");
+            let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+            assert!(
+                match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
+                    .is_none(),
+                "guard scratch aliasing a live VM register must fail closed"
+            );
+        }
     }
 
     #[test]
