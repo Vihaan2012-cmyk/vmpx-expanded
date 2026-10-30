@@ -65,6 +65,113 @@ fn reads_register_value(
         })
 }
 
+/// Keyless operand: a raw `mov`/`movzx` of `[vip]` whose register is never
+/// written before its first consumer and whose VIP advance equals its width.
+fn attempt_keyless_operand(
+    active: &[&vmpx_disasm::DecodedInstruction],
+    roles: HandlerRegisterRoles,
+    direction: BytecodeDirection,
+    mut vip_delta: i64,
+) -> Result<KeyedOperandCodecCandidate, String> {
+    if direction != BytecodeDirection::Ascending {
+        return Err("keyless operands require an ascending bytecode stream".to_owned());
+    }
+    let source = active
+        .first()
+        .copied()
+        .ok_or_else(|| "empty VIP-load interval".to_owned())?;
+    if !matches!(
+        source.instruction.mnemonic(),
+        Mnemonic::Mov | Mnemonic::Movzx
+    ) {
+        return Err("keyless operand load is not a raw mov/movzx".to_owned());
+    }
+    let destination = source.instruction.op0_register();
+    let width = source_load_width(&source.instruction)
+        .ok_or_else(|| "unsupported operand width".to_owned())?;
+    let full_register_value_proven = match source.instruction.mnemonic() {
+        Mnemonic::Movzx => destination.size() >= 4,
+        _ => {
+            destination.size() == 8 && width == crate::BitWidth::W64
+                || destination.size() == 4 && width == crate::BitWidth::W32
+        }
+    };
+    let mut factory = InstructionInfoFactory::new();
+    let mut first_consumer = None;
+    for decoded in active.iter().skip(1) {
+        let instruction = &decoded.instruction;
+        if instruction.op0_kind() == OpKind::Register
+            && canonical(instruction.op0_register()) == canonical(roles.vip)
+            && matches!(
+                instruction.mnemonic(),
+                Mnemonic::Add | Mnemonic::Sub | Mnemonic::Inc | Mnemonic::Dec
+            )
+        {
+            if instruction.op0_register().size() != 8 {
+                return Err("VIP adjustment is not a full-width write".to_owned());
+            }
+            let delta = match instruction.mnemonic() {
+                Mnemonic::Inc | Mnemonic::Dec => 1,
+                _ => signed_immediate(instruction, 1)
+                    .ok_or_else(|| "VIP adjustment is not an immediate".to_owned())?,
+            };
+            vip_delta = match instruction.mnemonic() {
+                Mnemonic::Add | Mnemonic::Inc => vip_delta.checked_add(delta),
+                _ => vip_delta.checked_sub(delta),
+            }
+            .ok_or_else(|| "VIP adjustment overflows".to_owned())?;
+            continue;
+        }
+        if writes_register(&mut factory, instruction, canonical(roles.vip)) {
+            return Err(format!("VIP has an unmodelled write at {}", decoded.rva));
+        }
+        if first_consumer.is_none() {
+            if reads_register_value(&mut factory, instruction, destination, width) {
+                first_consumer = Some(decoded.rva);
+            } else if instruction_writes_value(&mut factory, instruction, destination, width) {
+                return Err(format!(
+                    "raw operand is overwritten before its first consumer at {}",
+                    decoded.rva
+                ));
+            }
+        }
+    }
+    if first_consumer.is_none() {
+        return Err("raw operand has no live consumer".to_owned());
+    }
+    if vip_delta != i64::from(width.bytes()) {
+        return Err(format!(
+            "VIP delta {vip_delta} does not match raw width {}",
+            width.bytes()
+        ));
+    }
+    Ok(KeyedOperandCodecCandidate {
+        encoded_load: source.rva,
+        decoded_register: format!("{destination:?}"),
+        decoded_register_id: destination,
+        full_register_value_proven,
+        vip_delta,
+        key_update: source.rva,
+        first_consumer,
+        codec: KeyedTransformCodec {
+            width,
+            input_key_operation: None,
+            input_key_on_left: false,
+            transforms: TransformChain {
+                transforms: Vec::new(),
+            },
+            update_key_operation: None,
+        },
+        confidence: 100,
+        evidence: vec![
+            format!("raw {width:?} load from the recovered VIP register"),
+            "operand register is untouched until its first consumer".to_owned(),
+            format!("VIP advances by {vip_delta} bytes"),
+            "keyless dispatch: no rolling key participates in the operand".to_owned(),
+        ],
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn attempt_operand(
     active: &[&vmpx_disasm::DecodedInstruction],
@@ -267,13 +374,27 @@ pub fn extract_keyed_operand_codecs(
 
 /// Recovers operand codecs using the cursor timing of a proven VM profile.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn extract_keyed_operand_codecs_direction(
     trace: &DirectJumpTrace,
     slice: &NativeBackwardSlice,
     roles: HandlerRegisterRoles,
     dispatch_sources: &BTreeSet<Rva>,
     direction: BytecodeDirection,
+) -> KeyedOperandCodecReport {
+    extract_operand_codecs_mode(trace, slice, roles, dispatch_sources, direction, false)
+}
+
+/// As [`extract_keyed_operand_codecs_direction`]; `keyless` selects raw
+/// operands for VMs whose dispatch is proven to carry no rolling key.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn extract_operand_codecs_mode(
+    trace: &DirectJumpTrace,
+    slice: &NativeBackwardSlice,
+    roles: HandlerRegisterRoles,
+    dispatch_sources: &BTreeSet<Rva>,
+    direction: BytecodeDirection,
+    keyless: bool,
 ) -> KeyedOperandCodecReport {
     let dispositions: BTreeMap<_, _> = slice
         .instructions
@@ -296,6 +417,7 @@ pub fn extract_keyed_operand_codecs_direction(
         }
         let mut factory = InstructionInfoFactory::new();
         if position == 0
+            && !keyless
             && decoded[..source_index].iter().any(|decoded| {
                 dispositions
                     .get(&decoded.rva)
@@ -411,7 +533,12 @@ pub fn extract_keyed_operand_codecs_direction(
                     .is_some_and(is_active)
             })
             .collect();
-        match attempt_operand(&active, roles, direction, prefix_vip_delta) {
+        let attempt = if keyless {
+            attempt_keyless_operand(&active, roles, direction, prefix_vip_delta)
+        } else {
+            attempt_operand(&active, roles, direction, prefix_vip_delta)
+        };
+        match attempt {
             Ok(candidate) => candidates.push(candidate),
             Err(reason) => rejected_sources.push(KeyedOperandCodecRejection {
                 encoded_load: source.rva,
@@ -707,5 +834,94 @@ mod tests {
         .expect("low-byte codec remains valid as a byte value");
 
         assert!(!candidate.full_register_value_proven);
+    }
+
+    fn decode_for_test(mut assembler: CodeAssembler) -> Vec<DecodedInstruction> {
+        let bytes = assembler.assemble(0x1_4000_1000).expect("assemble");
+        let mut decoder = Decoder::with_ip(64, &bytes, 0x1_4000_1000, DecoderOptions::NONE);
+        let mut decoded = Vec::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            assert_ne!(instruction.code(), Code::INVALID);
+            let offset = usize::try_from(instruction.ip() - 0x1_4000_1000).expect("small offset");
+            decoded.push(DecodedInstruction {
+                rva: Rva(0x1000 + u32::try_from(offset).expect("small RVA")),
+                va: Va(instruction.ip()),
+                bytes: bytes[offset..offset + instruction.len()].to_vec(),
+                instruction,
+            });
+        }
+        decoded
+    }
+
+    fn keyless_candidate(assembler: CodeAssembler) -> Result<KeyedOperandCodecCandidate, String> {
+        let decoded = decode_for_test(assembler);
+        let active: Vec<_> = decoded.iter().collect();
+        attempt_keyless_operand(
+            &active,
+            HandlerRegisterRoles {
+                vip: Register::R15,
+                rolling_key: Register::RBP,
+                handler: Register::R14,
+            },
+            BytecodeDirection::Ascending,
+            0,
+        )
+    }
+
+    #[test]
+    fn keyless_operand_is_a_raw_vip_read_with_no_key_interaction() {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.movzx(ebx, word_ptr(r15)).expect("raw load");
+        assembler.add(r15, 2).expect("VIP advance");
+        assembler.mov(byte_ptr(rsp + rbx), dl).expect("consumer");
+        let candidate = keyless_candidate(assembler).expect("raw operand");
+
+        assert_eq!(candidate.codec.width, BitWidth::W16);
+        assert_eq!(candidate.vip_delta, 2);
+        assert!(candidate.full_register_value_proven);
+        assert!(candidate.first_consumer.is_some());
+        assert_eq!(candidate.codec.input_key_operation, None);
+        assert_eq!(candidate.codec.update_key_operation, None);
+        assert!(candidate.codec.transforms.transforms.is_empty());
+        assert_eq!(
+            candidate
+                .codec
+                .decode(0xBEEF, 0x1234)
+                .expect("decode")
+                .decoded,
+            0xBEEF
+        );
+    }
+
+    #[test]
+    fn keyless_operand_rejects_modified_or_mismatched_reads() {
+        let mut overwritten = CodeAssembler::new(64).expect("x64 assembler");
+        overwritten.movzx(ebx, byte_ptr(r15)).expect("raw load");
+        overwritten.inc(r15).expect("VIP advance");
+        overwritten.mov(ebx, edx).expect("operand replaced");
+        overwritten.mov(byte_ptr(rsp + rbx), dl).expect("consumer");
+        assert!(keyless_candidate(overwritten).is_err());
+
+        let mut width_mismatch = CodeAssembler::new(64).expect("x64 assembler");
+        width_mismatch.movzx(ebx, word_ptr(r15)).expect("raw load");
+        width_mismatch.add(r15, 1).expect("short VIP advance");
+        width_mismatch
+            .mov(byte_ptr(rsp + rbx), dl)
+            .expect("consumer");
+        assert!(keyless_candidate(width_mismatch).is_err());
+
+        let mut signed = CodeAssembler::new(64).expect("x64 assembler");
+        signed
+            .movsx(ebx, byte_ptr(r15))
+            .expect("sign-extending load");
+        signed.inc(r15).expect("VIP advance");
+        signed.mov(byte_ptr(rsp + rbx), dl).expect("consumer");
+        assert!(keyless_candidate(signed).is_err());
+
+        let mut unused = CodeAssembler::new(64).expect("x64 assembler");
+        unused.movzx(ebx, byte_ptr(r15)).expect("raw load");
+        unused.inc(r15).expect("VIP advance");
+        assert!(keyless_candidate(unused).is_err());
     }
 }

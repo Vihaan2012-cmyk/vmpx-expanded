@@ -18,7 +18,7 @@ use crate::{
     TableChecksumHandlerReport, VmExitReport, VmHandlerAnalysis, VmHandlerDecodeSpec,
     VmHandlerSemantic, VmSemanticMetadata, analyze_native_call_handler,
     analyze_table_checksum_handler, analyze_vm_exit, backward_slice_handler_trace,
-    classify_handler_effects, extract_handler_effects, extract_keyed_operand_codecs_direction,
+    classify_handler_effects, extract_handler_effects_keyed, extract_operand_codecs_mode,
     extract_relative_dispatch_codecs_with_postlude_direction, prove_handler_value_flow,
 };
 
@@ -225,12 +225,18 @@ pub fn recover_handler_codecs(
         .iter()
         .map(|candidate| candidate.encoded_load)
         .collect();
-    let operand_analysis = extract_keyed_operand_codecs_direction(
+    let keyless = !dispatch_analysis.candidates.is_empty()
+        && dispatch_analysis
+            .candidates
+            .iter()
+            .all(|candidate| candidate.codec.table.is_some());
+    let operand_analysis = extract_operand_codecs_mode(
         &trace,
         &slice,
         config.roles,
         &dispatch_sources,
         config.bytecode_direction,
+        keyless,
     );
 
     let mut table_checksum = None;
@@ -499,12 +505,13 @@ pub fn recover_handler_codecs(
     } else {
         match (config.effect_roles, dispatch_analysis.candidates.as_slice()) {
             (Some(roles), [dispatch_candidate]) => {
-                let effects = extract_handler_effects(
+                let effects = extract_handler_effects_keyed(
                     &trace,
                     &slice,
                     roles,
                     config.roles,
                     dispatch_candidate.encoded_load,
+                    dispatch_candidate.codec.table.is_none(),
                 );
                 let operand_width = operand.as_ref().map(|codec| codec.width);
                 let operand_vip_delta = match operand_analysis.candidates.as_slice() {

@@ -1027,6 +1027,7 @@ fn expected_delta(instruction: &DecodedVmInstruction, expected: i32) -> Result<(
 fn arithmetic_result(semantic: VmHandlerSemantic, left: Expr, right: Expr) -> Result<Expr, String> {
     match semantic {
         VmHandlerSemantic::Add => Expr::binary(BinaryOp::Add, left, right),
+        VmHandlerSemantic::Sub => Expr::binary(BinaryOp::Sub, left, right),
         VmHandlerSemantic::Nor => Expr::binary(
             BinaryOp::And,
             Expr::unary(UnaryOp::Not, left),
@@ -1408,7 +1409,10 @@ fn execute_instruction(
             let flags = machine.flags.clone();
             machine.store_stack(0, &flags)?;
         }
-        VmHandlerSemantic::Add | VmHandlerSemantic::Nor | VmHandlerSemantic::Nand => {
+        VmHandlerSemantic::Add
+        | VmHandlerSemantic::Sub
+        | VmHandlerSemantic::Nor
+        | VmHandlerSemantic::Nand => {
             let input_width = instruction.input_width.unwrap_or(width);
             let left_slot = machine.load_stack(0, width)?;
             let right_slot = machine.load_stack(i64::from(width.bytes()), width)?;

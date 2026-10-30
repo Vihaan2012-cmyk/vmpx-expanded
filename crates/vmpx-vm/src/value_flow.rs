@@ -201,6 +201,7 @@ fn context_address_is_proven(
     active: &[&DecodedInstruction],
     index: usize,
     operand_register: Register,
+    operand_width: BitWidth,
 ) -> bool {
     let instruction = &active[index].instruction;
     instruction.memory_base() != Register::None
@@ -209,7 +210,7 @@ fn context_address_is_proven(
         && instruction.memory_index().size() == 8
         && instruction.memory_index_scale() == 1
         && has_flat_segment_address(instruction)
-        && same_register_value(operand_register, instruction.memory_index(), BitWidth::W8)
+        && same_register_value(operand_register, instruction.memory_index(), operand_width)
         && context_base_is_stable(active, index, instruction.memory_base())
 }
 
@@ -285,6 +286,7 @@ fn operand_flow(
     operand_consumer: Option<Rva>,
     operand_register: Option<Register>,
     operand_full_register_value_proven: bool,
+    operand_width: Option<BitWidth>,
 ) -> Option<(Option<Rva>, Rva, String)> {
     match semantic {
         VmHandlerSemantic::ConstantPush => {
@@ -411,8 +413,8 @@ fn operand_flow(
             };
             (operand_consumer == Some(context_load)
                 && operand_full_register_value_proven
-                && operand_register.is_some_and(|operand| {
-                    context_address_is_proven(active, context_index, operand)
+                && operand_register.zip(operand_width).is_some_and(|(operand, operand_width)| {
+                    context_address_is_proven(active, context_index, operand, operand_width)
                 })
                 && width_relation_proven
                 && same_register_value(context_destination, stack_source, width)
@@ -471,9 +473,11 @@ fn operand_flow(
             };
             (operand_consumer == Some(context_store)
                 && operand_full_register_value_proven
-                && operand_register.is_some_and(|operand| {
-                    context_address_is_proven(active, context_index, operand)
-                })
+                && operand_register
+                    .zip(operand_width)
+                    .is_some_and(|(operand, operand_width)| {
+                        context_address_is_proven(active, context_index, operand, operand_width)
+                    })
                 && register_has_width(context_source, width)
                 && width_relation_proven
                 && latest_definition(active, context_index, context_source)
@@ -605,7 +609,14 @@ fn arithmetic_flow(
     }
     let width_displacement = i64::from(width.bytes());
     let input_flow = match semantic {
-        VmHandlerSemantic::Add if operation.mnemonic() == Mnemonic::Add => {
+        VmHandlerSemantic::Add | VmHandlerSemantic::Sub
+            if operation.mnemonic()
+                == if semantic == VmHandlerSemantic::Add {
+                    Mnemonic::Add
+                } else {
+                    Mnemonic::Sub
+                } =>
+        {
             latest_definition(active, operation_index, result_register).is_some_and(|definition| {
                 definition_is_load(
                     active,
@@ -766,6 +777,7 @@ fn resized_binary_flow(
     let operation = &active[operation_index].instruction;
     let expected_mnemonic = match semantic {
         VmHandlerSemantic::Add => Mnemonic::Add,
+        VmHandlerSemantic::Sub => Mnemonic::Sub,
         VmHandlerSemantic::Nor => Mnemonic::And,
         VmHandlerSemantic::Nand => Mnemonic::Or,
         _ => return None,
@@ -780,7 +792,7 @@ fn resized_binary_flow(
         return None;
     }
     let first_definition = latest_definition(active, operation_index, operation.op0_register())?;
-    let first_load = if semantic == VmHandlerSemantic::Add {
+    let first_load = if matches!(semantic, VmHandlerSemantic::Add | VmHandlerSemantic::Sub) {
         first_definition
     } else {
         let not = &active[first_definition].instruction;
@@ -813,7 +825,8 @@ fn resized_binary_flow(
                 && effect.input_width == input_width
                 && effect.output_width.bits() >= output_width.bits()
         });
-    let second_input_proven = if semantic == VmHandlerSemantic::Add {
+    let second_input_proven = if matches!(semantic, VmHandlerSemantic::Add | VmHandlerSemantic::Sub)
+    {
         binary_input_definition(
             active,
             summary,
@@ -1285,8 +1298,10 @@ pub fn prove_handler_value_flow(
                 operand_consumer,
                 operand_register,
                 operand_full_register_value_proven,
+                analysis.operand_width,
             ),
             VmHandlerSemantic::Add
+            | VmHandlerSemantic::Sub
             | VmHandlerSemantic::Nor
             | VmHandlerSemantic::Nand
             | VmHandlerSemantic::ShiftLeft
@@ -1296,7 +1311,10 @@ pub fn prove_handler_value_flow(
             | VmHandlerSemantic::RotateRight => {
                 let flow = match (analysis.semantic, analysis.input_width, analysis.resize) {
                     (
-                        VmHandlerSemantic::Add | VmHandlerSemantic::Nor | VmHandlerSemantic::Nand,
+                        VmHandlerSemantic::Add
+                        | VmHandlerSemantic::Sub
+                        | VmHandlerSemantic::Nor
+                        | VmHandlerSemantic::Nand,
                         Some(input_width),
                         Some(resize),
                     ) => resized_binary_flow(

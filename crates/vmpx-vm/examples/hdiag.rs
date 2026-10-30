@@ -38,6 +38,17 @@ fn main() {
         proof_limits: RegisterDispatchProofLimits::default(),
     };
 
+    if let Ok(v) = std::env::var("HDIAG_RVA") {
+        let rva = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+        let r = recover_handler_codecs(&pe, Rva(rva), &config).unwrap();
+        println!("status {:?}", r.status);
+        println!("diagnostics {:#?}", r.diagnostics);
+        println!("operand {:#?}", r.operand_analysis);
+        println!("effects {:#?}", r.effects);
+        println!("analysis {:#?}", r.handler_analysis);
+        println!("flow {:#?}", r.value_flow);
+        return;
+    }
     let mut recovered = 0usize;
     let mut dispatch_ok = 0usize;
     let mut decode_spec = 0usize;
@@ -73,6 +84,13 @@ fn main() {
         }
         if r.decode_spec.is_some() {
             decode_spec += 1;
+        }
+        if std::env::var("HDIAG_PER_OP").is_ok() {
+            println!(
+                "op{op} rva {handler_rva:#x} {:?} {:?}",
+                r.status,
+                r.handler_analysis.as_ref().map(|a| a.semantic)
+            );
         }
         let sem = r
             .handler_analysis

@@ -240,6 +240,32 @@ fn pops_native_flags_to_vsp(instruction: &Instruction, vsp: Register) -> bool {
         && instruction.memory_size().size() == 8
 }
 
+fn pops_native_flags_to_register(instruction: &Instruction, vsp: Register) -> Option<Register> {
+    (instruction.mnemonic() == Mnemonic::Pop
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op0_register().size() == 8
+        && canonical(instruction.op0_register()) != canonical(vsp)
+        && canonical(instruction.op0_register()) != Register::RSP)
+        .then(|| canonical(instruction.op0_register()))
+}
+
+fn stores_qword_register_to_vsp_top(
+    instruction: &Instruction,
+    vsp: Register,
+    register: Register,
+) -> bool {
+    instruction.mnemonic() == Mnemonic::Mov
+        && instruction.op0_kind() == OpKind::Memory
+        && canonical(instruction.memory_base()) == canonical(vsp)
+        && instruction.memory_base().size() == 8
+        && instruction.memory_index() == Register::None
+        && signed_displacement(instruction.memory_displacement64()) == 0
+        && instruction.memory_size().size() == 8
+        && instruction.op1_kind() == OpKind::Register
+        && instruction.op1_register().size() == 8
+        && canonical(instruction.op1_register()) == register
+}
+
 fn writes_static_handler_base(instruction: &Instruction, handler: Register) -> bool {
     instruction.mnemonic() == Mnemonic::Lea
         && instruction.op0_kind() == OpKind::Register
@@ -287,13 +313,28 @@ fn preserves_destination_by_zero_arithmetic(
 /// the semantic prefix of a handler. `semantic_end` must be the proven encoded
 /// dispatch load, so dispatch decoding and shared postludes are excluded.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn extract_handler_effects(
     trace: &DirectJumpTrace,
     slice: &NativeBackwardSlice,
     roles: HandlerEffectRoles,
     dispatch_roles: crate::HandlerRegisterRoles,
     semantic_end: Rva,
+) -> HandlerEffectSummary {
+    extract_handler_effects_keyed(trace, slice, roles, dispatch_roles, semantic_end, true)
+}
+
+/// As [`extract_handler_effects`]. In a keyless VM the rolling-key and handler
+/// registers carry no VM state across handlers, so arithmetic that targets them
+/// is ordinary scratch arithmetic and still counts as a semantic operation.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn extract_handler_effects_keyed(
+    trace: &DirectJumpTrace,
+    slice: &NativeBackwardSlice,
+    roles: HandlerEffectRoles,
+    dispatch_roles: crate::HandlerRegisterRoles,
+    semantic_end: Rva,
+    keyed: bool,
 ) -> HandlerEffectSummary {
     let dispositions: BTreeMap<_, _> = slice
         .instructions
@@ -307,6 +348,7 @@ pub fn extract_handler_effects(
     let mut diagnostics = Vec::new();
     let mut last_native_flags_writer = None;
     let mut pending_native_flags_source = None;
+    let mut flags_in_register: Option<(Register, Option<Rva>)> = None;
     let mut captures_native_flags_to_vsp = false;
     let mut captured_flags_source = None;
     let mut pushes_pre_adjustment_vsp = false;
@@ -338,9 +380,22 @@ pub fn extract_handler_effects(
         let vsp_delta_before_instruction = vsp_delta;
         let pops_flags = pending_native_flags_source.is_some()
             && pops_native_flags_to_vsp(instruction, roles.vsp);
+        if let Some((register, source)) = flags_in_register {
+            if stores_qword_register_to_vsp_top(instruction, roles.vsp, register) {
+                captures_native_flags_to_vsp = true;
+                captured_flags_source = source;
+                flags_in_register = None;
+            } else if writes_register(&mut factory, instruction, register) {
+                flags_in_register = None;
+            }
+        }
         if pops_flags {
             captures_native_flags_to_vsp = true;
             captured_flags_source = pending_native_flags_source.take();
+        } else if let Some(register) =
+            pending_native_flags_source.and(pops_native_flags_to_register(instruction, roles.vsp))
+        {
+            flags_in_register = Some((register, pending_native_flags_source.take()));
         } else if pending_native_flags_source.is_some()
             && (matches!(
                 instruction.mnemonic(),
@@ -435,11 +490,12 @@ pub fn extract_handler_effects(
         if is_semantic_arithmetic(instruction, roles.vsp)
             && !(instruction.op0_kind() == OpKind::Register
                 && [
-                    dispatch_roles.vip,
-                    dispatch_roles.rolling_key,
-                    dispatch_roles.handler,
+                    Some(dispatch_roles.vip),
+                    keyed.then_some(dispatch_roles.rolling_key),
+                    keyed.then_some(dispatch_roles.handler),
                 ]
                 .into_iter()
+                .flatten()
                 .map(canonical)
                 .any(|role| role == canonical(instruction.op0_register())))
         {
@@ -647,6 +703,7 @@ pub fn classify_handler_effects(
         .filter(|effect| effect.region == HandlerMemoryRegion::Other)
         .count();
     let is_add = summary.arithmetic_operations == ["Add"];
+    let is_sub = summary.arithmetic_operations == ["Sub"];
     let is_nor = summary.arithmetic_operations == ["Not", "Not", "And"];
     let is_nand = summary.arithmetic_operations == ["Not", "Not", "Or"];
     let is_unsigned_divide = summary.arithmetic_operations == ["Div"];
@@ -1193,7 +1250,7 @@ pub fn classify_handler_effects(
             Some(resized_constant_pushes[0].1),
         );
     }
-    if operand_width == Some(BitWidth::W8)
+    if matches!(operand_width, Some(BitWidth::W8 | BitWidth::W16))
         && context_read_width.is_some()
         && !context_write
         && !other_read
@@ -1206,7 +1263,7 @@ pub fn classify_handler_effects(
     {
         add_candidate(VmHandlerSemantic::VirtualRegisterRead, context_read_width);
     }
-    if operand_width == Some(BitWidth::W8)
+    if matches!(operand_width, Some(BitWidth::W8 | BitWidth::W16))
         && resized_context_reads.len() == 1
         && !context_write
         && !other_read
@@ -1222,7 +1279,7 @@ pub fn classify_handler_effects(
             Some(resized_context_reads[0].1),
         );
     }
-    if operand_width == Some(BitWidth::W8)
+    if matches!(operand_width, Some(BitWidth::W8 | BitWidth::W16))
         && context_write_width.is_some()
         && !context_read
         && !other_read
@@ -1235,7 +1292,7 @@ pub fn classify_handler_effects(
     {
         add_candidate(VmHandlerSemantic::VirtualRegisterWrite, context_write_width);
     }
-    if operand_width == Some(BitWidth::W8)
+    if matches!(operand_width, Some(BitWidth::W8 | BitWidth::W16))
         && resized_context_writes.len() == 1
         && !context_read
         && !other_read
@@ -1282,6 +1339,17 @@ pub fn classify_handler_effects(
         && !other_read
         && !other_write
         && summary.captures_native_flags_to_vsp
+        && binary_operation_width.is_some()
+        && is_sub
+        && stack_effect_count == 4
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::Sub, binary_operation_width);
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && summary.captures_native_flags_to_vsp
         && division_operation_width.is_some()
         && is_unsigned_divide
         && stack_effect_count == 6
@@ -1302,6 +1370,8 @@ pub fn classify_handler_effects(
     }
     let resized_binary_semantic = if is_add {
         Some(VmHandlerSemantic::Add)
+    } else if is_sub {
+        Some(VmHandlerSemantic::Sub)
     } else if is_nor {
         Some(VmHandlerSemantic::Nor)
     } else if is_nand {
@@ -1402,14 +1472,15 @@ pub fn classify_handler_effects(
             [] => (operation_width, None),
             _ => (None, None),
         },
-        VmHandlerSemantic::Add | VmHandlerSemantic::Nor | VmHandlerSemantic::Nand => {
-            match resized_binary_operations.as_slice() {
-                [resized] if Some(resized.output_width) == operation_width => {
-                    (Some(resized.input_width), Some(resized.operation))
-                }
-                _ => (None, None),
+        VmHandlerSemantic::Add
+        | VmHandlerSemantic::Sub
+        | VmHandlerSemantic::Nor
+        | VmHandlerSemantic::Nand => match resized_binary_operations.as_slice() {
+            [resized] if Some(resized.output_width) == operation_width => {
+                (Some(resized.input_width), Some(resized.operation))
             }
-        }
+            _ => (None, None),
+        },
         VmHandlerSemantic::VirtualRegisterRead => match resized_context_reads.as_slice() {
             [(input, output, resize)] if Some(*output) == operation_width => {
                 (Some(*input), Some(*resize))
@@ -2907,5 +2978,181 @@ mod tests {
 
         assert_eq!(analysis.semantic, VmHandlerSemantic::VirtualRegisterRead);
         assert!(!proof.proven);
+    }
+
+    fn keyless_alu(
+        assembler: CodeAssembler,
+        boundary_index: usize,
+        keyed: bool,
+    ) -> (HandlerEffectSummary, VmHandlerAnalysis, bool) {
+        let trace = trace_from_assembler(assembler);
+        let boundary = trace
+            .instructions()
+            .nth(boundary_index)
+            .expect("dispatch load")
+            .rva;
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![
+                    Register::R11,
+                    Register::R14,
+                    Register::R15,
+                    Register::RBP,
+                ],
+                live_out_rflags: 0,
+            },
+        );
+        let summary = extract_handler_effects_keyed(
+            &trace,
+            &slice,
+            HandlerEffectRoles {
+                vsp: Register::R11,
+                context_base: Register::RSP,
+            },
+            crate::HandlerRegisterRoles {
+                vip: Register::R15,
+                rolling_key: Register::RBP,
+                handler: Register::R14,
+            },
+            boundary,
+            keyed,
+        );
+        let analysis = classify_handler_effects(trace.entry, &summary, None, Some(1));
+        let proof =
+            crate::prove_handler_value_flow(&trace, &slice, &summary, &analysis, None, None, false);
+        (summary, analysis, proof.proven)
+    }
+
+    fn keyless_qword_add(flags_to_stack: impl FnOnce(&mut CodeAssembler)) -> CodeAssembler {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(rax, qword_ptr(r11)).expect("left input");
+        assembler.mov(rdx, qword_ptr(r11 + 8)).expect("right input");
+        assembler.add(rax, rdx).expect("add");
+        assembler.pushfq().expect("capture flags");
+        assembler.pop(rdx).expect("flags into a register");
+        assembler.mov(qword_ptr(r11 + 8), rax).expect("result");
+        flags_to_stack(&mut assembler);
+        assembler.mov(ecx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        assembler
+    }
+
+    #[test]
+    fn recognizes_keyless_add_with_flags_routed_through_a_register() {
+        let assembler = keyless_qword_add(|assembler| {
+            assembler.mov(qword_ptr(r11), rdx).expect("VM flags");
+        });
+        let (summary, analysis, proven) = keyless_alu(assembler, 7, false);
+
+        assert!(summary.captures_native_flags_to_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Add);
+        assert_eq!(analysis.operation_width, Some(BitWidth::W64));
+        assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
+        assert!(proven);
+    }
+
+    #[test]
+    fn rejects_register_routed_flags_that_are_clobbered_or_misplaced() {
+        let clobbered = keyless_qword_add(|assembler| {
+            assembler.mov(rdx, rax).expect("clobber the flags copy");
+            assembler.mov(qword_ptr(r11), rdx).expect("VM flags");
+        });
+        let (summary, analysis, _) = keyless_alu(clobbered, 8, false);
+        assert!(!summary.captures_native_flags_to_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+
+        let narrow = keyless_qword_add(|assembler| {
+            assembler.mov(dword_ptr(r11), edx).expect("narrow store");
+        });
+        let (summary, analysis, _) = keyless_alu(narrow, 7, false);
+        assert!(!summary.captures_native_flags_to_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+
+        let misplaced = keyless_qword_add(|assembler| {
+            assembler.mov(qword_ptr(r11 + 16), rdx).expect("wrong slot");
+        });
+        let (summary, analysis, _) = keyless_alu(misplaced, 7, false);
+        assert!(!summary.captures_native_flags_to_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+    }
+
+    fn keyless_shift() -> CodeAssembler {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(r14, qword_ptr(r11)).expect("value");
+        assembler.mov(cl, byte_ptr(r11 + 8)).expect("count");
+        assembler.sub(r11, 6).expect("reserve flags cell");
+        assembler.shr(r14, cl).expect("shift");
+        assembler.pushfq().expect("capture flags");
+        assembler.pop(rax).expect("flags into a register");
+        assembler.mov(qword_ptr(r11 + 8), r14).expect("result");
+        assembler.mov(qword_ptr(r11), rax).expect("VM flags");
+        assembler.mov(edx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        assembler
+    }
+
+    #[test]
+    fn keyless_shift_counts_scratch_arithmetic_on_the_handler_register() {
+        let (_, keyless, proven) = keyless_alu(keyless_shift(), 8, false);
+        assert_eq!(keyless.semantic, VmHandlerSemantic::ShiftRightLogical);
+        assert_eq!(keyless.operation_width, Some(BitWidth::W64));
+        assert!(proven);
+
+        let (_, keyed, _) = keyless_alu(keyless_shift(), 8, true);
+        assert_eq!(keyed.semantic, VmHandlerSemantic::Unknown);
+    }
+
+    fn byte_sub(
+        build: impl FnOnce(&mut CodeAssembler),
+        boundary_index: usize,
+    ) -> (VmHandlerAnalysis, bool) {
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.movzx(r9w, byte_ptr(r11)).expect("left input");
+        assembler.mov(r10b, byte_ptr(r11 + 2)).expect("right input");
+        assembler.sub(r11, 6).expect("reserve flags cell");
+        build(&mut assembler);
+        assembler.pushfq().expect("capture flags");
+        assembler.pop(rdi).expect("flags into a register");
+        assembler.mov(word_ptr(r11 + 8), r9w).expect("result");
+        assembler.mov(qword_ptr(r11), rdi).expect("VM flags");
+        assembler.mov(edx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let (_, analysis, proven) = keyless_alu(assembler, boundary_index, false);
+        (analysis, proven)
+    }
+
+    #[test]
+    fn recognizes_byte_sub_and_rejects_non_matching_shapes() {
+        let (analysis, proven) = byte_sub(
+            |assembler| {
+                assembler.sub(r9b, r10b).expect("byte sub");
+            },
+            8,
+        );
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Sub);
+        assert_eq!(analysis.input_width, Some(BitWidth::W8));
+        assert_eq!(analysis.operation_width, Some(BitWidth::W16));
+        assert!(proven);
+
+        let (analysis, _) = byte_sub(
+            |assembler| {
+                assembler.sub(r9b, r10b).expect("byte sub");
+                assembler.and(r9b, 1).expect("extra live operation");
+            },
+            9,
+        );
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+
+        let (analysis, proven) = byte_sub(
+            |assembler| {
+                assembler.sub(r10b, r9b).expect("reversed sub");
+                assembler
+                    .mov(r9b, r10b)
+                    .expect("result from the wrong operand");
+            },
+            9,
+        );
+        assert!(analysis.semantic == VmHandlerSemantic::Unknown || !proven);
     }
 }

@@ -78,6 +78,7 @@ pub use dispatch_extract::{
 pub use effect_extract::{
     HandlerEffectRoles, HandlerEffectSummary, HandlerMemoryEffect, HandlerMemoryRegion,
     HandlerResizeEffect, HandlerVspAdjustment, classify_handler_effects, extract_handler_effects,
+    extract_handler_effects_keyed,
 };
 pub use entry_paths::{
     BranchingRecoveryError, BranchingRecoveryLimits, EntryPathRecoveryError,
@@ -142,6 +143,7 @@ pub use oep::{OepDecision, decide_oep};
 pub use operand_extract::{
     KeyedOperandCodecCandidate, KeyedOperandCodecRejection, KeyedOperandCodecReport,
     extract_keyed_operand_codecs, extract_keyed_operand_codecs_direction,
+    extract_operand_codecs_mode,
 };
 pub use path_graph::{
     VmPathGraphEdge, VmPathGraphEdgeKind, VmPathGraphError, VmPathGraphNode, VmPathGraphNodeId,
