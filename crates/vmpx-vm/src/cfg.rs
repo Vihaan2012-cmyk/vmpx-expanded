@@ -6,7 +6,8 @@
 //! execution, or the image of a target over a proven-exhaustive input domain.
 //! Anything unresolved stops that path and is reported; no edge is invented.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use iced_x86::{FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use serde::Serialize;
@@ -50,6 +51,9 @@ pub struct VmCfgLimits {
     pub max_targets: usize,
     /// VM-to-VM re-entries followed across the whole walk.
     pub max_nested_entries: usize,
+    /// Iterations of one loop unrolled with exact state before its changing
+    /// cells are generalized.
+    pub max_loop_unrolls: usize,
 }
 
 impl Default for VmCfgLimits {
@@ -64,6 +68,7 @@ impl Default for VmCfgLimits {
             max_total_instructions: 200_000,
             max_targets: 16,
             max_nested_entries: 8,
+            max_loop_unrolls: 14,
         }
     }
 }
@@ -104,6 +109,9 @@ pub enum CfgEdgeKind {
     NativeCallReturn,
     /// A proven VM exit returns into another VM entry of the same VM.
     NestedEntry,
+    /// Back edge to a block already on the path whose entry state subsumes
+    /// the re-entry state; accompanies the `Branch`/`GuardedBranch` edge.
+    LoopBack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -383,6 +391,183 @@ struct Item {
     start: RelativeDispatchState,
     address: Option<Va>,
     symbolic: SymbolicVmInitialState,
+    path: Option<Rc<PathNode>>,
+}
+
+/// A block on the current walk path with the symbolic state it was entered in.
+struct PathNode {
+    key: Va,
+    state: SymbolicVmInitialState,
+    parent: Option<Rc<PathNode>>,
+}
+
+const HAVOC_PREFIX: &str = "loop_havoc_";
+
+fn is_havoc(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Register { name } if name.starts_with(HAVOC_PREFIX))
+}
+
+fn has_havoc(expr: &Expr) -> bool {
+    expr.dependencies()
+        .iter()
+        .any(|name| name.starts_with(HAVOC_PREFIX))
+}
+
+/// `a` holds every value `r` can take at this location. A generalized cell
+/// covers anything; any other cell covers only an identical expression free of
+/// generalized variables, whose meaning differs between iterations.
+fn covers(a: Option<&Expr>, r: Option<&Expr>) -> bool {
+    match (a, r) {
+        (None, None) => true,
+        (Some(a), _) if is_havoc(a) => true,
+        (Some(a), Some(r)) => a == r && !has_havoc(a),
+        _ => false,
+    }
+}
+
+fn generalize(
+    a: Option<&Expr>,
+    r: Option<&Expr>,
+    key: Va,
+    counter: &mut usize,
+    changed: &mut bool,
+) -> Result<Option<Expr>, String> {
+    if covers(a, r) {
+        return Ok(a.cloned());
+    }
+    let width = match (a, r) {
+        (Some(a), Some(r)) if a.width != r.width => {
+            return Err("a loop-carried cell changes width".to_owned());
+        }
+        (Some(cell), _) | (None, Some(cell)) => cell.width,
+        (None, None) => return Ok(None),
+    };
+    *changed = true;
+    *counter += 1;
+    Ok(Some(Expr::register(
+        width,
+        format!("{HAVOC_PREFIX}{:x}_{counter}", key.0),
+    )))
+}
+
+fn memory_by_address(state: &SymbolicVmInitialState) -> BTreeMap<String, &(Expr, Expr)> {
+    state
+        .memory_values
+        .iter()
+        .map(|entry| (format!("{:?}", entry.0), entry))
+        .collect()
+}
+
+/// The state covering both `a` and `r`, or `None` when `a` already covers `r`.
+/// Cells that differ become fresh unknowns; the stack pointer, allocations and
+/// memory precision must be loop-invariant.
+fn widen_state(
+    key: Va,
+    a: &SymbolicVmInitialState,
+    r: &SymbolicVmInitialState,
+    counter: &mut usize,
+) -> Result<Option<SymbolicVmInitialState>, String> {
+    if a.memory_tainted || r.memory_tainted {
+        return Err("loop follows an imprecise external-memory store".to_owned());
+    }
+    if a.vsp != r.vsp {
+        return Err("loop changes the VM stack pointer".to_owned());
+    }
+    if a.fresh_allocations != r.fresh_allocations {
+        return Err("loop changes the fresh allocations".to_owned());
+    }
+    let mut changed = false;
+    let flags = generalize(Some(&a.flags), Some(&r.flags), key, counter, &mut changed)?
+        .unwrap_or_else(|| a.flags.clone());
+    let mut context_values = BTreeMap::new();
+    let offsets: BTreeSet<i64> = a
+        .context_values
+        .keys()
+        .chain(r.context_values.keys())
+        .copied()
+        .collect();
+    for offset in offsets {
+        let cell = generalize(
+            a.context_values.get(&offset),
+            r.context_values.get(&offset),
+            key,
+            counter,
+            &mut changed,
+        )?;
+        if let Some(cell) = cell {
+            context_values.insert(offset, cell);
+        }
+    }
+    let (a_memory, r_memory) = (memory_by_address(a), memory_by_address(r));
+    let mut memory_values = Vec::new();
+    for address in a_memory
+        .keys()
+        .chain(r_memory.keys())
+        .collect::<BTreeSet<_>>()
+    {
+        let (a_entry, r_entry) = (a_memory.get(address), r_memory.get(address));
+        let location = a_entry.or(r_entry).map(|entry| entry.0.clone());
+        let cell = generalize(
+            a_entry.map(|entry| &entry.1),
+            r_entry.map(|entry| &entry.1),
+            key,
+            counter,
+            &mut changed,
+        )?;
+        if let (Some(location), Some(cell)) = (location, cell) {
+            memory_values.push((location, cell));
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(SymbolicVmInitialState {
+        vsp: a.vsp.clone(),
+        flags,
+        context_values,
+        memory_values,
+        memory_epoch: a.memory_epoch.max(r.memory_epoch),
+        memory_tainted: false,
+        next_native_call_epoch: a.next_native_call_epoch.max(r.next_native_call_epoch),
+        fresh_allocations: a.fresh_allocations.clone(),
+    }))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum LoopStep {
+    /// An enclosing entry state covers the re-entry state: a back edge.
+    Close,
+    /// Still within the exact-unroll budget.
+    Unroll,
+    /// Continue from this generalization of the nearest enclosing entry.
+    Widen(SymbolicVmInitialState),
+    Refuse(String),
+}
+
+/// Decides how a block re-entered while already on the path proceeds.
+/// `ancestors` are the entry states of the enclosing visits, nearest first.
+fn loop_step(
+    key: Va,
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+    unrolls: usize,
+    counter: &mut usize,
+) -> LoopStep {
+    let mut probe = *counter;
+    if ancestors
+        .iter()
+        .any(|a| matches!(widen_state(key, a, reentry, &mut probe), Ok(None)))
+    {
+        return LoopStep::Close;
+    }
+    if ancestors.len() < unrolls {
+        return LoopStep::Unroll;
+    }
+    match widen_state(key, ancestors[0], reentry, counter) {
+        Ok(Some(widened)) => LoopStep::Widen(widened),
+        Ok(None) => LoopStep::Close,
+        Err(reason) => LoopStep::Refuse(reason),
+    }
 }
 
 struct Walker<'a, 'p> {
@@ -392,6 +577,8 @@ struct Walker<'a, 'p> {
     global_table: Option<crate::GlobalTableBase>,
     profile: crate::VmProfile,
     nested_followed: usize,
+    havoc_counter: usize,
+    current: Option<Rc<PathNode>>,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
     cache: LinearDecodeCache,
@@ -446,6 +633,12 @@ impl Walker<'_, '_> {
             vip,
             reason: reason.into(),
         });
+    }
+
+    fn add_edge(&mut self, edge: CfgEdge) {
+        if !self.cfg.edges.contains(&edge) {
+            self.cfg.edges.push(edge);
+        }
     }
 
     fn decode_block(&mut self, item: &Item) -> bool {
@@ -533,14 +726,56 @@ impl Walker<'_, '_> {
         true
     }
 
+    /// The state to explore `item` in, or `None` when it closes a loop or
+    /// the loop cannot be generalized.
+    fn enter_loop(&mut self, item: &Item) -> Option<SymbolicVmInitialState> {
+        let key = item.start.vip;
+        let ancestors: Vec<Rc<PathNode>> =
+            std::iter::successors(item.path.clone(), |node| node.parent.clone())
+                .filter(|node| node.key == key)
+                .collect();
+        if ancestors.is_empty() {
+            return Some(item.symbolic.clone());
+        }
+        let states: Vec<&SymbolicVmInitialState> =
+            ancestors.iter().map(|node| &node.state).collect();
+        match loop_step(
+            key,
+            &states,
+            &item.symbolic,
+            self.limits.max_loop_unrolls,
+            &mut self.havoc_counter,
+        ) {
+            LoopStep::Close => {
+                if let Some(parent) = &item.path {
+                    self.add_edge(CfgEdge {
+                        from: parent.key,
+                        to: key,
+                        kind: CfgEdgeKind::LoopBack,
+                    });
+                }
+                None
+            }
+            LoopStep::Unroll => Some(item.symbolic.clone()),
+            LoopStep::Widen(widened) => Some(widened),
+            LoopStep::Refuse(reason) => {
+                self.stall(key, key, format!("loop cannot be closed: {reason}"));
+                None
+            }
+        }
+    }
+
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
         let key = item.start.vip;
         if self.cfg.visits >= self.limits.max_visits {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
         }
+        let Some(symbolic_in) = self.enter_loop(item) else {
+            return;
+        };
         let states = self.explored.entry(key).or_default();
-        if states.contains(&item.symbolic) {
+        if states.contains(&symbolic_in) {
             return;
         }
         if states.len() >= self.limits.max_visits_per_block {
@@ -548,8 +783,13 @@ impl Walker<'_, '_> {
             self.stall(key, key, "symbolic state keeps changing at this block");
             return;
         }
-        states.push(item.symbolic.clone());
+        states.push(symbolic_in.clone());
         self.cfg.visits += 1;
+        self.current = Some(Rc::new(PathNode {
+            key,
+            state: symbolic_in.clone(),
+            parent: item.path.clone(),
+        }));
         if !self.decode_block(item) {
             return;
         }
@@ -598,7 +838,7 @@ impl Walker<'_, '_> {
             &instructions,
             symbolic_boundary,
             self.limits.entry.symbolic,
-            &item.symbolic,
+            &symbolic_in,
             Some(&crate::immutable_image::ReadOnlyImage(self.pe)),
         ) {
             Ok(report) => report,
@@ -730,7 +970,7 @@ impl Walker<'_, '_> {
                     continue;
                 }
             };
-            self.cfg.edges.push(CfgEdge {
+            self.add_edge(CfgEdge {
                 from: key,
                 to: first.state_after.vip,
                 kind: if guarded {
@@ -743,6 +983,7 @@ impl Walker<'_, '_> {
                 start: first.state_after,
                 address: Some(target_va),
                 symbolic: symbolic.continuation_state(),
+                path: self.current.clone(),
             });
         }
     }
@@ -859,7 +1100,7 @@ impl Walker<'_, '_> {
             }
         };
         self.nested_followed += 1;
-        self.cfg.edges.push(CfgEdge {
+        self.add_edge(CfgEdge {
             from: key,
             to: setup.first_state.vip,
             kind: CfgEdgeKind::NestedEntry,
@@ -868,6 +1109,7 @@ impl Walker<'_, '_> {
             start: setup.first_state,
             address: Some(setup.bootstrap.initial_state.vip),
             symbolic: initial,
+            path: self.current.clone(),
         });
     }
 
@@ -917,7 +1159,7 @@ impl Walker<'_, '_> {
             }
         };
         self.cfg.record_native_call(key, &decoded.outcome);
-        self.cfg.edges.push(CfgEdge {
+        self.add_edge(CfgEdge {
             from: key,
             to: decoded.state_after.vip,
             kind: CfgEdgeKind::NativeCallReturn,
@@ -926,6 +1168,7 @@ impl Walker<'_, '_> {
             start: decoded.state_after,
             address: None,
             symbolic: call.continuation_state(),
+            path: self.current.clone(),
         });
     }
 }
@@ -967,6 +1210,8 @@ pub fn recover_vm_cfg(
         global_table: bootstrap_global_table(&setup.bootstrap),
         profile: setup.profile,
         nested_followed: 0,
+        havoc_counter: 0,
+        current: None,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
         cache: LinearDecodeCache::default(),
@@ -988,6 +1233,7 @@ pub fn recover_vm_cfg(
         start: setup.first_state,
         address: Some(entry_address),
         symbolic: initial,
+        path: None,
     }];
     while let Some(item) = pending.pop() {
         walker.visit(&item, &mut pending);
@@ -1131,5 +1377,125 @@ mod tests {
         for status in [RecoveryStatus::PartiallyRecovered, RecoveryStatus::Failed] {
             assert!(proven_exit_layout(Some(&exit_report(status))).is_none());
         }
+    }
+
+    fn w64(value: u64) -> Expr {
+        Expr::constant(BitWidth::W64, value)
+    }
+
+    fn loop_state(vsp_offset: u64, counter: Expr) -> SymbolicVmInitialState {
+        SymbolicVmInitialState {
+            vsp: Expr::binary(
+                BinaryOp::Add,
+                Expr::register(BitWidth::W64, "vsp_initial"),
+                w64(vsp_offset),
+            )
+            .expect("add"),
+            context_values: BTreeMap::from([(0, w64(7)), (8, counter)]),
+            ..SymbolicVmInitialState::default()
+        }
+    }
+
+    fn increment(expr: &Expr) -> Expr {
+        Expr::binary(BinaryOp::Add, expr.clone(), w64(1)).expect("add")
+    }
+
+    /// Walks one loop whose body runs `step` on the state; returns the steps
+    /// taken until the back edge closes, or the refusal.
+    fn walk_loop(
+        entry: SymbolicVmInitialState,
+        step: impl Fn(&SymbolicVmInitialState) -> SymbolicVmInitialState,
+        unrolls: usize,
+    ) -> Result<(usize, usize), String> {
+        let key = Va(0x1000);
+        let mut ancestors = vec![entry];
+        let mut counter = 0;
+        let mut widened = 0;
+        for iteration in 1..=32 {
+            let reentry = step(ancestors.last().expect("entry"));
+            let nearest_first: Vec<_> = ancestors.iter().rev().collect();
+            match loop_step(key, &nearest_first, &reentry, unrolls, &mut counter) {
+                LoopStep::Close => return Ok((iteration, widened)),
+                LoopStep::Unroll => ancestors.push(reentry),
+                LoopStep::Widen(state) => {
+                    widened += 1;
+                    ancestors.push(state);
+                }
+                LoopStep::Refuse(reason) => return Err(reason),
+            }
+        }
+        Err("did not terminate".to_owned())
+    }
+
+    #[test]
+    fn invariant_loop_closes_on_first_reentry() {
+        let entry = loop_state(0, w64(0));
+        assert_eq!(walk_loop(entry, Clone::clone, 4), Ok((1, 0)));
+    }
+
+    #[test]
+    fn counting_loop_is_generalized_once_then_closes() {
+        let entry = loop_state(0, w64(0));
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.context_values
+                .insert(8, increment(&state.context_values[&8]));
+            next
+        };
+        let (iterations, widened) = walk_loop(entry, step, 3).expect("converges");
+        assert_eq!(widened, 1);
+        assert_eq!(iterations, 4, "two exact unrolls, one widening, one close");
+    }
+
+    #[test]
+    fn widened_loop_state_keeps_invariant_cells_exact() {
+        let a = loop_state(0, w64(0));
+        let r = loop_state(0, w64(1));
+        let widened = widen_state(Va(0x1000), &a, &r, &mut 0)
+            .expect("widens")
+            .expect("changed");
+        assert_eq!(widened.context_values[&0], w64(7));
+        assert!(is_havoc(&widened.context_values[&8]));
+        assert_eq!(widened.vsp, a.vsp);
+        assert!(matches!(
+            widen_state(Va(0x1000), &widened, &r, &mut 0),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn expression_over_a_generalized_variable_is_never_assumed_invariant() {
+        let havoc = Expr::register(BitWidth::W64, format!("{HAVOC_PREFIX}1000_1"));
+        let derived = increment(&havoc);
+        let a = loop_state(0, derived.clone());
+        let r = loop_state(0, derived);
+        let widened = widen_state(Va(0x1000), &a, &r, &mut 1)
+            .expect("widens")
+            .expect("the same text means a different value next iteration");
+        assert!(is_havoc(&widened.context_values[&8]));
+    }
+
+    #[test]
+    fn loop_that_moves_the_stack_pointer_is_refused() {
+        let entry = loop_state(0, w64(0));
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.vsp = increment(&state.vsp);
+            next
+        };
+        let reason = walk_loop(entry, step, 2).expect_err("never converges");
+        assert!(reason.contains("stack pointer"), "{reason}");
+    }
+
+    #[test]
+    fn loop_after_an_imprecise_store_is_refused() {
+        let entry = loop_state(0, w64(0));
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.memory_tainted = true;
+            next
+        };
+        let reason = walk_loop(entry, step, 1).expect_err("tainted state");
+        assert!(reason.contains("imprecise"), "{reason}");
     }
 }
