@@ -290,6 +290,7 @@
 <li class="toctree-l4"><a class="reference internal" href="../pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#hybrid-output-decoded-stream-lifts">Hybrid output: decoded-stream lifts</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -682,6 +683,14 @@
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -713,6 +722,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -750,7 +760,7 @@
 it is safe to do so.</p>
 <section id="synopsis">
 <h2>Synopsis<a class="headerlink" href="#synopsis" title="Link to this heading"></a></h2>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">vmpx clean &lt;INPUT&gt; &lt;OUTPUT&gt; [--report &lt;PATH&gt;] [--reconstructed &lt;PATH&gt;] [--experimental &lt;PATH&gt;]</span>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">vmpx clean &lt;INPUT&gt; &lt;OUTPUT&gt; [--report &lt;PATH&gt;] [--reconstructed &lt;PATH&gt;] [--experimental &lt;PATH&gt;] [--decoded-lift]</span>
 </pre></div>
 </div>
 </section>
@@ -793,6 +803,16 @@ before the gate decision, so it is produced even when the gate refuses.</p>
 a warning on standard error. The report gains <code class="docutils literal notranslate"><span class="pre">experimental:</span> <span class="pre">true</span></code>. This
 does not relax the gate: the sound <code class="docutils literal notranslate"><span class="pre">OUTPUT</span></code> is still written only when
 the proof gate clears. See <a class="reference internal" href="#experimental-output"><span class="std std-ref">Experimental output</span></a>.</p>
+</dd></dl>
+
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-vmpx-clean-decoded-lift">
+<span class="sig-name descname"><span class="pre">--decoded-lift</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-vmpx-clean-decoded-lift" title="Link to this definition"></a></dt>
+<dd><p>Requires <code class="docutils literal notranslate"><span class="pre">--experimental</span></code>. Also lifts every remaining VM entry from its
+decoded handler stream (linear lift, then CFG lift) and redirects its stub to
+the native body, producing a hybrid image: devirtualized functions are native,
+the rest still run through the original VM. Slow on large inputs (minutes), so
+it is off by default. See <a class="reference internal" href="../pipeline/reintegration.html"><span class="doc">Reintegration</span></a>.</p>
 </dd></dl>
 
 </section>
@@ -919,6 +939,10 @@ net is only unreachable when the domain is proven complete.</p>
 </div>
 <p>Write the experimental reintegrated image:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>vmpx<span class="w"> </span>clean<span class="w"> </span>addon.dll<span class="w"> </span>addon.clean.dll<span class="w"> </span>--report<span class="w"> </span>r.json<span class="w"> </span>--experimental<span class="w"> </span>addon.exp.dll
+</pre></div>
+</div>
+<p>Write a hybrid image with decoded-stream lifts spliced in:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>vmpx<span class="w"> </span>clean<span class="w"> </span>addon.dll<span class="w"> </span>addon.clean.dll<span class="w"> </span>--experimental<span class="w"> </span>addon.hybrid.dll<span class="w"> </span>--decoded-lift
 </pre></div>
 </div>
 <p>Verified no-op on an unprotected file:</p>

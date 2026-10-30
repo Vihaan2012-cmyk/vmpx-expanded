@@ -290,6 +290,7 @@
 <li class="toctree-l4"><a class="reference internal" href="reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="reintegration.html#hybrid-output-decoded-stream-lifts">Hybrid output: decoded-stream lifts</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -682,6 +683,14 @@
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -713,6 +722,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -776,7 +786,7 @@ are followed through a control-flow walk. This page records what that covers.</p
 </tr>
 <tr class="row-odd"><td><p>Branches</p></td>
 <td><p>Followed by a CFG walk; targets resolved by symbolic execution and
-proven input domains</p></td>
+proven input domains; nested VM-to-VM continuations are followed</p></td>
 </tr>
 <tr class="row-even"><td><p>Native calls and checksum loops</p></td>
 <td><p>Decoded as dedicated handler semantics</p></td>
@@ -866,7 +876,7 @@ a linear function that is the whole body, ending at <code class="docutils litera
 entry block, symbolically executes it from a proven entry frame, and follows
 each block’s terminating branch to its successors, carrying the symbolic VM
 state. Each block ends in one of four ways: <code class="docutils literal notranslate"><span class="pre">VmExit</span></code>, <code class="docutils literal notranslate"><span class="pre">Branch</span></code>,
-<code class="docutils literal notranslate"><span class="pre">NativeCall</span></code> or <code class="docutils literal notranslate"><span class="pre">Stalled</span></code>. Edges are one of three kinds:</p>
+<code class="docutils literal notranslate"><span class="pre">NativeCall</span></code> or <code class="docutils literal notranslate"><span class="pre">Stalled</span></code>. Edges are one of four kinds:</p>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">Branch</span></code></dt><dd><p>The target simplified to a constant.</p>
 </dd>
@@ -874,6 +884,12 @@ state. Each block ends in one of four ways: <code class="docutils literal notran
 (<a class="reference internal" href="symbolic-execution.html"><span class="doc">Symbolic Execution</span></a>).</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">NativeCallReturn</span></code></dt><dd><p>Control resumes after a proven native call.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">NestedEntry</span></code></dt><dd><p>A proven VM exit returns into another entry stub of the same VM. The walk
+composes the native frame, decodes the nested entry’s stream and keeps
+going, so the continuation is part of the function’s CFG. Following is
+bounded (<code class="docutils literal notranslate"><span class="pre">max_nested_entries</span></code>); a target that is not provably a VM entry
+ends the path as an ordinary native return.</p>
 </dd>
 </dl>
 <p>A successor is followed only when its branch target is proven. Anything else
@@ -887,6 +903,12 @@ structural sharing and simplification so that long functions stay within bounds.
 frame (target and arguments) is recovered from the VM stack. The CFG walk
 treats the call as a block boundary, proves the frame, and resumes at the
 recorded continuation.</p>
+<p>A call target is resolved to a concrete import when that is provable: either the
+target is an IAT slot, or it is the address of a <code class="docutils literal notranslate"><span class="pre">jmp</span> <span class="pre">qword</span> <span class="pre">ptr</span> <span class="pre">[rip+disp32]</span></code>
+thunk in read-only bytes whose slot is exactly one import’s IAT entry. The
+resolved import selects a call-effect summary, which is how <code class="docutils literal notranslate"><span class="pre">HeapAlloc</span></code> and
+<code class="docutils literal notranslate"><span class="pre">HeapFree</span></code> are recovered from VM code. Memory is folded into the model only
+from read-only sections; a writable read is never treated as constant.</p>
 </section>
 </section>
 <section id="what-it-does-not-yet-do">

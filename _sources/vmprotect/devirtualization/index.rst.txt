@@ -88,6 +88,7 @@ identified as VMProtect's design constraints:
    attacking-imports
    limits
    static-frontier
+   dynamic-assist
    tooling-map
 
 How to read a result

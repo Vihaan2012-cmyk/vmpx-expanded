@@ -290,6 +290,7 @@
 <li class="toctree-l4"><a class="reference internal" href="../tool/pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#hybrid-output-decoded-stream-lifts">Hybrid output: decoded-stream lifts</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -682,6 +683,14 @@
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -713,6 +722,7 @@
 <li class="toctree-l2"><a class="reference internal" href="log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="log.html#design-documents">Design documents</a></li>
 </ul>
@@ -761,14 +771,20 @@ experimental mode exists only as scaffolding to exercise the machinery early.</p
 decoded: 256 of 256 handlers classified with none unknown or failed, table-indexed
 keyless dispatch modelled, and the stream decoded through a CFG walk. Linear
 functions devirtualize fully to native x86-64. Branching functions decode with
-branches resolved by symbolic execution and proven input domains, and their
-CFG-level lift is landing. The honest limits of the static approach (unbounded
+branches resolved by symbolic execution and proven input domains and lift
+through the CFG-level lift, including continuation exits; the first branching
+function (<code class="docutils literal notranslate"><span class="pre">0x126b02</span></code>) devirtualizes to native code. VM-side calls resolve to
+concrete imports (<code class="docutils literal notranslate"><span class="pre">HeapAlloc</span></code> and <code class="docutils literal notranslate"><span class="pre">HeapFree</span></code> are recovered), and nested
+VM-to-VM continuations are followed in the CFG. <code class="docutils literal notranslate"><span class="pre">clean</span> <span class="pre">--experimental</span>
+<span class="pre">--decoded-lift</span></code> splices the lifted functions into a valid hybrid PE with the
+stubs redirected. The honest limits of the static approach (unbounded
 input branches, re-entrant continuations, protector-continuation exits and
 environment-dependent branches) are in
 <a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html"><span class="doc">The Static Frontier</span></a>; dynamic assist is the
-intended way past them. See <a class="reference internal" href="../tool/pipeline/compact-vm.html"><span class="doc">The VMProtect 3.11 Compact VM</span></a> and
-<a class="reference internal" href="../tool/pipeline/function-lift.html"><span class="doc">Lifting Decoded Functions</span></a>. These stages are not yet driven by
-<code class="docutils literal notranslate"><span class="pre">clean</span></code>.</p>
+intended way past them, and its design (SP7, emulation first) is in
+<a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html"><span class="doc">Dynamic Assist: Emulation First</span></a>. See
+<a class="reference internal" href="../tool/pipeline/compact-vm.html"><span class="doc">The VMProtect 3.11 Compact VM</span></a> and <a class="reference internal" href="../tool/pipeline/function-lift.html"><span class="doc">Lifting Decoded Functions</span></a>. In
+<code class="docutils literal notranslate"><span class="pre">clean</span></code> these stages run only under the opt-in <code class="docutils literal notranslate"><span class="pre">--decoded-lift</span></code>.</p>
 </section>
 <section id="sub-projects">
 <h2>Sub-projects<a class="headerlink" href="#sub-projects" title="Link to this heading"></a></h2>
@@ -826,6 +842,12 @@ The <code class="docutils literal notranslate"><span class="pre">neutralize</spa
 <code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> report field (<code class="docutils literal notranslate"><span class="pre">applied:</span> <span class="pre">false</span></code>); nothing is neutralized in the
 sound path. VTIL bridge binding exists behind a feature, not yet in the
 pipeline</p></td>
+</tr>
+<tr class="row-odd"><td><p>SP7</p></td>
+<td><p>Emulation-first dynamic assist for user-mode samples</p></td>
+<td><p>Static limits: unbounded input branches, environment reads, re-entrant
+continuations</p></td>
+<td><p>Design only; see <a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html"><span class="doc">Dynamic Assist: Emulation First</span></a></p></td>
 </tr>
 </tbody>
 </table>

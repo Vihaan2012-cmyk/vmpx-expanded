@@ -171,9 +171,29 @@ Lift (``a09a025``, ``1e5d8ad``)
 Branch domains (``921ab03``)
     Finite domains proven for non-affine ``vm_flags_sub`` branch conditions.
 
-Result: linear functions devirtualize fully; branching functions decode and resolve,
-and their lift is landing. The sound frontier and what is refused are written up in
+Memory and imports (``07f631d``, ``5e2f3af``, ``06913ae``)
+    Statically constant memory and known TEB reads folded, from read-only sections
+    only; VM native-call targets resolved to concrete imports, recovering
+    ``HeapAlloc`` and ``HeapFree``.
+Branching lift (``ee20cb4``, ``b98c781``)
+    Memory reads hoisted with alias checks so branching functions lift; domains
+    proven for untracked-read and non-add-flags branch selectors.
+Hybrid image (``5a723b0``, ``eab392f``)
+    Decoded-stream lifts spliced into the ``--experimental`` image behind
+    ``--decoded-lift``, with the stubs redirected.
+Nested and continuation exits (``5d86035``, ``f13772f``)
+    Nested VM-to-VM continuations followed in the CFG; region (continuation) exits
+    lifted. The first branching function (``0x126b02``) devirtualizes to native code.
+
+Result: linear and branching functions devirtualize; the output is a valid hybrid PE
+with the lifted functions spliced in. The sound frontier and what is refused are written up in
 :doc:`/vmprotect/devirtualization/static-frontier`.
+
+SP7: dynamic assist (design)
+----------------------------
+
+An emulation-first design for going past the static frontier on user-mode samples:
+:doc:`/vmprotect/devirtualization/dynamic-assist`. Design only.
 
 Verification scope
 ------------------

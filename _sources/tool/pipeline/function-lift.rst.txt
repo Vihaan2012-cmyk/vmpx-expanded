@@ -25,13 +25,17 @@ Pipeline reached
    * - Linear
      - Fully devirtualized to native x86-64
    * - Branching
-     - Decoded through the CFG; branch targets resolved by symbolic execution
-       and proven input domains; the CFG-level lift is landing
+     - Decoded through the CFG, branch targets resolved by symbolic execution
+       and proven input domains, then lifted by the CFG-level lift, including
+       region (continuation) exits. The first real branching function (RVA
+       ``0x126b02`` of the Compact sample) devirtualizes to native code
    * - Anything else
      - Refused with a reason (:doc:`/vmprotect/devirtualization/static-frontier`)
 
-At this stage the lift is exercised from the library and its examples
-(``cfglift``, ``liftdiag``); it is not yet called by ``clean``.
+The lift is exercised from the library and its examples (``cfglift``,
+``liftdiag``) and, with ``clean --experimental --decoded-lift``, is spliced into
+a hybrid image (:doc:`reintegration`). It is opt-in because it is slow on large
+inputs; a plain ``clean`` does not run it.
 
 Semantic lowering
 -----------------
@@ -92,6 +96,19 @@ incoming state rather than by merging states.
   by the call's memory summary; without one, the call is assumed not to write the
   VM stack or context, and only when neither the target nor any argument can
   carry a pointer into the VM stack.
+* A memory read that precedes an external store or call on the same path is
+  hoisted, with an alias check against that path's earlier stores, so a
+  function that reads state and then writes can still be lifted. A read that
+  cannot be shown unaffected by a barrier is refused.
+* A VM exit that is not a callee return is a *region exit* (continuation exit):
+  the VM wrote the return address, so the exit continues into another native or
+  VM entry. The lift stages the continuation's stack words in the top of the
+  frame, restores the entry flags, loads the exit registers and returns through
+  the staged target, leaving those staged bytes on the stack
+  (``ReturnRetaining``). Together with nested-entry edges in the CFG
+  (:doc:`compact-vm`), this lets a function whose exit tail-continues into
+  another virtualized entry be lifted as one unit. An exit whose flags are a stack
+  pointer is still refused.
 * Expansion is bounded (``max_expanded_blocks``).
 
 The lift refuses the whole function on an incomplete CFG, a block that repeats on
@@ -103,6 +120,6 @@ The back end
 ------------
 
 The recompile IR gained the operations the new lowerings need: ``Cpuid``,
-``GsLoad``, ``DoubleShift``, ``ReadFlags``, ``EntryStackPointer`` and a
-``ReturnPopping`` form of return. As before, unsupported operations and unsafe ABI
+``GsLoad``, ``DoubleShift``, ``ReadFlags``, ``EntryStackPointer`` and
+``ReturnPopping`` and ``ReturnRetaining`` forms of return. As before, unsupported operations and unsafe ABI
 states are rejected, not approximated (:doc:`lifting-recompilation`).

@@ -287,6 +287,7 @@
 <li class="toctree-l4"><a class="reference internal" href="tool/pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="tool/pipeline/reintegration.html#hybrid-output-decoded-stream-lifts">Hybrid output: decoded-stream lifts</a></li>
 <li class="toctree-l3"><a class="reference internal" href="tool/pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="tool/pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="tool/pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -679,6 +680,14 @@
 <li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
+<li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
+<li class="toctree-l4"><a class="reference internal" href="vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -710,6 +719,7 @@
 <li class="toctree-l2"><a class="reference internal" href="project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -771,6 +781,13 @@
 
       <ul>
         <li><a href="tool/cli/unpack.html#cmdoption-vmpx-unpack-conventional">vmpx-unpack command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --decoded-lift
+
+      <ul>
+        <li><a href="tool/cli/clean.html#cmdoption-vmpx-clean-decoded-lift">vmpx-clean command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1064,6 +1081,8 @@
     vmpx-clean command line option
 
       <ul>
+        <li><a href="tool/cli/clean.html#cmdoption-vmpx-clean-decoded-lift">--decoded-lift</a>
+</li>
         <li><a href="tool/cli/clean.html#cmdoption-vmpx-clean-experimental">--experimental</a>
 </li>
         <li><a href="tool/cli/clean.html#cmdoption-vmpx-clean-reconstructed">--reconstructed</a>

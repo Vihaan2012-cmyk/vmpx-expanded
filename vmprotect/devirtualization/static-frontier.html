@@ -19,7 +19,7 @@
     <script src="../../_static/js/theme.js"></script>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Mapping Mechanisms to Tooling" href="tooling-map.html" />
+    <link rel="next" title="Dynamic Assist: Emulation First" href="dynamic-assist.html" />
     <link rel="prev" title="Limits and Open Problems" href="limits.html" /> 
 </head>
 
@@ -290,6 +290,7 @@
 <li class="toctree-l4"><a class="reference internal" href="../../tool/pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../../tool/pipeline/reintegration.html#hybrid-output-decoded-stream-lifts">Hybrid output: decoded-stream lifts</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../tool/pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../tool/pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../tool/pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -682,6 +683,14 @@
 <li class="toctree-l4"><a class="reference internal" href="#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
+<li class="toctree-l4"><a class="reference internal" href="dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l4"><a class="reference internal" href="dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
+<li class="toctree-l4"><a class="reference internal" href="dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -713,6 +722,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -780,18 +790,21 @@ end in a stall (<code class="docutils literal notranslate"><span class="pre">tar
 Guessing a bound would make the output wrong for some input, so the function
 is reported blocked.</p>
 </dd>
-<dt>Re-entrant and nested continuations</dt><dd><p>A virtualized function that re-enters the VM, or whose native continuation
-lands in another virtualized entry, cannot be modelled as a single closed
-path family. A nested entry is counted but never counted as covered, and no
-redirect is emitted for it. Loops within one function are refused for the same
+<dt>Re-entrant and nested continuations</dt><dd><p>A virtualized function that re-enters the VM cannot be modelled as a single
+closed path family. A VM exit that returns into another entry of the same VM
+is followed in the CFG and lifted as a continuation exit, but in the sound
+path a nested entry is counted and never counted as covered, and no redirect
+is emitted for it. Loops within one function are refused for the same
 reason: the lift expands paths into a tree, and a block that repeats on a path
 has no finite expansion.</p>
 </dd>
 <dt>Protector-continuation exits</dt><dd><p>A VM exit that returns into the entry frame (the protector’s own native
-continuation) rather than into the caller is not a callee-style return. The
-lift cannot prove that a native <code class="docutils literal notranslate"><span class="pre">ret</span></code> reads the same word, so it refuses
-(<code class="docutils literal notranslate"><span class="pre">the</span> <span class="pre">exit</span> <span class="pre">returns</span> <span class="pre">into</span> <span class="pre">the</span> <span class="pre">entry</span> <span class="pre">frame</span></code>). A return address written by the
-VM, or reached through a computed address, is refused for the same reason.</p>
+continuation) rather than into the caller is not a callee-style return. A
+return address written by the VM is lifted as a region exit when the exit
+registers, flags and staged stack words are all computed values. Where the
+lift cannot prove that a native <code class="docutils literal notranslate"><span class="pre">ret</span></code> reads the same word (an exit that
+returns into the entry frame, flags that are a stack pointer, a return
+reached through an unresolved computed address) it still refuses.</p>
 </dd>
 <dt>Environment-dependent branches</dt><dd><p>A branch fed by a value read from the environment (a <code class="docutils literal notranslate"><span class="pre">gs:</span></code>-relative read of
 the TEB, or a memory read the model does not track) depends on the machine
@@ -825,8 +838,8 @@ the real continuation of a protector exit, and the inputs that exercise a branch
 Such facts can seed the static model (a domain for an otherwise unbounded input,
 a resolved nested entry), but they are evidence about one execution, not a proof.
 Any output that relies on them must be labelled as such and kept out of the sound
-path, in the same way <code class="docutils literal notranslate"><span class="pre">--experimental</span></code> is today. This is the direction of future
-work; it is not implemented.</p>
+path, in the same way <code class="docutils literal notranslate"><span class="pre">--experimental</span></code> is today. The design is in
+<a class="reference internal" href="dynamic-assist.html"><span class="doc">Dynamic Assist: Emulation First</span></a>; it is not implemented.</p>
 </section>
 </section>
 
@@ -835,7 +848,7 @@ work; it is not implemented.</p>
           </div>
           <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
         <a href="limits.html" class="btn btn-neutral float-left" title="Limits and Open Problems" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
-        <a href="tooling-map.html" class="btn btn-neutral float-right" title="Mapping Mechanisms to Tooling" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+        <a href="dynamic-assist.html" class="btn btn-neutral float-right" title="Dynamic Assist: Emulation First" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
     </div>
 
   <hr/>

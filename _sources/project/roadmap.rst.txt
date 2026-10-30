@@ -20,14 +20,20 @@ The first real VMProtect 3.11 sample uses the "Compact" VM, and it is now fully
 decoded: 256 of 256 handlers classified with none unknown or failed, table-indexed
 keyless dispatch modelled, and the stream decoded through a CFG walk. Linear
 functions devirtualize fully to native x86-64. Branching functions decode with
-branches resolved by symbolic execution and proven input domains, and their
-CFG-level lift is landing. The honest limits of the static approach (unbounded
+branches resolved by symbolic execution and proven input domains and lift
+through the CFG-level lift, including continuation exits; the first branching
+function (``0x126b02``) devirtualizes to native code. VM-side calls resolve to
+concrete imports (``HeapAlloc`` and ``HeapFree`` are recovered), and nested
+VM-to-VM continuations are followed in the CFG. ``clean --experimental
+--decoded-lift`` splices the lifted functions into a valid hybrid PE with the
+stubs redirected. The honest limits of the static approach (unbounded
 input branches, re-entrant continuations, protector-continuation exits and
 environment-dependent branches) are in
 :doc:`/vmprotect/devirtualization/static-frontier`; dynamic assist is the
-intended way past them. See :doc:`/tool/pipeline/compact-vm` and
-:doc:`/tool/pipeline/function-lift`. These stages are not yet driven by
-``clean``.
+intended way past them, and its design (SP7, emulation first) is in
+:doc:`/vmprotect/devirtualization/dynamic-assist`. See
+:doc:`/tool/pipeline/compact-vm` and :doc:`/tool/pipeline/function-lift`. In
+``clean`` these stages run only under the opt-in ``--decoded-lift``.
 
 Sub-projects
 ------------
@@ -75,6 +81,11 @@ Sub-projects
        ``anti_debug`` report field (``applied: false``); nothing is neutralized in the
        sound path. VTIL bridge binding exists behind a feature, not yet in the
        pipeline
+   * - SP7
+     - Emulation-first dynamic assist for user-mode samples
+     - Static limits: unbounded input branches, environment reads, re-entrant
+       continuations
+     - Design only; see :doc:`/vmprotect/devirtualization/dynamic-assist`
 
 Definition-of-done ladder
 -------------------------
