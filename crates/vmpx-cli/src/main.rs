@@ -18,6 +18,7 @@ use vmpx_unpack::{UnpackLimits, unpack_to_mapped_image};
 use vmpx_vm::{VmDiscoveryLimits, VmDiscoveryReport, VmEntrySource, discover_vm_entries};
 
 mod clean;
+mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod input_closed_functions;

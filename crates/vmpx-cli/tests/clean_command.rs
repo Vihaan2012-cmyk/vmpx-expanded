@@ -108,7 +108,7 @@ fn clean_preserves_verified_unprotected_pe_and_reparses_disk_output() {
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(&report).expect("read clean report"))
             .expect("valid clean JSON");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["ready_to_write"], true);
     assert_eq!(json["validation"]["output_written"], true);
     assert_eq!(json["validation"]["output_reparsed"], true);

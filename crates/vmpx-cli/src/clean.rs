@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use vmpx_detect::{DetectionVerdict, ImageLayout, ProtectionReport, detect_vmprotect};
-use vmpx_disasm::{CfgLimits, DirectJumpTraceLimits, recover_cfg};
+use vmpx_disasm::{CfgLimits, DirectJumpTraceLimits, collect_dangling_refs, recover_cfg};
 use vmpx_pe::{PeImage, PeKind, Rva};
 use vmpx_rebuild::{relayout_conventional, validate_for_loader};
 use vmpx_unpack::{UnpackLimits, UnpackReport, unpack_to_mapped_image};
@@ -18,6 +18,8 @@ use vmpx_vm::{
 use vmpx_vmlift::audit_entry_effect_liveness;
 
 use crate::{
+    clean_wiring::{self, CleanAntiDebugReport, CleanCoverageReport, InventoryLoss},
+    coverage_gate::{CoverageInput, decide_coverage},
     sha256,
     vm_inventory::{VmInventoryEntry, merge_vm_inventory},
 };
@@ -59,6 +61,8 @@ pub struct CleanImportReport {
     pub parsed_modules: usize,
     pub parsed_symbols: usize,
     pub reconstruction_complete: bool,
+    pub proven_modules: usize,
+    pub proven_symbols: usize,
     pub unresolved: Vec<String>,
 }
 
@@ -189,6 +193,9 @@ pub struct CleanReport {
     pub vtil: CleanStageReport,
     pub recompilation: CleanStageReport,
     pub reintegration: CleanStageReport,
+    /// Coverage-gate verdict; `None` when no gate was evaluated.
+    pub coverage: Option<CleanCoverageReport>,
+    pub anti_debug: CleanAntiDebugReport,
     pub reconstruction: CleanStageReport,
     pub layout: CleanLayoutReport,
     pub validation: CleanValidationReport,
@@ -319,7 +326,8 @@ fn build_vm_inventory(
     pe: &PeImage<'_>,
     exports: &[CleanExportReport],
     warnings: &mut Vec<String>,
-) -> Vec<VmInventoryEntry> {
+) -> (Vec<VmInventoryEntry>, InventoryLoss) {
+    let mut loss = InventoryLoss::default();
     let mut items: Vec<(Rva, u8, &'static str, bool)> = Vec::new();
     match discover_vm_entries(
         pe,
@@ -336,17 +344,22 @@ fn build_vm_inventory(
             };
             (entry.rva, entry.confidence, label, false)
         })),
-        Err(error) => warnings.push(format!("VM entry inventory scan failed: {error}")),
+        Err(error) => {
+            warnings.push(format!("VM entry inventory scan failed: {error}"));
+            loss.scan_failure = Some(format!("VM entry inventory scan failed: {error}"));
+        }
     }
     let export_rvas: BTreeSet<Rva> = exports
         .iter()
         .flat_map(|export| export.vm_entries.iter().copied())
         .collect();
-    items.extend(export_rvas.into_iter().filter_map(|rva| {
-        analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
-            .map(|candidate| (rva, candidate.confidence, "export_xref", true))
-    }));
-    merge_vm_inventory(items)
+    for rva in export_rvas {
+        match analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default()) {
+            Some(candidate) => items.push((rva, candidate.confidence, "export_xref", true)),
+            None => loss.unanalyzed_exports.push(rva),
+        }
+    }
+    (merge_vm_inventory(items), loss)
 }
 
 fn exception_coverage_for_chain(
@@ -907,13 +920,12 @@ pub fn analyze_clean_with_image(
     // evidence and clears the blocker when every path provably reaches a VM
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
-    let vm_inventory = build_vm_inventory(&pe, &export_reports, &mut warnings);
+    let (vm_inventory, inventory_loss) = build_vm_inventory(&pe, &export_reports, &mut warnings);
     // Single-body functions (input-closed set plus the executable entry) that
     // reintegration below replaces in place.
     let mut single_body_functions: Vec<crate::input_closed_functions::InputClosedFunction> =
         Vec::new();
-    let mut branching_functions: Vec<crate::input_closed_functions::BranchingFunction> =
-        Vec::new();
+    let mut branching_functions: Vec<crate::input_closed_functions::BranchingFunction> = Vec::new();
     let input_closed_functions = if protection.verdict == DetectionVerdict::NoStrongEvidence {
         completed_stage("not required for an input with no strong protection evidence")
     } else {
@@ -1083,6 +1095,8 @@ pub fn analyze_clean_with_image(
     let mut recompilation = stage("no path reached a lowerable exit state");
     let mut reintegration = stage("native code reintegration was not attempted");
     let mut reintegrated: Option<Vec<u8>> = None;
+    // Entry stubs whose redirect to an emitted replacement actually succeeded.
+    let mut covered_rvas: BTreeSet<Rva> = BTreeSet::new();
     if protection.verdict != DetectionVerdict::NoStrongEvidence {
         let planned = planning_image.and_then(|bytes| {
             let rva = vmpx_rebuild::next_section_rva(bytes).ok()?;
@@ -1135,7 +1149,9 @@ pub fn analyze_clean_with_image(
             let mut layout_cursor: u32 = 0;
             let mut reintegration_payload: Vec<u8> = Vec::new();
             let mut header_redirect: Option<Rva> = None;
+            let mut header_family_proven = false;
             let mut tls_redirects: Vec<(usize, Rva)> = Vec::new();
+            let mut tls_redirect_stubs: Vec<(Rva, bool)> = Vec::new();
             let mut dispatcher_count: u64 = 0;
             let mut reintegration_diagnostics: Vec<String> = Vec::new();
 
@@ -1191,9 +1207,10 @@ pub fn analyze_clean_with_image(
                             // Record where this body landed so a redirect can
                             // target it: the entry stub has to jump somewhere
                             // specific.
-                            let entry_rva = Rva(
-                                planned_rva.0.checked_add(layout_cursor).unwrap_or(planned_rva.0),
-                            );
+                            let entry_rva = Rva(planned_rva
+                                .0
+                                .checked_add(layout_cursor)
+                                .unwrap_or(planned_rva.0));
                             placed.push(((*assignments).clone(), entry_rva));
                             layout_cursor = layout_cursor
                                 .saturating_add(u32::try_from(body.len()).unwrap_or(0));
@@ -1228,9 +1245,15 @@ pub fn analyze_clean_with_image(
                             dispatcher_count += 1;
                         }
                         match kind {
-                            GroupKind::Header => header_redirect = Some(redirect),
+                            GroupKind::Header => {
+                                header_redirect = Some(redirect);
+                                header_family_proven = *family_complete;
+                            }
                             GroupKind::Tls(rva) => match tls_callback_index(&pe, *rva) {
-                                Some(index) => tls_redirects.push((index, redirect)),
+                                Some(index) => {
+                                    tls_redirects.push((index, redirect));
+                                    tls_redirect_stubs.push((*rva, *family_complete));
+                                }
                                 None => reintegration_diagnostics.push(format!(
                                     "TLS entry {rva} has no resolvable callback-array index; \
                                      its body is emitted but not redirected"
@@ -1246,9 +1269,8 @@ pub fn analyze_clean_with_image(
                         placed.truncate(placed_start_len);
                         emitted = emitted_before;
                         total_bytes = total_bytes_before;
-                        reintegration_diagnostics.push(format!(
-                            "{group_label} dispatcher assembly failed: {error}"
-                        ));
+                        reintegration_diagnostics
+                            .push(format!("{group_label} dispatcher assembly failed: {error}"));
                     }
                 }
             }
@@ -1264,7 +1286,8 @@ pub fn analyze_clean_with_image(
             let mut single_body_bytes: u64 = 0;
             layout_cursor = u32::try_from(reintegration_payload.len()).unwrap_or(layout_cursor);
             for function in &single_body_functions {
-                let handled_by_group = (is_dll && function.rva == pe.optional.address_of_entry_point)
+                let handled_by_group = (is_dll
+                    && function.rva == pe.optional.address_of_entry_point)
                     || tls_callback_index(&pe, function.rva).is_some();
                 if handled_by_group || !seen_stubs.insert(function.rva) {
                     continue;
@@ -1302,7 +1325,8 @@ pub fn analyze_clean_with_image(
             let mut branching_bytes: u64 = 0;
             let mut branching_built: u64 = 0;
             for function in &branching_functions {
-                let handled_by_group = (is_dll && function.rva == pe.optional.address_of_entry_point)
+                let handled_by_group = (is_dll
+                    && function.rva == pe.optional.address_of_entry_point)
                     || tls_callback_index(&pe, function.rva).is_some();
                 if handled_by_group || !seen_stubs.insert(function.rva) {
                     continue;
@@ -1321,7 +1345,8 @@ pub fn analyze_clean_with_image(
                     va + u64::from(layout_cursor),
                 ) {
                     Ok((unit, dispatcher_offset)) => {
-                        let Some(dispatcher_rva) = unit_rva.0.checked_add(dispatcher_offset).map(Rva)
+                        let Some(dispatcher_rva) =
+                            unit_rva.0.checked_add(dispatcher_offset).map(Rva)
                         else {
                             reintegration_diagnostics.push(format!(
                                 "{}: branching dispatcher RVA overflow; skipped",
@@ -1353,14 +1378,22 @@ pub fn analyze_clean_with_image(
             // is out of scope here.
             for (assignments, exit, effects) in &nested_exits {
                 let body_va = va + u64::from(layout_cursor);
-                match compile_replacement_body(&pe, &inputs, &symbol_rewrites, exit, effects, body_va)
-                {
+                match compile_replacement_body(
+                    &pe,
+                    &inputs,
+                    &symbol_rewrites,
+                    exit,
+                    effects,
+                    body_va,
+                ) {
                     Ok(body) => {
                         // This RVA is past the real payload (nested bodies are
                         // never appended, only counted), so it is not a live
                         // placement; diagnostics should read it that way.
-                        let entry_rva =
-                            Rva(planned_rva.0.checked_add(layout_cursor).unwrap_or(planned_rva.0));
+                        let entry_rva = Rva(planned_rva
+                            .0
+                            .checked_add(layout_cursor)
+                            .unwrap_or(planned_rva.0));
                         placed.push((assignments.clone(), entry_rva));
                         layout_cursor =
                             layout_cursor.saturating_add(u32::try_from(body.len()).unwrap_or(0));
@@ -1392,9 +1425,31 @@ pub fn analyze_clean_with_image(
                     },
                 ) {
                     Ok((mut bytes, report)) => {
+                        // `reintegrate` fails as a whole if any TLS redirect fails,
+                        // so on Ok every requested one landed.
+                        if header_redirect.is_some() {
+                            clean_wiring::group_covered(
+                                &mut covered_rvas,
+                                pe.optional.address_of_entry_point,
+                                report.entry_redirected,
+                                header_family_proven,
+                            );
+                        }
+                        if report.tls_redirected == tls_redirect_stubs.len() {
+                            for (stub, complete) in &tls_redirect_stubs {
+                                clean_wiring::group_covered(
+                                    &mut covered_rvas,
+                                    *stub,
+                                    true,
+                                    *complete,
+                                );
+                            }
+                        }
                         let mut functions_redirected: u64 = 0;
                         for (stub, body) in &stub_redirects {
-                            match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *body) {
+                            let outcome = vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *body);
+                            clean_wiring::mark_covered(&mut covered_rvas, *stub, &outcome);
+                            match outcome {
                                 Ok(redirected) => {
                                     bytes = redirected;
                                     functions_redirected += 1;
@@ -1409,7 +1464,10 @@ pub fn analyze_clean_with_image(
                         }
                         let mut branching_redirected: u64 = 0;
                         for (stub, dispatcher) in &branching_stubs {
-                            match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *dispatcher) {
+                            let outcome =
+                                vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *dispatcher);
+                            clean_wiring::mark_covered(&mut covered_rvas, *stub, &outcome);
+                            match outcome {
                                 Ok(redirected) => {
                                     bytes = redirected;
                                     branching_redirected += 1;
@@ -1505,6 +1563,8 @@ pub fn analyze_clean_with_image(
     let oep_decision = decide_oep(&oep_paths, header_family_complete, |rva| {
         is_native_continuation(&pe, rva)
     });
+    let mut coverage: Option<CleanCoverageReport> = None;
+    let mut import_proof: Option<clean_wiring::ImportProof> = None;
     if verified_noop {
         warnings
             .push("input has no strong VMProtect evidence; clean is a verified no-op".to_owned());
@@ -1514,16 +1574,42 @@ pub fn analyze_clean_with_image(
                 .to_owned(),
         );
     } else {
-        if oep_decision.recovered_entry.is_none() {
-            blockers.push("original module entry point is not recovered".to_owned());
+        let (inventory, dropped_entries) = clean_wiring::build_inventory_items(
+            &vm_inventory,
+            discovery.entries.iter().map(|entry| entry.rva),
+            &inventory_loss,
+        );
+        let dangling = clean_wiring::summarize_dangling(&collect_dangling_refs(&pe, &covered_rvas));
+        let decision = decide_coverage(&CoverageInput {
+            inventory: &inventory,
+            recovered: &covered_rvas,
+            oep_proven: oep_decision.recovered_entry.is_some(),
+            dangling_vmp_refs: &dangling.targets,
+            dropped_entries,
+        });
+        blockers.extend(clean_wiring::coverage_blockers(
+            &decision,
+            dangling.has_unresolved,
+            reintegrated.is_some(),
+        ));
+        let proof =
+            clean_wiring::prove_imports(&report.imports, &clean_wiring::derive_referenced_slots());
+        if !proof.complete {
+            blockers.push(clean_wiring::IMPORT_BLOCKER.to_owned());
         }
-        blockers.extend([
-            "application import set is not proven independently reconstructed".to_owned(),
-            "native code reintegration has not produced a devirtualized replacement image"
-                .to_owned(),
-            "VMProtect sections remain referenced by unresolved paths".to_owned(),
-        ]);
+        import_proof = Some(proof);
+        coverage = Some(CleanCoverageReport {
+            can_clear_oep: decision.can_clear_oep_blocker,
+            can_clear_vmp_referenced: decision.can_clear_vmp_referenced_blocker
+                && !dangling.has_unresolved,
+            covered_entries: covered_rvas.iter().copied().collect(),
+            dangling_refs: dangling.targets.len(),
+            has_unresolved_dangling: dangling.has_unresolved,
+            dropped_entries,
+            reasons: decision.reasons,
+        });
     }
+    let anti_debug = clean_wiring::recognize_anti_debug(&[], &BTreeMap::new());
     blockers.sort();
     blockers.dedup();
 
@@ -1544,7 +1630,10 @@ pub fn analyze_clean_with_image(
             None,
         )
     } else {
-        match relayout.take().unwrap_or_else(|| relayout_conventional(&mapped)) {
+        match relayout
+            .take()
+            .unwrap_or_else(|| relayout_conventional(&mapped))
+        {
             Ok((bytes, report)) => {
                 let validation = validate_for_loader(&bytes);
                 let (loader_valid, loader_summary, mut layout_diagnostics) = match &validation {
@@ -1612,7 +1701,7 @@ pub fn analyze_clean_with_image(
 
     Ok((
         CleanReport {
-            schema_version: 2,
+            schema_version: 3,
             input: CleanInputReport {
                 path: input_path.to_owned(),
                 sha256: sha256(input),
@@ -1641,8 +1730,17 @@ pub fn analyze_clean_with_image(
             imports: CleanImportReport {
                 parsed_modules: report.imports.len(),
                 parsed_symbols: import_symbols,
-                reconstruction_complete: verified_noop,
-                unresolved: if verified_noop {
+                reconstruction_complete: verified_noop
+                    || import_proof.as_ref().is_some_and(|proof| proof.complete),
+                proven_modules: import_proof
+                    .as_ref()
+                    .map_or(0, |proof| proof.proven_modules),
+                proven_symbols: import_proof
+                    .as_ref()
+                    .map_or(0, |proof| proof.proven_symbols),
+                unresolved: if verified_noop
+                    || import_proof.as_ref().is_some_and(|proof| proof.complete)
+                {
                     Vec::new()
                 } else {
                     vec![
@@ -1668,6 +1766,8 @@ pub fn analyze_clean_with_image(
             },
             recompilation,
             reintegration,
+            coverage,
+            anti_debug,
             reconstruction: if verified_noop {
                 completed_stage("conventional input can be preserved byte-for-byte")
             } else {
@@ -1775,7 +1875,14 @@ fn compile_single_body(
         .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
     let mut rewrites = BTreeMap::new();
     let inputs = replacement_inputs(pe, &candidate, &mut rewrites)?;
-    compile_replacement_body(pe, &inputs, &rewrites, &function.exit, &function.effects, va)
+    compile_replacement_body(
+        pe,
+        &inputs,
+        &rewrites,
+        &function.exit,
+        &function.effects,
+        va,
+    )
 }
 
 /// Registers a Win64 callee may clobber. The dispatcher saves all of them so the
@@ -1875,9 +1982,7 @@ fn compile_branching_function(
         .rva_to_file_offset(function.rva)
         .map_err(|error| error.to_string())?;
     let stub_start = usize::try_from(stub_offset.0).map_err(|_| "stub offset overflow")?;
-    let stub_bytes = image
-        .get(stub_start..)
-        .ok_or("stub is outside the image")?;
+    let stub_bytes = image.get(stub_start..).ok_or("stub is outside the image")?;
     let displaced_va = address(&out);
     out.extend(
         vmpx_recompile::emit_displaced_stub(
@@ -1939,7 +2044,10 @@ fn layout_reintegration_payload(
             .checked_add(u32::try_from(bytes.len()).map_err(|_| "body too large")?)
             .ok_or("offset overflow")?;
     }
-    let dispatcher_rva = Rva(base.0.checked_add(offset).ok_or("dispatcher rva overflow")?);
+    let dispatcher_rva = Rva(base
+        .0
+        .checked_add(offset)
+        .ok_or("dispatcher rva overflow")?);
     let dispatcher = vmpx_recompile::emit_domain_dispatcher(
         domain_reg,
         &arms,
@@ -2054,12 +2162,10 @@ fn commit_group_layout(
     fallback: Rva,
     family_complete: bool,
 ) -> Result<(Rva, bool), String> {
-    let group_base = Rva(
-        planned_rva
-            .0
-            .checked_add(group_start_cursor)
-            .unwrap_or(planned_rva.0),
-    );
+    let group_base = Rva(planned_rva
+        .0
+        .checked_add(group_start_cursor)
+        .unwrap_or(planned_rva.0));
     let dispatcher_used = needs_dispatcher(group_bodies, family_complete, NATIVE_RDX_DOMAIN);
     let built = if dispatcher_used {
         layout_reintegration_payload(
@@ -2132,8 +2238,13 @@ mod reintegration_tests {
         let image_base = 0x1_4000_0000;
         let bodies = vec![(0u64, vec![0x90, 0xC3]), (1u64, vec![0x90, 0x90, 0xC3])];
         let (payload, dispatcher_rva) = layout_reintegration_payload(
-            base, image_base, &bodies, PhysicalRegister::Rdx, Rva(0x1000),
-        ).expect("layout");
+            base,
+            image_base,
+            &bodies,
+            PhysicalRegister::Rdx,
+            Rva(0x1000),
+        )
+        .expect("layout");
         // bodies total 5 bytes, so the dispatcher starts at base + 5.
         assert_eq!(dispatcher_rva, Rva(0x2005));
         assert_eq!(&payload[..5], &[0x90, 0xC3, 0x90, 0x90, 0xC3]);
@@ -2146,8 +2257,13 @@ mod reintegration_tests {
         let header_base = Rva(0x2000);
         let header_bodies = vec![(0u64, vec![0x90, 0xC3]), (1u64, vec![0x90, 0x90, 0xC3])];
         let (header_payload, header_dispatcher_rva) = layout_reintegration_payload(
-            header_base, image_base, &header_bodies, PhysicalRegister::Rdx, Rva(0x1000),
-        ).expect("header layout");
+            header_base,
+            image_base,
+            &header_bodies,
+            PhysicalRegister::Rdx,
+            Rva(0x1000),
+        )
+        .expect("header layout");
 
         // The next group's base, as clean.rs computes it, is the running
         // cursor right after the header group's full payload (bodies plus its
@@ -2155,10 +2271,18 @@ mod reintegration_tests {
         let tls_base = Rva(header_base.0 + u32::try_from(header_payload.len()).expect("fits"));
         let tls_bodies = vec![(0u64, vec![0xC3]), (2u64, vec![0x90, 0xC3])];
         let (_tls_payload, tls_dispatcher_rva) = layout_reintegration_payload(
-            tls_base, image_base, &tls_bodies, PhysicalRegister::Rdx, Rva(0x3000),
-        ).expect("tls layout");
+            tls_base,
+            image_base,
+            &tls_bodies,
+            PhysicalRegister::Rdx,
+            Rva(0x3000),
+        )
+        .expect("tls layout");
 
-        assert!(tls_base.0 > header_dispatcher_rva.0, "tls group must start after the header dispatcher");
+        assert!(
+            tls_base.0 > header_dispatcher_rva.0,
+            "tls group must start after the header dispatcher"
+        );
         // The TLS group's own dispatcher sits after only its own bodies (1 + 2
         // bytes), not after the header group's bodies too.
         assert_eq!(tls_dispatcher_rva, Rva(tls_base.0 + 3));
@@ -2174,10 +2298,25 @@ mod reintegration_tests {
         let mut cursor = 2u32;
         let mut payload = Vec::new();
         let (redirect, dispatcher_used) = commit_group_layout(
-            &mut cursor, &mut payload, 0, planned_rva, image_base, &bodies, Rva(0x1000), true,
-        ).expect("layout");
-        assert!(dispatcher_used, "a partial domain needs the fallback dispatcher");
-        assert_eq!(redirect, Rva(planned_rva.0 + 2), "redirect targets the dispatcher");
+            &mut cursor,
+            &mut payload,
+            0,
+            planned_rva,
+            image_base,
+            &bodies,
+            Rva(0x1000),
+            true,
+        )
+        .expect("layout");
+        assert!(
+            dispatcher_used,
+            "a partial domain needs the fallback dispatcher"
+        );
+        assert_eq!(
+            redirect,
+            Rva(planned_rva.0 + 2),
+            "redirect targets the dispatcher"
+        );
         assert!(payload.len() > 2, "dispatcher bytes follow the body");
 
         // An unproven family counts as incomplete even when the values line up.
@@ -2185,19 +2324,36 @@ mod reintegration_tests {
         let mut cursor = 4u32;
         let mut payload = Vec::new();
         let (_, used) = commit_group_layout(
-            &mut cursor, &mut payload, 0, planned_rva, image_base, &full, Rva(0x1000), false,
-        ).expect("layout");
+            &mut cursor,
+            &mut payload,
+            0,
+            planned_rva,
+            image_base,
+            &full,
+            Rva(0x1000),
+            false,
+        )
+        .expect("layout");
         assert!(used);
     }
 
     #[test]
     fn single_body_redirects_directly_only_when_the_domain_is_provably_complete() {
         let lone = vec![(1u64, vec![0xC3])];
-        assert!(!needs_dispatcher(&lone, true, 1..=1), "complete one-value domain");
+        assert!(
+            !needs_dispatcher(&lone, true, 1..=1),
+            "complete one-value domain"
+        );
         assert!(needs_dispatcher(&lone, false, 1..=1), "unproven family");
-        assert!(needs_dispatcher(&lone, true, 0..=3), "body covers only part of the domain");
+        assert!(
+            needs_dispatcher(&lone, true, 0..=3),
+            "body covers only part of the domain"
+        );
         let pair = vec![(0u64, vec![0xC3]), (1u64, vec![0xC3])];
-        assert!(needs_dispatcher(&pair, true, 0..=1), "multi-body always dispatches");
+        assert!(
+            needs_dispatcher(&pair, true, 0..=1),
+            "multi-body always dispatches"
+        );
     }
 
     #[test]
@@ -2218,24 +2374,49 @@ mod reintegration_tests {
         ];
         cursor += 5;
         let failed = commit_group_layout(
-            &mut cursor, &mut payload, group1_start, planned_rva, image_base,
-            &group1_bodies, Rva(0x1000), true,
+            &mut cursor,
+            &mut payload,
+            group1_start,
+            planned_rva,
+            image_base,
+            &group1_bodies,
+            Rva(0x1000),
+            true,
         );
-        assert!(failed.is_err(), "a too-wide domain value must fail dispatcher assembly");
-        assert_eq!(cursor, group1_start, "a failed group must roll the cursor back");
-        assert!(payload.is_empty(), "a failed group must not contribute any bytes");
+        assert!(
+            failed.is_err(),
+            "a too-wide domain value must fail dispatcher assembly"
+        );
+        assert_eq!(
+            cursor, group1_start,
+            "a failed group must roll the cursor back"
+        );
+        assert!(
+            payload.is_empty(),
+            "a failed group must not contribute any bytes"
+        );
 
         // Group 2 "compiles" as if group 1 had never been attempted.
         let group2_start = cursor;
         let group2_bodies = vec![(0u64, vec![0xC3]), (1u64, vec![0x90, 0xC3])];
         cursor += 3;
         let (redirect, dispatcher_used) = commit_group_layout(
-            &mut cursor, &mut payload, group2_start, planned_rva, image_base,
-            &group2_bodies, Rva(0x3000), true,
-        ).expect("group 2 layout");
+            &mut cursor,
+            &mut payload,
+            group2_start,
+            planned_rva,
+            image_base,
+            &group2_bodies,
+            Rva(0x3000),
+            true,
+        )
+        .expect("group 2 layout");
 
         assert!(dispatcher_used);
-        assert_eq!(group2_start, group1_start, "group 2 must start exactly where group 1 would have");
+        assert_eq!(
+            group2_start, group1_start,
+            "group 2 must start exactly where group 1 would have"
+        );
         assert_eq!(redirect, Rva(planned_rva.0 + group2_start + 3));
         // The final payload holds only group 2's bytes: no gap and no
         // phantom bytes left behind by the failed group 1.
