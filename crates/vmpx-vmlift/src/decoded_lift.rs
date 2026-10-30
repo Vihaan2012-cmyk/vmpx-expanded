@@ -27,6 +27,11 @@ use crate::{
     entry_frame::frame_initial_state,
 };
 
+/// Upper bound on the words a region exit may stage as its continuation stack.
+/// A below-VSP exit frame stages the whole span up to the entry stack pointer;
+/// an implausibly large span is refused rather than walked.
+const MAX_STAGED_CONTINUATION_WORDS: i64 = 512;
+
 /// How one VM semantic reaches native code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,8 +191,10 @@ pub struct StubExit {
 }
 
 /// An exit that transfers to a computed target instead of returning to the
-/// caller: the `ret` pops a word the entry frame held, so the continuation runs
-/// on the stack the VM left inside that frame.
+/// caller: the `ret` pops a word the VM wrote below the entry stack pointer, so
+/// the continuation runs on the stack the VM left. The slot sits inside the
+/// captured entry frame, or below the captured VSP when the VM built a fresh
+/// exit frame there (a negative offset).
 #[derive(Debug)]
 pub struct RegionExit {
     pub registers: BTreeMap<X64NativeRegister, Expr>,
@@ -195,8 +202,9 @@ pub struct RegionExit {
     /// Words from the `ret` slot up to the entry stack pointer, lowest first.
     /// Word zero is the computed target; the rest are the continuation's stack.
     pub staged: Vec<Expr>,
-    /// Offset of the `ret` slot from the initial VM stack pointer.
-    pub slot_offset: u32,
+    /// Signed byte offset of the `ret` slot from the initial VM stack pointer;
+    /// negative when the VM's exit frame sits below the captured VSP.
+    pub slot_offset: i64,
 }
 
 #[derive(Debug)]
@@ -296,7 +304,19 @@ pub fn recover_exit(
     match read(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
         Err(error) => return Err(error),
-        Ok(_) if (0..entry_sp).contains(&return_slot) && return_slot % 8 == 0 => {
+        // The VM wrote the return slot below the entry stack pointer: the target
+        // is a computed continuation the exit transfers through, with the words
+        // up to the entry stack pointer its stack (region exit). The slot may sit
+        // inside the captured entry frame or below the captured VSP (the VM built
+        // a fresh exit frame there); either way every staged word must be a
+        // tracked value or the lift fails closed.
+        Ok(_) if return_slot < entry_sp && return_slot % 8 == 0 => {
+            let staged_words = entry_sp.checked_sub(return_slot).map_or(0, |span| span / 8);
+            if staged_words > MAX_STAGED_CONTINUATION_WORDS {
+                return Err(fail(format!(
+                    "region continuation stages {staged_words} words, over the {MAX_STAGED_CONTINUATION_WORDS} limit"
+                )));
+            }
             let mut staged = Vec::new();
             for slot in (return_slot..entry_sp).step_by(8) {
                 let address = Expr::binary(
@@ -315,7 +335,7 @@ pub fn recover_exit(
                 registers,
                 rflags,
                 staged,
-                slot_offset: u32::try_from(return_slot).map_err(|error| fail(error.to_string()))?,
+                slot_offset: return_slot,
             }));
         }
         // The VM wrote the slot exactly at the entry stack pointer with the
@@ -526,13 +546,13 @@ mod tests {
         RecoveryStatus, SymbolicExecutionStop, SymbolicVmExecutionReport, VmExitRestoreSlot,
     };
 
-    fn store_qword(memory: &mut Vec<(Expr, Expr)>, offset: u32, value: &Expr) {
+    fn store_qword(memory: &mut Vec<(Expr, Expr)>, offset: i64, value: &Expr) {
         let base = Expr::register(BitWidth::W64, "vsp_initial");
         for byte in 0..8 {
             let address = Expr::binary(
                 BinaryOp::Add,
                 base.clone(),
-                Expr::constant(BitWidth::W64, u64::from(offset + byte)),
+                Expr::constant(BitWidth::W64, offset.wrapping_add(i64::from(byte)).cast_unsigned()),
             )
             .expect("byte address");
             memory.push((address, Expr::extract(BitWidth::W8, byte * 8, value.clone()).unwrap()));
@@ -544,7 +564,7 @@ mod tests {
     fn report(return_value: &Expr) -> (SymbolicVmExecutionReport, VmExitReport) {
         let mut memory = Vec::new();
         for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
-            let offset = u32::try_from(index * 8).unwrap();
+            let offset = i64::try_from(index * 8).unwrap();
             store_qword(&mut memory, offset, &Expr::register(BitWidth::W64, register.symbolic_name()));
         }
         store_qword(&mut memory, 120, &Expr::register(BitWidth::W64, "native_rflags_initial"));
@@ -650,5 +670,60 @@ mod tests {
             recover_exit(&symbolic, &exit, 16, 0),
             Err(DecodedLiftError::NotCalleeReturn(_))
         ));
+    }
+
+    // The VM built its exit frame below the captured VSP (`final_vsp` is negative
+    // of `vsp_initial`), so the return slot and the whole staged continuation sit
+    // below the entry frame. When every staged word up to the entry stack pointer
+    // is tracked, this is a region exit with a negative `slot_offset`.
+    #[test]
+    fn a_below_vsp_written_slot_is_a_region_exit_with_a_negative_offset() {
+        // final_vsp = vsp_initial - 232; return slot at final_vsp + 128 = -104.
+        let final_offset: i64 = -232;
+        let mut memory = Vec::new();
+        // Track every qword from the exit frame bottom up to the entry stack
+        // pointer (frame_cells = 17, top_offset = 0 => entry_sp = 136).
+        for slot in (final_offset..136).step_by(8) {
+            store_qword(&mut memory, slot, &Expr::constant(BitWidth::W64, 0x1111_u64.wrapping_add(slot.cast_unsigned())));
+        }
+        let final_vsp = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "vsp_initial"),
+            Expr::constant(BitWidth::W64, final_offset.cast_unsigned()),
+        )
+        .unwrap();
+        let symbolic = SymbolicVmExecutionReport {
+            schema_version: 4,
+            executed_instructions: 0,
+            stop_reason: SymbolicExecutionStop::ControlFlowBoundary,
+            final_vsp,
+            final_vsp_offset: Some(final_offset),
+            final_flags: Expr::constant(BitWidth::W64, 0),
+            branch_target: None,
+            branch_target_dependencies: Vec::new(),
+            context_cells: BTreeMap::new(),
+            memory_values: memory,
+            memory_epoch: 0,
+            memory_tainted: false,
+            image_reads_suppressed: false,
+            assumed_external_disjoint_from_vm_stack: false,
+            external_writes: Vec::new(),
+            memory_havocs: Vec::new(),
+            native_calls: Vec::new(),
+            fresh_allocations: Vec::new(),
+            next_native_call_epoch: 0,
+            peak_expression_nodes: 1,
+            tracked_memory_bytes: 0,
+            resolved_image_bytes: 0,
+        };
+        let (_, exit) = report(&Expr::constant(BitWidth::W64, 0));
+        match recover_exit(&symbolic, &exit, 17, 0) {
+            Ok(RecoveredExit::Region(region)) => {
+                assert_eq!(region.slot_offset, -104);
+                // staged spans the return slot up to the entry stack pointer.
+                assert_eq!(region.staged.len(), usize::try_from((136 - -104) / 8).unwrap());
+            }
+            other => panic!("expected a below-VSP region exit, got {other:?}"),
+        }
     }
 }

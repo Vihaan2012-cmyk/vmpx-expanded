@@ -125,8 +125,9 @@ struct RegionLeaf {
     /// Flags the continuation starts with; `None` is the entry flags.
     rflags: Option<Expr>,
     staged: Vec<Expr>,
-    /// Offset of `staged[0]` from the initial VM stack pointer.
-    slot_offset: u32,
+    /// Signed offset of `staged[0]` from the initial VM stack pointer; negative
+    /// when the VM's exit frame sits below the captured VSP.
+    slot_offset: i64,
 }
 
 /// One loop-carried cell, emitted as a frame slot (`phi`) live across the
@@ -2049,7 +2050,12 @@ impl Emitter<'_> {
     fn emit_region(&mut self, leaf: &RegionLeaf) -> Result<(), ReplacementError> {
         self.stash_exit_registers(&leaf.registers)?;
         for (index, word) in leaf.staged.iter().enumerate() {
-            let offset = u64::from(leaf.slot_offset) + 8 * index as u64;
+            // Modular W64 offset from the VM stack root; negative for a below-VSP
+            // exit frame, so the add wraps to the correct lower address.
+            let offset = leaf
+                .slot_offset
+                .wrapping_add(8 * i64::try_from(index).unwrap_or(i64::MAX))
+                .cast_unsigned();
             let address = Expr::binary(
                 BinaryOp::Add,
                 Expr::register(BitWidth::W64, "vsp_initial"),
