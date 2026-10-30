@@ -1096,6 +1096,7 @@ pub fn analyze_clean_with_image(
     let mut recompilation = stage("no path reached a lowerable exit state");
     let mut reintegration = stage("native code reintegration was not attempted");
     let mut reintegrated: Option<Vec<u8>> = None;
+    let mut header_entry_redirected = false;
     // Entry stubs whose redirect to an emitted replacement actually succeeded.
     let mut covered_rvas: BTreeSet<Rva> = BTreeSet::new();
     if protection.verdict != DetectionVerdict::NoStrongEvidence {
@@ -1377,7 +1378,7 @@ pub fn analyze_clean_with_image(
             // stream lifts to a clean callee return. A failed lift skips only
             // that entry and leaves its stub; redirects are not counted as
             // coverage, so the sound gate is unaffected.
-            let mut decoded_stubs: Vec<(Rva, Rva)> = Vec::new();
+            let mut decoded_stubs: Vec<(Rva, Rva, BTreeSet<String>)> = Vec::new();
             let mut decoded_bytes: u64 = 0;
             let mut decoded_failed: u64 = 0;
             for entry in vm_inventory.iter().filter(|_| decoded_lift) {
@@ -1402,7 +1403,7 @@ pub fn analyze_clean_with_image(
                         decoded_bytes += len;
                         emitted += 1;
                         reintegration_payload.extend_from_slice(&body.bytes);
-                        decoded_stubs.push((entry.rva, body_rva));
+                        decoded_stubs.push((entry.rva, body_rva, body.imports));
                         reintegration_diagnostics.push(format!(
                             "{}: decoded-stream {} lift, {len} byte(s) at {body_rva}",
                             entry.rva, body.kind
@@ -1471,6 +1472,7 @@ pub fn analyze_clean_with_image(
                     },
                 ) {
                     Ok((mut bytes, report)) => {
+                        header_entry_redirected = report.entry_redirected;
                         // `reintegrate` fails as a whole if any TLS redirect fails,
                         // so on Ok every requested one landed.
                         if header_redirect.is_some() {
@@ -1527,11 +1529,13 @@ pub fn analyze_clean_with_image(
                             }
                         }
                         let mut decoded_redirected: u64 = 0;
-                        for (stub, body) in &decoded_stubs {
+                        let mut resolved_imports: BTreeSet<String> = BTreeSet::new();
+                        for (stub, body, imports) in &decoded_stubs {
                             match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *body) {
                                 Ok(redirected) => {
                                     bytes = redirected;
                                     decoded_redirected += 1;
+                                    resolved_imports.extend(imports.iter().cloned());
                                 }
                                 Err(error) => reintegration_diagnostics.push(format!(
                                     "{stub}: decoded-stream redirect failed, original stub kept: {error}"
@@ -1547,6 +1551,16 @@ pub fn analyze_clean_with_image(
                             u64::from(report.entry_redirected),
                             report.tls_redirected
                         )];
+                        if !resolved_imports.is_empty() {
+                            diags.push(format!(
+                                "spliced functions call proven imports: {}",
+                                resolved_imports
+                                    .iter()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
                         diags.extend(reintegration_diagnostics);
                         CleanStageReport {
                             complete: true,
@@ -1572,6 +1586,10 @@ pub fn analyze_clean_with_image(
                                     u64::try_from(decoded_stubs.len()).unwrap_or(0),
                                 ),
                                 ("decoded_redirected".to_owned(), decoded_redirected),
+                                (
+                                    "resolved_imports".to_owned(),
+                                    u64::try_from(resolved_imports.len()).unwrap_or(0),
+                                ),
                                 ("decoded_failed".to_owned(), decoded_failed),
                                 ("decoded_bytes".to_owned(), decoded_bytes),
                                 (
@@ -1628,6 +1646,24 @@ pub fn analyze_clean_with_image(
     let oep_decision = decide_oep(&oep_paths, header_family_complete, |rva| {
         is_native_continuation(&pe, rva)
     });
+    if let (Some(bytes), Some(oep), false) = (
+        reintegrated.as_mut(),
+        oep_decision.recovered_entry,
+        header_entry_redirected,
+    ) {
+        match vmpx_rebuild::set_entry_point(bytes, oep) {
+            Ok(updated) => {
+                *bytes = updated;
+                reintegration.metrics.insert("oep_set".to_owned(), 1);
+                reintegration
+                    .diagnostics
+                    .push(format!("entry point set to the proven OEP {oep}"));
+            }
+            Err(error) => reintegration
+                .diagnostics
+                .push(format!("proven OEP {oep} not applied: {error}")),
+        }
+    }
     let mut coverage: Option<CleanCoverageReport> = None;
     let mut import_proof: Option<clean_wiring::ImportProof> = None;
     if verified_noop {
