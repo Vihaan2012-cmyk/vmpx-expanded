@@ -219,8 +219,9 @@ pub fn recover_stub_exit(
     symbolic: &vmpx_vm::SymbolicVmExecutionReport,
     exit: &VmExitReport,
     frame_cells: usize,
+    top_offset: u64,
 ) -> Result<StubExit, DecodedLiftError> {
-    match recover_exit(symbolic, exit, frame_cells)? {
+    match recover_exit(symbolic, exit, frame_cells, top_offset)? {
         RecoveredExit::Callee(exit) => Ok(exit),
         RecoveredExit::Region(_) => Err(DecodedLiftError::NotCalleeReturn(
             "the return address was written by the VM, not read from caller stack".to_owned(),
@@ -234,14 +235,27 @@ pub fn recover_stub_exit(
 /// native `ret` after `add rsp, pop` reads exactly the same word. A return
 /// address held in a tracked cell of the entry frame is a region exit.
 ///
+/// `top_offset` is the VSP-to-top-cell byte offset of the entry frame (see
+/// [`crate::recover_entry_frame`]); the entry stack pointer sits one word above
+/// the highest captured cell, at `top_offset + frame_cells * 8`. A capture that
+/// ignored it placed the entry stack pointer too low and mistook an in-frame
+/// continuation slot (region exit) for a VM-written caller slot.
+///
+/// A VM-written slot exactly at the entry stack pointer whose value is provably
+/// the caller's own pushed return address (threaded unchanged through the VM) is
+/// a clean callee return: popping it is byte-identical to popping the untouched
+/// slot. Any other VM-written slot above the frame is refused.
+///
 /// # Errors
 ///
-/// Refuses a return through a VM-written slot outside the entry frame, an
-/// untracked staged word, or an inconsistent layout.
+/// Refuses a return through a VM-written slot outside the entry frame that is
+/// not the proven caller return, an untracked staged word, or an inconsistent
+/// layout.
 pub fn recover_exit(
     symbolic: &vmpx_vm::SymbolicVmExecutionReport,
     exit: &VmExitReport,
     frame_cells: usize,
+    top_offset: u64,
 ) -> Result<RecoveredExit, DecodedLiftError> {
     let fail = |message: String| DecodedLiftError::NativeExit(message);
     if exit.status != vmpx_vm::RecoveryStatus::Recovered {
@@ -275,7 +289,9 @@ pub fn recover_exit(
     }
     let rflags = read(flags_offset)?;
 
-    let entry_sp = i64::try_from(frame_cells * 8).unwrap_or(i64::MAX);
+    let entry_sp = i64::try_from(frame_cells * 8)
+        .unwrap_or(i64::MAX)
+        .saturating_add(top_offset.cast_signed());
     let return_slot = final_offset + i64::from(return_offset);
     match read(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
@@ -302,6 +318,11 @@ pub fn recover_exit(
                 slot_offset: u32::try_from(return_slot).map_err(|error| fail(error.to_string()))?,
             }));
         }
+        // The VM wrote the slot exactly at the entry stack pointer with the
+        // caller's own pushed return address, threaded unchanged through the VM
+        // stack. Popping it is byte-identical to popping the untouched caller
+        // slot, so this is a clean callee return.
+        Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
         Ok(_) => {
             return Err(DecodedLiftError::NotCalleeReturn(
                 "the return address was written by the VM, not read from caller stack".to_owned(),
@@ -383,6 +404,15 @@ fn is_register(expression: &Expr, name: &str) -> bool {
     matches!(&expression.simplify().kind, ExprKind::Register { name: found } if found == name)
 }
 
+/// Whether `expression` is provably the caller's pushed return address: the
+/// opaque root the entry frame threads for its `ReturnAddress` cell. Only this
+/// structural identity proves a VM-written return slot equals the standard
+/// callee return; a reconstructed address (e.g. relocation base plus a constant)
+/// is not accepted, so the lift fails closed on it.
+fn is_caller_return_address(expression: &Expr) -> bool {
+    is_register(expression, "native_return_address_initial")
+}
+
 /// Lifts a decoded linear function that ends in a proven VM exit.
 ///
 /// # Errors
@@ -419,7 +449,8 @@ pub fn lift_decoded_linear(
             "memory havoc, native calls and allocations are not bridged yet".to_owned(),
         ));
     }
-    let mut exit_state = recover_stub_exit(&symbolic, input.exit, input.frame.len())?;
+    let mut exit_state =
+        recover_stub_exit(&symbolic, input.exit, input.frame.len(), input.top_offset)?;
     if symbolic.external_writes.is_empty() {
         for value in exit_state.registers.values_mut() {
             *value = reads_of_untouched_memory(value)?;
@@ -485,4 +516,139 @@ pub fn lift_decoded_linear(
         semantic_counts,
         assumptions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmpx_pe::Rva;
+    use vmpx_vm::{
+        RecoveryStatus, SymbolicExecutionStop, SymbolicVmExecutionReport, VmExitRestoreSlot,
+    };
+
+    fn store_qword(memory: &mut Vec<(Expr, Expr)>, offset: u32, value: &Expr) {
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        for byte in 0..8 {
+            let address = Expr::binary(
+                BinaryOp::Add,
+                base.clone(),
+                Expr::constant(BitWidth::W64, u64::from(offset + byte)),
+            )
+            .expect("byte address");
+            memory.push((address, Expr::extract(BitWidth::W8, byte * 8, value.clone()).unwrap()));
+        }
+    }
+
+    /// Standard 17-qword exit frame (15 registers, flags, return) whose return
+    /// slot at `return_offset` holds `return_value`. `final_vsp == vsp_initial`.
+    fn report(return_value: &Expr) -> (SymbolicVmExecutionReport, VmExitReport) {
+        let mut memory = Vec::new();
+        for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
+            let offset = u32::try_from(index * 8).unwrap();
+            store_qword(&mut memory, offset, &Expr::register(BitWidth::W64, register.symbolic_name()));
+        }
+        store_qword(&mut memory, 120, &Expr::register(BitWidth::W64, "native_rflags_initial"));
+        store_qword(&mut memory, 128, return_value);
+        let symbolic = SymbolicVmExecutionReport {
+            schema_version: 4,
+            executed_instructions: 0,
+            stop_reason: SymbolicExecutionStop::ControlFlowBoundary,
+            final_vsp: Expr::register(BitWidth::W64, "vsp_initial"),
+            final_vsp_offset: Some(0),
+            final_flags: Expr::constant(BitWidth::W64, 0),
+            branch_target: None,
+            branch_target_dependencies: Vec::new(),
+            context_cells: BTreeMap::new(),
+            memory_values: memory,
+            memory_epoch: 0,
+            memory_tainted: false,
+            image_reads_suppressed: false,
+            assumed_external_disjoint_from_vm_stack: false,
+            external_writes: Vec::new(),
+            memory_havocs: Vec::new(),
+            native_calls: Vec::new(),
+            fresh_allocations: Vec::new(),
+            next_native_call_epoch: 0,
+            peak_expression_nodes: 1,
+            tracked_memory_bytes: 136,
+            resolved_image_bytes: 0,
+        };
+        let exit = VmExitReport {
+            schema_version: 2,
+            entry: Rva(0x1000),
+            status: RecoveryStatus::Recovered,
+            stack_switch: None,
+            restored_registers: Vec::new(),
+            restore_slots: X64NativeRegister::ALL
+                .iter()
+                .enumerate()
+                .map(|(index, register)| VmExitRestoreSlot {
+                    register: *register,
+                    stack_offset: u32::try_from(index * 8).unwrap(),
+                    pop: Rva(0),
+                })
+                .collect(),
+            flags_restore: None,
+            flags_stack_offset: Some(120),
+            native_return: None,
+            return_stack_offset: Some(128),
+            frame_size: Some(136),
+            confidence: 100,
+            evidence: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        (symbolic, exit)
+    }
+
+    // The return slot (offset 128) lies one qword above the top captured cell of
+    // a `top_offset`-shifted 12-cell frame (top cell at 40 + 11*8 = 128), so the
+    // VM-written target is a continuation inside the frame: a region exit. The
+    // same layout read with the un-shifted entry stack pointer wrongly placed the
+    // slot above the frame and refused it.
+    #[test]
+    fn a_top_offset_shifted_in_frame_written_slot_is_a_region_exit() {
+        let target = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "native_r13_initial"),
+            Expr::constant(BitWidth::W64, 0x1_8001_D7DE),
+        )
+        .unwrap();
+        let (symbolic, exit) = report(&target);
+        // 12 cells, top_offset 0x28: entry stack pointer at 0x28 + 96 = 136 > 128.
+        assert!(matches!(
+            recover_exit(&symbolic, &exit, 12, 0x28),
+            Ok(RecoveredExit::Region(_))
+        ));
+        // Ignoring top_offset put the entry stack pointer at 96 < 128 and refused.
+        assert!(matches!(
+            recover_exit(&symbolic, &exit, 12, 0),
+            Err(DecodedLiftError::NotCalleeReturn(_))
+        ));
+    }
+
+    // A VM-written return slot sitting exactly at the entry stack pointer whose
+    // value is provably the caller's own pushed return address is a clean callee
+    // return (pop 0): popping it is byte-identical to the untouched slot.
+    #[test]
+    fn a_written_slot_proven_to_be_the_caller_return_is_a_clean_return() {
+        let return_address = Expr::register(BitWidth::W64, "native_return_address_initial");
+        let (symbolic, exit) = report(&return_address);
+        // 16 cells, top_offset 0: entry stack pointer at 128 == return slot.
+        match recover_exit(&symbolic, &exit, 16, 0) {
+            Ok(RecoveredExit::Callee(stub)) => assert_eq!(stub.return_pop, 0),
+            other => panic!("expected a clean callee return, got {other:?}"),
+        }
+    }
+
+    // The same position, but the VM computed some other target: not provably the
+    // caller return, so it is refused (fail closed) rather than lifted as `ret`.
+    #[test]
+    fn a_written_slot_with_a_computed_non_return_target_is_refused() {
+        let computed = Expr::constant(BitWidth::W64, 0x1_8002_A700);
+        let (symbolic, exit) = report(&computed);
+        assert!(matches!(
+            recover_exit(&symbolic, &exit, 16, 0),
+            Err(DecodedLiftError::NotCalleeReturn(_))
+        ));
+    }
 }

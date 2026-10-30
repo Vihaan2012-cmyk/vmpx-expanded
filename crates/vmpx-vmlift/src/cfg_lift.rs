@@ -1046,13 +1046,16 @@ impl Builder<'_> {
                         state = composed;
                         continue;
                     }
-                    let recovered =
-                        recover_exit(&report, layout, input.frame.len()).map_err(|error| {
-                            DecodedLiftError::Cfg {
-                                block: key,
-                                reason: error.to_string(),
-                            }
-                        })?;
+                    let recovered = recover_exit(
+                        &report,
+                        layout,
+                        input.frame.len(),
+                        input.top_offset,
+                    )
+                    .map_err(|error| DecodedLiftError::Cfg {
+                        block: key,
+                        reason: error.to_string(),
+                    })?;
                     let exit = match recovered {
                         RecoveredExit::Callee(exit) => exit,
                         RecoveredExit::Region(exit) => {
