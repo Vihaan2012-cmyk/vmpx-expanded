@@ -16,7 +16,10 @@ fn main() {
         report.candidates.len(),
         report.rejected_role_assignments
     );
-    println!("recovered: {}", if recovered.is_some() { "YES" } else { "NO" });
+    println!(
+        "recovered: {}",
+        if recovered.is_some() { "YES" } else { "NO" }
+    );
     for c in &report.candidates {
         println!(
             "  VIP={} key={} handler={} dir={:?} anchor={} vip0={} encoded_load={}",

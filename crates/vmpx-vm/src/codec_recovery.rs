@@ -10,16 +10,16 @@ use vmpx_pe::{PeImage, Rva, Va};
 
 use crate::{
     BitWidth, BytecodeDecodeError, BytecodeDirection, DecodedVmInstruction,
-    DispatchExtractionReport, EffectKnowledge, HandlerEffectRoles, HandlerEffectSummary,
-    HandlerMemoryRegion, HandlerRegisterRoles, HandlerSliceConfig, HandlerValueFlowProof,
-    KeyedOperandCodecReport, KeyedTransformCodec, LinearDecodeStop, LinearVmDecodeReport,
-    NativeBackwardSlice, NativeCallAnalysisReport, NativeCallBoundarySpec, RecoveryStatus,
-    RelativeDispatchCodec, RelativeDispatchState, RelativeThreadedCodec,
-    TableChecksumHandlerReport, VmExitReport, VmHandlerAnalysis, VmHandlerDecodeSpec,
-    VmHandlerSemantic, VmSemanticMetadata, analyze_native_call_handler,
+    DispatchExtractionCandidate, DispatchExtractionReport, EffectKnowledge, HandlerEffectRoles,
+    HandlerEffectSummary, HandlerMemoryRegion, HandlerRegisterRoles, HandlerSliceConfig,
+    HandlerValueFlowProof, KeyedOperandCodecReport, KeyedTransformCodec, LinearDecodeStop,
+    LinearVmDecodeReport, NativeBackwardSlice, NativeCallAnalysisReport, NativeCallBoundarySpec,
+    RecoveryStatus, RelativeDispatchCodec, RelativeDispatchState, RelativeThreadedCodec,
+    StackCheckRoles, TableChecksumHandlerReport, VmExitReport, VmHandlerAnalysis,
+    VmHandlerDecodeSpec, VmHandlerSemantic, VmSemanticMetadata, analyze_native_call_handler,
     analyze_table_checksum_handler, analyze_vm_exit, backward_slice_handler_trace,
     classify_handler_effects, extract_handler_effects_keyed, extract_operand_codecs_mode,
-    extract_relative_dispatch_codecs_with_postlude_direction, prove_handler_value_flow,
+    extract_relative_dispatch_codecs_with_stack_check, prove_handler_value_flow,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,6 +191,31 @@ fn is_dispatch_only_effect(
         && effects.diagnostics.is_empty()
 }
 
+/// A keyless VM has no rolling key to reset, and a handler that reloads VIP from
+/// the VM stack re-enters the table dispatch only if the static table anchor is
+/// re-established on the traced path ahead of the proven table-indexed dispatch.
+fn apply_keyless_reentry_facts(
+    effects: &mut HandlerEffectSummary,
+    trace: &vmpx_disasm::DirectJumpTrace,
+    dispatch: &DispatchExtractionCandidate,
+) {
+    if dispatch.codec.table.is_none() || !effects.loads_vip_from_vsp {
+        return;
+    }
+    let Some(anchor) = dispatch.handler_rebase_rva else {
+        return;
+    };
+    let anchored = dispatch.postlude.is_some()
+        || trace
+            .instructions()
+            .take_while(|decoded| decoded.rva != dispatch.encoded_load)
+            .any(|decoded| decoded.rva == anchor);
+    if anchored {
+        effects.resets_key_from_vip = true;
+        effects.reinitializes_handler_base = true;
+    }
+}
+
 /// Runs the bounded native handler pipeline and selects codecs only when each
 /// recovered role is unambiguous.
 ///
@@ -212,13 +237,17 @@ pub fn recover_handler_codecs(
             live_out_rflags: config.live_out_rflags,
         },
     );
-    let mut dispatch_analysis = extract_relative_dispatch_codecs_with_postlude_direction(
+    let mut dispatch_analysis = extract_relative_dispatch_codecs_with_stack_check(
         pe,
         &trace,
         &slice,
         config.roles,
         config.bytecode_direction,
         config.proof_limits,
+        config.effect_roles.map(|roles| StackCheckRoles {
+            vsp: roles.vsp,
+            context_base: roles.context_base,
+        }),
     )?;
     let dispatch_sources: BTreeSet<_> = dispatch_analysis
         .candidates
@@ -317,13 +346,14 @@ pub fn recover_handler_codecs(
                         live_out_rflags: config.live_out_rflags,
                     },
                 );
-                let resume_dispatch = extract_relative_dispatch_codecs_with_postlude_direction(
+                let resume_dispatch = extract_relative_dispatch_codecs_with_stack_check(
                     pe,
                     &resume_trace,
                     &resume_slice,
                     config.roles,
                     config.bytecode_direction,
                     config.proof_limits,
+                    None,
                 )?;
                 if resume_dispatch.candidates.len() == 1 {
                     dispatch_analysis = resume_dispatch;
@@ -505,14 +535,15 @@ pub fn recover_handler_codecs(
     } else {
         match (config.effect_roles, dispatch_analysis.candidates.as_slice()) {
             (Some(roles), [dispatch_candidate]) => {
-                let effects = extract_handler_effects_keyed(
+                let mut effects = extract_handler_effects_keyed(
                     &trace,
                     &slice,
                     roles,
                     config.roles,
-                    dispatch_candidate.encoded_load,
+                    dispatch_candidate.semantic_end(),
                     dispatch_candidate.codec.table.is_none(),
                 );
+                apply_keyless_reentry_facts(&mut effects, &trace, dispatch_candidate);
                 let operand_width = operand.as_ref().map(|codec| codec.width);
                 let operand_vip_delta = match operand_analysis.candidates.as_slice() {
                     [] => Some(0_i64),

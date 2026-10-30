@@ -347,12 +347,12 @@ impl RelativeDispatchCodec {
         let encoded_opcode = read_bytes(pe, opcode_address, table.opcode_width.bytes())?;
         let opcode = little_endian_value(&encoded_opcode);
         let table_base = table.table_base.unwrap_or(state.handler);
-        let entry_offset = opcode
-            .checked_mul(u64::from(table.stride))
-            .ok_or_else(|| BytecodeDecodeError::Address {
+        let entry_offset = opcode.checked_mul(u64::from(table.stride)).ok_or_else(|| {
+            BytecodeDecodeError::Address {
                 va: table_base,
                 message: "dispatch table index overflows".to_owned(),
-            })?;
+            }
+        })?;
         let entry_address =
             table_base
                 .checked_add(entry_offset)

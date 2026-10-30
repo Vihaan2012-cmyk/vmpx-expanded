@@ -71,9 +71,10 @@ pub use decoder::{
 };
 pub use dispatch_extract::{
     DispatchExtractionCandidate, DispatchExtractionRejection, DispatchExtractionReport,
-    HandlerRegisterRoles, extract_relative_dispatch_codecs,
+    HandlerRegisterRoles, PostludeDispatch, StackCheckRoles, extract_relative_dispatch_codecs,
     extract_relative_dispatch_codecs_with_postlude,
     extract_relative_dispatch_codecs_with_postlude_direction,
+    extract_relative_dispatch_codecs_with_stack_check,
 };
 pub use effect_extract::{
     HandlerEffectRoles, HandlerEffectSummary, HandlerMemoryEffect, HandlerMemoryRegion,

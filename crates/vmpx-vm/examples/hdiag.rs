@@ -87,9 +87,11 @@ fn main() {
         }
         if std::env::var("HDIAG_PER_OP").is_ok() {
             println!(
-                "op{op} rva {handler_rva:#x} {:?} {:?}",
+                "op{op} rva {handler_rva:#x} {:?} {:?} vip_from_vsp={:?} vsp_delta={:?}",
                 r.status,
-                r.handler_analysis.as_ref().map(|a| a.semantic)
+                r.handler_analysis.as_ref().map(|a| a.semantic),
+                r.effects.as_ref().map(|e| e.loads_vip_from_vsp),
+                r.effects.as_ref().map(|e| e.vsp_delta)
             );
         }
         let sem = r

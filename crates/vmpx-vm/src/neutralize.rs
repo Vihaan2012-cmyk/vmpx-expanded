@@ -195,15 +195,22 @@ mod tests {
             INTEGRITY_CHECKSUM_INTRINSIC,
             vec![Expr::register(BitWidth::W32, "accumulator")],
         );
-        let condition = Expr::binary(BinaryOp::Xor, checksum, Expr::constant(BitWidth::W32, 0xDEAD_BEEF))
-            .expect("same width");
+        let condition = Expr::binary(
+            BinaryOp::Xor,
+            checksum,
+            Expr::constant(BitWidth::W32, 0xDEAD_BEEF),
+        )
+        .expect("same width");
         let guard = RecoveredGuard {
             site: Rva(0x1000),
             condition,
             detected_when: DetectedWhen::NonZero,
         };
-        let (rewritten, actions) =
-            neutralize(&[guard], &BTreeMap::new(), NeutralizeOptions { enabled: true });
+        let (rewritten, actions) = neutralize(
+            &[guard],
+            &BTreeMap::new(),
+            NeutralizeOptions { enabled: true },
+        );
         assert_eq!(rewritten.len(), 1);
         assert_eq!(rewritten[0].condition, Expr::constant(BitWidth::W32, 0));
         assert_eq!(actions.len(), 1);
@@ -245,8 +252,11 @@ mod tests {
             condition,
             detected_when: DetectedWhen::Zero,
         };
-        let (rewritten, actions) =
-            neutralize(&[guard], &BTreeMap::new(), NeutralizeOptions { enabled: true });
+        let (rewritten, actions) = neutralize(
+            &[guard],
+            &BTreeMap::new(),
+            NeutralizeOptions { enabled: true },
+        );
         assert_eq!(
             rewritten[0].condition,
             Expr::constant(BitWidth::W64, u64::MAX)

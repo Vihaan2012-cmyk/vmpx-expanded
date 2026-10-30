@@ -1,16 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
+use iced_x86::{
+    FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
+};
 use serde::Serialize;
 use vmpx_disasm::{
-    DecodedInstruction, DirectJumpTrace, DirectJumpTraceStopKind, DisasmError,
-    RegisterDispatchProof, RegisterDispatchProofLimits, prove_register_dispatch_postlude,
+    DecodedInstruction, DirectJumpTrace, DirectJumpTraceLimits, DirectJumpTraceStopKind,
+    DisasmError, RegisterDispatchProof, RegisterDispatchProofLimits, decode_one, is_executable_rva,
+    prove_register_dispatch_postlude, trace_direct_jump_fragments,
 };
 use vmpx_pe::{PeImage, Rva, Va};
 
 use crate::{
-    BitWidth, BytecodeDirection, KeyOperation, NativeBackwardSlice, NativeInstructionDisposition,
-    RelativeDispatchCodec, Transform, TransformChain, TransformOp,
+    BitWidth, BytecodeDirection, HandlerSliceConfig, KeyOperation, NativeBackwardSlice,
+    NativeInstructionDisposition, RelativeDispatchCodec, Transform, TransformChain, TransformOp,
+    backward_slice_handler_trace,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +41,35 @@ pub struct DispatchExtractionCandidate {
     pub codec: RelativeDispatchCodec,
     pub confidence: u8,
     pub evidence: Vec<String>,
+    /// Set when the dispatch lives in the shared head reached through the
+    /// handler's stack-check postlude rather than inside the handler trace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postlude: Option<PostludeDispatch>,
+}
+
+/// Registers of the shared stack-check postlude `lea tmp,[ctx+disp];
+/// cmp vsp,tmp; ja head`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StackCheckRoles {
+    pub vsp: Register,
+    pub context_base: Register,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PostludeDispatch {
+    /// First instruction of the stack-check (the `lea`); handler effects end here.
+    pub stack_check_start: Rva,
+    pub branch: Rva,
+    pub head: Rva,
+}
+
+impl DispatchExtractionCandidate {
+    /// Where the handler's own semantic effects end.
+    #[must_use]
+    pub fn semantic_end(&self) -> Rva {
+        self.postlude
+            .map_or(self.encoded_load, |postlude| postlude.stack_check_start)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -816,6 +849,7 @@ fn attempt_candidate(
         },
         confidence: 100,
         evidence,
+        postlude: None,
     })
 }
 
@@ -885,8 +919,8 @@ fn attempt_table_indexed_candidate(
     if source.instruction.mnemonic() != Mnemonic::Movzx {
         return Err("table-indexed opcode load is not zero-extended".to_owned());
     }
-    let opcode_width =
-        source_load_width(&source.instruction).ok_or_else(|| "unsupported opcode width".to_owned())?;
+    let opcode_width = source_load_width(&source.instruction)
+        .ok_or_else(|| "unsupported opcode width".to_owned())?;
     let index = canonical(source.instruction.op0_register());
     if index == canonical(roles.vip)
         || index == canonical(roles.handler)
@@ -965,8 +999,8 @@ fn attempt_table_indexed_candidate(
     }
     let (table, stride, entry_width, table_load_index) =
         table_load.ok_or_else(|| "no table-indexed dispatch load".to_owned())?;
-    let handler_add_index =
-        handler_add_index.ok_or_else(|| "table-indexed handler base addition is absent".to_owned())?;
+    let handler_add_index = handler_add_index
+        .ok_or_else(|| "table-indexed handler base addition is absent".to_owned())?;
     if table_load_index >= handler_add_index {
         return Err("table load does not precede the handler base addition".to_owned());
     }
@@ -1041,6 +1075,7 @@ fn attempt_table_indexed_candidate(
         },
         confidence: 100,
         evidence,
+        postlude: None,
     })
 }
 
@@ -1199,6 +1234,33 @@ pub fn extract_relative_dispatch_codecs_with_postlude_direction(
     direction: BytecodeDirection,
     proof_limits: RegisterDispatchProofLimits,
 ) -> Result<DispatchExtractionReport, DisasmError> {
+    extract_relative_dispatch_codecs_with_stack_check(
+        pe,
+        trace,
+        slice,
+        roles,
+        direction,
+        proof_limits,
+        None,
+    )
+}
+
+/// As [`extract_relative_dispatch_codecs_with_postlude_direction`], and when
+/// `stack_check` is given also recognizes a handler that ends in the shared
+/// stack-check postlude whose `ja` targets a proven table-indexed dispatch head.
+///
+/// # Errors
+///
+/// Propagates invalid postlude entry or native decoding errors.
+pub fn extract_relative_dispatch_codecs_with_stack_check(
+    pe: &PeImage<'_>,
+    trace: &DirectJumpTrace,
+    slice: &NativeBackwardSlice,
+    roles: HandlerRegisterRoles,
+    direction: BytecodeDirection,
+    proof_limits: RegisterDispatchProofLimits,
+    stack_check: Option<StackCheckRoles>,
+) -> Result<DispatchExtractionReport, DisasmError> {
     if let Some(terminal) = terminal_dispatches_through(trace, roles.handler) {
         return Ok(extract_relative_dispatch_codecs_with_terminal(
             trace,
@@ -1233,7 +1295,29 @@ pub fn extract_relative_dispatch_codecs_with_postlude_direction(
             .or_else(|| proof.push_return_sites.first())
             .copied()
     });
-    Ok(extract_relative_dispatch_codecs_with_terminal(
+    let mut stack_check_rejection = None;
+    if terminal.flatten().is_none()
+        && let Some(check) = stack_check
+    {
+        match recognize_postlude_dispatch(pe, trace, roles, check, direction) {
+            Ok(Some(candidate)) => {
+                return Ok(DispatchExtractionReport {
+                    schema_version: 2,
+                    candidates: vec![candidate],
+                    rejected_sources: Vec::new(),
+                    postlude_proof: Some(proof),
+                });
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                stack_check_rejection = Some(DispatchExtractionRejection {
+                    encoded_load: trace.stop.at,
+                    reason: format!("stack-check postlude: {reason}"),
+                });
+            }
+        }
+    }
+    let mut report = extract_relative_dispatch_codecs_with_terminal(
         trace,
         slice,
         roles,
@@ -1241,7 +1325,305 @@ pub fn extract_relative_dispatch_codecs_with_postlude_direction(
         terminal.flatten(),
         "an acyclic all-path postlude proof reaches the handler-register dispatch",
         Some(proof),
-    ))
+    );
+    report.rejected_sources.extend(stack_check_rejection);
+    Ok(report)
+}
+
+const MAX_ANCHOR_LOOKBACK: u32 = 48;
+const MAX_POSTLUDE_INSTRUCTIONS: usize = 512;
+
+fn is_flag_junk(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.mnemonic(),
+        Mnemonic::Stc | Mnemonic::Clc | Mnemonic::Cmc
+    )
+}
+
+fn is_direct_jump(instruction: &Instruction) -> bool {
+    instruction.mnemonic() == Mnemonic::Jmp && instruction.op0_kind() == OpKind::NearBranch64
+}
+
+struct StackCheckShape {
+    start: Rva,
+    branch: Rva,
+    head: Rva,
+    fallthrough: Rva,
+}
+
+/// Matches the exact tail `lea tmp,[ctx+disp]; cmp vsp,tmp; ja head`. Only
+/// direct jumps may separate `cmp` from `ja` (they leave flags intact) and only
+/// direct jumps or carry-flag junk may precede `cmp` (it rewrites every flag).
+fn match_stack_check(
+    trace: &DirectJumpTrace,
+    roles: HandlerRegisterRoles,
+    check: StackCheckRoles,
+) -> Option<StackCheckShape> {
+    if trace.stop.kind != DirectJumpTraceStopKind::ConditionalBranch {
+        return None;
+    }
+    let instructions: Vec<_> = trace.instructions().collect();
+    let branch = instructions.last()?;
+    if branch.rva != trace.stop.at || branch.instruction.mnemonic() != Mnemonic::Ja {
+        return None;
+    }
+    let head = trace.stop.direct_target?;
+    let fallthrough = trace.stop.fallthrough?;
+    let mut index = instructions.len() - 1;
+    let cmp_index = loop {
+        index = index.checked_sub(1)?;
+        if !is_direct_jump(&instructions[index].instruction) {
+            break index;
+        }
+    };
+    let cmp = &instructions[cmp_index].instruction;
+    if cmp.mnemonic() != Mnemonic::Cmp
+        || cmp.op0_kind() != OpKind::Register
+        || cmp.op1_kind() != OpKind::Register
+        || cmp.op0_register() != canonical(check.vsp)
+        || cmp.op0_register().size() != 8
+        || cmp.op1_register().size() != 8
+    {
+        return None;
+    }
+    let tmp = cmp.op1_register();
+    if tmp != canonical(tmp)
+        || [check.vsp, roles.vip, roles.handler]
+            .into_iter()
+            .any(|register| canonical(register) == tmp)
+    {
+        return None;
+    }
+    index = cmp_index;
+    let lea_index = loop {
+        index = index.checked_sub(1)?;
+        let instruction = &instructions[index].instruction;
+        if !(is_direct_jump(instruction) || is_flag_junk(instruction)) {
+            break index;
+        }
+    };
+    let lea = &instructions[lea_index].instruction;
+    let exact_lea = lea.mnemonic() == Mnemonic::Lea
+        && lea.op0_kind() == OpKind::Register
+        && lea.op0_register() == tmp
+        && lea.op1_kind() == OpKind::Memory
+        && lea.memory_base() == canonical(check.context_base)
+        && lea.memory_base().size() == 8
+        && lea.memory_index() == Register::None
+        && has_flat_segment_address(lea);
+    exact_lea.then_some(StackCheckShape {
+        start: instructions[lea_index].rva,
+        branch: branch.rva,
+        head,
+        fallthrough,
+    })
+}
+
+/// Straight-line decodes that land exactly on `head` and end in the unique
+/// static `lea table,[abs]` anchor. Ambiguous or absent anchors are rejected.
+fn table_anchor_before(pe: &PeImage<'_>, head: Rva, table: Register) -> Result<(Va, Rva), String> {
+    let mut factory = InstructionInfoFactory::new();
+    let mut found: Option<(Va, Rva)> = None;
+    for back in 1..=MAX_ANCHOR_LOOKBACK {
+        let Some(start) = head.0.checked_sub(back) else {
+            break;
+        };
+        let mut cursor = Rva(start);
+        let mut anchor = None;
+        let mut synchronized = false;
+        for _ in 0..MAX_ANCHOR_LOOKBACK {
+            if cursor == head {
+                synchronized = true;
+                break;
+            }
+            let Ok(decoded) = decode_one(pe, cursor) else {
+                break;
+            };
+            if decoded.instruction.flow_control() != FlowControl::Next {
+                break;
+            }
+            if let Some(base) = static_handler_rebase(&decoded.instruction, table) {
+                anchor = Some((base, decoded.rva));
+            } else if writes_register(&mut factory, &decoded.instruction, table) {
+                anchor = None;
+            }
+            let Some(next) = decoded.next_rva() else {
+                break;
+            };
+            cursor = next;
+        }
+        if let (true, Some(anchor)) = (synchronized, anchor) {
+            match found {
+                None => found = Some(anchor),
+                Some(previous) if previous != anchor => {
+                    return Err("table anchor before the dispatch head is ambiguous".to_owned());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    found.ok_or_else(|| "no static table anchor falls through into the dispatch head".to_owned())
+}
+
+/// Every direct-flow path from `from` must reach `head` without calls, returns,
+/// or indirect transfers, and without writing any `protected` register.
+fn region_reaches_head(
+    pe: &PeImage<'_>,
+    from: Rva,
+    head: Rva,
+    protected: &[Register],
+) -> Result<(), String> {
+    let mut factory = InstructionInfoFactory::new();
+    let mut visited = BTreeSet::new();
+    let mut queue = vec![from];
+    while let Some(rva) = queue.pop() {
+        if rva == head || !visited.insert(rva) {
+            continue;
+        }
+        if visited.len() > MAX_POSTLUDE_INSTRUCTIONS {
+            return Err("fall-through postlude exceeds the instruction limit".to_owned());
+        }
+        if !is_executable_rva(pe, rva) {
+            return Err(format!(
+                "fall-through postlude leaves executable code at {rva}"
+            ));
+        }
+        let decoded = decode_one(pe, rva).map_err(|error| error.to_string())?;
+        if protected
+            .iter()
+            .any(|register| writes_register(&mut factory, &decoded.instruction, *register))
+        {
+            return Err(format!(
+                "fall-through postlude writes a protected VM register at {rva}"
+            ));
+        }
+        match decoded.instruction.flow_control() {
+            FlowControl::Next => queue.extend(decoded.next_rva()),
+            FlowControl::UnconditionalBranch => {
+                queue.push(
+                    decoded
+                        .direct_target_rva(pe)
+                        .ok_or_else(|| format!("unresolved jump at {rva}"))?,
+                );
+            }
+            FlowControl::ConditionalBranch => {
+                queue.push(
+                    decoded
+                        .direct_target_rva(pe)
+                        .ok_or_else(|| format!("unresolved branch at {rva}"))?,
+                );
+                queue.extend(decoded.next_rva());
+            }
+            other => {
+                return Err(format!(
+                    "fall-through postlude reaches {other:?} at {rva} instead of the dispatch head"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recognizes a handler whose trace ends in the exact stack-check postlude
+/// `lea tmp,[ctx+disp]; cmp vsp,tmp; ja head`, where `head` is a proven keyless
+/// table-indexed dispatch and the fall-through path also reaches `head`.
+///
+/// `Ok(None)` means the trace does not have this shape; `Err` means it does but
+/// a soundness condition failed.
+fn recognize_postlude_dispatch(
+    pe: &PeImage<'_>,
+    trace: &DirectJumpTrace,
+    roles: HandlerRegisterRoles,
+    check: StackCheckRoles,
+    direction: BytecodeDirection,
+) -> Result<Option<DispatchExtractionCandidate>, String> {
+    let Some(shape) = match_stack_check(trace, roles, check) else {
+        return Ok(None);
+    };
+    let head_trace = trace_direct_jump_fragments(pe, shape.head, DirectJumpTraceLimits::default())
+        .map_err(|error| error.to_string())?;
+    let terminal = terminal_dispatches_through(&head_trace, roles.handler).ok_or_else(|| {
+        "branch target does not terminate in a handler-register dispatch".to_owned()
+    })?;
+    let head_slice = backward_slice_handler_trace(
+        &head_trace,
+        &HandlerSliceConfig {
+            live_out_registers: vec![roles.vip, roles.handler, roles.rolling_key],
+            live_out_rflags: 0,
+        },
+    );
+    let report = extract_relative_dispatch_codecs_with_terminal(
+        &head_trace,
+        &head_slice,
+        roles,
+        direction,
+        Some(terminal),
+        "stack-check branch target is a proven table-indexed dispatch head",
+        None,
+    );
+    let [head_candidate] = report.candidates.as_slice() else {
+        return Err(format!(
+            "branch target is not a unique table-indexed dispatch head ({} codecs, {} rejected)",
+            report.candidates.len(),
+            report.rejected_sources.len()
+        ));
+    };
+    let mut candidate = head_candidate.clone();
+    let Some(entry_table) = candidate.codec.table else {
+        return Err("branch target dispatch is not table-indexed".to_owned());
+    };
+    if !report.rejected_sources.is_empty()
+        || candidate.encoded_load != shape.head
+        || candidate.handler_rebase.is_some()
+    {
+        return Err("branch target is not a bare dispatch head".to_owned());
+    }
+    let index = head_trace
+        .instructions()
+        .find(|decoded| decoded.rva == candidate.encoded_load)
+        .map(|decoded| canonical(decoded.instruction.op0_register()))
+        .ok_or_else(|| "dispatch head load was not retained".to_owned())?;
+    let table = head_trace
+        .instructions()
+        .find_map(|decoded| {
+            table_entry_load(&decoded.instruction, roles.handler, index).map(|(table, _, _)| table)
+        })
+        .ok_or_else(|| "dispatch head table load was not retained".to_owned())?;
+    let (anchor, anchor_rva) = table_anchor_before(pe, shape.head, table)?;
+
+    let mut factory = InstructionInfoFactory::new();
+    if trace
+        .instructions()
+        .any(|decoded| writes_register(&mut factory, &decoded.instruction, table))
+    {
+        return Err("handler writes the dispatch table register".to_owned());
+    }
+    region_reaches_head(
+        pe,
+        shape.fallthrough,
+        shape.head,
+        &[roles.vip, check.vsp, table],
+    )?;
+
+    candidate.handler_rebase = Some(anchor);
+    candidate.handler_rebase_rva = Some(anchor_rva);
+    candidate.codec.table = Some(crate::TableIndexedDispatch {
+        table_base: Some(anchor),
+        ..entry_table
+    });
+    candidate.postlude = Some(PostludeDispatch {
+        stack_check_start: shape.start,
+        branch: shape.branch,
+        head: shape.head,
+    });
+    candidate.evidence.push(
+        "handler ends in the shared stack-check postlude; ja targets the proven dispatch head"
+            .to_owned(),
+    );
+    candidate.evidence.push(format!(
+        "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base {anchor} falls into the head"
+    ));
+    Ok(Some(candidate))
 }
 
 #[cfg(test)]
@@ -1618,9 +2000,7 @@ mod tests {
         // The table load must be indexed by the decoded opcode register.
         let mut wrong_index = CodeAssembler::new(64).expect("x64 assembler");
         wrong_index.lea(r11, qword_ptr(0x1800_u64)).expect("anchor");
-        wrong_index
-            .movzx(eax, byte_ptr(r15))
-            .expect("opcode load");
+        wrong_index.movzx(eax, byte_ptr(r15)).expect("opcode load");
         wrong_index.add(r15, 1).expect("VIP advance");
         wrong_index
             .movsxd(r14, dword_ptr(r11 + rcx * 4))
@@ -1631,10 +2011,10 @@ mod tests {
 
         // A dense signed table requires the stride to equal the entry width.
         let mut wrong_stride = CodeAssembler::new(64).expect("x64 assembler");
-        wrong_stride.lea(r11, qword_ptr(0x1800_u64)).expect("anchor");
         wrong_stride
-            .movzx(eax, byte_ptr(r15))
-            .expect("opcode load");
+            .lea(r11, qword_ptr(0x1800_u64))
+            .expect("anchor");
+        wrong_stride.movzx(eax, byte_ptr(r15)).expect("opcode load");
         wrong_stride.add(r15, 1).expect("VIP advance");
         wrong_stride
             .movsxd(r14, dword_ptr(r11 + rax * 2))
