@@ -453,6 +453,16 @@ fn print_detection(report: &ProtectionReport) {
     for item in &report.evidence {
         println!("  +{:>2} {}: {}", item.weight, item.id, item.statement);
     }
+    let mode = &report.protection_mode;
+    println!(
+        "[mode] {:?} (probed={} clean_vm={} mutated_vm={} no_vm={})",
+        mode.mode,
+        mode.probed_entries,
+        mode.clean_vm_entries,
+        mode.mutated_vm_entries,
+        mode.no_vm_entries
+    );
+    println!("[mode] signal: {}", mode.signal);
     for region in &report.executable_regions {
         println!(
             "[region] {:<8} rva={} size={:#X} entropy={} entry={}",

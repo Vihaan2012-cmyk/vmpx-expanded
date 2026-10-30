@@ -1,7 +1,10 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 use vmpx_pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT, PeImage, Rva, Va};
-use vmpx_vm::{VmDiscoveryLimits, discover_vm_entries};
+use vmpx_vm::{
+    EntryProfileRecoveryError, EntryProfileRecoveryLimits, VmDiscoveryLimits, VmDiscoveryReport,
+    discover_vm_entries, recover_entry_stream,
+};
 
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -22,6 +25,49 @@ pub enum DetectionVerdict {
     NoStrongEvidence,
     Suspicious,
     VmprotectLikely,
+}
+
+/// Per-function `VMProtect` protection mode, distinguished by whether a real VM
+/// dispatch is recoverable from the entry-stub swarm and whether its handlers
+/// decode into a coherent VM instruction stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionMode {
+    /// A VM bootstrap dispatch is recoverable and its handlers decode cleanly.
+    Virtualization,
+    /// Entry stubs lead to native code with no recoverable VM dispatch.
+    Mutation,
+    /// A VM bootstrap dispatch is recoverable but its handlers do not decode
+    /// (handlers appear mutated) — the virtualization-plus-mutation signature.
+    Ultra,
+    /// No entry stubs to probe, or the signal is contradictory.
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProtectionModeReport {
+    pub mode: ProtectionMode,
+    pub probed_entries: usize,
+    /// Stubs whose VM stream decoded into coherent handler semantics.
+    pub clean_vm_entries: usize,
+    /// Stubs whose bootstrap recovered but whose handlers did not decode.
+    pub mutated_vm_entries: usize,
+    /// Stubs with no recoverable VM dispatch (native code).
+    pub no_vm_entries: usize,
+    pub signal: String,
+}
+
+impl ProtectionModeReport {
+    fn unknown(signal: &str) -> Self {
+        Self {
+            mode: ProtectionMode::Unknown,
+            probed_entries: 0,
+            clean_vm_entries: 0,
+            mutated_vm_entries: 0,
+            no_vm_entries: 0,
+            signal: signal.to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -53,6 +99,7 @@ pub struct ProtectionReport {
     pub rva_mapped_sections: usize,
     pub executable_regions: Vec<ExecutableRegion>,
     pub evidence: Vec<DetectionEvidence>,
+    pub protection_mode: ProtectionModeReport,
     pub warnings: Vec<String>,
 }
 
@@ -132,6 +179,95 @@ fn add_evidence(
         weight,
         statement,
     });
+}
+
+const MODE_MAX_PROBED_ENTRIES: usize = 6;
+const MODE_MIN_CLEAN_VM_INSNS: usize = 4;
+// A clean VM decodes well past this; a mutated-handler VM decodes zero. Keeping
+// the window small bounds the per-binary probe cost.
+const MODE_PROBE_INSTRUCTION_LIMIT: usize = 8;
+
+/// Classifies the `VMProtect` protection mode by probing discovered VM entry
+/// stubs: recover each bootstrap dispatch, then try to decode its handler
+/// stream. Virtualization yields a clean stream; Ultra (virt+mutation) recovers
+/// the bootstrap but its mutated handlers refuse to decode; pure Mutation leaves
+/// native stubs with no recoverable VM dispatch.
+fn classify_protection_mode(pe: &PeImage<'_>, discovery: &VmDiscoveryReport) -> ProtectionModeReport {
+    let limits = EntryProfileRecoveryLimits {
+        instruction_limit: MODE_PROBE_INSTRUCTION_LIMIT,
+        ..EntryProfileRecoveryLimits::default()
+    };
+    let mut clean = 0_usize;
+    let mut mutated = 0_usize;
+    let mut no_vm = 0_usize;
+    let mut probed = 0_usize;
+    for entry in discovery.entries.iter().take(MODE_MAX_PROBED_ENTRIES) {
+        probed += 1;
+        match recover_entry_stream(pe, entry, limits) {
+            Ok(stream) => {
+                if stream.decode.decode.instructions.len() >= MODE_MIN_CLEAN_VM_INSNS {
+                    clean += 1;
+                } else {
+                    // Bootstrap recovered a VM dispatch, but the handlers do not
+                    // decode into coherent semantics — the handlers are mutated.
+                    mutated += 1;
+                }
+            }
+            Err(
+                EntryProfileRecoveryError::Bootstrap(_)
+                | EntryProfileRecoveryError::AmbiguousBootstrap { .. },
+            ) => no_vm += 1,
+            // A bootstrap dispatch was recovered but later recovery stalled on an
+            // obstructed frame or handler; consistent with a mutated VM.
+            Err(_) => mutated += 1,
+        }
+    }
+
+    let (mode, signal) = decide_protection_mode(probed, clean, mutated, no_vm);
+    ProtectionModeReport {
+        mode,
+        probed_entries: probed,
+        clean_vm_entries: clean,
+        mutated_vm_entries: mutated,
+        no_vm_entries: no_vm,
+        signal,
+    }
+}
+
+/// Maps the per-stub probe tallies to a protection mode. A single mutated-handler
+/// stub (bootstrap recovers but handlers refuse to decode) is the Ultra tell;
+/// clean decodes without any mutated stub are Virtualization; entry stubs that
+/// recover no VM dispatch at all are native-only Mutation.
+fn decide_protection_mode(
+    probed: usize,
+    clean: usize,
+    mutated: usize,
+    no_vm: usize,
+) -> (ProtectionMode, String) {
+    if probed == 0 {
+        (ProtectionMode::Unknown, "no VM entry stubs to probe".to_owned())
+    } else if mutated > 0 {
+        (
+            ProtectionMode::Ultra,
+            format!(
+                "{mutated}/{probed} probed VM entry stubs recover a bootstrap dispatch but their handlers do not decode (handlers mutated); {clean} decode cleanly"
+            ),
+        )
+    } else if clean > 0 {
+        (
+            ProtectionMode::Virtualization,
+            format!(
+                "{clean}/{probed} probed VM entry stubs decode into a coherent VM instruction stream with recoverable handlers"
+            ),
+        )
+    } else {
+        (
+            ProtectionMode::Mutation,
+            format!(
+                "{no_vm}/{probed} probed entry stubs lead to native code with no recoverable VM dispatch"
+            ),
+        )
+    }
 }
 
 /// Profiles structural `VMProtect` evidence without relying on the file extension
@@ -325,6 +461,8 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
     // Virtualization-only images carry no packed blob; the anomalous pairing of a
     // non-standard executable entry section with a swarm of push/call VM stubs
     // into one common target is the tell. Discovery runs only when the first holds.
+    let mut protection_mode =
+        ProtectionModeReport::unknown("no non-standard executable entry section to probe");
     if let Some(entry_index) = entry_section {
         let section = &pe.sections[entry_index];
         if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
@@ -340,21 +478,23 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
                     section.name
                 ),
             );
-            if let Ok(discovery) = discover_vm_entries(pe, VmDiscoveryLimits::default())
-                && let Some((target, count)) =
+            if let Ok(discovery) = discover_vm_entries(pe, VmDiscoveryLimits::default()) {
+                if let Some((target, count)) =
                     largest_stub_swarm(discovery.entries.iter().map(|entry| entry.call_target))
-                && count >= STUB_SWARM_WEAK
-            {
-                let weight = if count >= STUB_SWARM_STRONG { 45 } else { 20 };
-                add_evidence(
-                    &mut evidence,
-                    &mut score,
-                    "vm_entry_stub_swarm",
-                    weight,
-                    format!(
-                        "{count} push-immediate/call VM entry stubs share the common call target {target}"
-                    ),
-                );
+                    && count >= STUB_SWARM_WEAK
+                {
+                    let weight = if count >= STUB_SWARM_STRONG { 45 } else { 20 };
+                    add_evidence(
+                        &mut evidence,
+                        &mut score,
+                        "vm_entry_stub_swarm",
+                        weight,
+                        format!(
+                            "{count} push-immediate/call VM entry stubs share the common call target {target}"
+                        ),
+                    );
+                }
+                protection_mode = classify_protection_mode(pe, &discovery);
             }
         }
     }
@@ -375,7 +515,7 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
         );
     }
     ProtectionReport {
-        schema_version: 1,
+        schema_version: 2,
         verdict,
         confidence,
         image_layout,
@@ -385,6 +525,7 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
         rva_mapped_sections,
         executable_regions,
         evidence,
+        protection_mode,
         warnings,
     }
 }
@@ -482,6 +623,20 @@ mod tests {
         assert!(has(&report, "nonstandard_executable_entry_section"));
         assert!(!has(&report, "vm_entry_stub_swarm"));
         assert_eq!(report.verdict, DetectionVerdict::NoStrongEvidence);
+    }
+
+    #[test]
+    fn mode_decision_maps_probe_tallies() {
+        // Virtualization: clean decodes, no mutated handlers (coredll.virt.dll).
+        assert_eq!(decide_protection_mode(6, 6, 0, 0).0, ProtectionMode::Virtualization);
+        // Ultra: a mutated-handler stub is present, even alongside clean ones
+        // (coredll.ultra.dll decodes 0 clean, 6 mutated).
+        assert_eq!(decide_protection_mode(6, 0, 6, 0).0, ProtectionMode::Ultra);
+        assert_eq!(decide_protection_mode(6, 3, 3, 0).0, ProtectionMode::Ultra);
+        // Mutation: entry stubs recover no VM dispatch at all.
+        assert_eq!(decide_protection_mode(6, 0, 0, 6).0, ProtectionMode::Mutation);
+        // Unknown: nothing to probe.
+        assert_eq!(decide_protection_mode(0, 0, 0, 0).0, ProtectionMode::Unknown);
     }
 
     #[test]
