@@ -1,0 +1,1026 @@
+//! Lift of a branching virtualized function from its recovered CFG.
+//!
+//! The CFG is expanded into a tree of paths: each block is symbolically
+//! executed from the exact state its predecessor left, so a join is handled by
+//! re-expanding the successor under each incoming state rather than by merging
+//! states. A conditional VM branch becomes a native compare-and-jump on the
+//! symbolic branch target; a block ending in a native call becomes a real call
+//! through the symbolic `[vsp]` target. Everything else must be proven or the
+//! lift refuses.
+//!
+//! A branch is lowered only when its targets resolve over a proven domain and
+//! every target is a recovered CFG edge. A back edge, an unproven edge, an
+//! unlowerable condition or a missing exit report refuses the whole function.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use vmpx_pe::Va;
+use vmpx_recompile::{
+    Address, BinarySource, CallTarget, CodeAddress, Condition, Function, Label, Operation,
+    PhysicalRegister, RegisterAssignment, SpillSlot, StackFrame, VirtualRegister, Width, compile,
+};
+use vmpx_vm::{
+    BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeCallMemoryDecision,
+    NativeCallSelectorOutcome, NativeFrameSource, SymbolicDomainLimits, SymbolicExecutionLimits,
+    SymbolicMemorySource, SymbolicVmExecutionReport, SymbolicVmInitialState, VmCfg, VmCfgLimits,
+    VmExitReport, VmHandlerSemantic, X64NativeRegister, enumerate_symbolic_value,
+    execute_symbolic_linear_block_with_initial_state,
+    execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
+    symbolic_pointer_offset,
+};
+
+use crate::decoded_lift::{DecodedLiftError, LiftAssumption, first_unliftable, recover_stub_exit};
+use crate::entry_frame::frame_initial_state;
+use crate::replacement::{
+    ENTRY_STACK_POINTER, Trust, canonical_register, lower_fragment_with, operation_slots,
+    physical_for, rewrite_symbols,
+};
+use crate::{EffectStore, ExpressionInput, Replacement, ReplacementConfig, ReplacementError};
+
+#[cfg(test)]
+mod tests;
+
+const MAX_CALL_ARGUMENTS: usize = 4;
+const CALL_SCRATCH_SLOTS: u16 = 5;
+
+pub struct DecodedCfgInput<'a> {
+    pub cfg: &'a VmCfg,
+    /// Initial VM stack, top first.
+    pub frame: &'a [NativeFrameSource],
+    /// Recovered VM-exit layouts, keyed by the exit handler's address.
+    pub exits: &'a BTreeMap<Va, VmExitReport>,
+    /// Proven call frames, keyed by the key of the block that ends in the call.
+    pub native_calls: &'a BTreeMap<Va, NativeCallSelectorOutcome>,
+    pub memory: Option<&'a dyn SymbolicMemorySource>,
+    pub limits: SymbolicExecutionLimits,
+    /// Limits for resolving a branch target over its input domain.
+    pub target_limits: VmCfgLimits,
+    /// Block expansions across all paths before the lift gives up.
+    pub max_expanded_blocks: usize,
+}
+
+#[derive(Debug)]
+pub struct LiftedCfgFunction {
+    pub replacement: Replacement,
+    /// Distinct CFG blocks that took part in the lift.
+    pub blocks: BTreeSet<Va>,
+    /// Block expansions, counting a joined block once per incoming path.
+    pub expanded_blocks: usize,
+    pub exit_paths: usize,
+    pub conditional_branches: usize,
+    pub native_calls: usize,
+    pub assumptions: Vec<LiftAssumption>,
+}
+
+struct CallSite {
+    index: usize,
+    target: Expr,
+    arguments: Vec<Expr>,
+}
+
+enum Step {
+    Store(EffectStore),
+    Call(CallSite),
+}
+
+struct ExitLeaf {
+    registers: BTreeMap<X64NativeRegister, Expr>,
+    return_pop: u32,
+}
+
+enum End {
+    Exit(ExitLeaf),
+    /// Arms are ordered by target value; the last is the fall-through.
+    Branch {
+        condition: Expr,
+        arms: Vec<(u64, Node)>,
+    },
+}
+
+struct Node {
+    steps: Vec<Step>,
+    end: End,
+}
+
+#[derive(Clone, Default)]
+struct Path {
+    trail: Vec<Va>,
+    /// Memory epoch at the latest external store or call on this path. A load
+    /// from an earlier epoch cannot be re-read natively after that barrier.
+    barrier: u64,
+    /// A store on this path wrote a value derived from the VM stack pointer.
+    root_escaped: bool,
+    /// Native-call result intrinsics bound to their frame-slot input names.
+    results: BTreeMap<String, String>,
+}
+
+struct Builder<'a> {
+    input: &'a DecodedCfgInput<'a>,
+    expanded: usize,
+    blocks: BTreeSet<Va>,
+    exit_paths: usize,
+    branches: usize,
+    call_sites: usize,
+    uses_root: bool,
+    assumptions: Vec<LiftAssumption>,
+}
+
+fn refuse<T>(block: Va, reason: impl Into<String>) -> Result<T, DecodedLiftError> {
+    Err(DecodedLiftError::Cfg {
+        block,
+        reason: reason.into(),
+    })
+}
+
+fn call_result_name(index: usize) -> String {
+    format!("__call_result_{index}")
+}
+
+/// Targets a branch can take: the constant it simplifies to, or its image over
+/// a proven-exhaustive input domain (`true` when guarded by inputs).
+fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    let simplified = target.simplify();
+    if let ExprKind::Const { value } = simplified.kind {
+        return Ok((vec![value], false));
+    }
+    let inferred = infer_branch_input_domains(&simplified, limits.input_domain)
+        .map_err(|refusal| format!("target depends on unproven input: {refusal}"))?;
+    let domain = SymbolicDomainLimits {
+        max_values_per_variable: limits
+            .domain
+            .max_values_per_variable
+            .max(limits.input_domain.max_values_per_variable),
+        ..limits.domain
+    };
+    let report = enumerate_symbolic_value(&simplified, &inferred.domains, domain)
+        .map_err(|error| format!("target enumeration failed: {error}"))?;
+    if !report.complete || report.unique_values.is_empty() {
+        return Err("target domain is incomplete".to_owned());
+    }
+    if report.unique_values.len() > limits.max_targets {
+        return Err(format!(
+            "branch has {} targets, exceeding limit {}",
+            report.unique_values.len(),
+            limits.max_targets
+        ));
+    }
+    let mut values = report.unique_values;
+    values.sort_unstable();
+    values.dedup();
+    Ok((values, true))
+}
+
+fn is_native_rflags_initial(expression: &Expr) -> bool {
+    matches!(
+        &expression.simplify().kind,
+        ExprKind::Register { name } if name == "native_rflags_initial"
+    )
+}
+
+impl Builder<'_> {
+    /// Rewrites an expression into what the native function can evaluate at the
+    /// current point, or refuses.
+    fn prepare(
+        &mut self,
+        block: Va,
+        expression: &Expr,
+        barrier: u64,
+        results: &BTreeMap<String, String>,
+    ) -> Result<Expr, DecodedLiftError> {
+        let rewritten = expression
+            .rewrite_intrinsics(&mut |width, name, arguments| {
+                if let Some(register) = results.get(name) {
+                    return (width == BitWidth::W64)
+                        .then(|| Expr::register(width, register.clone()));
+                }
+                let epoch = name
+                    .strip_prefix("memory_load_epoch_")?
+                    .parse::<u64>()
+                    .ok()?;
+                match arguments {
+                    [address] if epoch >= barrier && address.width == BitWidth::W64 => {
+                        Some(Expr::load(width, address.clone()))
+                    }
+                    _ => None,
+                }
+            })
+            .map_err(|error| DecodedLiftError::Cfg {
+                block,
+                reason: error.to_string(),
+            })?;
+        if rewritten
+            .intrinsic_dependencies()
+            .iter()
+            .any(|name| name.starts_with("memory_load_epoch_"))
+        {
+            return refuse(
+                block,
+                "a memory read predates a store or native call that precedes its use",
+            );
+        }
+        let allowed: BTreeSet<&str> = X64NativeRegister::ALL
+            .iter()
+            .map(|register| register.symbolic_name())
+            .chain(std::iter::once("vsp_initial"))
+            .chain(results.values().map(String::as_str))
+            .collect();
+        let dependencies = rewritten.dependencies();
+        let foreign: Vec<&String> = dependencies
+            .iter()
+            .filter(|name| !allowed.contains(name.as_str()))
+            .collect();
+        if !foreign.is_empty() {
+            return refuse(
+                block,
+                format!(
+                    "value depends on {foreign:?}, which a callee-style replacement cannot read"
+                ),
+            );
+        }
+        if dependencies.contains("vsp_initial") {
+            self.uses_root = true;
+        }
+        Ok(rewritten)
+    }
+
+    fn successor_for(&self, block: Va, value: u64) -> Result<Va, DecodedLiftError> {
+        let cfg = self.input.cfg;
+        let Some(successor) = cfg
+            .blocks
+            .values()
+            .find(|candidate| candidate.address == Some(Va(value)))
+        else {
+            return refuse(
+                block,
+                format!("branch target {value:#x} is not a recovered block"),
+            );
+        };
+        let key = successor.start.vip;
+        let proven = cfg.edges.iter().any(|edge| {
+            edge.from == block
+                && edge.to == key
+                && matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch)
+        });
+        if proven {
+            Ok(key)
+        } else {
+            refuse(
+                block,
+                format!("branch target {value:#x} has no proven CFG edge from this block"),
+            )
+        }
+    }
+
+    fn call_return_block(&self, block: Va) -> Result<Va, DecodedLiftError> {
+        let mut returns = self
+            .input
+            .cfg
+            .edges
+            .iter()
+            .filter(|edge| edge.from == block && edge.kind == CfgEdgeKind::NativeCallReturn);
+        match (returns.next(), returns.next()) {
+            (Some(edge), None) => Ok(edge.to),
+            _ => refuse(block, "native call has no single proven return edge"),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn walk(
+        &mut self,
+        mut key: Va,
+        mut state: SymbolicVmInitialState,
+        mut path: Path,
+        mut steps: Vec<Step>,
+    ) -> Result<Node, DecodedLiftError> {
+        let input = self.input;
+        loop {
+            if self.expanded >= input.max_expanded_blocks {
+                return refuse(key, "block expansion budget exhausted");
+            }
+            self.expanded += 1;
+            if path.trail.contains(&key) {
+                return refuse(key, "loop: a block repeats on one path");
+            }
+            path.trail.push(key);
+            self.blocks.insert(key);
+            let Some(block) = input.cfg.blocks.get(&key) else {
+                return refuse(key, "block is not in the recovered CFG");
+            };
+            if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
+                return refuse(key, format!("instruction {index} ({semantic:?}): {reason}"));
+            }
+            let boundary = match block.exit {
+                BlockExit::VmExit => Some(VmHandlerSemantic::VmExit),
+                BlockExit::Branch => Some(VmHandlerSemantic::UnconditionalBranch),
+                BlockExit::NativeCall => None,
+                BlockExit::Stalled => return refuse(key, "block did not reach a control boundary"),
+            };
+            let report = execute_symbolic_linear_block_with_initial_state(
+                &block.instructions,
+                boundary,
+                input.limits,
+                &state,
+                input.memory,
+            )
+            .map_err(|error| DecodedLiftError::Cfg {
+                block: key,
+                reason: format!("symbolic execution failed: {error}"),
+            })?;
+            if !report.memory_havocs.is_empty()
+                || !report.native_calls.is_empty()
+                || !report.fresh_allocations.is_empty()
+                || report.memory_tainted
+            {
+                return refuse(key, "block body havocs memory, calls natively or allocates");
+            }
+
+            let entry_barrier = path.barrier;
+            for (index, write) in report.external_writes.iter().enumerate() {
+                let barrier = if index == 0 {
+                    entry_barrier
+                } else {
+                    report.memory_epoch
+                };
+                if write.value.dependencies().contains("vsp_initial") {
+                    path.root_escaped = true;
+                }
+                let address = self.prepare(key, &write.address, barrier, &path.results)?;
+                let value = self.prepare(key, &write.value, barrier, &path.results)?;
+                let width = value.width;
+                steps.push(Step::Store(EffectStore {
+                    address,
+                    value,
+                    width,
+                }));
+            }
+            if !report.external_writes.is_empty() {
+                path.barrier = path.barrier.max(report.memory_epoch);
+            }
+
+            match block.exit {
+                BlockExit::VmExit => {
+                    let handler = block
+                        .instructions
+                        .last()
+                        .map_or(block.start.handler, |last| last.state_after.handler);
+                    let Some(layout) = input.exits.get(&handler) else {
+                        return refuse(
+                            key,
+                            format!("no recovered VM-exit layout for handler {handler}"),
+                        );
+                    };
+                    let exit =
+                        recover_stub_exit(&report, layout, input.frame.len()).map_err(|error| {
+                            DecodedLiftError::Cfg {
+                                block: key,
+                                reason: error.to_string(),
+                            }
+                        })?;
+                    if !is_native_rflags_initial(&exit.rflags) {
+                        return refuse(
+                            key,
+                            "the exit flags differ from the entry flags; the frame teardown cannot preserve them",
+                        );
+                    }
+                    self.assume(LiftAssumption::FlagsVolatileAtReturn);
+                    let mut registers = BTreeMap::new();
+                    for (register, value) in &exit.registers {
+                        registers.insert(
+                            *register,
+                            self.prepare(key, value, path.barrier, &path.results)?,
+                        );
+                    }
+                    self.exit_paths += 1;
+                    return Ok(Node {
+                        steps,
+                        end: End::Exit(ExitLeaf {
+                            registers,
+                            return_pop: exit.return_pop,
+                        }),
+                    });
+                }
+                BlockExit::Branch => {
+                    let Some(target) = report.branch_target.as_ref() else {
+                        return refuse(key, "branch has no symbolic target");
+                    };
+                    let (values, guarded) =
+                        resolve_targets(target, input.target_limits).map_err(|reason| {
+                            DecodedLiftError::Cfg {
+                                block: key,
+                                reason: format!("unresolved branch target: {reason}"),
+                            }
+                        })?;
+                    let mut successors = Vec::with_capacity(values.len());
+                    for value in &values {
+                        successors.push((*value, self.successor_for(key, *value)?));
+                    }
+                    let next = report.continuation_state();
+                    if let [(_, only)] = successors[..] {
+                        if guarded {
+                            return refuse(key, "guarded branch resolved to a single target");
+                        }
+                        key = only;
+                        state = next;
+                        continue;
+                    }
+                    let condition = self.prepare(key, target, path.barrier, &path.results)?;
+                    self.branches += 1;
+                    let mut arms = Vec::with_capacity(successors.len());
+                    for (value, successor) in successors {
+                        let arm = self.walk(successor, next.clone(), path.clone(), Vec::new())?;
+                        arms.push((value, arm));
+                    }
+                    return Ok(Node {
+                        steps,
+                        end: End::Branch { condition, arms },
+                    });
+                }
+                BlockExit::NativeCall => {
+                    let Some(outcome) = input.native_calls.get(&key) else {
+                        return refuse(key, "no proven call frame for this native call");
+                    };
+                    if !outcome.stack_argument_offsets.is_empty() {
+                        return refuse(key, "stack-passed call arguments are not bridged");
+                    }
+                    let pre = report.continuation_state();
+                    let vip = block
+                        .instructions
+                        .last()
+                        .map_or(block.start.vip, |last| last.state_after.vip);
+                    let call = execute_symbolic_native_call_boundary_with_initial_state(
+                        vip,
+                        outcome,
+                        input.limits,
+                        &pre,
+                        input.memory,
+                    )
+                    .map_err(|error| DecodedLiftError::Cfg {
+                        block: key,
+                        reason: format!("native-call effect failed: {error}"),
+                    })?;
+                    let [symbolic_call] = &call.native_calls[..] else {
+                        return refuse(key, "native-call boundary did not yield exactly one call");
+                    };
+                    if call.fresh_allocations.len() != pre.fresh_allocations.len()
+                        || call.memory_tainted
+                    {
+                        return refuse(key, "native call allocates or taints memory");
+                    }
+                    let invocation = &symbolic_call.invocation;
+                    if invocation.arguments.len() > MAX_CALL_ARGUMENTS {
+                        return refuse(key, "native call passes more than four register arguments");
+                    }
+                    let ExprKind::Intrinsic {
+                        name: result_name, ..
+                    } = &symbolic_call.applied_effect.result.kind
+                    else {
+                        return refuse(key, "native-call result is not an opaque value");
+                    };
+                    if symbolic_call.applied_effect.result.width != BitWidth::W64 {
+                        return refuse(key, "native-call result is not 64 bits");
+                    }
+                    let target =
+                        self.prepare(key, &invocation.target.value, path.barrier, &path.results)?;
+                    let mut arguments = Vec::with_capacity(invocation.arguments.len());
+                    for argument in &invocation.arguments {
+                        arguments.push(self.prepare(
+                            key,
+                            &argument.value,
+                            path.barrier,
+                            &path.results,
+                        )?);
+                    }
+                    let post = match &symbolic_call.applied_effect.memory {
+                        NativeCallMemoryDecision::PreserveTracked => call.continuation_state(),
+                        NativeCallMemoryDecision::PreserveTrackedAndCreateFreshAllocation {
+                            ..
+                        } => return refuse(key, "allocator calls are not bridged in the CFG lift"),
+                        NativeCallMemoryDecision::HavocTracked { .. } => {
+                            if path.root_escaped
+                                || invocation
+                                    .arguments
+                                    .iter()
+                                    .map(|argument| &argument.value)
+                                    .chain(std::iter::once(&invocation.target.value))
+                                    .any(|value| value.dependencies().contains("vsp_initial"))
+                            {
+                                return refuse(
+                                    key,
+                                    "a pointer into the VM stack may reach the callee, so the VM state cannot be assumed to survive it",
+                                );
+                            }
+                            self.assume(LiftAssumption::VmStateSurvivesNativeCall);
+                            restore_vm_state(&pre, &call)
+                        }
+                    };
+                    let index = self.call_sites;
+                    self.call_sites += 1;
+                    steps.push(Step::Call(CallSite {
+                        index,
+                        target,
+                        arguments,
+                    }));
+                    path.results
+                        .insert(result_name.clone(), call_result_name(index));
+                    path.barrier = path.barrier.max(call.memory_epoch);
+                    key = self.call_return_block(key)?;
+                    state = post;
+                }
+                BlockExit::Stalled => unreachable!("stalled blocks are refused above"),
+            }
+        }
+    }
+
+    fn assume(&mut self, assumption: LiftAssumption) {
+        if !self.assumptions.contains(&assumption) {
+            self.assumptions.push(assumption);
+        }
+    }
+}
+
+/// State after an opaque native call that cannot reach the VM stack: the
+/// call's own result cell replaces what it covers, every other VM-stack cell and
+/// every context cell keeps its pre-call value, and memory outside the VM stack
+/// stays forgotten.
+fn restore_vm_state(
+    pre: &SymbolicVmInitialState,
+    call: &SymbolicVmExecutionReport,
+) -> SymbolicVmInitialState {
+    let mut cells: HashMap<Expr, Expr> = pre
+        .memory_values
+        .iter()
+        .filter(|(address, _)| symbolic_pointer_offset(address, "vsp_initial").is_some())
+        .cloned()
+        .collect();
+    cells.extend(call.memory_values.iter().cloned());
+    let mut post = call.continuation_state();
+    post.memory_values = cells.into_iter().collect();
+    post.memory_values
+        .sort_by_cached_key(|(address, _)| format!("{address:?}"));
+    post.context_values = pre.context_values.clone();
+    post
+}
+
+/// How far the path expansion gets on a possibly incomplete CFG. Nothing is
+/// emitted; this is a diagnostic of where a real lift would stop.
+#[derive(Debug)]
+pub struct CfgProbe {
+    pub blocks: BTreeSet<Va>,
+    pub expanded_blocks: usize,
+    pub exit_paths: usize,
+    pub conditional_branches: usize,
+    pub native_calls: usize,
+    pub stop: Option<DecodedLiftError>,
+}
+
+/// Expands the CFG into paths without requiring it to be complete and without
+/// emitting code.
+#[must_use]
+pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
+    let (initial, _) = frame_initial_state(input.frame);
+    let mut builder = Builder {
+        input,
+        expanded: 0,
+        blocks: BTreeSet::new(),
+        exit_paths: 0,
+        branches: 0,
+        call_sites: 0,
+        uses_root: false,
+        assumptions: Vec::new(),
+    };
+    let stop = builder
+        .walk(input.cfg.entry, initial, Path::default(), Vec::new())
+        .err();
+    CfgProbe {
+        blocks: builder.blocks,
+        expanded_blocks: builder.expanded,
+        exit_paths: builder.exit_paths,
+        conditional_branches: builder.branches,
+        native_calls: builder.call_sites,
+        stop,
+    }
+}
+
+/// Lifts a fully recovered branching function to one native replacement.
+///
+/// # Errors
+///
+/// Refuses an incomplete CFG, a loop, any branch whose targets are not proven
+/// recovered edges, any condition, value or native call the backend cannot
+/// lower, and any block without a verified lowering. No partial function is
+/// ever returned.
+pub fn lift_decoded_cfg(
+    input: &DecodedCfgInput<'_>,
+    address: CodeAddress,
+) -> Result<LiftedCfgFunction, DecodedLiftError> {
+    let cfg = input.cfg;
+    if !cfg.is_complete() {
+        return refuse(
+            cfg.entry,
+            format!(
+                "the CFG is incomplete ({} stalls, limit hit: {:?})",
+                cfg.stalls.len(),
+                cfg.limit_hit
+            ),
+        );
+    }
+    let (initial, _) = frame_initial_state(input.frame);
+    let mut builder = Builder {
+        input,
+        expanded: 0,
+        blocks: BTreeSet::new(),
+        exit_paths: 0,
+        branches: 0,
+        call_sites: 0,
+        uses_root: false,
+        assumptions: Vec::new(),
+    };
+    let root = builder.walk(cfg.entry, initial, Path::default(), Vec::new())?;
+
+    let config = ReplacementConfig {
+        inputs: X64NativeRegister::ALL
+            .iter()
+            .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+            .collect(),
+        max_expression_nodes: 200_000,
+        max_spill_slots: 64,
+        import_calls: BTreeMap::new(),
+        continuation: None,
+        effects: Vec::new(),
+        effect_calls: Vec::new(),
+        rflags: None,
+        symbol_rewrites: BTreeMap::new(),
+    };
+    let frame_bytes = builder
+        .uses_root
+        .then(|| u32::try_from(input.frame.len() * 8).unwrap_or(u32::MAX));
+    let replacement =
+        build_tree_replacement(&root, builder.call_sites, frame_bytes, &config, address)?;
+    Ok(LiftedCfgFunction {
+        replacement,
+        blocks: builder.blocks,
+        expanded_blocks: builder.expanded,
+        exit_paths: builder.exit_paths,
+        conditional_branches: builder.branches,
+        native_calls: builder.call_sites,
+        assumptions: builder.assumptions,
+    })
+}
+
+struct Emitter<'c> {
+    config: &'c ReplacementConfig,
+    inputs: Vec<ExpressionInput>,
+    canonical: BTreeMap<PhysicalRegister, VirtualRegister>,
+    assignments: Vec<RegisterAssignment>,
+    next_register: u32,
+    window_base: u16,
+    shared_end: u16,
+    trust: Trust,
+    operations: Vec<Operation>,
+    next_label: u32,
+    call_result_base: u16,
+    result_base: u16,
+    scratch_base: u16,
+}
+
+impl Emitter<'_> {
+    fn register(&mut self, physical: PhysicalRegister) -> VirtualRegister {
+        canonical_register(
+            physical,
+            &mut self.canonical,
+            &mut self.assignments,
+            &mut self.next_register,
+        )
+    }
+
+    fn lower(&mut self, expression: &Expr) -> Result<VirtualRegister, ReplacementError> {
+        let bound = rewrite_symbols(expression, &self.config.symbol_rewrites)?;
+        self.window_base = self.shared_end;
+        let (operations, result) = lower_fragment_with(
+            &bound,
+            &self.inputs,
+            &[],
+            self.config,
+            &mut self.canonical,
+            &mut self.assignments,
+            &mut self.next_register,
+            &mut self.window_base,
+            &self.shared_end,
+            &mut self.trust,
+            true,
+        )?;
+        self.operations.extend(operations);
+        Ok(result)
+    }
+
+    fn scratch(&self, index: u16) -> SpillSlot {
+        SpillSlot(self.scratch_base + index)
+    }
+
+    fn emit_store(&mut self, store: &EffectStore) -> Result<(), ReplacementError> {
+        let address = self.lower(&store.address)?;
+        let held = self.scratch(0);
+        self.operations.push(Operation::SpillStore {
+            slot: held,
+            source: address,
+        });
+        let value = self.lower(&store.value)?;
+        let base = self.register(PhysicalRegister::R11);
+        self.operations.push(Operation::SpillLoad {
+            destination: base,
+            slot: held,
+        });
+        let width = match store.width {
+            BitWidth::W8 => Width::W8,
+            BitWidth::W16 => Width::W16,
+            BitWidth::W32 => Width::W32,
+            BitWidth::W64 => Width::W64,
+        };
+        self.operations.push(Operation::Store {
+            address: Address::new(base, 0),
+            source: VirtualRegister::new(value.id, width),
+        });
+        Ok(())
+    }
+
+    fn emit_call(&mut self, call: &CallSite) -> Result<(), ReplacementError> {
+        const ARGUMENT_REGISTERS: [PhysicalRegister; MAX_CALL_ARGUMENTS] = [
+            PhysicalRegister::Rcx,
+            PhysicalRegister::Rdx,
+            PhysicalRegister::R8,
+            PhysicalRegister::R9,
+        ];
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let value = self.lower(argument)?;
+            let slot = self.scratch(1 + u16::try_from(index).unwrap_or(u16::MAX));
+            self.operations.push(Operation::SpillStore {
+                slot,
+                source: value,
+            });
+        }
+        let target = self.lower(&call.target)?;
+        let target_slot = self.scratch(0);
+        self.operations.push(Operation::SpillStore {
+            slot: target_slot,
+            source: target,
+        });
+        let mut registers = Vec::with_capacity(call.arguments.len());
+        for (index, physical) in ARGUMENT_REGISTERS
+            .iter()
+            .take(call.arguments.len())
+            .enumerate()
+        {
+            let destination = self.register(*physical);
+            let slot = self.scratch(1 + u16::try_from(index).unwrap_or(u16::MAX));
+            self.operations
+                .push(Operation::SpillLoad { destination, slot });
+            registers.push(destination);
+        }
+        let callee = self.register(PhysicalRegister::R10);
+        self.operations.push(Operation::SpillLoad {
+            destination: callee,
+            slot: target_slot,
+        });
+        let result = self.register(PhysicalRegister::Rax);
+        self.operations.push(Operation::Call {
+            target: CallTarget::Register(callee),
+            arguments: registers,
+            result: Some(result),
+        });
+        let index = u16::try_from(call.index).map_err(|_| ReplacementError::TooManyInputs)?;
+        self.operations.push(Operation::SpillStore {
+            slot: SpillSlot(self.call_result_base + index),
+            source: result,
+        });
+        Ok(())
+    }
+
+    fn emit_exit(&mut self, leaf: &ExitLeaf) -> Result<(), ReplacementError> {
+        for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
+            let expression = leaf
+                .registers
+                .get(register)
+                .ok_or(ReplacementError::Lowering {
+                    register: *register,
+                    message: "the exit state has no value for this register".to_owned(),
+                })?;
+            let value = self.lower(expression).map_err(|error| match error {
+                ReplacementError::Effect(inner) => ReplacementError::Lowering {
+                    register: *register,
+                    message: inner.to_string(),
+                },
+                other => other,
+            })?;
+            let slot = SpillSlot(self.result_base + u16::try_from(index).unwrap_or(u16::MAX));
+            self.operations.push(Operation::SpillStore {
+                slot,
+                source: value,
+            });
+        }
+        for (index, register) in X64NativeRegister::ALL.iter().enumerate() {
+            let destination = self.register(physical_for(register));
+            let slot = SpillSlot(self.result_base + u16::try_from(index).unwrap_or(u16::MAX));
+            self.operations
+                .push(Operation::SpillLoad { destination, slot });
+        }
+        self.operations.push(Operation::ReturnPopping {
+            bytes: leaf.return_pop,
+        });
+        Ok(())
+    }
+
+    fn emit_node(&mut self, node: &Node) -> Result<(), ReplacementError> {
+        for step in &node.steps {
+            match step {
+                Step::Store(store) => self.emit_store(store)?,
+                Step::Call(call) => self.emit_call(call)?,
+            }
+        }
+        match &node.end {
+            End::Exit(leaf) => self.emit_exit(leaf),
+            End::Branch { condition, arms } => {
+                let Some((last, taken)) = arms.split_last() else {
+                    return Err(ReplacementError::EffectBindings(
+                        "branch has no arms".to_owned(),
+                    ));
+                };
+                let selector = self.lower(condition)?;
+                let held = self.scratch(0);
+                self.operations.push(Operation::SpillStore {
+                    slot: held,
+                    source: selector,
+                });
+                let mut labels = Vec::with_capacity(taken.len());
+                for (value, _) in taken {
+                    let selector = self.register(PhysicalRegister::R10);
+                    let constant = self.register(PhysicalRegister::R11);
+                    self.operations.push(Operation::SpillLoad {
+                        destination: selector,
+                        slot: held,
+                    });
+                    self.operations.push(Operation::MoveImmediate {
+                        destination: constant,
+                        value: *value,
+                    });
+                    self.operations.push(Operation::Compare {
+                        left: selector,
+                        right: BinarySource::Register(constant),
+                    });
+                    let label = Label(self.next_label);
+                    self.next_label += 1;
+                    self.operations.push(Operation::BranchIf {
+                        condition: Condition::Equal,
+                        target: label,
+                    });
+                    labels.push(label);
+                }
+                self.emit_node(&last.1)?;
+                for (label, (_, arm)) in labels.into_iter().zip(taken) {
+                    self.operations.push(Operation::Label(label));
+                    self.emit_node(arm)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Emits the path tree as one function: capture the entry registers, then walk
+/// the tree, jumping to a labelled arm on a matching branch target and falling
+/// through into the last. Every leaf restores the exit registers and returns.
+fn build_tree_replacement(
+    root: &Node,
+    call_count: usize,
+    stack_root_bytes: Option<u32>,
+    config: &ReplacementConfig,
+    address: CodeAddress,
+) -> Result<Replacement, ReplacementError> {
+    let extended;
+    let config = if let Some(bytes) = stack_root_bytes {
+        let entry = Expr::register(BitWidth::W64, ENTRY_STACK_POINTER);
+        let root_pointer = Expr::binary(
+            BinaryOp::Sub,
+            entry,
+            Expr::constant(BitWidth::W64, u64::from(bytes)),
+        )
+        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+        let mut owned = config.clone();
+        owned
+            .inputs
+            .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
+        owned
+            .symbol_rewrites
+            .insert("vsp_initial".to_owned(), root_pointer);
+        extended = owned;
+        &extended
+    } else {
+        config
+    };
+
+    let input_slots =
+        u16::try_from(config.inputs.len()).map_err(|_| ReplacementError::TooManyInputs)?;
+    let call_slots = u16::try_from(call_count).map_err(|_| ReplacementError::TooManyInputs)?;
+    let call_result_base = input_slots;
+    let result_base = input_slots
+        .checked_add(call_slots)
+        .ok_or(ReplacementError::TooManyInputs)?;
+    let register_count = u16::try_from(X64NativeRegister::ALL.len()).unwrap_or(u16::MAX);
+    let scratch_base = result_base + register_count;
+    let shared_end = scratch_base + CALL_SCRATCH_SLOTS;
+
+    let mut inputs = Vec::with_capacity(config.inputs.len() + call_count);
+    for (index, (name, _)) in config.inputs.iter().enumerate() {
+        inputs.push(ExpressionInput::slot(
+            name.clone(),
+            BitWidth::W64,
+            SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?),
+        ));
+    }
+    for index in 0..call_count {
+        inputs.push(ExpressionInput::slot(
+            call_result_name(index),
+            BitWidth::W64,
+            SpillSlot(call_result_base + u16::try_from(index).unwrap_or(u16::MAX)),
+        ));
+    }
+
+    let mut emitter = Emitter {
+        config,
+        inputs,
+        canonical: BTreeMap::new(),
+        assignments: Vec::new(),
+        next_register: 0,
+        window_base: shared_end,
+        shared_end,
+        trust: Trust::default(),
+        operations: Vec::new(),
+        next_label: 0,
+        call_result_base,
+        result_base,
+        scratch_base,
+    };
+    for (index, (name, physical)) in config.inputs.iter().enumerate() {
+        let source = emitter.register(*physical);
+        if name == ENTRY_STACK_POINTER {
+            emitter.operations.push(Operation::EntryStackPointer {
+                destination: source,
+            });
+        }
+        emitter.operations.push(Operation::SpillStore {
+            slot: SpillSlot(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?),
+            source,
+        });
+    }
+    emitter.emit_node(root)?;
+
+    let Emitter {
+        operations,
+        assignments,
+        trust,
+        ..
+    } = emitter;
+    let mut preserve: Vec<PhysicalRegister> = Vec::new();
+    for assignment in &assignments {
+        if assignment.physical_register.is_win64_nonvolatile()
+            && !preserve.contains(&assignment.physical_register)
+        {
+            preserve.push(assignment.physical_register);
+        }
+    }
+    let highest = operations
+        .iter()
+        .flat_map(operation_slots)
+        .max()
+        .unwrap_or(0);
+    let call_ready = operations
+        .iter()
+        .any(|operation| matches!(operation, Operation::Call { .. }));
+    let mut stack_allocation = u32::from(highest.saturating_add(1)).saturating_mul(8);
+    if call_ready {
+        stack_allocation = stack_allocation.saturating_add(32);
+        let pushes = u32::try_from(preserve.len())
+            .map_err(|_| ReplacementError::TooManyInputs)?
+            .saturating_mul(8);
+        let residual = (8_u32.wrapping_sub(pushes.saturating_add(stack_allocation))) & 0xF;
+        stack_allocation = stack_allocation.saturating_add(residual);
+    }
+    let function = Function {
+        operations,
+        assignments,
+        frame: StackFrame {
+            stack_allocation,
+            preserve,
+            call_ready,
+            preinitialized_slots: (0..input_slots).map(SpillSlot).collect(),
+            tail_transfer: true,
+        },
+    };
+    let compiled = compile(&function, address)?;
+    Ok(Replacement {
+        function,
+        compiled,
+        emitted: X64NativeRegister::ALL.into_iter().collect(),
+        passthroughs: trust.passthroughs,
+        environment_boundaries: trust.environment_boundaries,
+    })
+}

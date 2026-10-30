@@ -163,7 +163,7 @@ pub fn build_replacement(
     build_replacement_popping(registers, config, address, None, None)
 }
 
-const ENTRY_STACK_POINTER: &str = "__entry_rsp";
+pub(crate) const ENTRY_STACK_POINTER: &str = "__entry_rsp";
 
 /// As [`build_replacement`], but the routine returns through the qword
 /// `return_pop` bytes above the stack pointer it was entered with, discarding the
@@ -732,7 +732,7 @@ pub fn build_replacement_popping(
 
 /// Applies caller-supplied symbol rewrites, which replace a symbolic input with
 /// an expression that denotes the same value by another route.
-fn rewrite_symbols(
+pub(crate) fn rewrite_symbols(
     expression: &Expr,
     rewrites: &BTreeMap<String, Expr>,
 ) -> Result<Expr, ReplacementError> {
@@ -815,6 +815,38 @@ fn lower_fragment(
     shared_frame_slots: &u16,
     trust: &mut Trust,
 ) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
+    lower_fragment_with(
+        expression,
+        inputs,
+        extra_inputs,
+        config,
+        canonical,
+        assignments,
+        next_register,
+        window_base,
+        shared_frame_slots,
+        trust,
+        false,
+    )
+}
+
+/// As `lower_fragment`. With `exact_flags` the `vm_flags_*` intrinsics are left
+/// for the backend to compute as real status flags instead of being rewritten
+/// to the arithmetic result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_fragment_with(
+    expression: &Expr,
+    inputs: &[ExpressionInput],
+    extra_inputs: &[ExpressionInput],
+    config: &ReplacementConfig,
+    canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
+    assignments: &mut Vec<RegisterAssignment>,
+    next_register: &mut u32,
+    window_base: &mut u16,
+    shared_frame_slots: &u16,
+    trust: &mut Trust,
+    exact_flags: bool,
+) -> Result<(Vec<Operation>, VirtualRegister), ReplacementError> {
     let mut all_inputs = inputs.to_vec();
     for input in extra_inputs {
         if !all_inputs
@@ -826,7 +858,13 @@ fn lower_fragment(
     }
     // The flag intrinsic names a plain arithmetic operation on the flag word;
     // it carries no VM state, so it lowers to the operation it denotes.
-    let expression = &rewrite_vm_flag_intrinsics(expression)?;
+    let rewritten;
+    let expression = if exact_flags {
+        expression
+    } else {
+        rewritten = rewrite_vm_flag_intrinsics(expression)?;
+        &rewritten
+    };
     let lowered = lower_expression(
         expression,
         &ExpressionCodegenConfig {
@@ -909,7 +947,7 @@ fn lower_fragment(
 /// Returns the canonical virtual register for a physical register, allocating
 /// one on first use. The backend allows exactly one virtual register per
 /// physical register, so every fragment naming the same register shares it.
-fn canonical_register(
+pub(crate) fn canonical_register(
     physical: PhysicalRegister,
     canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
     assignments: &mut Vec<RegisterAssignment>,
@@ -927,9 +965,9 @@ fn canonical_register(
 
 /// Native passthroughs collected across every lowered fragment.
 #[derive(Default)]
-struct Trust {
-    passthroughs: BTreeSet<String>,
-    environment_boundaries: BTreeSet<String>,
+pub(crate) struct Trust {
+    pub(crate) passthroughs: BTreeSet<String>,
+    pub(crate) environment_boundaries: BTreeSet<String>,
 }
 
 impl Trust {
@@ -940,7 +978,7 @@ impl Trust {
     }
 }
 
-fn operation_slots(operation: &Operation) -> Vec<u16> {
+pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
     match operation {
         Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot.0],
         Operation::Cpuid {
@@ -976,7 +1014,8 @@ fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
 /// Rewrites the virtual registers of one operation through `map`.
 fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>) -> Operation {
     let register = |value: VirtualRegister| -> VirtualRegister {
-        map.get(&value.id).copied().unwrap_or(value)
+        map.get(&value.id)
+            .map_or(value, |mapped| VirtualRegister::new(mapped.id, value.width))
     };
     match *operation {
         Operation::Label(label) => Operation::Label(label),
@@ -1108,7 +1147,7 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
     }
 }
 
-fn physical_for(register: &X64NativeRegister) -> PhysicalRegister {
+pub(crate) fn physical_for(register: &X64NativeRegister) -> PhysicalRegister {
     match register {
         X64NativeRegister::Rax => PhysicalRegister::Rax,
         X64NativeRegister::Rbx => PhysicalRegister::Rbx,

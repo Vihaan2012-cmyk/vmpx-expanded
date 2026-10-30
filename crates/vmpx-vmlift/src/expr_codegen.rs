@@ -339,6 +339,67 @@ impl LoweringContext<'_> {
         Ok(())
     }
 
+    /// Computes the status-flag word of an add or subtract with the native
+    /// instruction that defines it, masked to the bits the VM flag model carries
+    /// (CF, PF, AF, ZF, SF, OF plus the fixed `0x202`).
+    fn lower_status_flags(
+        &mut self,
+        name: &str,
+        subtract: bool,
+        width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "status flags take two operands"));
+        };
+        if left.width != width || right.width != width || expression.width != BitWidth::W64 {
+            return Err(malformed(name, "status-flag operand widths disagree"));
+        }
+        self.lower(left)?;
+        let left_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: left_slot,
+            source: accumulator(width),
+        });
+        self.lower(right)?;
+        self.operations.push(Operation::Move {
+            destination: temporary(width),
+            source: accumulator(width),
+        });
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(width),
+            slot: left_slot,
+        });
+        self.release_slot();
+        if subtract {
+            self.operations.push(Operation::Compare {
+                left: accumulator(width),
+                right: BinarySource::Register(temporary(width)),
+            });
+        } else {
+            self.operations.push(Operation::Binary {
+                operation: NativeBinaryOp::Add,
+                destination: accumulator(width),
+                source: BinarySource::Register(temporary(width)),
+            });
+        }
+        self.operations.push(Operation::ReadFlags {
+            destination: accumulator(BitWidth::W64),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::And,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_MASK),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::Or,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_FIXED),
+        });
+        Ok(())
+    }
+
     /// Lowers an intrinsic that stands for an imported call's return value.
     ///
     /// The intrinsic's leading arguments become the call arguments, the call is
@@ -411,6 +472,26 @@ impl LoweringContext<'_> {
         });
         Ok(())
     }
+}
+
+const STATUS_FLAG_MASK: i32 = 0x8D5;
+const STATUS_FLAG_FIXED: i32 = 0x202;
+
+/// `vm_flags_add_wN` / `vm_flags_sub_wN`: whether it subtracts, and its width.
+fn status_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
+    let (subtract, rest) = if let Some(rest) = name.strip_prefix("vm_flags_add_") {
+        (false, rest)
+    } else {
+        (true, name.strip_prefix("vm_flags_sub_")?)
+    };
+    let width = match rest {
+        "w8" => BitWidth::W8,
+        "w16" => BitWidth::W16,
+        "w32" => BitWidth::W32,
+        "w64" => BitWidth::W64,
+        _ => return None,
+    };
+    Some((subtract, width))
 }
 
 fn native_width(width: BitWidth) -> Width {
@@ -516,6 +597,8 @@ impl LoweringContext<'_> {
                 } else if let Some(kind) = passthrough::classify(name) {
                     self.lower_passthrough(name, kind, expression, arguments)?;
                     self.passthroughs.insert(name.clone());
+                } else if let Some((subtract, width)) = status_flags_intrinsic(name) {
+                    self.lower_status_flags(name, subtract, width, expression, arguments)?;
                 } else {
                     return Err(ExpressionCodegenError::UnsupportedIntrinsic {
                         name: name.clone(),

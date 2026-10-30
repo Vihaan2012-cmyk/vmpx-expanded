@@ -101,6 +101,10 @@ pub enum LiftAssumption {
     /// The VM restores the caller's flags, the replacement leaves them
     /// clobbered. Valid because flags are volatile across a Win64 call.
     FlagsVolatileAtReturn,
+    /// A native call whose target has no memory summary is assumed not to write
+    /// the VM stack or context. Applied only when neither the target nor any
+    /// argument can carry a pointer into the VM stack.
+    VmStateSurvivesNativeCall,
 }
 
 #[derive(Debug, Error)]
@@ -119,6 +123,8 @@ pub enum DecodedLiftError {
     NotCalleeReturn(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error("CFG lift refused at block {block}: {reason}")]
+    Cfg { block: vmpx_pe::Va, reason: String },
     #[error("replacement build failed: {0}")]
     Replacement(#[from] ReplacementError),
 }

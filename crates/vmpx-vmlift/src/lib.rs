@@ -5,6 +5,7 @@
 //! refuses to describe a routine as codegen-ready while any semantic, state,
 //! ABI, or control-flow dependency is missing.
 
+mod cfg_lift;
 mod constant_dispatch;
 mod decoded_lift;
 mod effect_liveness;
@@ -17,6 +18,7 @@ mod replacement;
 
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
+pub use cfg_lift::{CfgProbe, DecodedCfgInput, LiftedCfgFunction, lift_decoded_cfg, probe_decoded_cfg};
 pub use constant_dispatch::{
     ConstantDispatchConfig, ConstantDispatchError, compile_constant_dispatch,
 };
