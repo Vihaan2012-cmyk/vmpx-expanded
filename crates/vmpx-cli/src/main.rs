@@ -54,6 +54,10 @@ enum Command {
         /// blockers remain. The sound `output` path is unaffected.
         #[arg(long)]
         experimental: Option<PathBuf>,
+        /// With `--experimental`, also lift VM entries from their decoded handler
+        /// streams (slow: minutes on large inputs).
+        #[arg(long, requires = "experimental")]
+        decoded_lift: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -722,6 +726,7 @@ fn main() -> Result<()> {
             report,
             reconstructed,
             experimental,
+            decoded_lift,
         } => {
             if input == output {
                 bail!("refusing to overwrite the input file");
@@ -757,7 +762,11 @@ fn main() -> Result<()> {
             }
             let input_data = read_file(&input)?;
             let (mut clean, conventional, reintegrated) =
-                clean::analyze_clean_with_image(&input.display().to_string(), &input_data)?;
+                clean::analyze_clean_with_image(
+                    &input.display().to_string(),
+                    &input_data,
+                    decoded_lift,
+                )?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
                 clean.protection.verdict,

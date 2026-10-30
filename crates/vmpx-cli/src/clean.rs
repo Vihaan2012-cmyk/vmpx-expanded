@@ -601,7 +601,7 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
 pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
-    analyze_clean_with_image(input_path, input).map(|(report, _, _)| report)
+    analyze_clean_with_image(input_path, input, false).map(|(report, _, _)| report)
 }
 
 /// Runs the same analysis and additionally returns the conventional-layout
@@ -617,6 +617,7 @@ pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
 pub fn analyze_clean_with_image(
     input_path: &str,
     input: &[u8],
+    decoded_lift: bool,
 ) -> Result<(CleanReport, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let input_pe = PeImage::parse(input).context("clean input is not a supported PE")?;
     let protection = detect_vmprotect(&input_pe);
@@ -1372,14 +1373,14 @@ pub fn analyze_clean_with_image(
                 }
             }
 
-            // Decoded-stream lifts: every remaining inventory entry whose handler
+            // Decoded-stream lifts (opt-in, slow): every remaining inventory entry whose handler
             // stream lifts to a clean callee return. A failed lift skips only
             // that entry and leaves its stub; redirects are not counted as
             // coverage, so the sound gate is unaffected.
             let mut decoded_stubs: Vec<(Rva, Rva)> = Vec::new();
             let mut decoded_bytes: u64 = 0;
             let mut decoded_failed: u64 = 0;
-            for entry in &vm_inventory {
+            for entry in vm_inventory.iter().filter(|_| decoded_lift) {
                 let handled_by_group = (is_dll && entry.rva == pe.optional.address_of_entry_point)
                     || tls_callback_index(&pe, entry.rva).is_some();
                 if handled_by_group || !seen_stubs.insert(entry.rva) {

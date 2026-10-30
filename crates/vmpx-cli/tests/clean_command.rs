@@ -399,6 +399,7 @@ fn experimental_splices_decoded_stream_lifts_and_sound_output_stays_refused() {
         .arg(&output)
         .args(["--experimental"])
         .arg(&experimental)
+        .args(["--decoded-lift"])
         .args(["--report"])
         .arg(&report)
         .output()
