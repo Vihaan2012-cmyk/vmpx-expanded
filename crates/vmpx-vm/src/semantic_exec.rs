@@ -1483,10 +1483,10 @@ fn execute_instruction(
                 machine.store_stack(i64::from(8_u32.saturating_add(bytes)), &quotient)?;
                 let flags = machine.flags.clone();
                 machine.store_stack(0, &flags)?;
-            } else if width == BitWidth::W64 && instruction.vsp_delta == Some(8) {
-                machine.adjust_vsp(8)?;
+            } else if instruction.vsp_delta == i32::try_from(bytes).ok() {
+                machine.adjust_vsp(i32::try_from(bytes).unwrap_or(0))?;
                 machine.store_stack(0, &remainder)?;
-                machine.store_stack(8, &quotient)?;
+                machine.store_stack(i64::from(bytes), &quotient)?;
             } else {
                 return Err(format!(
                     "recovered VSP delta {:?} does not match a division layout",
