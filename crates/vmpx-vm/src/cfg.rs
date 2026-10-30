@@ -587,7 +587,7 @@ impl Walker<'_, '_> {
             symbolic_boundary,
             self.limits.entry.symbolic,
             &item.symbolic,
-            Some(self.pe),
+            Some(&crate::immutable_image::ReadOnlyImage(self.pe)),
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -770,7 +770,7 @@ impl Walker<'_, '_> {
             &decoded.outcome,
             self.limits.entry.symbolic,
             &symbolic.continuation_state(),
-            Some(self.pe),
+            Some(&crate::immutable_image::ReadOnlyImage(self.pe)),
         ) {
             Ok(call) => call,
             Err(error) => {
