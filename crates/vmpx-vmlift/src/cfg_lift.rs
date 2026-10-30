@@ -322,6 +322,25 @@ struct Builder<'a> {
     node_base_epoch: u64,
     /// Native-call barrier inherited by the current node (ancestor calls only).
     node_call_barrier: u64,
+    /// Branch nodes currently open on the path from the root to the node being
+    /// built, outermost first. A read in a descendant whose ordered position
+    /// lies in an ancestor's epoch range is eagerly captured into that
+    /// ancestor's `steps` and threaded forward through its spill slot. See
+    /// [`cross_node_capture`].
+    ancestors: Vec<OpenNode>,
+}
+
+/// A branch node still being built: its steps buffer stays reachable while its
+/// arms are walked so a descendant read can be captured at the right epoch
+/// position here. `base_epoch` is the memory epoch this node's steps began at;
+/// it owns the epoch range `[base_epoch, child_base)`, so the owner of a read's
+/// epoch is the deepest open node whose `base_epoch` does not exceed it.
+struct OpenNode {
+    base_epoch: u64,
+    /// Call-result spill-slot names produced at or before this node, the only
+    /// call results a capture placed here may reference.
+    available_calls: BTreeSet<String>,
+    steps: Vec<Step>,
 }
 
 /// Forward (non-back-edge) predecessors of each block. A `(from, to)` pair that
@@ -629,6 +648,82 @@ fn read_fits_in_node(
             .all(|store| provably_disjoint(address, bytes, &store.address, store.bytes))
 }
 
+/// Whether an expression embeds a raw memory load. Such a load would re-read
+/// memory at whatever point it is emitted, so an address carrying one cannot be
+/// hoisted into an ancestor (it could observe different memory there).
+fn expr_has_load(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::Const { .. } | ExprKind::Register { .. } => false,
+        ExprKind::Load { .. } => true,
+        ExprKind::Unary { value, .. } | ExprKind::Extract { value, .. } | ExprKind::Resize { value, .. } => {
+            expr_has_load(value)
+        }
+        ExprKind::Binary { left, right, .. } => expr_has_load(left) || expr_has_load(right),
+        ExprKind::Concat { high, low } => expr_has_load(high) || expr_has_load(low),
+        ExprKind::Intrinsic { arguments, .. } => arguments.iter().any(expr_has_load),
+    }
+}
+
+/// Eagerly captures a memory read whose ordered position lies in an ancestor
+/// node (its required store/call was emitted there and cannot be reordered
+/// against in the current node). The read is captured at its epoch-ordered
+/// position in the owner ancestor, spilled to a result slot, and referenced
+/// here through that slot — the slot's value is threaded forward unchanged
+/// because the ancestor's steps are emitted, unconditionally, before any of its
+/// arms.
+///
+/// Returns the slot reference, or `None` to fail closed when the capture cannot
+/// be placed soundly: no owning ancestor; an address that embeds a raw load (it
+/// could read different memory in the ancestor); an address that still carries
+/// an unresolved earlier read; or an address depending on a value not available
+/// at the owner (a later call result, a loop phi, or anything foreign).
+fn cross_node_capture(
+    ancestors: &mut [OpenNode],
+    read_sites: &mut usize,
+    uses_root: &mut bool,
+    allowed_registers: &BTreeSet<&str>,
+    epoch: u64,
+    address: &Expr,
+    width: BitWidth,
+) -> Option<Expr> {
+    // The address is evaluated at the capture point, so it must mean the same
+    // there: no embedded load, and no unresolved earlier read left behind.
+    if expr_has_load(address)
+        || address
+            .intrinsic_dependencies()
+            .iter()
+            .any(|name| name.starts_with("memory_load_epoch_"))
+    {
+        return None;
+    }
+    // Owner = deepest open node whose epoch range covers the read.
+    let owner = ancestors.iter_mut().rev().find(|node| node.base_epoch <= epoch)?;
+    // Every address dependency must be nameable at the owner. Entry registers,
+    // the stack root and already-captured read slots are stable everywhere; a
+    // call result must have been produced at or before the owner; anything else
+    // (a loop phi, a foreign value) fails closed.
+    for dependency in address.dependencies() {
+        if dependency == "vsp_initial" {
+            *uses_root = true;
+        } else if dependency.starts_with(READ_RESULT_PREFIX)
+            || allowed_registers.contains(dependency.as_str())
+        {
+            // Stable across node boundaries.
+        } else if dependency.starts_with("__call_result_") {
+            if !owner.available_calls.contains(&dependency) {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    let index = *read_sites;
+    let reference = read_result_ref(width, index)?;
+    *read_sites = index + 1;
+    Builder::place_captured_read(&mut owner.steps, index, epoch, address.clone(), width);
+    Some(reference)
+}
+
 fn is_native_rflags_initial(expression: &Expr) -> bool {
     matches!(
         &expression.simplify().kind,
@@ -658,7 +753,15 @@ impl Builder<'_> {
         let results = &path.results;
         let node_base = self.node_base_epoch;
         let node_call_barrier = self.node_call_barrier;
+        // Disjoint field borrows the capture closure needs alongside `read_sites`.
         let read_sites = &mut self.read_sites;
+        let ancestors = self.ancestors.as_mut_slice();
+        let mut captured_uses_root = false;
+        let uses_root_flag = &mut captured_uses_root;
+        let allowed_registers: BTreeSet<&str> = X64NativeRegister::ALL
+            .iter()
+            .map(|register| register.symbolic_name())
+            .collect();
         let rewritten = expression
             .rewrite_intrinsics(&mut |width, name, arguments| {
                 if let Some(register) = results.get(name) {
@@ -677,10 +780,20 @@ impl Builder<'_> {
                     return Some(Expr::load(width, address.clone()));
                 }
                 // Cannot re-issue the read here. Keep it in place if ordering
-                // permits; otherwise leave it for the refusal below.
+                // permits within this node; otherwise try capturing it in the
+                // ancestor node whose epoch range owns the read (cross-node eager
+                // capture); otherwise leave it for the refusal below.
                 if !read_fits_in_node(path, epoch, address, width.bytes(), node_base, node_call_barrier)
                 {
-                    return None;
+                    return cross_node_capture(
+                        ancestors,
+                        read_sites,
+                        uses_root_flag,
+                        &allowed_registers,
+                        epoch,
+                        address,
+                        width,
+                    );
                 }
                 let index = *read_sites;
                 let reference = read_result_ref(width, index)?;
@@ -724,7 +837,7 @@ impl Builder<'_> {
                 ),
             );
         }
-        if dependencies.contains("vsp_initial") {
+        if dependencies.contains("vsp_initial") || captured_uses_root {
             self.uses_root = true;
         }
         Ok(rewritten)
@@ -1035,11 +1148,30 @@ impl Builder<'_> {
                     }
                     let condition = self.prepare(key, target, path.barrier, &path, &mut steps)?;
                     self.branches += 1;
+                    // Keep this node's steps reachable while its arms are walked,
+                    // so a descendant read whose ordered position lies in this
+                    // node's epoch range is captured here (cross-node eager
+                    // capture) rather than refused. The node is this walk's steps
+                    // begun at `node_base_epoch`.
+                    self.ancestors.push(OpenNode {
+                        base_epoch: self.node_base_epoch,
+                        available_calls: path.results.values().cloned().collect(),
+                        steps: std::mem::take(&mut steps),
+                    });
                     let mut arms = Vec::with_capacity(successors.len());
+                    let mut result = Ok(());
                     for (value, successor) in successors {
-                        let arm = self.walk(successor, next.clone(), path.clone(), Vec::new())?;
-                        arms.push((value, arm));
+                        match self.walk(successor, next.clone(), path.clone(), Vec::new()) {
+                            Ok(arm) => arms.push((value, arm)),
+                            Err(error) => {
+                                result = Err(error);
+                                break;
+                            }
+                        }
                     }
+                    // Reclaim the (now capture-augmented) steps before returning.
+                    let steps = self.ancestors.pop().expect("ancestors balanced").steps;
+                    result?;
                     return Ok(Node {
                         steps,
                         end: End::Branch { condition, arms },
@@ -1608,6 +1740,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         active_phis: BTreeSet::new(),
         node_base_epoch: 0,
         node_call_barrier: 0,
+        ancestors: Vec::new(),
     };
     let stop = builder
         .walk(input.cfg.entry, initial, Path::default(), Vec::new())
@@ -1690,6 +1823,7 @@ fn lift_with_nested(
         active_phis: BTreeSet::new(),
         node_base_epoch: 0,
         node_call_barrier: 0,
+        ancestors: Vec::new(),
     };
     let root = builder.walk(cfg.entry, initial, Path::default(), Vec::new())?;
 
