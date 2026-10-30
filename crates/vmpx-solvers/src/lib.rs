@@ -3,10 +3,12 @@
 //!
 //! Depends on `vmpx-mutation` (contract types) only; never the reverse.
 
+pub mod dictionary;
 pub mod general_mba;
 pub mod linear_mba;
 pub mod opaque_predicate;
 pub mod substitution_solver;
+pub mod synthesis;
 
 use vmpx_mutation::{Candidate, Cost, Problem, ProblemClass, SolverId};
 
