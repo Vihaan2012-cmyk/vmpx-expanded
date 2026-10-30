@@ -1,8 +1,11 @@
 //! Memory source that exposes only bytes the loader maps read-only.
 
-use vmpx_pe::{PeImage, Va};
+use vmpx_pe::{ImageBase, ImportModule, PeImage, Va};
 
-use crate::{NativeCallImportResolution, SymbolicMemorySource};
+use crate::{
+    NativeCallImportDescriptor, NativeCallImportMatchKind, NativeCallImportResolution,
+    SymbolicMemorySource,
+};
 
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -31,7 +34,66 @@ impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
     }
 
     fn resolve_native_call_import(&self, target: u64) -> Option<NativeCallImportResolution> {
-        SymbolicMemorySource::resolve_native_call_import(self.0, target)
+        let direct = SymbolicMemorySource::resolve_native_call_import(self.0, target);
+        if !matches!(direct, Some(NativeCallImportResolution::NoMatch { .. })) {
+            return direct;
+        }
+        let imports = self.0.report().imports;
+        let thunk = resolve_import_thunk(
+            &imports,
+            self.0.optional.image_base,
+            |address| SymbolicMemorySource::read_byte(self, address),
+            target,
+        );
+        thunk.or(direct)
+    }
+}
+
+/// Resolves a call target that is the VA of a `jmp qword ptr [rip+disp32]`
+/// stub whose slot is exactly an import's IAT entry. The caller supplies only
+/// bytes that cannot change after load, so the stub provably forwards to that
+/// import. Anything else returns `None`.
+pub(crate) fn resolve_import_thunk(
+    imports: &[ImportModule],
+    image_base: ImageBase,
+    read_byte: impl Fn(Va) -> Option<u8>,
+    target: u64,
+) -> Option<NativeCallImportResolution> {
+    let mut stub = [0_u8; 6];
+    for (offset, byte) in stub.iter_mut().enumerate() {
+        *byte = read_byte(Va(target.checked_add(offset as u64)?))?;
+    }
+    if stub[..2] != [0xFF, 0x25] {
+        return None;
+    }
+    let displacement = i32::from_le_bytes(stub[2..].try_into().ok()?);
+    let slot = target
+        .checked_add(6)?
+        .checked_add_signed(i64::from(displacement))?;
+    let slot_rva = image_base.checked_rva_of(Va(slot))?;
+    let mut matches = imports
+        .iter()
+        .flat_map(|module| module.entries.iter().map(move |symbol| (module, symbol)))
+        .filter(|(_, symbol)| symbol.iat_rva == slot_rva)
+        .map(|(module, symbol)| NativeCallImportDescriptor {
+            module: module.name.clone(),
+            iat_rva: symbol.iat_rva,
+            lookup_value: symbol.lookup_value,
+            name: symbol.name.clone(),
+            ordinal: symbol.ordinal,
+            match_kinds: vec![NativeCallImportMatchKind::ImportThunk],
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => None,
+        1 => Some(NativeCallImportResolution::Unique {
+            target,
+            import: matches.remove(0),
+        }),
+        _ => Some(NativeCallImportResolution::Ambiguous {
+            target,
+            imports: matches,
+        }),
     }
 }
 
@@ -96,5 +158,81 @@ pub(crate) mod tests {
         );
         assert_eq!(image.read_byte(Va(IMAGE_BASE + 0x2800)), None);
         assert_eq!(image.read_byte(Va(0x10)), None);
+    }
+
+    fn module(slot_rva: u32, name: &str) -> vmpx_pe::ImportModule {
+        vmpx_pe::ImportModule {
+            name: "kernel32.dll".to_owned(),
+            descriptor_rva: vmpx_pe::Rva(0),
+            original_first_thunk: vmpx_pe::Rva(0),
+            first_thunk: vmpx_pe::Rva(slot_rva),
+            entries: vec![vmpx_pe::ImportSymbol {
+                iat_rva: vmpx_pe::Rva(slot_rva),
+                lookup_value: 0x9000,
+                name: Some(name.to_owned()),
+                hint: None,
+                ordinal: None,
+            }],
+        }
+    }
+
+    fn stub_reader(stub_va: u64, bytes: &[u8]) -> impl Fn(Va) -> Option<u8> + '_ {
+        move |address| {
+            let offset = address.0.checked_sub(stub_va)?;
+            bytes.get(usize::try_from(offset).ok()?).copied()
+        }
+    }
+
+    #[test]
+    fn jmp_stub_to_iat_slot_resolves_to_that_import() {
+        let stub_va = IMAGE_BASE + 0x1100;
+        let slot_rva = 0x2040_u32;
+        let disp = (i64::from(slot_rva) - 0x1100 - 6) as i32;
+        let mut stub = vec![0xFF, 0x25];
+        stub.extend_from_slice(&disp.to_le_bytes());
+        let imports = [module(slot_rva, "CreateFileW")];
+        let read = stub_reader(stub_va, &stub);
+        let Some(NativeCallImportResolution::Unique { import, target }) =
+            resolve_import_thunk(&imports, ImageBase(IMAGE_BASE), read, stub_va)
+        else {
+            panic!("stub into an IAT slot must resolve");
+        };
+        assert_eq!(target, stub_va);
+        assert_eq!(import.name.as_deref(), Some("CreateFileW"));
+        assert_eq!(
+            import.match_kinds,
+            vec![NativeCallImportMatchKind::ImportThunk]
+        );
+    }
+
+    #[test]
+    fn stub_not_into_an_iat_slot_or_not_a_jmp_stays_unresolved() {
+        let stub_va = IMAGE_BASE + 0x1100;
+        let disp = (0x2040_i64 - 0x1100 - 6) as i32;
+        let mut stub = vec![0xFF, 0x25];
+        stub.extend_from_slice(&disp.to_le_bytes());
+        let other_slot = [module(0x2048, "Other")];
+        assert!(
+            resolve_import_thunk(
+                &other_slot,
+                ImageBase(IMAGE_BASE),
+                stub_reader(stub_va, &stub),
+                stub_va
+            )
+            .is_none()
+        );
+        let slot = [module(0x2040, "CreateFileW")];
+        let mut call = stub.clone();
+        call[1] = 0x15;
+        assert!(
+            resolve_import_thunk(
+                &slot,
+                ImageBase(IMAGE_BASE),
+                stub_reader(stub_va, &call),
+                stub_va
+            )
+            .is_none()
+        );
+        assert!(resolve_import_thunk(&slot, ImageBase(IMAGE_BASE), |_| None, stub_va).is_none());
     }
 }

@@ -134,6 +134,7 @@ pub enum NativeCallImportMatchKind {
     LookupValue,
     IatRva,
     IatVa,
+    ImportThunk,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
