@@ -1094,7 +1094,7 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
         },
     };
     let replacement =
-        build_tree_replacement(&root, 0, 0, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
+        build_tree_replacement(&root, 0, 0, 0, &[], None, None, &tree_config(), CodeAddress(ADDRESS))
             .expect("emit");
     let operations = &replacement.function.operations;
     assert_eq!(
@@ -1128,6 +1128,84 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
     .collect();
     assert_eq!(decoded.iter().filter(|m| **m == Mnemonic::Je).count(), 2);
     assert_eq!(decoded.iter().filter(|m| **m == Mnemonic::Ret).count(), 3);
+}
+
+// A sub-64-bit loop-carried cell lives in its 64-bit frame slot but is read and
+// written at its own width. Declaring the phi input at that width lets the narrow
+// `next` lower; declaring it at the full 64 bits is rejected by the codegen width
+// check, so the lift fails closed rather than reading undefined upper bytes.
+#[test]
+fn a_narrow_loop_carried_cell_lifts_at_its_own_width() {
+    let phi_in = Expr::register(BitWidth::W8, loop_phi_name(0));
+    let next =
+        Expr::binary(BinaryOp::Add, phi_in, Expr::constant(BitWidth::W8, 1)).expect("w8 add");
+    let init = Expr::extract(BitWidth::W8, 0, entry(X64NativeRegister::Rdx)).expect("w8 init");
+    let make_root = || Node {
+        steps: Vec::new(),
+        end: End::Loop(LoopLeaf {
+            phis: vec![LoopPhi {
+                id: 0,
+                init: init.clone(),
+                next: next.clone(),
+            }],
+            steps: Vec::new(),
+            exits: vec![LoopExit {
+                epoch: 0,
+                condition: entry(X64NativeRegister::Rax),
+                continue_value: 0x920,
+                continuation: Box::new(identity_exit()),
+            }],
+        }),
+    };
+    // The phi input declared at the cell's width (W8) lifts: a back-edge closes it.
+    let replacement = build_tree_replacement(
+        &make_root(),
+        0,
+        0,
+        1,
+        &[BitWidth::W8],
+        None,
+        None,
+        &tree_config(),
+        CodeAddress(ADDRESS),
+    )
+    .expect("narrow phi lifts at its own width");
+    assert_eq!(
+        count(&replacement.function.operations, |o| matches!(
+            o,
+            Operation::Jump(_)
+        )),
+        1,
+        "the loop back-edge is a native jump"
+    );
+    // Declaring the same W8 cell's slot as 64 bits is rejected (fail closed): the
+    // W8 `next` reading a W64-declared input is a width mismatch.
+    let wide = build_tree_replacement(
+        &make_root(),
+        0,
+        0,
+        1,
+        &[BitWidth::W64],
+        None,
+        None,
+        &tree_config(),
+        CodeAddress(ADDRESS),
+    );
+    assert!(wide.is_err(), "a W64 slot declared for a W8 cell must be rejected");
+}
+
+// A loop-carried cell whose width differs between iterations (its upper bytes are
+// not consistently defined) is refused, never silently widened.
+#[test]
+fn a_loop_carried_cell_that_changes_width_fails_closed() {
+    let mut pre = SymbolicVmInitialState::default();
+    pre.context_values.insert(0, Expr::constant(BitWidth::W8, 5));
+    let mut reentry = SymbolicVmInitialState::default();
+    reentry.context_values.insert(0, Expr::constant(BitWidth::W16, 7));
+    let Err(error) = loop_cells(Va(0xB0), &pre, &reentry) else {
+        panic!("width change must refuse");
+    };
+    assert!(error.to_string().contains("changes width"), "{error}");
 }
 
 #[test]
@@ -1195,6 +1273,7 @@ fn prepare_read_in_node(
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
+        phi_widths: Vec::new(),
         active_phis: BTreeSet::new(),
         node_base_epoch: node_base,
         node_call_barrier,
@@ -1254,6 +1333,7 @@ fn prepare_read_with_ancestor(
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
+        phi_widths: Vec::new(),
         active_phis: BTreeSet::new(),
         node_base_epoch: node_base,
         node_call_barrier: 0,

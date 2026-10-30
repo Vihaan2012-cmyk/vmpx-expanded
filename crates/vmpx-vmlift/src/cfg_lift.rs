@@ -344,6 +344,10 @@ struct Builder<'a> {
     loop_bodies: BTreeMap<Va, BTreeSet<Va>>,
     /// Loop `phi` slots allocated so far; also the next slot id.
     loop_phis: u16,
+    /// Bit width of each loop `phi` by id. A sub-64-bit carried cell lives in its
+    /// 64-bit frame slot but is read and written at exactly this width, so its
+    /// input is declared at this width (the upper bits are never observed).
+    phi_widths: Vec<BitWidth>,
     /// Active `phi` input names a prepared expression may legitimately read.
     active_phis: BTreeSet<String>,
     /// Memory epoch at which the current node's steps began; stores/calls below
@@ -551,11 +555,13 @@ fn loop_cells(
             if pre_value.width != reentry_value.width {
                 return refuse(header, "a loop-carried cell changes width");
             }
-            // The phi lives in a 64-bit frame slot; a narrower carried cell would
-            // leave the slot's upper bytes undefined. Fail closed on it.
-            if pre_value.width != BitWidth::W64 {
-                return refuse(header, "a loop-carried cell is not 64 bits wide");
-            }
+            // The phi lives in a 64-bit frame slot. A narrower carried cell is
+            // sound only because its value has a definite width `W` in both the
+            // pre-loop and re-entry states (checked just above) and is therefore
+            // produced and consumed at exactly `W` bits every iteration: the slot
+            // holds the `W`-bit value and the cell reads it back at `W` bits, so
+            // the upper `64 - W` bits are never observed. A cell whose width were
+            // to differ between iterations is refused above, never widened here.
             cells.push((cell.clone(), pre_value.width));
         }
     }
@@ -1353,6 +1359,8 @@ impl Builder<'_> {
                 })?;
             let name = loop_phi_name(id);
             self.active_phis.insert(name.clone());
+            debug_assert_eq!(usize::from(id), self.phi_widths.len());
+            self.phi_widths.push(width);
             set_cell(&mut phi_state, &cell, Expr::register(width, name));
             specs.push((cell, id, width));
         }
@@ -1779,6 +1787,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
+        phi_widths: Vec::new(),
         active_phis: BTreeSet::new(),
         node_base_epoch: 0,
         node_call_barrier: 0,
@@ -1863,6 +1872,7 @@ fn lift_with_nested(
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
+        phi_widths: Vec::new(),
         active_phis: BTreeSet::new(),
         node_base_epoch: 0,
         node_call_barrier: 0,
@@ -1904,6 +1914,7 @@ fn lift_with_nested(
         builder.call_sites,
         builder.read_sites,
         builder.loop_phis,
+        &builder.phi_widths,
         frame_bytes,
         region,
         &config,
@@ -2348,6 +2359,7 @@ fn build_tree_replacement(
     call_count: usize,
     read_count: usize,
     loop_phis: u16,
+    phi_widths: &[BitWidth],
     stack_root_bytes: Option<u32>,
     region_retained: Option<u32>,
     config: &ReplacementConfig,
@@ -2414,9 +2426,15 @@ fn build_tree_replacement(
         ));
     }
     for id in 0..loop_phis {
+        // A loop phi reads its carried value at the cell's own width; a sub-64-bit
+        // cell lives in the low bits of its 64-bit slot (upper bits unobserved).
+        let width = phi_widths
+            .get(usize::from(id))
+            .copied()
+            .unwrap_or(BitWidth::W64);
         inputs.push(ExpressionInput::slot(
             loop_phi_name(id),
-            BitWidth::W64,
+            width,
             SpillSlot(phi_base + id),
         ));
     }
