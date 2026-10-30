@@ -7,6 +7,7 @@
 
 mod constant_dispatch;
 mod effect_liveness;
+mod equivalence;
 mod expr_codegen;
 mod live_in;
 mod replacement;
@@ -17,6 +18,10 @@ pub use constant_dispatch::{
 pub use effect_liveness::{
     CollectedCall, CollectedEffects, CollectedStore, EntryEffectLivenessReport,
     PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects,
+};
+pub use equivalence::{
+    Assignment, AssignmentDivergence, Divergence, ExitSemantics, Side, Verdict, VerificationReport,
+    compare_exits, verify_over_domain,
 };
 pub use expr_codegen::ImportCall;
 pub use expr_codegen::{
