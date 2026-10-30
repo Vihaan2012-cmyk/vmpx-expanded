@@ -441,6 +441,21 @@ fn bytecode_section(pe: &PeImage<'_>, vip: Va) -> Option<usize> {
         .map(|section| section.index)
 }
 
+/// Why a branch target that left the entry's bytecode section cannot be followed
+/// as bytecode. VMProtect fetches bytecode from the executable protector section
+/// that holds the entry stream, so a non-executable target is data (never
+/// bytecode) and a different executable section is one this walk has not proven
+/// holds this VM's bytecode. Either way the target is refused, not guessed;
+/// `target_characteristics` is the section's flags, or `None` when unmapped.
+fn out_of_bytecode_section_reason(target_characteristics: Option<u32>) -> &'static str {
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    match target_characteristics {
+        None => "it is not mapped to any section",
+        Some(flags) if flags & IMAGE_SCN_MEM_EXECUTE == 0 => "it is in a non-executable data section",
+        Some(_) => "it is in a different executable section not proven to hold this VM's bytecode",
+    }
+}
+
 const NESTED_ENTRY_CONFIDENCE: u8 = 60;
 
 struct Item {
@@ -1364,10 +1379,25 @@ impl Walker<'_, '_> {
         for value in targets {
             let target_va = Va(value);
             if self.section.is_none() || bytecode_section(self.pe, target_va) != self.section {
+                let target_characteristics = self
+                    .pe
+                    .optional
+                    .image_base
+                    .checked_rva_of(target_va)
+                    .and_then(|rva| {
+                        self.pe
+                            .sections
+                            .iter()
+                            .find(|section| section.contains_mapped_rva(rva))
+                    })
+                    .map(|section| section.characteristics);
                 self.stall(
                     key,
                     vip,
-                    format!("branch target {target_va} is outside the bytecode section"),
+                    format!(
+                        "branch target {target_va} is outside the bytecode section: {}",
+                        out_of_bytecode_section_reason(target_characteristics)
+                    ),
                 );
                 continue;
             }
@@ -1714,6 +1744,27 @@ mod tests {
         )
         .unwrap();
         Expr::binary(BinaryOp::Add, Expr::constant(BitWidth::W64, low), scaled).unwrap()
+    }
+
+    #[test]
+    fn out_of_section_branch_target_is_classified_for_a_fail_closed_diagnostic() {
+        const EXEC: u32 = 0x6000_0020; // CODE | EXECUTE | READ
+        const RDATA: u32 = 0x4000_0040; // INITIALIZED_DATA | READ
+        // coredll.ultra's 0x184AE lands in read-only .rdata: data, never bytecode.
+        assert_eq!(
+            out_of_bytecode_section_reason(Some(RDATA)),
+            "it is in a non-executable data section"
+        );
+        // A different executable section is unproven, not followed.
+        assert_eq!(
+            out_of_bytecode_section_reason(Some(EXEC)),
+            "it is in a different executable section not proven to hold this VM's bytecode"
+        );
+        // A target outside every section is unmapped.
+        assert_eq!(
+            out_of_bytecode_section_reason(None),
+            "it is not mapped to any section"
+        );
     }
 
     #[test]

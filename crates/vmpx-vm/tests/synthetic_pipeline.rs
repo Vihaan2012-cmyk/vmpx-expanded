@@ -437,9 +437,10 @@ fn cfg_walk_refuses_a_constant_target_outside_the_bytecode_section() {
     assert_eq!(cfg.blocks.len(), 1, "{cfg:#?}");
     assert!(cfg.edges.is_empty());
     assert!(
-        cfg.stalls
-            .iter()
-            .any(|stall| stall.reason.contains("outside the bytecode section")),
+        cfg.stalls.iter().any(|stall| {
+            stall.reason.contains("outside the bytecode section")
+                && stall.reason.contains("it is not mapped to any section")
+        }),
         "{cfg:#?}"
     );
 }
