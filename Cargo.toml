@@ -30,6 +30,14 @@ thiserror = "2.0"
 lzma-rs = "0.3"
 iced-x86 = "1.21"
 
+# Faster dev/test builds: drop debuginfo for deps entirely (we never debug into
+# egui/iced-x86/etc.) and keep only line tables for our own crates.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
