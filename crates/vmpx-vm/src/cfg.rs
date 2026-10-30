@@ -53,7 +53,10 @@ pub struct VmCfgLimits {
     /// VM-to-VM re-entries followed across the whole walk.
     pub max_nested_entries: usize,
     /// Iterations of one loop unrolled with exact state before its changing
-    /// cells are generalized.
+    /// cells are generalized to a stable over-approximation. Kept well under
+    /// `max_visits_per_block`: each unrolled iteration propagates a distinct
+    /// state into post-loop join blocks, so an over-large budget stalls those
+    /// joins before the widened state can subsume the iterations.
     pub max_loop_unrolls: usize,
 }
 
@@ -69,7 +72,7 @@ impl Default for VmCfgLimits {
             max_total_instructions: 200_000,
             max_targets: 16,
             max_nested_entries: 8,
-            max_loop_unrolls: 14,
+            max_loop_unrolls: 4,
         }
     }
 }
@@ -471,11 +474,16 @@ fn covers(a: Option<&Expr>, r: Option<&Expr>) -> bool {
     }
 }
 
+/// Widens a differing loop-carried cell to a single canonical unknown named for
+/// its `(block, cell)` site — never a fresh name per pass. Idempotent: once a
+/// site is TOP it stays that exact name, so a re-widened state equals the prior
+/// one and the loop closes (abstract-interpretation widening to a fixpoint).
+/// Distinct sites get distinct names, so independent unknowns are never aliased.
 fn generalize(
     a: Option<&Expr>,
     r: Option<&Expr>,
     key: Va,
-    counter: &mut usize,
+    cell: &str,
     changed: &mut bool,
 ) -> Result<Option<Expr>, String> {
     if covers(a, r) {
@@ -489,11 +497,21 @@ fn generalize(
         (None, None) => return Ok(None),
     };
     *changed = true;
-    *counter += 1;
     Ok(Some(Expr::register(
         width,
-        format!("{HAVOC_PREFIX}{:x}_{counter}", key.0),
+        format!("{HAVOC_PREFIX}{:x}_{cell}", key.0),
     )))
+}
+
+/// A short, stable token for a memory site (its address), used only to name the
+/// site's canonical unknown. Collisions across distinct addresses are harmless
+/// precision loss; it never aliases a memory cell with flags or a context slot
+/// (those names carry a different prefix).
+fn cell_token(address: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut hasher);
+    format!("m{:x}", hasher.finish())
 }
 
 fn memory_by_address(state: &SymbolicVmInitialState) -> BTreeMap<String, &(Expr, Expr)> {
@@ -511,7 +529,6 @@ fn widen_state(
     key: Va,
     a: &SymbolicVmInitialState,
     r: &SymbolicVmInitialState,
-    counter: &mut usize,
 ) -> Result<Option<SymbolicVmInitialState>, String> {
     if a.memory_tainted || r.memory_tainted {
         return Err("loop follows an imprecise external-memory store".to_owned());
@@ -523,7 +540,7 @@ fn widen_state(
         return Err("loop changes the fresh allocations".to_owned());
     }
     let mut changed = false;
-    let flags = generalize(Some(&a.flags), Some(&r.flags), key, counter, &mut changed)?
+    let flags = generalize(Some(&a.flags), Some(&r.flags), key, "f", &mut changed)?
         .unwrap_or_else(|| a.flags.clone());
     let mut context_values = BTreeMap::new();
     let offsets: BTreeSet<i64> = a
@@ -537,7 +554,7 @@ fn widen_state(
             a.context_values.get(&offset),
             r.context_values.get(&offset),
             key,
-            counter,
+            &format!("c{offset}"),
             &mut changed,
         )?;
         if let Some(cell) = cell {
@@ -557,7 +574,7 @@ fn widen_state(
             a_entry.map(|entry| &entry.1),
             r_entry.map(|entry| &entry.1),
             key,
-            counter,
+            &cell_token(address),
             &mut changed,
         )?;
         if let (Some(location), Some(cell)) = (location, cell) {
@@ -597,19 +614,17 @@ fn loop_step(
     ancestors: &[&SymbolicVmInitialState],
     reentry: &SymbolicVmInitialState,
     unrolls: usize,
-    counter: &mut usize,
 ) -> LoopStep {
-    let mut probe = *counter;
     if ancestors
         .iter()
-        .any(|a| matches!(widen_state(key, a, reentry, &mut probe), Ok(None)))
+        .any(|a| matches!(widen_state(key, a, reentry), Ok(None)))
     {
         return LoopStep::Close;
     }
     if ancestors.len() < unrolls {
         return LoopStep::Unroll;
     }
-    match widen_state(key, ancestors[0], reentry, counter) {
+    match widen_state(key, ancestors[0], reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
         Err(reason) => LoopStep::Refuse(reason),
@@ -623,7 +638,6 @@ struct Walker<'a, 'p> {
     global_table: Option<crate::GlobalTableBase>,
     profile: crate::VmProfile,
     nested_followed: usize,
-    havoc_counter: usize,
     current: Option<Rc<PathNode>>,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
@@ -994,13 +1008,7 @@ impl Walker<'_, '_> {
         }
         let states: Vec<&SymbolicVmInitialState> =
             ancestors.iter().map(|node| &node.state).collect();
-        match loop_step(
-            key,
-            &states,
-            &item.symbolic,
-            self.limits.max_loop_unrolls,
-            &mut self.havoc_counter,
-        ) {
+        match loop_step(key, &states, &item.symbolic, self.limits.max_loop_unrolls) {
             LoopStep::Close => {
                 if let Some(parent) = &item.path {
                     self.add_edge(CfgEdge {
@@ -1476,7 +1484,6 @@ pub fn recover_vm_cfg(
         global_table: bootstrap_global_table(&setup.bootstrap),
         profile: setup.profile,
         nested_followed: 0,
-        havoc_counter: 0,
         current: None,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
@@ -1923,12 +1930,11 @@ mod tests {
     ) -> Result<(usize, usize), String> {
         let key = Va(0x1000);
         let mut ancestors = vec![entry];
-        let mut counter = 0;
         let mut widened = 0;
         for iteration in 1..=32 {
             let reentry = step(ancestors.last().expect("entry"));
             let nearest_first: Vec<_> = ancestors.iter().rev().collect();
-            match loop_step(key, &nearest_first, &reentry, unrolls, &mut counter) {
+            match loop_step(key, &nearest_first, &reentry, unrolls) {
                 LoopStep::Close => return Ok((iteration, widened)),
                 LoopStep::Unroll => ancestors.push(reentry),
                 LoopStep::Widen(state) => {
@@ -1965,16 +1971,13 @@ mod tests {
     fn widened_loop_state_keeps_invariant_cells_exact() {
         let a = loop_state(0, w64(0));
         let r = loop_state(0, w64(1));
-        let widened = widen_state(Va(0x1000), &a, &r, &mut 0)
+        let widened = widen_state(Va(0x1000), &a, &r)
             .expect("widens")
             .expect("changed");
         assert_eq!(widened.context_values[&0], w64(7));
         assert!(is_havoc(&widened.context_values[&8]));
         assert_eq!(widened.vsp, a.vsp);
-        assert!(matches!(
-            widen_state(Va(0x1000), &widened, &r, &mut 0),
-            Ok(None)
-        ));
+        assert!(matches!(widen_state(Va(0x1000), &widened, &r), Ok(None)));
     }
 
     #[test]
@@ -1983,7 +1986,7 @@ mod tests {
         let derived = increment(&havoc);
         let a = loop_state(0, derived.clone());
         let r = loop_state(0, derived);
-        let widened = widen_state(Va(0x1000), &a, &r, &mut 1)
+        let widened = widen_state(Va(0x1000), &a, &r)
             .expect("widens")
             .expect("the same text means a different value next iteration");
         assert!(is_havoc(&widened.context_values[&8]));
@@ -2011,5 +2014,33 @@ mod tests {
         };
         let reason = walk_loop(entry, step, 1).expect_err("tainted state");
         assert!(reason.contains("imprecise"), "{reason}");
+    }
+
+    #[test]
+    fn generalized_cell_uses_a_stable_name_so_rewidening_is_a_fixpoint() {
+        let a = loop_state(0, w64(0));
+        let w1 = widen_state(Va(0x1000), &a, &loop_state(0, w64(1)))
+            .expect("widens")
+            .expect("changed");
+        let w2 = widen_state(Va(0x1000), &a, &loop_state(0, w64(2)))
+            .expect("widens")
+            .expect("changed");
+        // Same (block, cell) site generalizes to one canonical name, never a
+        // fresh one per pass, so the widened state stops changing.
+        assert_eq!(w1.context_values[&8], w2.context_values[&8]);
+        // Re-widening the generalized state against any further value closes.
+        assert!(matches!(
+            widen_state(Va(0x1000), &w1, &loop_state(0, w64(9))),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn branch_over_a_generalized_cell_fails_closed() {
+        // A cell widened to TOP is a bare generalized register: an unconstrained
+        // value. A branch target that is this value must resolve to no concrete
+        // target (fail closed) rather than silently pick one.
+        let top = Expr::register(BitWidth::W64, format!("{HAVOC_PREFIX}1000_f"));
+        assert!(resolve_targets(&top, VmCfgLimits::default()).is_err());
     }
 }
