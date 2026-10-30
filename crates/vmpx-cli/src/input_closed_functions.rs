@@ -47,13 +47,21 @@ pub(crate) struct InputClosedFunction {
 #[derive(Clone, Debug)]
 pub(crate) struct BranchingFunction {
     pub rva: Rva,
-    #[expect(dead_code, reason = "consumed by SP2 Task 5 reintegration")]
     pub branch_target: Expr,
-    /// `(branch target value, exit expressed over the live-in registers)`.
-    pub paths: Vec<(u64, NativeExitState)>,
+    pub paths: Vec<BranchPath>,
+    /// The recovered family's proof that `paths` cover the whole input domain.
+    pub domain_complete: bool,
     pub inputs: BTreeSet<String>,
     pub live_in: BTreeSet<X64NativeRegister>,
     pub certificates: BTreeMap<String, DomainCertificate>,
+}
+
+/// One guarded path: runs exactly when `branch_target == target`.
+#[derive(Clone, Debug)]
+pub(crate) struct BranchPath {
+    pub target: u64,
+    pub exit: NativeExitState,
+    pub effects: CollectedEffects,
 }
 
 /// Why an entry is not an input-closed single-path function.
@@ -224,7 +232,12 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         if !path.assignments.is_empty() {
             return Err("branching path was specialized by an input".to_owned());
         }
-        paths.push((*target, closed_exit(family, path, &allowed)?.0));
+        let (exit, effects) = closed_exit(family, path, &allowed)?;
+        paths.push(BranchPath {
+            target: *target,
+            exit,
+            effects,
+        });
     }
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
@@ -232,6 +245,7 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         rva,
         branch_target: guarded.branch_target.clone(),
         paths,
+        domain_complete: family.domain_complete,
         inputs: allowed,
         live_in: calling_convention(family, &frame).live_in,
         certificates: guarded.certificates.clone(),

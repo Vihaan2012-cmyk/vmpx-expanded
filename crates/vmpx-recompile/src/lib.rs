@@ -13,7 +13,10 @@ mod ir;
 
 pub use abi::{RegisterAssignment, StackFrame, validate_function};
 pub use compose::{ComposeError, Composition, Fragment, compose};
-pub use dispatch::{DispatchArm, DispatchError, emit_domain_dispatcher};
+pub use dispatch::{
+    DispatchArm, DispatchError, ValueDispatch, emit_displaced_stub, emit_domain_dispatcher,
+    emit_value_dispatcher,
+};
 pub use encode::{CodeAddress, CompiledFunction, compile};
 pub use error::CompileError;
 pub use ir::{

@@ -912,6 +912,8 @@ pub fn analyze_clean_with_image(
     // reintegration below replaces in place.
     let mut single_body_functions: Vec<crate::input_closed_functions::InputClosedFunction> =
         Vec::new();
+    let mut branching_functions: Vec<crate::input_closed_functions::BranchingFunction> =
+        Vec::new();
     let input_closed_functions = if protection.verdict == DetectionVerdict::NoStrongEvidence {
         completed_stage("not required for an input with no strong protection evidence")
     } else {
@@ -922,6 +924,7 @@ pub fn analyze_clean_with_image(
         );
         recovered.closed.extend(exe_entry_function);
         single_body_functions.clone_from(&recovered.closed);
+        branching_functions.clone_from(&recovered.branching);
         let mut diagnostics = std::mem::take(&mut recovered.diagnostics);
         diagnostics.extend(recovered.closed.iter().map(|function| {
             format!(
@@ -1256,6 +1259,7 @@ pub fn analyze_clean_with_image(
             // function and leaves the cursor and payload untouched.
             let is_dll = pe.coff.characteristics & IMAGE_FILE_DLL != 0;
             let mut stub_redirects: Vec<(Rva, Rva)> = Vec::new();
+            let mut branching_stubs: Vec<(Rva, Rva)> = Vec::new();
             let mut seen_stubs = BTreeSet::new();
             let mut single_body_bytes: u64 = 0;
             layout_cursor = u32::try_from(reintegration_payload.len()).unwrap_or(layout_cursor);
@@ -1288,6 +1292,57 @@ pub fn analyze_clean_with_image(
                         "{}: single-body replacement not built ({} effect store(s)): {error}",
                         function.rva,
                         function.effects.stores.len()
+                    )),
+                }
+            }
+
+            // Branching functions: bodies, the branch-target callable, a
+            // displaced copy of the stub and the value dispatcher form one
+            // contiguous unit, committed only if the whole unit builds.
+            let mut branching_bytes: u64 = 0;
+            let mut branching_built: u64 = 0;
+            for function in &branching_functions {
+                let handled_by_group = (is_dll && function.rva == pe.optional.address_of_entry_point)
+                    || tls_callback_index(&pe, function.rva).is_some();
+                if handled_by_group || !seen_stubs.insert(function.rva) {
+                    continue;
+                }
+                let Some(unit_rva) = planned_rva.0.checked_add(layout_cursor).map(Rva) else {
+                    reintegration_diagnostics.push(format!(
+                        "{}: branching layout overflow; skipped",
+                        function.rva
+                    ));
+                    continue;
+                };
+                match compile_branching_function(
+                    &pe,
+                    image,
+                    function,
+                    va + u64::from(layout_cursor),
+                ) {
+                    Ok((unit, dispatcher_offset)) => {
+                        let Some(dispatcher_rva) = unit_rva.0.checked_add(dispatcher_offset).map(Rva)
+                        else {
+                            reintegration_diagnostics.push(format!(
+                                "{}: branching dispatcher RVA overflow; skipped",
+                                function.rva
+                            ));
+                            continue;
+                        };
+                        let len = u64::try_from(unit.len()).unwrap_or(0);
+                        layout_cursor =
+                            layout_cursor.saturating_add(u32::try_from(unit.len()).unwrap_or(0));
+                        total_bytes += len;
+                        branching_bytes += len;
+                        branching_built += 1;
+                        emitted += u64::try_from(function.paths.len()).unwrap_or(0);
+                        reintegration_payload.extend_from_slice(&unit);
+                        branching_stubs.push((function.rva, dispatcher_rva));
+                    }
+                    Err(error) => reintegration_diagnostics.push(format!(
+                        "{}: branching function deferred ({} path(s)): {error}",
+                        function.rva,
+                        function.paths.len()
                     )),
                 }
             }
@@ -1352,6 +1407,21 @@ pub fn analyze_clean_with_image(
                                 )),
                             }
                         }
+                        let mut branching_redirected: u64 = 0;
+                        for (stub, dispatcher) in &branching_stubs {
+                            match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *dispatcher) {
+                                Ok(redirected) => {
+                                    bytes = redirected;
+                                    branching_redirected += 1;
+                                    reintegration_diagnostics.push(format!(
+                                        "{stub}: VM entry stub redirected to value dispatcher at {dispatcher}"
+                                    ));
+                                }
+                                Err(error) => reintegration_diagnostics.push(format!(
+                                    "{stub}: dispatcher redirect failed, original stub kept: {error}"
+                                )),
+                            }
+                        }
                         reintegrated = Some(bytes);
                         let entries_redirected = u64::from(report.entry_redirected)
                             + u64::try_from(report.tls_redirected).unwrap_or(0);
@@ -1378,6 +1448,9 @@ pub fn analyze_clean_with_image(
                                 ),
                                 ("single_body_redirected".to_owned(), functions_redirected),
                                 ("single_body_bytes".to_owned(), single_body_bytes),
+                                ("branching_built".to_owned(), branching_built),
+                                ("branching_redirected".to_owned(), branching_redirected),
+                                ("branching_bytes".to_owned(), branching_bytes),
                                 (
                                     "tls_redirected".to_owned(),
                                     u64::try_from(report.tls_redirected).unwrap_or(0),
@@ -1705,6 +1778,135 @@ fn compile_single_body(
     compile_replacement_body(pe, &inputs, &rewrites, &function.exit, &function.effects, va)
 }
 
+/// Registers a Win64 callee may clobber. The dispatcher saves all of them so the
+/// chosen body, or the fallback stub, starts with the entry register state.
+const DISPATCH_SAVED: [vmpx_recompile::PhysicalRegister; 7] = {
+    use vmpx_recompile::PhysicalRegister as P;
+    [P::Rax, P::Rcx, P::Rdx, P::R8, P::R9, P::R10, P::R11]
+};
+
+/// Compiles `branch_target` into a callable that returns it in `RAX`, preserving
+/// nonvolatile registers, via the ordinary replacement lowering (the target is
+/// the only register value). Refused unless it is a 64-bit expression over this
+/// function's own entry inputs.
+fn compile_branch_target(
+    branch_target: &vmpx_vm::Expr,
+    inputs: &[(String, vmpx_recompile::PhysicalRegister)],
+    va: u64,
+) -> Result<Vec<u8>, String> {
+    if branch_target.width != BitWidth::W64 {
+        return Err("branch target is not a 64-bit value".to_owned());
+    }
+    let mut selected = Vec::new();
+    for name in branch_target.dependencies() {
+        let input = inputs
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .ok_or_else(|| format!("branch target reads {name}, which is not an entry input"))?;
+        selected.push(input.clone());
+    }
+    let config = vmpx_vmlift::ReplacementConfig {
+        inputs: selected,
+        max_expression_nodes: 200_000,
+        max_spill_slots: 64,
+        import_calls: BTreeMap::new(),
+        continuation: None,
+        effects: Vec::new(),
+        effect_calls: Vec::new(),
+        rflags: None,
+        symbol_rewrites: BTreeMap::new(),
+    };
+    let registers = BTreeMap::from([(vmpx_vm::X64NativeRegister::Rax, branch_target.clone())]);
+    vmpx_vmlift::build_replacement(&registers, &config, vmpx_recompile::CodeAddress(va))
+        .map(|replacement| replacement.compiled.bytes)
+        .map_err(|error| error.to_string())
+}
+
+/// Builds `[body_i]..[branch-target callable][displaced stub][dispatcher]` for a
+/// recovered branching function, laid out from `va`. Returns the bytes and the
+/// dispatcher's offset (the stub's redirect target). Nothing is partially
+/// returned: any failure yields `Err`.
+fn compile_branching_function(
+    pe: &PeImage<'_>,
+    image: &[u8],
+    function: &crate::input_closed_functions::BranchingFunction,
+    va: u64,
+) -> Result<(Vec<u8>, u32), String> {
+    if !function.domain_complete {
+        return Err("path family domain is not proven complete".to_owned());
+    }
+    if function.paths.is_empty() {
+        return Err("no recovered paths".to_owned());
+    }
+    let candidate = analyze_vm_entry_at(pe, function.rva, VmDiscoveryLimits::default())
+        .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
+    let mut rewrites = BTreeMap::new();
+    let inputs = replacement_inputs(pe, &candidate, &mut rewrites)?;
+    let address = |bytes: &[u8]| va.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut arms = Vec::with_capacity(function.paths.len());
+    for path in &function.paths {
+        let body_va = address(&out);
+        let body =
+            compile_replacement_body(pe, &inputs, &rewrites, &path.exit, &path.effects, body_va)
+                .map_err(|error| format!("path for target {:#x}: {error}", path.target))?;
+        arms.push(vmpx_recompile::DispatchArm {
+            value: path.target,
+            body: body_va,
+        });
+        out.extend(body);
+    }
+    let compute_va = address(&out);
+    out.extend(compile_branch_target(
+        &function.branch_target,
+        &inputs,
+        compute_va,
+    )?);
+
+    let stub_va = pe
+        .optional
+        .image_base
+        .checked_add_rva(function.rva)
+        .ok_or("stub VA overflow")?
+        .0;
+    let image_pe = PeImage::parse(image).map_err(|error| error.to_string())?;
+    let stub_offset = image_pe
+        .rva_to_file_offset(function.rva)
+        .map_err(|error| error.to_string())?;
+    let stub_start = usize::try_from(stub_offset.0).map_err(|_| "stub offset overflow")?;
+    let stub_bytes = image
+        .get(stub_start..)
+        .ok_or("stub is outside the image")?;
+    let displaced_va = address(&out);
+    out.extend(
+        vmpx_recompile::emit_displaced_stub(
+            &stub_bytes[..stub_bytes.len().min(32)],
+            stub_va,
+            5,
+            displaced_va,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+
+    let dispatcher_offset = u32::try_from(out.len()).map_err(|_| "layout too large")?;
+    let dispatcher_va = address(&out);
+    let dispatcher = vmpx_recompile::emit_value_dispatcher(
+        &vmpx_recompile::ValueDispatch {
+            value: vmpx_recompile::PhysicalRegister::Rax,
+            scratch: vmpx_recompile::PhysicalRegister::Rcx,
+            saved: &DISPATCH_SAVED,
+            compute: compute_va,
+            arms: &arms,
+            fallback: displaced_va,
+        },
+        dispatcher_va,
+    )
+    .map_err(|error| error.to_string())?;
+    out.extend(dispatcher);
+    Ok((out, dispatcher_offset))
+}
+
 /// Resolves a TLS entry's RVA back to its position in the TLS directory's
 /// callback array, which is the index `set_tls_callback`/`reintegrate` need.
 fn tls_callback_index(pe: &PeImage<'_>, entry_rva: Rva) -> Option<usize> {
@@ -1893,6 +2095,36 @@ mod reintegration_tests {
     use super::*;
     use vmpx_pe::Rva;
     use vmpx_recompile::PhysicalRegister;
+
+    fn rax_input() -> Vec<(String, PhysicalRegister)> {
+        vec![("native_rax_initial".to_owned(), PhysicalRegister::Rax)]
+    }
+
+    #[test]
+    fn branch_target_over_an_entry_input_compiles_to_a_callable() {
+        let target = vmpx_vm::Expr::binary(
+            vmpx_vm::BinaryOp::Add,
+            vmpx_vm::Expr::register(BitWidth::W64, "native_rax_initial"),
+            vmpx_vm::Expr::constant(BitWidth::W64, 5),
+        )
+        .expect("expr");
+        let bytes = compile_branch_target(&target, &rax_input(), 0x1_4000_2000).expect("compile");
+        assert_eq!(bytes.last().copied(), Some(0xC3));
+    }
+
+    #[test]
+    fn branch_target_over_a_non_input_symbol_is_deferred() {
+        let target = vmpx_vm::Expr::register(BitWidth::W64, "native_rbx_initial");
+        let error = compile_branch_target(&target, &rax_input(), 0x1_4000_2000)
+            .expect_err("rbx is not bound");
+        assert!(error.contains("not an entry input"));
+    }
+
+    #[test]
+    fn narrow_branch_target_is_deferred() {
+        let target = vmpx_vm::Expr::register(BitWidth::W32, "native_rax_initial");
+        assert!(compile_branch_target(&target, &rax_input(), 0x1_4000_2000).is_err());
+    }
 
     #[test]
     fn dispatcher_follows_bodies_and_targets_each_body() {
