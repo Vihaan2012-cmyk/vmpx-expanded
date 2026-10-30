@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 iced-x86.workspace = true
+vmpx-pe = { path = "../vmpx-pe" }
 
 [dev-dependencies]
 iced-x86 = { workspace = true, features = ["code_asm"] }

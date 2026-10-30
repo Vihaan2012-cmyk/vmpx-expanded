@@ -162,7 +162,9 @@ impl Emulator {
     }
 
     fn ea(&self, ins: &Instruction) -> Result<u64, Stop> {
-        if matches!(ins.memory_segment(), Register::FS | Register::GS) {
+        // Only gs: is modeled (base added below); fs: and other segments stop.
+        let seg = ins.memory_segment();
+        if seg == Register::FS {
             return Err(self.unsup());
         }
         let base = ins.memory_base();
@@ -183,6 +185,9 @@ impl Emulator {
             }
             let v = self.cpu.reg(idx).ok_or_else(|| self.unsup())?;
             a = a.wrapping_add(v.wrapping_mul(u64::from(ins.memory_index_scale())));
+        }
+        if seg == Register::GS {
+            a = a.wrapping_add(self.cpu.gs_base);
         }
         Ok(a)
     }

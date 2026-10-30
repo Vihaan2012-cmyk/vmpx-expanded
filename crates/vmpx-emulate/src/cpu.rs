@@ -16,12 +16,15 @@ pub fn mask(bytes: u32) -> u64 {
 
 /// x64 user-mode register state. `undef_flags` marks rflags bits whose value
 /// the architecture leaves undefined after the last flag-writing instruction.
+/// `gs_base` is the linear base added to `gs:`-relative memory operands (the
+/// only segment base modeled; see [`crate::Emulator`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cpu {
     pub regs: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
     pub undef_flags: u64,
+    pub gs_base: u64,
 }
 
 enum Loc {
@@ -46,7 +49,7 @@ fn locate(r: Register) -> Option<Loc> {
 impl Cpu {
     #[must_use]
     pub fn new(rip: u64) -> Self {
-        Self { regs: [0; 16], rip, rflags: 2, undef_flags: 0 }
+        Self { regs: [0; 16], rip, rflags: 2, undef_flags: 0, gs_base: 0 }
     }
 
     /// Read a general-purpose register; `None` for non-GPRs.

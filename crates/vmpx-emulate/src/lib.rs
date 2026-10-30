@@ -23,10 +23,11 @@
 //! commits and may stop the run; the caller can then patch [`Cpu`]/[`Memory`]
 //! (e.g. fake an API return) and resume with `step`/`run`.
 //!
-//! # Planned layers (not implemented yet)
+//! # Layers
 //!
-//! 1. PE loader: map sections of a `vmpx-pe` image with section permissions,
-//!    build a stack, TEB/PEB stubs and an import table pointing at stub thunks.
+//! 1. PE loader ([`loader`]): map sections of a `vmpx-pe` image with section
+//!    permissions, build a stack, TEB/PEB stubs and an import table pointing at
+//!    stub thunks. **Implemented.**
 //! 2. API-stub hooks: resolve thunk addresses in `Hook::on_flow`, emulate the
 //!    needed Win32 surface (memory, loader, sync) and return into the guest.
 //! 3. Instruction coverage: widen the subset (string ops, SSE, flags-reading
@@ -47,9 +48,11 @@
 mod alu;
 mod cpu;
 mod emu;
+mod loader;
 mod memory;
 
 pub use alu::{Alu, Flags, Shift};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
 pub use emu::{Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, Stop, TraceEntry};
+pub use loader::{LoadError, LoadOptions, LoadedImage, load};
 pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
