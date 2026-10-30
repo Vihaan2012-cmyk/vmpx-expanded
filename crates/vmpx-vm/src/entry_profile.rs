@@ -152,17 +152,26 @@ fn decode_entry_stream(
 
 /// The register the VM entry captures native RSP into, taken from the first
 /// full-width `mov reg, rsp` on the call-target trace before any nested call.
-fn first_rsp_capture(
+fn last_rsp_capture(
     pe: &PeImage<'_>,
     call_target: Rva,
     limits: DirectJumpTraceLimits,
 ) -> Result<Option<iced_x86::Register>, DisasmError> {
     use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
     let trace = trace_direct_jump_fragments(pe, call_target, limits)?;
+    // The VM operand-stack pointer is the stack-pointer snapshot that is still
+    // live when the first handler dispatches. A heavily mutated bootstrap may
+    // take several `mov reg,rsp` / `lea reg,[rsp+disp]` snapshots before
+    // dispatch, with the earlier destinations repurposed afterwards (e.g.
+    // `mov r11,rsp` ... `lea r11,[rbp-200h]`), so the *last* snapshot before
+    // any call is the surviving cursor; the earlier ones are mutation decoys.
+    // A wrong choice makes handler shapes fail closed (the VM stalls) rather
+    // than mis-decode, so taking the final snapshot never trades soundness.
+    let mut cursor = None;
     for decoded in trace.instructions() {
         let instruction = &decoded.instruction;
         if instruction.flow_control() == FlowControl::Call {
-            return Ok(None);
+            break;
         }
         if instruction.mnemonic() == Mnemonic::Mov
             && instruction.op0_kind() == OpKind::Register
@@ -171,7 +180,7 @@ fn first_rsp_capture(
             && instruction.op1_register() == Register::RSP
             && instruction.op0_register() != Register::RSP
         {
-            return Ok(Some(instruction.op0_register()));
+            cursor = Some(instruction.op0_register());
         }
         // Mutated bootstraps capture the stack pointer with `lea reg,[rsp+disp]`
         // instead of `mov reg,rsp` (e.g. `lea rbp,[rsp-28h]`). Base must be RSP
@@ -183,10 +192,10 @@ fn first_rsp_capture(
             && instruction.memory_base() == Register::RSP
             && instruction.memory_index() == Register::None
         {
-            return Ok(Some(instruction.op0_register()));
+            cursor = Some(instruction.op0_register());
         }
     }
-    Ok(None)
+    Ok(cursor)
 }
 
 /// The linear VM stream of an entry, decoded without requiring a fully proven
@@ -202,8 +211,9 @@ pub struct RecoveredEntryStream {
 
 /// Decodes an entry's linear VM stream from the bootstrap-proven roles, initial
 /// state and table anchor. The VSP register comes from the proven native frame
-/// when available, otherwise from the entry's first `mov reg, rsp` capture; a
-/// wrong VSP makes handler semantics fail closed rather than mis-decode.
+/// when available, otherwise from the last stack-pointer snapshot the bootstrap
+/// takes before dispatch (`mov reg, rsp` / `lea reg,[rsp+disp]`); a wrong VSP
+/// makes handler semantics fail closed rather than mis-decode.
 ///
 /// # Errors
 ///
@@ -253,7 +263,7 @@ pub(crate) fn prepare_entry_stream(
         Some(register) if native_frame.status == RecoveryStatus::Recovered => register.to_iced(),
         _ => entry
             .call_target
-            .map(|target| first_rsp_capture(pe, target, limits.trace))
+            .map(|target| last_rsp_capture(pe, target, limits.trace))
             .transpose()?
             .flatten()
             .ok_or(EntryProfileRecoveryError::MissingCursor)?,
@@ -379,4 +389,88 @@ pub fn recover_entry_profile(
         operational_instruction_offset,
         symbolic,
     })
+}
+
+#[cfg(test)]
+mod last_rsp_capture_tests {
+    use iced_x86::code_asm::*;
+    use vmpx_disasm::DirectJumpTraceLimits;
+    use vmpx_pe::{PeImage, Rva};
+
+    use super::last_rsp_capture;
+
+    // Minimal 64-bit PE with a single `.text` section holding `code` at RVA 0x1000.
+    fn executable_pe64(code: &[u8]) -> Vec<u8> {
+        let mut data = vec![0_u8; 0x800];
+        data[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        data[0x3C..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        data[0x80..0x84].copy_from_slice(&0x0000_4550_u32.to_le_bytes());
+        let coff = 0x84;
+        data[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+        data[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        data[coff + 16..coff + 18].copy_from_slice(&0xF0_u16.to_le_bytes());
+        data[coff + 18..coff + 20].copy_from_slice(&0x2022_u16.to_le_bytes());
+        let optional = coff + 20;
+        data[optional..optional + 2].copy_from_slice(&0x20B_u16.to_le_bytes());
+        data[optional + 16..optional + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 20..optional + 24].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 24..optional + 32].copy_from_slice(&0x1_4000_0000_u64.to_le_bytes());
+        data[optional + 32..optional + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 36..optional + 40].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[optional + 56..optional + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+        data[optional + 60..optional + 64].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[optional + 68..optional + 70].copy_from_slice(&3_u16.to_le_bytes());
+        data[optional + 108..optional + 112].copy_from_slice(&16_u32.to_le_bytes());
+        let section = optional + 0xF0;
+        data[section..section + 5].copy_from_slice(b".text");
+        data[section + 8..section + 12].copy_from_slice(&0x600_u32.to_le_bytes());
+        data[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&0x600_u32.to_le_bytes());
+        data[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[section + 36..section + 40].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+        data[0x200..0x200 + code.len()].copy_from_slice(code);
+        data
+    }
+
+    fn capture_of(code: &[u8]) -> Option<iced_x86::Register> {
+        let bytes = executable_pe64(code);
+        let pe = PeImage::parse(&bytes).expect("valid synthetic PE");
+        last_rsp_capture(&pe, Rva(0x1000), DirectJumpTraceLimits::default())
+            .expect("trace decodes")
+    }
+
+    // A mutated bootstrap snapshots RSP into a decoy register that is then
+    // repurposed, before taking the real snapshot. The surviving (last) one wins.
+    #[test]
+    fn prefers_last_snapshot_over_repurposed_decoy() {
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.mov(r11, rsp).expect("decoy capture");
+        a.lea(r11, qword_ptr(rbp - 0x200)).expect("repurpose decoy");
+        a.mov(rbp, rsp).expect("real capture");
+        a.jmp(r14).expect("dispatch");
+        let code = a.assemble(0x1_4000_1000).expect("assemble");
+        assert_eq!(capture_of(&code), Some(iced_x86::Register::RBP));
+    }
+
+    // A clean bootstrap with a single snapshot is unchanged.
+    #[test]
+    fn single_snapshot_is_the_cursor() {
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.lea(rbp, qword_ptr(rsp - 0x28)).expect("lea capture");
+        a.jmp(r14).expect("dispatch");
+        let code = a.assemble(0x1_4000_1000).expect("assemble");
+        assert_eq!(capture_of(&code), Some(iced_x86::Register::RBP));
+    }
+
+    // Scanning stops at the first call: a snapshot after the call is ignored.
+    #[test]
+    fn ignores_snapshots_after_a_call() {
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.mov(rbp, rsp).expect("pre-call capture");
+        a.call(0x1_4000_2000_u64).expect("call");
+        a.mov(r12, rsp).expect("post-call capture");
+        a.jmp(r14).expect("dispatch");
+        let code = a.assemble(0x1_4000_1000).expect("assemble");
+        assert_eq!(capture_of(&code), Some(iced_x86::Register::RBP));
+    }
 }
