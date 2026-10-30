@@ -42,6 +42,8 @@ pub struct BootstrapDispatchRecovery {
     pub slice: NativeBackwardSlice,
     pub encoded_load: Rva,
     pub initial_state: RelativeDispatchState,
+    /// Register that held the statically anchored table base at dispatch.
+    pub table_register: Option<Register>,
     pub confidence: u8,
 }
 
@@ -651,6 +653,7 @@ pub fn recover_bootstrap_dispatch(
                             slice: slice.clone(),
                             encoded_load: candidate.encoded_load,
                             initial_state,
+                            table_register: candidate.table_register,
                             confidence: candidate.confidence,
                         });
                     }

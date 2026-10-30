@@ -35,6 +35,9 @@ pub struct DispatchExtractionCandidate {
     /// Static handler anchor established before the dispatch load, if any.
     pub handler_rebase: Option<Va>,
     pub handler_rebase_rva: Option<Rva>,
+    /// Register holding the table base of a table-indexed dispatch.
+    #[serde(skip)]
+    pub table_register: Option<Register>,
     pub vip_delta: i64,
     pub handler_update: Rva,
     pub terminal_dispatch: Rva,
@@ -834,6 +837,7 @@ fn attempt_candidate(
         vip_rebased_before_source,
         handler_rebase,
         handler_rebase_rva,
+        table_register: None,
         vip_delta,
         handler_update,
         terminal_dispatch,
@@ -1053,6 +1057,7 @@ fn attempt_table_indexed_candidate(
         vip_rebased_before_source: false,
         handler_rebase,
         handler_rebase_rva,
+        table_register: Some(table),
         vip_delta,
         handler_update: decoded[handler_add_index].rva,
         terminal_dispatch,

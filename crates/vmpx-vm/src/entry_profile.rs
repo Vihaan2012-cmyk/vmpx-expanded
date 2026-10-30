@@ -1,16 +1,19 @@
 use serde::Serialize;
 use thiserror::Error;
-use vmpx_disasm::{DirectJumpTraceLimits, DisasmError, RegisterDispatchProofLimits};
-use vmpx_pe::PeImage;
+use vmpx_disasm::{
+    DirectJumpTraceLimits, DisasmError, RegisterDispatchProofLimits, trace_direct_jump_fragments,
+};
+use vmpx_pe::{PeImage, Rva};
 
 use crate::{
     BootstrapDispatchRecovery, BootstrapDispatchReport, BootstrapRecoveryError,
-    BytecodeDecodeError, HandlerCodecRecoveryConfig, HandlerEffectRoles,
+    BytecodeDecodeError, GlobalTableBase, HandlerCodecRecoveryConfig, HandlerEffectRoles,
     LinearHandlerRecoveryError, LinearHandlerRecoveryReport, NativeContextMappingReport,
-    RecoveryStatus, SymbolicExecutionError, SymbolicExecutionLimits, SymbolicVmExecutionReport,
-    VmEntryCandidate, VmProfile, X64NativeFrameReport, analyze_x64_native_frame,
-    execute_symbolic_linear_block_with_initial_state, map_native_context_scatter,
-    recover_and_decode_linear_vm_stream, recover_bootstrap_dispatch,
+    RecoveryStatus, RelativeDispatchState, SymbolicExecutionError, SymbolicExecutionLimits,
+    SymbolicVmExecutionReport, VmEntryCandidate, VmProfile, X64NativeFrameReport,
+    analyze_x64_native_frame, execute_symbolic_linear_block_with_initial_state,
+    map_native_context_scatter, recover_and_decode_linear_vm_stream_with_table,
+    recover_bootstrap_dispatch,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +101,131 @@ impl From<SymbolicExecutionError> for EntryProfileRecoveryError {
     }
 }
 
+/// Walks the linear VM stream from `state`, threading the bootstrap-proven table
+/// anchor (when the dispatch is table-indexed) into every handler.
+fn decode_entry_stream(
+    pe: &PeImage<'_>,
+    bootstrap: &BootstrapDispatchRecovery,
+    state: RelativeDispatchState,
+    profile: &VmProfile,
+    limits: EntryProfileRecoveryLimits,
+) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
+    let global_table = bootstrap
+        .codec
+        .table
+        .and_then(|table| table.table_base)
+        .zip(bootstrap.table_register)
+        .map(|(base, register)| GlobalTableBase { register, base });
+    recover_and_decode_linear_vm_stream_with_table(
+        pe,
+        state,
+        &HandlerCodecRecoveryConfig {
+            roles: profile.handler_roles,
+            bytecode_direction: profile.bytecode_direction,
+            effect_roles: Some(profile.effect_roles),
+            live_out_registers: vec![
+                profile.effect_roles.vsp,
+                profile.handler_roles.handler,
+                profile.handler_roles.vip,
+                profile.handler_roles.rolling_key,
+            ],
+            live_out_rflags: 0,
+            trace_limits: limits.trace,
+            proof_limits: limits.dispatch_proof,
+        },
+        limits.instruction_limit,
+        global_table,
+    )
+}
+
+/// The register the VM entry captures native RSP into, taken from the first
+/// full-width `mov reg, rsp` on the call-target trace before any nested call.
+fn first_rsp_capture(
+    pe: &PeImage<'_>,
+    call_target: Rva,
+    limits: DirectJumpTraceLimits,
+) -> Result<Option<iced_x86::Register>, DisasmError> {
+    use iced_x86::{FlowControl, Mnemonic, OpKind, Register};
+    let trace = trace_direct_jump_fragments(pe, call_target, limits)?;
+    for decoded in trace.instructions() {
+        let instruction = &decoded.instruction;
+        if instruction.flow_control() == FlowControl::Call {
+            return Ok(None);
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register().size() == 8
+            && instruction.op1_register() == Register::RSP
+            && instruction.op0_register() != Register::RSP
+        {
+            return Ok(Some(instruction.op0_register()));
+        }
+    }
+    Ok(None)
+}
+
+/// The linear VM stream of an entry, decoded without requiring a fully proven
+/// saved-native frame.
+#[derive(Clone, Debug)]
+pub struct RecoveredEntryStream {
+    pub bootstrap_report: BootstrapDispatchReport,
+    pub bootstrap: BootstrapDispatchRecovery,
+    pub native_frame: X64NativeFrameReport,
+    pub profile: VmProfile,
+    pub decode: LinearHandlerRecoveryReport,
+}
+
+/// Decodes an entry's linear VM stream from the bootstrap-proven roles, initial
+/// state and table anchor. The VSP register comes from the proven native frame
+/// when available, otherwise from the entry's first `mov reg, rsp` capture; a
+/// wrong VSP makes handler semantics fail closed rather than mis-decode.
+///
+/// # Errors
+///
+/// Fails on an ambiguous bootstrap, a missing VSP capture, or decode errors.
+pub fn recover_entry_stream(
+    pe: &PeImage<'_>,
+    entry: &VmEntryCandidate,
+    limits: EntryProfileRecoveryLimits,
+) -> Result<RecoveredEntryStream, EntryProfileRecoveryError> {
+    let (bootstrap_report, bootstrap) = recover_bootstrap_dispatch(pe, entry, limits.trace)?;
+    let bootstrap = bootstrap.ok_or_else(|| EntryProfileRecoveryError::AmbiguousBootstrap {
+        message: bootstrap_report.diagnostics.join("; "),
+    })?;
+    let native_frame = analyze_x64_native_frame(pe, entry.rva, limits.trace)?;
+    let vsp = match native_frame.cursor_architectural_register {
+        Some(register) if native_frame.status == RecoveryStatus::Recovered => register.to_iced(),
+        _ => entry
+            .call_target
+            .map(|target| first_rsp_capture(pe, target, limits.trace))
+            .transpose()?
+            .flatten()
+            .ok_or(EntryProfileRecoveryError::MissingCursor)?,
+    };
+    let first = bootstrap.codec.decode_direction(
+        pe,
+        bootstrap.initial_state,
+        bootstrap.bytecode_direction,
+    )?;
+    let profile = VmProfile {
+        handler_roles: bootstrap.roles,
+        effect_roles: HandlerEffectRoles {
+            vsp,
+            context_base: iced_x86::Register::RSP,
+        },
+        bytecode_direction: bootstrap.bytecode_direction,
+    };
+    let decode = decode_entry_stream(pe, &bootstrap, first.state_after, &profile, limits)?;
+    Ok(RecoveredEntryStream {
+        bootstrap_report,
+        bootstrap,
+        native_frame,
+        profile,
+        decode,
+    })
+}
+
 /// Recovers a loader-visible VM entry through its first virtual control-flow
 /// boundary using only native bootstrap data flow and handler behavior.
 ///
@@ -144,25 +272,7 @@ pub fn recover_entry_profile(
         effect_roles,
         bytecode_direction: bootstrap.bytecode_direction,
     };
-    let decode = recover_and_decode_linear_vm_stream(
-        pe,
-        first.state_after,
-        &HandlerCodecRecoveryConfig {
-            roles: profile.handler_roles,
-            bytecode_direction: profile.bytecode_direction,
-            effect_roles: Some(profile.effect_roles),
-            live_out_registers: vec![
-                vsp,
-                profile.handler_roles.handler,
-                profile.handler_roles.vip,
-                profile.handler_roles.rolling_key,
-            ],
-            live_out_rflags: 0,
-            trace_limits: limits.trace,
-            proof_limits: limits.dispatch_proof,
-        },
-        limits.instruction_limit,
-    )?;
+    let decode = decode_entry_stream(pe, &bootstrap, first.state_after, &profile, limits)?;
     let operational_instruction_offset = native_frame.slots.len();
     let scatter = decode
         .decode

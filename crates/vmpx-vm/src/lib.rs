@@ -58,10 +58,12 @@ pub use checksum_handler::{
     analyze_table_checksum_handler,
 };
 pub use codec_recovery::{
-    HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport, LinearHandlerRecoveryError,
-    LinearHandlerRecoveryReport, ResolvedVmProfileRoles, VmProfileRoleCandidateReport,
-    VmProfileRoleResolution, VmProfileRoleResolutionConfig, VmProfileRoleResolutionReport,
-    recover_and_decode_linear_vm_stream, recover_handler_codecs, resolve_vm_profile_roles,
+    GlobalTableBase, HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport,
+    LinearHandlerRecoveryError, LinearHandlerRecoveryReport, ResolvedVmProfileRoles,
+    TableDispatchFacts, VmProfileRoleCandidateReport, VmProfileRoleResolution,
+    VmProfileRoleResolutionConfig, VmProfileRoleResolutionReport,
+    recover_and_decode_linear_vm_stream, recover_and_decode_linear_vm_stream_with_table,
+    recover_handler_codecs, resolve_vm_profile_roles,
 };
 pub use decoder::{
     BytecodeDecodeError, DecodedDispatch, DecodedOperandDispatch, DecodedVmInstruction,
@@ -88,7 +90,7 @@ pub use entry_paths::{
 };
 pub use entry_profile::{
     EntryProfileRecoveryError, EntryProfileRecoveryLimits, RecoveredEntryProfile,
-    recover_entry_profile,
+    RecoveredEntryStream, recover_entry_profile, recover_entry_stream,
 };
 pub use exception_flow::{
     ExceptionContinuationResolution, ExceptionContinuationSource, ExceptionStackSledReport,

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::Register;
+use iced_x86::{InstructionInfoFactory, Register};
 use serde::Serialize;
 use vmpx_disasm::{
     CfgLimits, DirectJumpTraceLimits, DirectJumpTraceStop, DirectJumpTraceStopKind, DisasmError,
@@ -8,6 +8,7 @@ use vmpx_disasm::{
 };
 use vmpx_pe::{PeImage, Rva, Va};
 
+use crate::dispatch_extract::writes_register;
 use crate::{
     BitWidth, BytecodeDecodeError, BytecodeDirection, DecodedVmInstruction,
     DispatchExtractionCandidate, DispatchExtractionReport, EffectKnowledge, HandlerEffectRoles,
@@ -73,6 +74,21 @@ pub struct VmProfileRoleResolution {
     pub recovered: Option<ResolvedVmProfileRoles>,
 }
 
+/// Register a table-indexed dispatch reads its base from, and whether the
+/// handler's own native trace leaves that register untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableDispatchFacts {
+    pub register: Register,
+    pub preserved: bool,
+}
+
+/// Bootstrap-proven table anchor that table-indexed handlers inherit as a live-in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlobalTableBase {
+    pub register: Register,
+    pub base: Va,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HandlerCodecRecoveryReport {
     pub schema_version: u32,
@@ -95,6 +111,8 @@ pub struct HandlerCodecRecoveryReport {
     pub semantic_metadata: Option<VmSemanticMetadata>,
     pub boundary_spec: Option<NativeCallBoundarySpec>,
     pub decode_spec: Option<VmHandlerDecodeSpec>,
+    #[serde(skip)]
+    pub table_dispatch: Option<TableDispatchFacts>,
     pub confidence: u8,
     pub diagnostics: Vec<String>,
 }
@@ -687,6 +705,18 @@ pub fn recover_handler_codecs(
     if let Some(spec) = &mut decode_spec {
         spec.confidence = spec.confidence.min(confidence);
     }
+    let table_dispatch = match dispatch_analysis.candidates.as_slice() {
+        [candidate] => candidate.table_register.map(|register| {
+            let mut factory = InstructionInfoFactory::new();
+            TableDispatchFacts {
+                register,
+                preserved: !trace
+                    .instructions()
+                    .any(|decoded| writes_register(&mut factory, &decoded.instruction, register)),
+            }
+        }),
+        _ => None,
+    };
     Ok(HandlerCodecRecoveryReport {
         schema_version: 12,
         entry,
@@ -708,6 +738,7 @@ pub fn recover_handler_codecs(
         semantic_metadata,
         boundary_spec,
         decode_spec,
+        table_dispatch,
         confidence,
         diagnostics,
     })
@@ -847,12 +878,67 @@ fn linear_report(
 /// # Errors
 ///
 /// Returns structured native-disassembly, address, or bytecode errors.
-#[allow(clippy::too_many_lines)]
 pub fn recover_and_decode_linear_vm_stream(
     pe: &PeImage<'_>,
     initial_state: RelativeDispatchState,
     config: &HandlerCodecRecoveryConfig,
     max_instructions: usize,
+) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
+    recover_and_decode_linear_vm_stream_with_table(
+        pe,
+        initial_state,
+        config,
+        max_instructions,
+        None,
+    )
+}
+
+/// Binds the bootstrap-proven table anchor into a table-indexed spec that has no
+/// anchor of its own. The handler must read its table from the same register the
+/// bootstrap anchored and never write it, otherwise the spec is refused.
+fn bind_table_base(
+    mut spec: VmHandlerDecodeSpec,
+    facts: Option<TableDispatchFacts>,
+    global: Option<GlobalTableBase>,
+) -> Result<VmHandlerDecodeSpec, String> {
+    let Some(global) = global else {
+        return Ok(spec);
+    };
+    let Some(table) = spec.dispatch.table.as_mut() else {
+        return Ok(spec);
+    };
+    if table.table_base.is_some() {
+        return Ok(spec);
+    }
+    match facts {
+        Some(facts) if facts.register == global.register && facts.preserved => {
+            table.table_base = Some(global.base);
+            Ok(spec)
+        }
+        Some(facts) if facts.register != global.register => Err(format!(
+            "handler dispatches through table register {:?}, bootstrap anchored {:?}",
+            facts.register, global.register
+        )),
+        Some(_) => Err("handler writes the dispatch table register".to_owned()),
+        None => Err("handler table register is not recovered".to_owned()),
+    }
+}
+
+/// Like [`recover_and_decode_linear_vm_stream`], threading the bootstrap-proven
+/// table anchor into every table-indexed handler that lacks its own. With
+/// `global_table` set, a table-indexed handler whose table register cannot be
+/// proven equal to the anchor and unmodified is refused (`MissingHandlerSpec`).
+///
+/// # Errors
+///
+/// Returns structured native-disassembly, address, or bytecode errors.
+#[allow(clippy::too_many_lines)]
+pub fn recover_and_decode_linear_vm_stream_with_table(
+    pe: &PeImage<'_>,
+    initial_state: RelativeDispatchState,
+    config: &HandlerCodecRecoveryConfig,
+    max_instructions: usize,
+    global_table: Option<GlobalTableBase>,
 ) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
     let mut instructions = Vec::new();
     let mut seen = BTreeSet::new();
@@ -941,7 +1027,7 @@ pub fn recover_and_decode_linear_vm_stream(
                     partial: Box::new(partial),
                 });
             };
-            let recovery = match recover_handler_codecs(pe, handler_rva, config) {
+            let mut recovery = match recover_handler_codecs(pe, handler_rva, config) {
                 Ok(recovery) => recovery,
                 Err(source) => {
                     let partial = linear_report(
@@ -959,7 +1045,18 @@ pub fn recover_and_decode_linear_vm_stream(
                     });
                 }
             };
-            let spec = recovery.decode_spec.clone();
+            let spec = match recovery.decode_spec.clone() {
+                Some(spec) => match bind_table_base(spec, recovery.table_dispatch, global_table) {
+                    Ok(spec) => Some(spec),
+                    Err(reason) => {
+                        recovery.diagnostics.push(format!(
+                            "table base cannot be bound from the bootstrap anchor: {reason}"
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
             let codecs_complete = codec_recovery_status(
                 recovery.dispatch_analysis.candidates.len(),
                 recovery.operand_analysis.candidates.len(),
