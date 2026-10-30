@@ -58,38 +58,56 @@ Text output
 ``UnpackReport``
 ----------------
 
-=======================  =====================================================
-Field                    Contents
-=======================  =====================================================
-``schema_version``       Report format version
-``input_size``           Input size in bytes
-``output_size``          Size of the analysis image
-``packed_sections``      Number of packed destination sections
-``packer_table``         ``{kind, file_offset, destination_key,
-                         lzma_properties, entries}``
-``blocks``               One entry per decompressed block
-``in_memory_reparsed``   The image parsed successfully in memory
-``disk_reparsed``        The written file parsed successfully from disk
-``warnings``             For example a block that decompressed to fewer bytes
-                         than its section's virtual size
-=======================  =====================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 23 53
+
+   * - Field
+     - Contents
+   * - ``schema_version``
+     - Report format version
+   * - ``input_size``
+     - Input size in bytes
+   * - ``output_size``
+     - Size of the analysis image
+   * - ``packed_sections``
+     - Number of packed destination sections
+   * - ``packer_table``
+     - ``{kind, file_offset, destination_key, lzma_properties, entries}``
+   * - ``blocks``
+     - One entry per decompressed block
+   * - ``in_memory_reparsed``
+     - The image parsed successfully in memory
+   * - ``disk_reparsed``
+     - The written file parsed successfully from disk
+   * - ``warnings``
+     - For example a block that decompressed to fewer bytes than its section's virtual size
 
 ``packer_table.kind`` is ``LegacyPlaintext`` or ``EncodedRotatingKey`` (see
 :doc:`/vmprotect/packing`). ``destination_key`` is the recovered rotating key
 for the encoded layout and null for the legacy layout. Each entry in ``entries``
 is ``{source_rva, destination_rva}``. Each entry in ``blocks`` is:
 
-========================  ====================================================
-Field                     Contents
-========================  ====================================================
-``section_index``         Index of the destination section
-``section_name``          Name of the destination section
-``source_rva``            RVA of the compressed stream
-``destination_rva``       RVA the stream expands to
-``section_virtual_size``  The section's virtual size
-``destination_capacity``  Bytes available before the next section
-``decompressed_size``     Bytes actually produced
-========================  ====================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 24 52
+
+   * - Field
+     - Contents
+   * - ``section_index``
+     - Index of the destination section
+   * - ``section_name``
+     - Name of the destination section
+   * - ``source_rva``
+     - RVA of the compressed stream
+   * - ``destination_rva``
+     - RVA the stream expands to
+   * - ``section_virtual_size``
+     - The section's virtual size
+   * - ``destination_capacity``
+     - Bytes available before the next section
+   * - ``decompressed_size``
+     - Bytes actually produced
 
 Failure modes
 -------------

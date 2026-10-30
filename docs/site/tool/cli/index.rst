@@ -26,20 +26,40 @@ variants of the clap ``Command`` enum in ``crates/vmpx-cli/src/main.rs``.
 Summary
 -------
 
-=============  ===========  ====================================================
-Subcommand     Effect       Purpose
-=============  ===========  ====================================================
-``clean``      writes       Full proof-gated recovery pipeline; emits a clean PE
-                            only when safe
-``info``       read-only    Inspect a PE-family file by content
-``verify``     read-only    Structural validation without executing the input
-``compare``    read-only    Research-only structural comparison of two files
-``unpack``     writes       Recover packed sections into an analysis image
-``detect``     read-only    Profile VMProtect evidence and layout
-``vm-list``    read-only    Discover evidence-scored VM entry stubs
-``imports``    read-only    Inventory imports and direct IAT references
-``oep``        read-only    Rank module-entry evidence
-=============  ===========  ====================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 13 11 52
+
+   * - Subcommand
+     - Effect
+     - Purpose
+   * - ``clean``
+     - writes
+     - Full proof-gated recovery pipeline; emits a clean PE only when safe
+   * - ``info``
+     - read-only
+     - Inspect a PE-family file by content
+   * - ``verify``
+     - read-only
+     - Structural validation without executing the input
+   * - ``compare``
+     - read-only
+     - Research-only structural comparison of two files
+   * - ``unpack``
+     - writes
+     - Recover packed sections into an analysis image
+   * - ``detect``
+     - read-only
+     - Profile VMProtect evidence and layout
+   * - ``vm-list``
+     - read-only
+     - Discover evidence-scored VM entry stubs
+   * - ``imports``
+     - read-only
+     - Inventory imports and direct IAT references
+   * - ``oep``
+     - read-only
+     - Rank module-entry evidence
 
 Conventions
 -----------
@@ -58,34 +78,56 @@ Wherever ``--json`` is accepted the output is a single pretty-printed JSON
 document on standard output. Without it, a bracket-tagged text report is
 printed. The tags identify the stage that produced each line:
 
-====================  =========================================================
-Tag                   Meaning
-====================  =========================================================
-``[pe]``, ``[file]``  Image kind and path (``info``, ``verify``)
-``[hash]``            SHA-256 of the input, uppercase hexadecimal
-``[headers]``         Image base, entry RVA/VA, size of image
-``[sections]``        One line per section
-``[directories]``     Data directories
-``[imports]``         Import module and symbol counts (``info``) or the IAT
-                      reference inventory (``imports``)
-``[exports]``         Export count
-``[tls]``             TLS callbacks
-``[exceptions]``      x64 exception-table function count
-``[relocations]``     Base relocation blocks and entries
-``[verify]``          Result of structural validation or of reparsing a
-                      written file from disk
-``[vmp]``             VMProtect detection verdict and weighted evidence
-``[region]``          One line per executable section
-``[vm]``              VM discovery summary, instances, entries and warnings
-``[oep]``             Module-entry assessment
-``[compare]``         Structural differences between two files
-``[unpack]``          Packer table, blocks and loader validation
-``[clean]``           Pipeline summary and blockers
-``[decode]``          One line per recovered VM path
-``[layout]``          Conventional relayout and loader validation
-``[experimental]``    Experimental-output notices
-``[report]``          Path of a written JSON report
-====================  =========================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 20 57
+
+   * - Tag
+     - Meaning
+   * - ``[pe]``, ``[file]``
+     - Image kind and path (``info``, ``verify``)
+   * - ``[hash]``
+     - SHA-256 of the input, uppercase hexadecimal
+   * - ``[headers]``
+     - Image base, entry RVA/VA, size of image
+   * - ``[sections]``
+     - One line per section
+   * - ``[directories]``
+     - Data directories
+   * - ``[imports]``
+     - Import module and symbol counts (``info``) or the IAT reference inventory (``imports``)
+   * - ``[exports]``
+     - Export count
+   * - ``[tls]``
+     - TLS callbacks
+   * - ``[exceptions]``
+     - x64 exception-table function count
+   * - ``[relocations]``
+     - Base relocation blocks and entries
+   * - ``[verify]``
+     - Result of structural validation or of reparsing a written file from disk
+   * - ``[vmp]``
+     - VMProtect detection verdict and weighted evidence
+   * - ``[region]``
+     - One line per executable section
+   * - ``[vm]``
+     - VM discovery summary, instances, entries and warnings
+   * - ``[oep]``
+     - Module-entry assessment
+   * - ``[compare]``
+     - Structural differences between two files
+   * - ``[unpack]``
+     - Packer table, blocks and loader validation
+   * - ``[clean]``
+     - Pipeline summary and blockers
+   * - ``[decode]``
+     - One line per recovered VM path
+   * - ``[layout]``
+     - Conventional relayout and loader validation
+   * - ``[experimental]``
+     - Experimental-output notices
+   * - ``[report]``
+     - Path of a written JSON report
 
 Every JSON document carries a ``schema_version`` field so that consumers can
 detect format changes. Addresses are serialized as plain integers (an ``Rva``

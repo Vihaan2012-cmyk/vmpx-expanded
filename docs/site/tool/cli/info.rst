@@ -67,29 +67,44 @@ JSON output
 
 ``pe`` is a ``PeReport``:
 
-====================  ====================================================
-Field                 Contents
-====================  ====================================================
-``schema_version``    Report format version
-``file_size``         Size of the file in bytes
-``nt_headers_offset`` File offset of the NT headers
-``coff``              COFF header (machine, section count, characteristics)
-``optional``          Optional header (kind, image base, entry point,
-                      alignments, size of image, subsystem)
-``entry_point_va``    Entry point as a VA, or null when unrepresentable
-``sections``          Section headers with ``name``, ``virtual_size``,
-                      ``virtual_address``, ``size_of_raw_data``,
-                      ``pointer_to_raw_data`` and ``characteristics``
-``directories``       The 16 data directories
-``imports``           Import modules with their symbols (by name or ordinal)
-``exports``           Export directory with symbols and forwarders, or null
-``tls``               TLS directory with callback VAs, or null
-``exception_functions``  x64 ``RUNTIME_FUNCTION`` table
-``relocations``       Base relocation blocks and entries
-``debug_entries``     Debug directory entries
-``load_config``       Load configuration directory, or null
-``diagnostics``       Structural diagnostics, each ``{stage, message}``
-====================  ====================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 20 52
+
+   * - Field
+     - Contents
+   * - ``schema_version``
+     - Report format version
+   * - ``file_size``
+     - Size of the file in bytes
+   * - ``nt_headers_offset``
+     - File offset of the NT headers
+   * - ``coff``
+     - COFF header (machine, section count, characteristics)
+   * - ``optional``
+     - Optional header (kind, image base, entry point, alignments, size of image, subsystem)
+   * - ``entry_point_va``
+     - Entry point as a VA, or null when unrepresentable
+   * - ``sections``
+     - Section headers with ``name``, ``virtual_size``, ``virtual_address``, ``size_of_raw_data``, ``pointer_to_raw_data`` and ``characteristics``
+   * - ``directories``
+     - The 16 data directories
+   * - ``imports``
+     - Import modules with their symbols (by name or ordinal)
+   * - ``exports``
+     - Export directory with symbols and forwarders, or null
+   * - ``tls``
+     - TLS directory with callback VAs, or null
+   * - ``exception_functions``
+     - x64 ``RUNTIME_FUNCTION`` table
+   * - ``relocations``
+     - Base relocation blocks and entries
+   * - ``debug_entries``
+     - Debug directory entries
+   * - ``load_config``
+     - Load configuration directory, or null
+   * - ``diagnostics``
+     - Structural diagnostics, each ``{stage, message}``
 
 Notes
 -----

@@ -28,7 +28,7 @@ Illustrative handlers
 The bodies below are what the semantic prefix looks like **before mutation**.
 Real handlers are the same operations hidden in junk (see :doc:`../mutation`).
 
-*Push a constant (``LCONST``)*
+**Push a constant** (``LCONST``)
 
 .. code-block:: nasm
 
@@ -36,7 +36,7 @@ Real handlers are the same operations hidden in junk (see :doc:`../mutation`).
     sub     rbp, 8                 ; VSP -= 8
     mov     [rbp], rax             ; push value
 
-*Add (``ADD``)*
+**Add** (``ADD``)
 
 .. code-block:: nasm
 
@@ -51,7 +51,7 @@ The final two instructions are how the VM obtains *virtual flags*: the native ``
 sets the real ``RFLAGS`` and the handler captures them onto the VM stack
 (:doc:`context-switch`).
 
-*Load a virtual register (``LREG``)*
+**Load a virtual register** (``LREG``)
 
 .. code-block:: nasm
 
@@ -60,7 +60,7 @@ sets the real ``RFLAGS`` and the handler captures them onto the VM stack
     sub     rbp, 8
     mov     [rbp], rdx
 
-*NOR*
+**NOR**
 
 .. code-block:: nasm
 

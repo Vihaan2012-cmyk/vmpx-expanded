@@ -89,9 +89,9 @@ The executable entry
 
 A non-DLL executable's entry point (CRT start) is invoked once, not with a
 ``DllMain``-style reason, so its invocation domain is a single path. The same
-empty-domain input-closed recovery applies (``decide_exe_entry``), and the
-"generic finite input-domain recovery for an executable entry is not
-implemented" blocker is dropped only on a successful recovery.
+empty-domain input-closed recovery applies (``decide_exe_entry``). On failure
+the blocker reads "executable entry is not recoverable as an input-closed
+single path"; on a successful recovery there is no blocker.
 
 4. Branching functions and proven-exhaustive domains
 ----------------------------------------------------

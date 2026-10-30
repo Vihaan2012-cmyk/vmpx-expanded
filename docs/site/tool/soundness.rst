@@ -106,6 +106,8 @@ Conditional blockers
 
    * - Blocker
      - Raised when
+   * - ``executable entry has VM-entry confidence N, below 60``
+     - The executable's entry is not a confident VM entry
    * - ``protected header entry has no recovered VM profile``
      - The input has VMProtect evidence but the header entry is not a VM entry
    * - ``header VM entry path recovery is incomplete``
@@ -114,7 +116,7 @@ Conditional blockers
      - The effect-liveness audit does not clear the family
    * - ``N loader-reachable TLS VM entry/entries remain semantically unresolved``
      - A TLS callback VM entry was not fully recovered
-   * - generic finite input-domain recovery for an executable entry is not implemented
+   * - ``executable entry is not recoverable as an input-closed single path: ...``
      - A non-DLL header entry could not be recovered as a single input-closed path
    * - ``input has no strong VMProtect evidence but its layout is not a conventional PE file``
      - ``NoStrongEvidence`` with a non-conventional layout

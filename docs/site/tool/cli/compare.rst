@@ -61,22 +61,39 @@ JSON output
 
 ``left`` and ``right`` are file summaries:
 
-=======================  ==================================================
-Field                    Contents
-=======================  ==================================================
-``path``, ``sha256``     Identity of the file
-``file_size``            Size in bytes
-``kind``, ``machine``    Image kind and machine code
-``image_base``           Preferred image base
-``entry_point``          Entry RVA
-``size_of_image``        Size of image in memory
-``section_count``        Number of sections
-``import_modules``       Count of import modules
-``import_symbols``       Count of imported symbols
-``exports``              Count of exports
-``tls_callbacks``        Count of TLS callbacks
-``exception_functions``  Count of x64 runtime functions
-``relocation_blocks``    Count of relocation blocks
-``relocation_entries``   Count of relocation entries
-``diagnostics``          Count of structural diagnostics
-=======================  ==================================================
+.. list-table::
+   :header-rows: 1
+   :widths: 23 50
+
+   * - Field
+     - Contents
+   * - ``path``, ``sha256``
+     - Identity of the file
+   * - ``file_size``
+     - Size in bytes
+   * - ``kind``, ``machine``
+     - Image kind and machine code
+   * - ``image_base``
+     - Preferred image base
+   * - ``entry_point``
+     - Entry RVA
+   * - ``size_of_image``
+     - Size of image in memory
+   * - ``section_count``
+     - Number of sections
+   * - ``import_modules``
+     - Count of import modules
+   * - ``import_symbols``
+     - Count of imported symbols
+   * - ``exports``
+     - Count of exports
+   * - ``tls_callbacks``
+     - Count of TLS callbacks
+   * - ``exception_functions``
+     - Count of x64 runtime functions
+   * - ``relocation_blocks``
+     - Count of relocation blocks
+   * - ``relocation_entries``
+     - Count of relocation entries
+   * - ``diagnostics``
+     - Count of structural diagnostics

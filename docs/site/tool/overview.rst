@@ -29,20 +29,28 @@ output: a PE that does what the protected file did, with the VMProtect
 sections removed. The project reaches that goal as a ladder of independently
 testable milestones rather than a single finish line:
 
-====  =======================================================  ================================
-Rung  Milestone                                                Status
-====  =======================================================  ================================
-L1    Native replacements spliced into a new section, entry    Implemented; behind
-      and TLS callbacks redirected                             ``--experimental``
-L2    Proven original entry point and every reachable          Analysis implemented; emission
-      virtualized routine recovered                            partial
-L3    Imports reduced to the proven application set            Library implemented; not wired
-                                                               into ``clean``
-L4    Dangling ``.vmp`` references resolved and sections       Reference checker implemented
-      stripped
-L5    Optimized recompilation and differential verification    Verifier and neutralize
-                                                               transform implemented
-====  =======================================================  ================================
+.. list-table::
+   :header-rows: 1
+   :widths: 10 55 32
+
+   * - Rung
+     - Milestone
+     - Status
+   * - L1
+     - Native replacements spliced into a new section, entry and TLS callbacks redirected
+     - Implemented; behind ``--experimental``
+   * - L2
+     - Proven original entry point and every reachable virtualized routine recovered
+     - Analysis implemented; emission partial
+   * - L3
+     - Imports reduced to the proven application set
+     - Library implemented; not wired into ``clean``
+   * - L4
+     - Dangling ``.vmp`` references resolved and sections stripped
+     - Reference checker implemented
+   * - L5
+     - Optimized recompilation and differential verification
+     - Verifier and neutralize transform implemented
 
 See :doc:`/project/roadmap` for the detailed status of each sub-project.
 

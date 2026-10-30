@@ -92,7 +92,7 @@ blockers, each of which clears only when the corresponding proof exists:
 * ``VMProtect sections remain referenced by unresolved paths``
 
 Further blockers are added per case: a non-DLL header entry whose recovery
-fails, unresolved TLS VM entries, incomplete entry path recovery, and a header
+fails (or whose VM-entry confidence is below 60), unresolved TLS VM entries, incomplete entry path recovery, and a header
 entry with no recovered VM profile. See :doc:`/tool/soundness` for the
 complete list and what each one means.
 

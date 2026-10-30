@@ -7,7 +7,7 @@ version = "0.1"
 extensions = []
 
 templates_path = []
-exclude_patterns = ["_build"]
+exclude_patterns = ["_build", "extra"]
 master_doc = "index"
 source_suffix = ".rst"
 language = "en"
@@ -24,6 +24,7 @@ html_theme_options = {
     "titles_only": False,
 }
 html_static_path = []
+html_extra_path = ["extra"]
 html_title = "vmpx documentation"
 html_short_title = "vmpx"
 html_show_sphinx = False
