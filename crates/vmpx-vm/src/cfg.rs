@@ -17,7 +17,8 @@ use vmpx_pe::{PeImage, Va};
 
 use crate::{
     BinaryOp, BitWidth, DecodedVmInstruction, DispatchExtractionCandidate,
-    EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprKind, InputDomainLimits,
+    EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprError, ExprKind,
+    InputDomainLimits,
     LinearDecodeCache, LinearDecodeStop, ModuloImageTargetLimits, NativeCallSelectorOutcome,
     NativeFrameSource, RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits,
     SymbolicVmExecutionReport, SymbolicVmInitialState, VmDiscoveryLimits, VmEntryCandidate,
@@ -32,7 +33,7 @@ use crate::{
     },
     native_vm_chain::compose_native_frame,
     recover_and_decode_linear_vm_stream_cached, recover_modulo_image_targets,
-    recover_native_exit_state,
+    recover_native_exit_state, value_range,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -634,8 +635,19 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
     if let ExprKind::Const { value } = simplified.kind {
         return Ok((vec![value], false));
     }
-    let inferred = infer_branch_input_domains(&simplified, limits.input_domain)
-        .map_err(|refusal| format!("target depends on unproven input: {refusal}"))?;
+    let inferred = match infer_branch_input_domains(&simplified, limits.input_domain) {
+        Ok(inferred) => inferred,
+        Err(refusal) => {
+            // Sound fallback: a conditional branch whose next-VIP is a function
+            // of flag bits the affine-domain path cannot characterize still
+            // forks exactly when every input reaches the target through a
+            // boolean, by enumerating that boolean over {0, 1}.
+            if let Some(targets) = flag_fork_targets(&simplified, limits) {
+                return Ok((targets, true));
+            }
+            return Err(format!("target depends on unproven input: {refusal}"));
+        }
+    };
     let domain = SymbolicDomainLimits {
         max_values_per_variable: limits
             .domain
@@ -656,6 +668,130 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
         ));
     }
     Ok((report.unique_values, true))
+}
+
+/// Largest subexpressions, in `out`, that `target` depends on its inputs only
+/// through: each is proven to lie in {0, 1}. `Err` when an input reaches the
+/// target outside of such a boolean (a bare register, memory, or an opaque
+/// intrinsic value), which forbids the fallback.
+fn collect_flag_frontier(
+    expr: &Expr,
+    out: &mut Vec<Expr>,
+    seen: &mut std::collections::HashSet<*const Expr>,
+) -> Result<(), ()> {
+    if !seen.insert(std::ptr::from_ref(expr)) {
+        return Ok(());
+    }
+    // An input-independent subexpression has a fixed value; it routes no input.
+    if expr.dependencies().is_empty() && expr.intrinsic_dependencies().is_empty() {
+        return Ok(());
+    }
+    // Proven single bit: the only sound value to substitute.
+    if value_range(expr).max() <= 1 {
+        out.push(expr.clone());
+        return Ok(());
+    }
+    match &expr.kind {
+        ExprKind::Unary { value, .. }
+        | ExprKind::Extract { value, .. }
+        | ExprKind::Resize { value, .. } => collect_flag_frontier(value, out, seen),
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => {
+            collect_flag_frontier(left, out, seen)?;
+            collect_flag_frontier(right, out, seen)
+        }
+        // Input reaches the target as a full value, not through a bit.
+        ExprKind::Register { .. } | ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => Err(()),
+        ExprKind::Const { .. } => Ok(()),
+    }
+}
+
+/// Replaces each subexpression equal to a flag in `assignment` with its assigned
+/// bit, rebuilding and resimplifying the rest.
+fn substitute_flags(
+    expr: &Expr,
+    assignment: &[(&Expr, u64)],
+    memo: &mut std::collections::HashMap<*const Expr, Expr>,
+) -> Result<Expr, ExprError> {
+    for (flag, bit) in assignment {
+        if expr == *flag {
+            return Ok(Expr::constant(flag.width, *bit));
+        }
+    }
+    let key = std::ptr::from_ref(expr);
+    if let Some(done) = memo.get(&key) {
+        return Ok(done.clone());
+    }
+    let mut go = |value: &Expr| substitute_flags(value, assignment, memo);
+    let rebuilt = match &expr.kind {
+        ExprKind::Const { .. } | ExprKind::Register { .. } => expr.clone(),
+        ExprKind::Unary { op, value } => Expr::unary(*op, go(value)?),
+        ExprKind::Binary { op, left, right } => Expr::binary(*op, go(left)?, go(right)?)?,
+        ExprKind::Load { address } => Expr::load(expr.width, go(address)?),
+        ExprKind::Intrinsic { name, arguments } => Expr::intrinsic(
+            expr.width,
+            name.clone(),
+            arguments
+                .iter()
+                .map(|argument| substitute_flags(argument, assignment, memo))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        ExprKind::Extract { value, lsb } => Expr::extract(expr.width, *lsb, go(value)?)?,
+        ExprKind::Concat { high, low } => Expr::concat(go(high)?, go(low)?)?,
+        ExprKind::Resize { op, value } => Expr::resize(*op, expr.width, go(value)?)?,
+    };
+    memo.insert(key, rebuilt.clone());
+    Ok(rebuilt)
+}
+
+/// Resolves a conditional branch whose next-VIP depends on the inputs only
+/// through a small set of boolean flags, by enumerating every flag over {0, 1}.
+///
+/// Sound because each substituted flag is proven to lie in {0, 1} (so the two
+/// substitutions are exhaustive for it) and every assignment is required to
+/// collapse to a constant: any residual input dependence fails the branch
+/// closed rather than emitting a guessed target. Over-approximation can only add
+/// a target, never drop one.
+fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
+    const MAX_NODES: usize = 4_096;
+    const MAX_FLAGS: usize = 2;
+    if target.node_count_bounded(MAX_NODES) > MAX_NODES {
+        return None;
+    }
+    let mut frontier = Vec::new();
+    collect_flag_frontier(target, &mut frontier, &mut std::collections::HashSet::new()).ok()?;
+    let mut flags: Vec<Expr> = Vec::new();
+    for flag in frontier {
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+    }
+    if flags.is_empty() || flags.len() > MAX_FLAGS {
+        return None;
+    }
+    let mut targets = BTreeSet::new();
+    for combination in 0_u32..(1_u32 << flags.len()) {
+        let assignment: Vec<(&Expr, u64)> = flags
+            .iter()
+            .enumerate()
+            .map(|(index, flag)| (flag, u64::from((combination >> index) & 1)))
+            .collect();
+        let resolved = substitute_flags(target, &assignment, &mut std::collections::HashMap::new())
+            .ok()?
+            .simplify();
+        match resolved.kind {
+            ExprKind::Const { value } => {
+                targets.insert(value);
+            }
+            // Residual input dependence beyond the flags: fail closed.
+            _ => return None,
+        }
+    }
+    (!targets.is_empty() && targets.len() <= limits.max_targets)
+        .then(|| targets.into_iter().collect())
 }
 
 impl Walker<'_, '_> {
@@ -1286,6 +1422,93 @@ mod tests {
 
     fn decode_one(bytes: &[u8]) -> iced_x86::Instruction {
         iced_x86::Decoder::with_ip(64, bytes, 0x1_4000_1000, iced_x86::DecoderOptions::NONE).decode()
+    }
+
+    /// A non-affine 32-bit flag operand the affine-domain path cannot
+    /// characterize (an opaque intrinsic over a register), as in the oracle.
+    fn opaque_operand() -> Expr {
+        Expr::intrinsic(
+            BitWidth::W32,
+            "x86_cpuid_eax_65",
+            vec![
+                Expr::constant(BitWidth::W32, 1),
+                Expr::register(BitWidth::W32, "native_rcx_initial"),
+            ],
+        )
+    }
+
+    /// The ZF bit of `vm_flags_sub_w32(operand, 4064)` as the oracle encodes it:
+    /// `!( ~1 | (flags >> 6) )`, which is provably in {0, 1}.
+    fn zf_bit(operand: Expr) -> Expr {
+        let flags = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_sub_w32",
+            vec![operand, Expr::constant(BitWidth::W32, 4064)],
+        );
+        let shifted =
+            Expr::binary(BinaryOp::Shr, flags, Expr::constant(BitWidth::W64, 6)).unwrap();
+        let masked =
+            Expr::binary(BinaryOp::Or, Expr::constant(BitWidth::W64, !1_u64), shifted).unwrap();
+        Expr::unary(crate::UnaryOp::Not, masked)
+    }
+
+    /// `low + bit * (high - low)`: `low` when `bit` is 0, `high` when it is 1.
+    fn select(bit: Expr, low: u64, high: u64) -> Expr {
+        let scaled = Expr::binary(
+            BinaryOp::Mul,
+            bit,
+            Expr::constant(BitWidth::W64, high.wrapping_sub(low)),
+        )
+        .unwrap();
+        Expr::binary(BinaryOp::Add, Expr::constant(BitWidth::W64, low), scaled).unwrap()
+    }
+
+    #[test]
+    fn flag_fork_resolves_both_outcomes_of_a_nonaffine_flag_branch() {
+        let target = select(zf_bit(opaque_operand()), 0x1800_1000, 0x1800_2000).simplify();
+        // The affine-domain path cannot characterize the flag operand.
+        assert!(infer_branch_input_domains(&target, InputDomainLimits::default()).is_err());
+        // The boolean fallback forks both outcomes exactly.
+        assert_eq!(
+            flag_fork_targets(&target, VmCfgLimits::default()),
+            Some(vec![0x1800_1000, 0x1800_2000])
+        );
+        // `resolve_targets` routes through it and marks the branch guarded.
+        assert_eq!(
+            resolve_targets(&target, VmCfgLimits::default()),
+            Ok((vec![0x1800_1000, 0x1800_2000], true))
+        );
+    }
+
+    #[test]
+    fn flag_fork_fails_closed_on_residual_input_dependence() {
+        // An input (native_r13_initial) reaches the target outside the flag,
+        // exactly like the coredll oracle; the fallback must not guess.
+        let target = Expr::binary(
+            BinaryOp::Add,
+            select(zf_bit(opaque_operand()), 0x1800_1000, 0x1800_2000),
+            Expr::register(BitWidth::W64, "native_r13_initial"),
+        )
+        .unwrap()
+        .simplify();
+        assert!(target.dependencies().contains("native_r13_initial"));
+        assert_eq!(flag_fork_targets(&target, VmCfgLimits::default()), None);
+    }
+
+    #[test]
+    fn flag_fork_rejects_a_value_not_proven_to_be_a_bit() {
+        // `flags >> 6` is not masked to bit 0 and can hold values other than
+        // {0, 1}; substituting it would be unsound, so the fallback refuses.
+        let flags = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_sub_w32",
+            vec![opaque_operand(), Expr::constant(BitWidth::W32, 4064)],
+        );
+        let not_a_bit =
+            Expr::binary(BinaryOp::Shr, flags, Expr::constant(BitWidth::W64, 6)).unwrap();
+        assert!(value_range(&not_a_bit).max() > 1);
+        let target = select(not_a_bit, 0x1800_1000, 0x1800_2000).simplify();
+        assert_eq!(flag_fork_targets(&target, VmCfgLimits::default()), None);
     }
 
     #[test]
