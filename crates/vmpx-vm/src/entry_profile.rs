@@ -173,6 +173,18 @@ fn first_rsp_capture(
         {
             return Ok(Some(instruction.op0_register()));
         }
+        // Mutated bootstraps capture the stack pointer with `lea reg,[rsp+disp]`
+        // instead of `mov reg,rsp` (e.g. `lea rbp,[rsp-28h]`). Base must be RSP
+        // with no index; the frame layout recovers the displacement separately.
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().size() == 8
+            && instruction.op0_register() != Register::RSP
+            && instruction.memory_base() == Register::RSP
+            && instruction.memory_index() == Register::None
+        {
+            return Ok(Some(instruction.op0_register()));
+        }
     }
     Ok(None)
 }
