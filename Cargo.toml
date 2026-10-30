@@ -17,6 +17,7 @@ members = [
     "crates/vmpx-vm",
     "crates/vmpx-vmlift",
     "crates/vmpx-vtil-sys",
+    "crates/vmpx-demutate",
 ]
 
 [workspace.package]

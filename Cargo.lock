@@ -2735,6 +2735,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-demutate"
+version = "0.1.0"
+dependencies = [
+ "vmpx-mutation",
+ "vmpx-solvers",
+ "vmpx-tournament",
+ "vmpx-verify",
+ "vmpx-vm",
+]
+
+[[package]]
 name = "vmpx-detect"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "vmpx-demutate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "vmpx-demutate"
+path = "src/main.rs"
+
+[dependencies]
+vmpx-mutation = { path = "../vmpx-mutation" }
+vmpx-solvers = { path = "../vmpx-solvers" }
+vmpx-verify = { path = "../vmpx-verify" }
+vmpx-tournament = { path = "../vmpx-tournament" }
+vmpx-vm = { path = "../vmpx-vm" }
+
+[lints]
+workspace = true
