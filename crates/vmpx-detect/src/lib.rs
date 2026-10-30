@@ -99,7 +99,9 @@ const STANDARD_SECTION_NAMES: &[&str] = &[
     "INIT", "PAGE", "CODE", "DATA", ".sdata", ".orpc",
 ];
 
-fn is_standard_section_name(name: &str) -> bool {
+/// True for standard compiler/linker section names. A non-standard executable
+/// section name is a protector signal (VMProtect randomizes its section names).
+pub fn is_standard_section_name(name: &str) -> bool {
     STANDARD_SECTION_NAMES
         .iter()
         .any(|standard| standard.eq_ignore_ascii_case(name))

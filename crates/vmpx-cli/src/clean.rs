@@ -234,10 +234,14 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
     let Some(exports) = &report.exports else {
         return Vec::new();
     };
+    // Protector regions are identified structurally, not by name: VMProtect
+    // randomizes section names, so a `.vmp` prefix misses every randomized build.
+    // A non-standard-named section owning the RVA is the protector signal.
     let is_protector = |rva: Rva| {
-        pe.sections
-            .iter()
-            .any(|section| section.name.starts_with(".vmp") && section.contains_mapped_rva(rva))
+        pe.sections.iter().any(|section| {
+            !vmpx_detect::is_standard_section_name(&section.name)
+                && section.contains_mapped_rva(rva)
+        })
     };
     let mut results = Vec::new();
     for symbol in &exports.symbols {
