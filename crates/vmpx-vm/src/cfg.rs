@@ -610,9 +610,73 @@ enum LoopStep {
     Close,
     /// Still within the exact-unroll budget.
     Unroll,
-    /// Continue from this generalization of the nearest enclosing entry.
+    /// Continue from this generalization of every enclosing entry at once.
     Widen(SymbolicVmInitialState),
     Refuse(String),
+}
+
+/// Generalizes the nearest enclosing entry against every other enclosing entry
+/// and the re-entry at once, so a cell that differs across *any* observed
+/// iteration is widened to TOP in one step. Widening against only the nearest
+/// neighbour lets a loop-carried cell that changes on a longer stride (an epoch
+/// that only some iterations bump, a counter touched every few passes) escape
+/// generalization for one visit at a time, so a state with many such cells never
+/// reaches a fixpoint within the block-visit budget. Joining all observed states
+/// caps the widening at the lattice height the exact unrolls already expose.
+///
+/// Sound: strictly more cells go to TOP than the nearest-only widen produced, so
+/// the result still over-approximates every iteration (a TOP cell fails closed in
+/// branch resolution and is never read as a value). `None` when the nearest entry
+/// already covers all the others and the re-entry.
+fn widen_to_fixpoint(
+    key: Va,
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+) -> Result<Option<SymbolicVmInitialState>, String> {
+    let mut acc = ancestors[0].clone();
+    let mut changed = false;
+    let others = ancestors
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(std::iter::once(reentry));
+    for other in others {
+        if let Some(widened) = widen_state(key, &acc, other)? {
+            acc = widened;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(acc))
+}
+
+/// Folds `incoming` together with every state already seen at a block into one
+/// over-approximation: a cell that differs anywhere goes to TOP, the rest stay
+/// exact. Unlike [`widen_to_fixpoint`] this spans all recorded states (not a
+/// single enclosing path), which converges a block re-reached through sibling
+/// paths. `Err` when the states cannot be generalized (stack/allocation/taint
+/// drift), which fails the re-entry closed.
+fn fold_states(
+    key: Va,
+    states: &[SymbolicVmInitialState],
+    incoming: &SymbolicVmInitialState,
+) -> Result<SymbolicVmInitialState, String> {
+    let mut acc = incoming.clone();
+    for state in states {
+        if let Some(widened) = widen_state(key, &acc, state)? {
+            acc = widened;
+        }
+    }
+    Ok(acc)
+}
+
+/// Outcome of generalizing a re-entry against a block's accumulated states.
+enum GeneralizeAcross {
+    /// The running over-approximation already covers this re-entry: it closes.
+    Closed,
+    /// Continue exploring from this broadened state.
+    Continue(SymbolicVmInitialState),
+    /// The states cannot be generalized soundly: fail closed.
+    Stall,
 }
 
 /// Decides how a block re-entered while already on the path proceeds.
@@ -632,7 +696,7 @@ fn loop_step(
     if ancestors.len() < unrolls {
         return LoopStep::Unroll;
     }
-    match widen_state(key, ancestors[0], reentry) {
+    match widen_to_fixpoint(key, ancestors, reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
         Err(reason) => LoopStep::Refuse(reason),
@@ -652,6 +716,12 @@ struct Walker<'a, 'p> {
     cache: LinearDecodeCache,
     decoded: BTreeMap<Va, DecodedBlock>,
     explored: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
+    /// Per-block running over-approximation used once a block has hit the
+    /// `max_visits_per_block` cap with distinct states that no path-local loop
+    /// generalizes (blocks re-reached through many sibling paths, whose only drift
+    /// is fresh-name bookkeeping). Incoming states fold into it so the block
+    /// converges to a sound fixpoint instead of stalling at the cap.
+    widened: BTreeMap<Va, SymbolicVmInitialState>,
     cfg: VmCfg,
     total_instructions: usize,
 }
@@ -764,8 +834,21 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
             .max(limits.input_domain.max_values_per_variable),
         ..limits.domain
     };
-    let report = enumerate_symbolic_value(&simplified, &inferred.domains, domain)
-        .map_err(|error| format!("target enumeration failed: {error}"))?;
+    let report = match enumerate_symbolic_value(&simplified, &inferred.domains, domain) {
+        Ok(report) => report,
+        Err(error) => {
+            // The full input cross-product is infeasible (too many independent
+            // input values), but the target may route all of its inputs through
+            // only a bounded set of boolean flags — a flag-selected jump whose
+            // real target set is tiny. Enumerate those flags over {0, 1} instead.
+            // Sound: each substituted flag is proven single-bit, and any residual
+            // input dependence fails the branch closed rather than guessing.
+            if let Some(targets) = flag_fork_targets(&simplified, limits) {
+                return Ok((targets, true));
+            }
+            return Err(format!("target enumeration failed: {error}"));
+        }
+    };
     if !report.complete || report.unique_values.is_empty() {
         return Err("target domain is incomplete".to_owned());
     }
@@ -1036,25 +1119,75 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// Generalizes a re-entry at a saturated block against its running
+    /// over-approximation (seeded from every state recorded there). A cell the
+    /// generalization already holds at TOP is covered, so once the varying cells
+    /// saturate the block closes on every further re-entry. Pure over-approximation
+    /// (cells only ever broaden to TOP), so no reachable state is dropped.
+    fn generalize_across(
+        &mut self,
+        key: Va,
+        incoming: &SymbolicVmInitialState,
+    ) -> GeneralizeAcross {
+        if let Some(canonical) = self.widened.get(&key) {
+            return match widen_state(key, canonical, incoming) {
+                Ok(None) => GeneralizeAcross::Closed,
+                Ok(Some(widened)) => {
+                    self.widened.insert(key, widened.clone());
+                    GeneralizeAcross::Continue(widened)
+                }
+                Err(_) => GeneralizeAcross::Stall,
+            };
+        }
+        let states = self.explored.get(&key).cloned().unwrap_or_default();
+        match fold_states(key, &states, incoming) {
+            Ok(widened) => {
+                self.widened.insert(key, widened.clone());
+                GeneralizeAcross::Continue(widened)
+            }
+            Err(_) => GeneralizeAcross::Stall,
+        }
+    }
+
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
         let key = item.start.vip;
         if self.cfg.visits >= self.limits.max_visits {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
         }
-        let Some(symbolic_in) = self.enter_loop(item) else {
+        let Some(mut symbolic_in) = self.enter_loop(item) else {
             return;
         };
-        let states = self.explored.entry(key).or_default();
-        if states.contains(&symbolic_in) {
+        if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
             return;
         }
-        if states.len() >= self.limits.max_visits_per_block {
-            self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
-            self.stall(key, key, "symbolic state keeps changing at this block");
-            return;
+        let visited = self.explored.get(&key).map_or(0, Vec::len);
+        if visited >= self.limits.max_visits_per_block {
+            // No path-local loop generalizes this block (it is re-reached through
+            // many sibling paths whose only drift is fresh-name bookkeeping), so
+            // the per-path widening never engaged. Fold every state seen here to a
+            // single sound over-approximation and continue from it, converging the
+            // block before the cap stalls it. A hard ceiling still fails closed if
+            // even the generalization keeps broadening.
+            if visited >= self.limits.max_visits_per_block.saturating_mul(2) {
+                self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
+                self.stall(key, key, "symbolic state keeps changing at this block");
+                return;
+            }
+            match self.generalize_across(key, &symbolic_in) {
+                GeneralizeAcross::Closed => return,
+                GeneralizeAcross::Stall => {
+                    self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
+                    self.stall(key, key, "symbolic state keeps changing at this block");
+                    return;
+                }
+                GeneralizeAcross::Continue(widened) => symbolic_in = widened,
+            }
+            if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
+                return;
+            }
         }
-        states.push(symbolic_in.clone());
+        self.explored.entry(key).or_default().push(symbolic_in.clone());
         self.cfg.visits += 1;
         self.current = Some(Rc::new(PathNode {
             key,
@@ -1503,6 +1636,7 @@ pub fn recover_vm_cfg(
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
         explored: BTreeMap::new(),
+        widened: BTreeMap::new(),
         cfg: VmCfg {
             entry: setup.first_state.vip,
             blocks: BTreeMap::new(),
@@ -1612,6 +1746,58 @@ mod tests {
         .simplify();
         assert!(target.dependencies().contains("native_r13_initial"));
         assert_eq!(flag_fork_targets(&target, VmCfgLimits::default()), None);
+    }
+
+    #[test]
+    fn enumeration_explosion_recovers_a_bounded_flag_selector() {
+        // A flag-selected branch whose flag operand is characterizable, so input
+        // inference succeeds. With the cross-product capped below the domain size
+        // (standing in for the real oracle's 256^4 blow-up), the full enumeration
+        // is infeasible, yet the real target set is just the two selector outcomes
+        // and the flag fork recovers them — no target dropped, none invented.
+        let bit = Expr::binary(
+            BinaryOp::And,
+            Expr::register(BitWidth::W64, "native_rax_initial"),
+            w64(1),
+        )
+        .unwrap();
+        let target = select(bit, 0x1800_1000, 0x1800_2000).simplify();
+        let limits = VmCfgLimits {
+            domain: SymbolicDomainLimits {
+                max_combinations: 1,
+                ..SymbolicDomainLimits::default()
+            },
+            ..VmCfgLimits::default()
+        };
+        // Inference succeeds, so this exercises the enumeration-failure fallback
+        // (not the inference-refusal one).
+        assert!(infer_branch_input_domains(&target, limits.input_domain).is_ok());
+        assert_eq!(
+            resolve_targets(&target, limits),
+            Ok((vec![0x1800_1000, 0x1800_2000], true))
+        );
+    }
+
+    #[test]
+    fn enumeration_explosion_over_a_full_value_fails_closed() {
+        // The target reads a whole register value, not a bounded flag. With the
+        // cross-product capped the enumeration is infeasible and the flag fork
+        // cannot characterize it, so the branch fails closed rather than guessing.
+        let target = Expr::binary(
+            BinaryOp::Add,
+            w64(0x1800_1000),
+            Expr::register(BitWidth::W64, "native_rax_initial"),
+        )
+        .unwrap()
+        .simplify();
+        let limits = VmCfgLimits {
+            domain: SymbolicDomainLimits {
+                max_combinations: 1,
+                ..SymbolicDomainLimits::default()
+            },
+            ..VmCfgLimits::default()
+        };
+        assert!(resolve_targets(&target, limits).is_err());
     }
 
     /// A predicate matching the oracle's bytecode-section preferred-base VAs.
@@ -2055,5 +2241,56 @@ mod tests {
         // target (fail closed) rather than silently pick one.
         let top = Expr::register(BitWidth::W64, format!("{HAVOC_PREFIX}1000_f"));
         assert!(resolve_targets(&top, VmCfgLimits::default()).is_err());
+    }
+
+    #[test]
+    fn widen_to_fixpoint_generalizes_a_cell_that_only_differs_across_a_stride() {
+        // The counter agrees between the nearest ancestor and the re-entry but
+        // differs from an older ancestor (it oscillates). Nearest-only widening
+        // would keep it exact and never converge; joining all enclosing entries
+        // generalizes it in one step.
+        let older = loop_state(0, w64(5));
+        let nearest = loop_state(0, w64(9));
+        let reentry = loop_state(0, w64(9));
+        assert!(matches!(
+            widen_state(Va(0x1000), &nearest, &reentry),
+            Ok(None)
+        ));
+        let states = [&nearest, &older];
+        let widened = widen_to_fixpoint(Va(0x1000), &states, &reentry)
+            .expect("widens")
+            .expect("changed");
+        assert!(is_havoc(&widened.context_values[&8]));
+        assert_eq!(widened.context_values[&0], w64(7));
+    }
+
+    #[test]
+    fn fold_states_generalizes_the_varying_cell_then_covers_every_reentry() {
+        // A block re-reached with distinct counter values folds to one state whose
+        // counter is TOP and whose invariant cell stays exact; that fixpoint then
+        // covers any further counter value, so the block closes instead of piling
+        // up states until the visit cap.
+        let states = [
+            loop_state(0, w64(0)),
+            loop_state(0, w64(1)),
+            loop_state(0, w64(2)),
+        ];
+        let incoming = loop_state(0, w64(3));
+        let canonical = fold_states(Va(0x1000), &states, &incoming).expect("folds");
+        assert!(is_havoc(&canonical.context_values[&8]));
+        assert_eq!(canonical.context_values[&0], w64(7));
+        assert!(matches!(
+            widen_state(Va(0x1000), &canonical, &loop_state(0, w64(99))),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn fold_states_refuses_a_stack_pointer_that_moves() {
+        // Generalization is sound only when the stack pointer is loop-invariant;
+        // a block whose re-entries move it cannot be folded and fails closed.
+        let states = [loop_state(0, w64(0))];
+        let incoming = loop_state(8, w64(0));
+        assert!(fold_states(Va(0x1000), &states, &incoming).is_err());
     }
 }
