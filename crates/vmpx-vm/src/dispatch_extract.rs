@@ -1349,6 +1349,20 @@ fn is_direct_jump(instruction: &Instruction) -> bool {
     instruction.mnemonic() == Mnemonic::Jmp && instruction.op0_kind() == OpKind::NearBranch64
 }
 
+/// A dead-flag producer such as a junk `cmp`/`test`: it writes status flags but
+/// no register or memory, so it cannot disturb the stack-check operands and its
+/// flags are overwritten by the real `cmp vsp,tmp` before the `ja`.
+fn writes_only_flags(factory: &mut InstructionInfoFactory, instruction: &Instruction) -> bool {
+    let info = factory.info(instruction);
+    info.used_memory().is_empty()
+        && info.used_registers().iter().all(|used| {
+            matches!(
+                used.access(),
+                OpAccess::Read | OpAccess::CondRead | OpAccess::NoMemAccess
+            )
+        })
+}
+
 struct StackCheckShape {
     start: Rva,
     branch: Rva,
@@ -1400,10 +1414,14 @@ fn match_stack_check(
         return None;
     }
     index = cmp_index;
+    let mut factory = InstructionInfoFactory::new();
     let lea_index = loop {
         index = index.checked_sub(1)?;
         let instruction = &instructions[index].instruction;
-        if !(is_direct_jump(instruction) || is_flag_junk(instruction)) {
+        if !(is_direct_jump(instruction)
+            || is_flag_junk(instruction)
+            || writes_only_flags(&mut factory, instruction))
+        {
             break index;
         }
     };
@@ -1791,6 +1809,80 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn conditional_trace(bytes: &[u8]) -> DirectJumpTrace {
+        let mut decoder = Decoder::with_ip(64, bytes, 0x1_4000_1000, DecoderOptions::NONE);
+        let mut instructions = Vec::new();
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            assert_ne!(instruction.code(), Code::INVALID);
+            let offset = usize::try_from(instruction.ip() - 0x1_4000_1000).expect("small offset");
+            let length = instruction.len();
+            instructions.push(DecodedInstruction {
+                rva: Rva(0x1000 + u32::try_from(offset).expect("small RVA")),
+                va: Va(instruction.ip()),
+                bytes: bytes[offset..offset + length].to_vec(),
+                instruction,
+            });
+        }
+        let terminal = instructions.last().expect("at least one instruction");
+        let terminal_rva = terminal.rva;
+        let fallthrough = terminal.next_rva().expect("small end RVA");
+        DirectJumpTrace {
+            entry: Rva(0x1000),
+            decoded_instructions: instructions.len(),
+            fragments: vec![DirectJumpFragment {
+                start: Rva(0x1000),
+                end: fallthrough,
+                instructions,
+                next_fragment: None,
+            }],
+            stop: DirectJumpTraceStop {
+                kind: DirectJumpTraceStopKind::ConditionalBranch,
+                at: terminal_rva,
+                direct_target: Some(Rva(0x2000)),
+                fallthrough: Some(fallthrough),
+                detail: None,
+            },
+        }
+    }
+
+    const STACK_CHECK_ROLES: HandlerRegisterRoles = HandlerRegisterRoles {
+        vip: Register::R15,
+        rolling_key: Register::RCX,
+        handler: Register::R14,
+    };
+    const STACK_CHECK: StackCheckRoles = StackCheckRoles {
+        vsp: Register::RBP,
+        context_base: Register::RSP,
+    };
+
+    #[test]
+    fn stack_check_tolerates_dead_flag_junk_between_lea_and_cmp() {
+        // `lea tmp,[ctx+disp]; cmp vip,rsp (dead junk); clc; cmp vsp,tmp; ja head`
+        let mut a = CodeAssembler::new(64).expect("x64 assembler");
+        a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+        a.cmp(r15, rsp).expect("dead flag-only junk cmp");
+        a.clc().expect("flag junk");
+        a.cmp(rbp, rax).expect("real vsp vs guard compare");
+        a.ja(0x1_4000_2000_u64).expect("stack-check branch");
+        let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+        let shape = match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
+            .expect("stack-check shape recovered despite the junk cmp");
+        assert_eq!(shape.head, Rva(0x2000));
+    }
+
+    #[test]
+    fn stack_check_rejects_register_write_between_lea_and_cmp() {
+        // A real register write (not flag-only) must still break the match.
+        let mut a = CodeAssembler::new(64).expect("x64 assembler");
+        a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+        a.add(rbx, 1).expect("register write clobbers the tolerance");
+        a.cmp(rbp, rax).expect("real compare");
+        a.ja(0x1_4000_2000_u64).expect("stack-check branch");
+        let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+        assert!(match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK).is_none());
     }
 
     #[test]
