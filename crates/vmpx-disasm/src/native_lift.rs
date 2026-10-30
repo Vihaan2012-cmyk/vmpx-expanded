@@ -6,11 +6,18 @@
 //! which depends on it); [`crate::NativeAlgebra`] is the built-in domain.
 //!
 //! Anything not explicitly modeled fails closed with [`LiftError`].
+//!
+//! A flag that is read (`adc`/`sbb`/`cmovcc`/`setcc`) before the block sets it is
+//! the 8-bit 0/1 input `cf_in`/`zf_in`/... ; a flag the block left unmodeled
+//! (`Clobbered`) makes the reader fail closed. `rsp` is tracked as `rsp_in + k`
+//! across push/pop and constant `add`/`sub rsp`; any other write to `rsp` makes
+//! later push/pop fail closed. `div`/`idiv` are undefined where hardware raises #DE.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use iced_x86::{
-    Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register,
+    ConditionCode, Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic,
+    OpKind, Register,
 };
 use thiserror::Error;
 
@@ -217,10 +224,25 @@ pub enum Flag {
     Of,
 }
 
+impl Flag {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cf => "cf",
+            Self::Pf => "pf",
+            Self::Af => "af",
+            Self::Zf => "zf",
+            Self::Sf => "sf",
+            Self::Of => "of",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FlagState<E> {
     /// 0/1 value (8-bit). Built from the intrinsics `zf`, `sf`, `pf` (of the
-    /// result) and `cf_add`/`of_add`/`af_add`/`cf_sub`/`of_sub`/`af_sub` (of the operands).
+    /// result) and `cf_add`/`of_add`/`af_add`/`cf_sub`/`of_sub`/`af_sub` (of the operands;
+    /// `*_adc`/`*_sbb` take the carry-in as a third argument).
     Value(E),
     /// Possibly changed by the block; value not modeled (undefined or not tracked).
     Clobbered,
@@ -395,7 +417,11 @@ fn gpr_info(reg: Register) -> R<(Gpr, Width, bool)> {
         r if r.is_gpr16() => (Width::W16, false),
         r if r.is_gpr32() => (Width::W32, false),
         r if r.is_gpr64() => (Width::W64, false),
-        _ => return unsupported(format!("register {reg:?} is not a general-purpose register")),
+        _ => {
+            return unsupported(format!(
+                "register {reg:?} is not a general-purpose register"
+            ));
+        }
     };
     let gpr = match reg.full_register() {
         Register::RAX => Gpr::Rax,
@@ -433,6 +459,8 @@ struct Lifter<'a, A: Algebra> {
     flags: BTreeMap<Flag, FlagState<A::Expr>>,
     stores: Vec<StoreRec<A::Expr>>,
     reads: Vec<MemoryRead<A::Expr>>,
+    /// `Some(k)` while `regs[rsp] == rsp_in + k`.
+    rsp_off: Option<i64>,
 }
 
 impl<'a, A: Algebra> Lifter<'a, A> {
@@ -448,6 +476,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             flags: BTreeMap::new(),
             stores: Vec::new(),
             reads: Vec::new(),
+            rsp_off: Some(0),
         }
     }
 
@@ -519,6 +548,9 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         };
         self.regs[gpr as usize] = new;
         self.written.insert(gpr);
+        if gpr == Gpr::Rsp {
+            self.rsp_off = None;
+        }
         Ok(())
     }
 
@@ -545,7 +577,15 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         let mut disp = inst.memory_displacement64().cast_signed();
         match inst.memory_base() {
             Register::None | Register::RIP => {}
-            base if base.is_gpr64() => sym = Some(self.read_reg(base)?),
+            base if base.is_gpr64() => {
+                sym = Some(self.read_reg(base)?);
+                if base == Register::RSP
+                    && let Some(off) = self.rsp_off
+                {
+                    sym = Some(self.rsp_entry());
+                    disp = disp.wrapping_add(off);
+                }
+            }
             other => return unsupported(format!("address base register {other:?}")),
         }
         match inst.memory_index() {
@@ -579,10 +619,66 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         Ok((address, MemKey { sym, disp }))
     }
 
+    fn rsp_entry(&self) -> A::Expr {
+        self.alg.input(Width::W64, &Gpr::Rsp.input_name())
+    }
+
+    fn tracked_rsp(&self) -> R<i64> {
+        self.rsp_off
+            .map_or_else(|| unsupported("rsp is not entry rsp plus a constant"), Ok)
+    }
+
+    fn stack_slot(&self, off: i64) -> R<(A::Expr, MemKey<A::Expr>)> {
+        let base = self.rsp_entry();
+        let address = if off == 0 {
+            base.clone()
+        } else {
+            self.bin(
+                BinOp::Add,
+                base.clone(),
+                self.k(Width::W64, off.cast_unsigned()),
+            )?
+        };
+        Ok((
+            address,
+            MemKey {
+                sym: Some(base),
+                disp: off,
+            },
+        ))
+    }
+
+    fn set_rsp(&mut self, off: i64) -> R<()> {
+        let base = self.rsp_entry();
+        self.regs[Gpr::Rsp as usize] = if off == 0 {
+            base
+        } else {
+            self.bin(BinOp::Add, base, self.k(Width::W64, off.cast_unsigned()))?
+        };
+        self.rsp_off = Some(off);
+        self.written.insert(Gpr::Rsp);
+        Ok(())
+    }
+
+    fn stack_width(inst: &Instruction, push: bool) -> R<Width> {
+        let inc = inst.stack_pointer_increment();
+        if (inc < 0) != push {
+            return unsupported("unexpected stack pointer direction");
+        }
+        match Width::from_bytes(inc.unsigned_abs() as usize) {
+            Some(width @ (Width::W16 | Width::W64)) => Ok(width),
+            _ => unsupported(format!("stack operand size {inc}")),
+        }
+    }
+
     fn load_mem(&mut self, inst: &Instruction, width: Width) -> R<A::Expr> {
         let (address, key) = self.mem_address(inst, true)?;
+        self.load_at(address, &key, width)
+    }
+
+    fn load_at(&mut self, address: A::Expr, key: &MemKey<A::Expr>, width: Width) -> R<A::Expr> {
         for store in self.stores.iter().rev() {
-            match relate(&key, width, &store.key, store.write.width) {
+            match relate(key, width, &store.key, store.write.width) {
                 Rel::Disjoint => {}
                 Rel::Exact => return Ok(store.write.value.clone()),
                 Rel::Unknown => {
@@ -603,8 +699,13 @@ impl<'a, A: Algebra> Lifter<'a, A> {
     }
 
     fn store_mem(&mut self, inst: &Instruction, value: A::Expr) -> R<()> {
-        let width = self.alg.width(&value);
         let (address, key) = self.mem_address(inst, true)?;
+        self.store_at(address, key, value);
+        Ok(())
+    }
+
+    fn store_at(&mut self, address: A::Expr, key: MemKey<A::Expr>, value: A::Expr) {
+        let width = self.alg.width(&value);
         self.stores.push(StoreRec {
             key,
             write: MemoryWrite {
@@ -613,7 +714,6 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 width,
             },
         });
-        Ok(())
     }
 
     fn read_operand(&mut self, inst: &Instruction, index: u32, width: Width) -> R<A::Expr> {
@@ -656,7 +756,85 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         }
     }
 
-    fn set_flags(&mut self, kind: Arith, a: &A::Expr, b: &A::Expr, result: &A::Expr, keep_cf: bool) {
+    fn flag_value(&self, flag: Flag) -> R<A::Expr> {
+        match self.flags.get(&flag) {
+            Some(FlagState::Value(value)) => Ok(value.clone()),
+            Some(FlagState::Clobbered) => {
+                unsupported(format!("{flag:?} is not modeled at this point"))
+            }
+            None => Ok(self.alg.input(Width::W8, &format!("{}_in", flag.name()))),
+        }
+    }
+
+    fn condition(&self, cc: ConditionCode) -> R<A::Expr> {
+        let one = self.k(Width::W8, 1);
+        let not = |e: A::Expr| self.bin(BinOp::Xor, e, one.clone());
+        let or = |a: A::Expr, b: A::Expr| self.bin(BinOp::Or, a, b);
+        let lt = || {
+            self.bin(
+                BinOp::Xor,
+                self.flag_value(Flag::Sf)?,
+                self.flag_value(Flag::Of)?,
+            )
+        };
+        let f = |flag: Flag| self.flag_value(flag);
+        match cc {
+            ConditionCode::o => f(Flag::Of),
+            ConditionCode::no => not(f(Flag::Of)?),
+            ConditionCode::b => f(Flag::Cf),
+            ConditionCode::ae => not(f(Flag::Cf)?),
+            ConditionCode::e => f(Flag::Zf),
+            ConditionCode::ne => not(f(Flag::Zf)?),
+            ConditionCode::be => or(f(Flag::Cf)?, f(Flag::Zf)?),
+            ConditionCode::a => not(or(f(Flag::Cf)?, f(Flag::Zf)?)?),
+            ConditionCode::s => f(Flag::Sf),
+            ConditionCode::ns => not(f(Flag::Sf)?),
+            ConditionCode::p => f(Flag::Pf),
+            ConditionCode::np => not(f(Flag::Pf)?),
+            ConditionCode::l => lt(),
+            ConditionCode::ge => not(lt()?),
+            ConditionCode::le => or(f(Flag::Zf)?, lt()?),
+            ConditionCode::g => not(or(f(Flag::Zf)?, lt()?)?),
+            ConditionCode::None => unsupported("no condition code"),
+        }
+    }
+
+    fn set_carry_flags(
+        &mut self,
+        tag: &str,
+        a: &A::Expr,
+        b: &A::Expr,
+        cin: &A::Expr,
+        result: &A::Expr,
+    ) {
+        let w8 = Width::W8;
+        let ops = || vec![a.clone(), b.clone(), cin.clone()];
+        let zf = self.alg.intrinsic(w8, "zf", vec![result.clone()]);
+        let sf = self.alg.intrinsic(w8, "sf", vec![result.clone()]);
+        let pf = self.alg.intrinsic(w8, "pf", vec![result.clone()]);
+        let cf = self.alg.intrinsic(w8, &format!("cf_{tag}"), ops());
+        let of = self.alg.intrinsic(w8, &format!("of_{tag}"), ops());
+        let af = self.alg.intrinsic(w8, &format!("af_{tag}"), ops());
+        for (flag, value) in [
+            (Flag::Zf, zf),
+            (Flag::Sf, sf),
+            (Flag::Pf, pf),
+            (Flag::Cf, cf),
+            (Flag::Of, of),
+            (Flag::Af, af),
+        ] {
+            self.set_flag(flag, value);
+        }
+    }
+
+    fn set_flags(
+        &mut self,
+        kind: Arith,
+        a: &A::Expr,
+        b: &A::Expr,
+        result: &A::Expr,
+        keep_cf: bool,
+    ) {
         let w8 = Width::W8;
         let res = || vec![result.clone()];
         let flag = |name: &str, args: Vec<A::Expr>| self.alg.intrinsic(w8, name, args);
@@ -751,11 +929,98 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 let result = self.bin(op, a.clone(), b.clone())?;
                 self.set_flags(kind, &a, &b, &result, false);
                 if matches!(mnemonic, Mnemonic::Cmp | Mnemonic::Test) {
-                    Ok(())
-                } else {
-                    self.write_operand(inst, 0, result)
+                    return Ok(());
                 }
+                let prev_rsp = self.rsp_off;
+                self.write_operand(inst, 0, result)?;
+                let adjusts_rsp = matches!(mnemonic, Mnemonic::Add | Mnemonic::Sub)
+                    && inst.op_kind(0) == OpKind::Register
+                    && inst.op_register(0) == Register::RSP
+                    && matches!(
+                        inst.op_kind(1),
+                        OpKind::Immediate8to64 | OpKind::Immediate32to64
+                    );
+                if adjusts_rsp && let Some(prev) = prev_rsp {
+                    let imm = inst.immediate(1).cast_signed();
+                    let delta = if mnemonic == Mnemonic::Add {
+                        Some(imm)
+                    } else {
+                        imm.checked_neg()
+                    };
+                    if let Some(off) = delta.and_then(|d| prev.checked_add(d)) {
+                        self.set_rsp(off)?;
+                    }
+                }
+                Ok(())
             }
+            Mnemonic::Adc | Mnemonic::Sbb => {
+                Self::expect_ops(inst, 2)?;
+                let width = Self::operand_width(inst, 0)?;
+                let a = self.read_operand(inst, 0, width)?;
+                let b = self.read_operand(inst, 1, width)?;
+                let cin = self.flag_value(Flag::Cf)?;
+                let carry = self.resize(Resize::ZeroExtend, width, cin.clone())?;
+                let (op, tag) = if mnemonic == Mnemonic::Adc {
+                    (BinOp::Add, "adc")
+                } else {
+                    (BinOp::Sub, "sbb")
+                };
+                let partial = self.bin(op, a.clone(), b.clone())?;
+                let result = self.bin(op, partial, carry)?;
+                self.set_carry_flags(tag, &a, &b, &cin, &result);
+                self.write_operand(inst, 0, result)
+            }
+            Mnemonic::Push => {
+                Self::expect_ops(inst, 1)?;
+                let width = Self::stack_width(inst, true)?;
+                let value = self.read_operand(inst, 0, width)?;
+                let off = self
+                    .tracked_rsp()?
+                    .checked_sub(i64::from(width.bytes()))
+                    .map_or_else(|| unsupported("rsp offset overflow"), Ok)?;
+                let (address, key) = self.stack_slot(off)?;
+                self.set_rsp(off)?;
+                self.store_at(address, key, value);
+                Ok(())
+            }
+            Mnemonic::Pop => {
+                Self::expect_ops(inst, 1)?;
+                let width = Self::stack_width(inst, false)?;
+                if Self::operand_width(inst, 0)? != width {
+                    return unsupported("pop operand width mismatch");
+                }
+                let off = self.tracked_rsp()?;
+                let (address, key) = self.stack_slot(off)?;
+                let value = self.load_at(address, &key, width)?;
+                let new = off
+                    .checked_add(i64::from(width.bytes()))
+                    .map_or_else(|| unsupported("rsp offset overflow"), Ok)?;
+                self.set_rsp(new)?;
+                self.write_operand(inst, 0, value)
+            }
+            m if Self::is_cmov(m) => {
+                Self::expect_ops(inst, 2)?;
+                let width = Self::operand_width(inst, 0)?;
+                let cond = self.condition(inst.condition_code())?;
+                let src = self.read_operand(inst, 1, width)?;
+                let dst = self.read_operand(inst, 0, width)?;
+                let result = if let Some(taken) = self.alg.as_const(&cond) {
+                    if taken & 1 == 1 { src } else { dst }
+                } else {
+                    let wide = self.resize(Resize::ZeroExtend, width, cond)?;
+                    let mask = self.un(UnOp::Neg, wide)?;
+                    let diff = self.bin(BinOp::Xor, dst.clone(), src)?;
+                    let picked = self.bin(BinOp::And, diff, mask)?;
+                    self.bin(BinOp::Xor, dst, picked)?
+                };
+                self.write_operand(inst, 0, result)
+            }
+            m if Self::is_setcc(m) => {
+                Self::expect_ops(inst, 1)?;
+                let cond = self.condition(inst.condition_code())?;
+                self.write_operand(inst, 0, cond)
+            }
+            Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv => self.exec_wide(inst, mnemonic),
             Mnemonic::Imul => {
                 let (a, b) = match inst.op_count() {
                     2 => {
@@ -772,7 +1037,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                             self.read_operand(inst, 2, width)?,
                         )
                     }
-                    _ => return unsupported("one-operand widening imul"),
+                    1 => return self.exec_wide(inst, mnemonic),
+                    _ => return unsupported("imul operand count"),
                 };
                 let result = self.bin(BinOp::Mul, a, b)?;
                 self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
@@ -826,6 +1092,102 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             }
             other => unsupported(format!("mnemonic {other:?} is not modeled")),
         }
+    }
+
+    fn is_cmov(m: Mnemonic) -> bool {
+        matches!(
+            m,
+            Mnemonic::Cmovo
+                | Mnemonic::Cmovno
+                | Mnemonic::Cmovb
+                | Mnemonic::Cmovae
+                | Mnemonic::Cmove
+                | Mnemonic::Cmovne
+                | Mnemonic::Cmovbe
+                | Mnemonic::Cmova
+                | Mnemonic::Cmovs
+                | Mnemonic::Cmovns
+                | Mnemonic::Cmovp
+                | Mnemonic::Cmovnp
+                | Mnemonic::Cmovl
+                | Mnemonic::Cmovge
+                | Mnemonic::Cmovle
+                | Mnemonic::Cmovg
+        )
+    }
+
+    fn is_setcc(m: Mnemonic) -> bool {
+        matches!(
+            m,
+            Mnemonic::Seto
+                | Mnemonic::Setno
+                | Mnemonic::Setb
+                | Mnemonic::Setae
+                | Mnemonic::Sete
+                | Mnemonic::Setne
+                | Mnemonic::Setbe
+                | Mnemonic::Seta
+                | Mnemonic::Sets
+                | Mnemonic::Setns
+                | Mnemonic::Setp
+                | Mnemonic::Setnp
+                | Mnemonic::Setl
+                | Mnemonic::Setge
+                | Mnemonic::Setle
+                | Mnemonic::Setg
+        )
+    }
+
+    /// One-operand mul/imul (`DX:AX = AX * src`, AH:AL for 8-bit) and div/idiv.
+    fn exec_wide(&mut self, inst: &Instruction, mnemonic: Mnemonic) -> R<()> {
+        Self::expect_ops(inst, 1)?;
+        let width = Self::operand_width(inst, 0)?;
+        let (lo_reg, hi_reg) = match width {
+            Width::W8 => (Register::AL, Register::AH),
+            Width::W16 => (Register::AX, Register::DX),
+            Width::W32 => (Register::EAX, Register::EDX),
+            Width::W64 => (Register::RAX, Register::RDX),
+        };
+        let src = self.read_operand(inst, 0, width)?;
+        let signed = matches!(mnemonic, Mnemonic::Imul | Mnemonic::Idiv);
+        let (lo, hi) = if matches!(mnemonic, Mnemonic::Mul | Mnemonic::Imul) {
+            let a = self.read_reg(lo_reg)?;
+            if width == Width::W64 {
+                let name = if signed { "mulhi_s" } else { "mulhi_u" };
+                let hi = self
+                    .alg
+                    .intrinsic(width, name, vec![a.clone(), src.clone()]);
+                (self.bin(BinOp::Mul, a, src)?, hi)
+            } else {
+                let ext = if signed {
+                    Resize::SignExtend
+                } else {
+                    Resize::ZeroExtend
+                };
+                let a = self.resize(ext, Width::W64, a)?;
+                let b = self.resize(ext, Width::W64, src)?;
+                let product = self.bin(BinOp::Mul, a, b)?;
+                let shift = self.k(Width::W64, u64::from(width.bits()));
+                let high = self.bin(BinOp::Shr, product.clone(), shift)?;
+                (
+                    self.resize(Resize::Truncate, width, product)?,
+                    self.resize(Resize::Truncate, width, high)?,
+                )
+            }
+        } else {
+            let hi = self.read_reg(hi_reg)?;
+            let lo = self.read_reg(lo_reg)?;
+            let args = vec![hi, lo, src];
+            let prefix = if signed { "sdiv" } else { "udiv" };
+            (
+                self.alg
+                    .intrinsic(width, &format!("{prefix}_q"), args.clone()),
+                self.alg.intrinsic(width, &format!("{prefix}_r"), args),
+            )
+        };
+        self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+        self.write_reg(lo_reg, lo)?;
+        self.write_reg(hi_reg, hi)
     }
 
     fn expect_ops(inst: &Instruction, count: u32) -> R<()> {

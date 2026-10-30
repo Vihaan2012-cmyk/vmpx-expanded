@@ -2,12 +2,14 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::cast_lossless
+    clippy::cast_lossless,
+    clippy::many_single_char_names,
+    clippy::similar_names
 )]
 
 use iced_x86::code_asm::{
-    CodeAssembler, ah, al, ax, bl, bx, cl, cx, dl, eax, ebx, ecx, edx, ptr, qword_ptr, rax, rbx, rcx,
-    rdx, rsp,
+    CodeAssembler, ah, al, ax, bl, bx, byte_ptr, cl, cx, dl, eax, ebx, ecx, edx, ptr, qword_ptr,
+    r8b, rax, rbp, rbx, rcx, rdi, rdx, rsi, rsp,
 };
 
 use crate::{
@@ -36,15 +38,25 @@ fn mix(mut x: u64) -> u64 {
 }
 
 fn input_value(seed: u64, name: &str) -> u64 {
-    let tag = name
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(131).wrapping_add(u64::from(b)));
-    mix(seed.wrapping_mul(0x1_0000_0001).wrapping_add(tag))
+    let tag = name.bytes().fold(0u64, |acc, b| {
+        acc.wrapping_mul(131).wrapping_add(u64::from(b))
+    });
+    let value = mix(seed.wrapping_mul(0x1_0000_0001).wrapping_add(tag));
+    if matches!(
+        name,
+        "cf_in" | "pf_in" | "af_in" | "zf_in" | "sf_in" | "of_in"
+    ) {
+        value & 1
+    } else {
+        value
+    }
 }
 
 fn eval_expr(expr: &NativeExpr, seed: u64) -> u64 {
-    expr.eval(&|name| input_value(seed, name), &|addr, _| mix(addr ^ 0xABCD))
-        .expect("evaluable")
+    expr.eval(&|name| input_value(seed, name), &|addr, _| {
+        mix(addr ^ 0xABCD)
+    })
+    .expect("evaluable")
 }
 
 fn reg(sem: &Sem, seed: u64, gpr: Gpr) -> u64 {
@@ -66,7 +78,9 @@ fn trunc(w: Width, e: NativeExpr) -> NativeExpr {
 }
 
 fn zext64(e: NativeExpr) -> NativeExpr {
-    NativeAlgebra.resize(Resize::ZeroExtend, Width::W64, e).unwrap()
+    NativeAlgebra
+        .resize(Resize::ZeroExtend, Width::W64, e)
+        .unwrap()
 }
 
 fn bin(op: BinOp, l: NativeExpr, r: NativeExpr) -> NativeExpr {
@@ -156,9 +170,11 @@ fn substitution_identities_round_trip() {
         a.mov(eax, ecx).unwrap();
         a.not(eax).unwrap();
     });
-    let expected = zext64(NativeAlgebra
-        .unary(crate::UnOp::Not, trunc(Width::W32, input("rcx_in")))
-        .unwrap());
+    let expected = zext64(
+        NativeAlgebra
+            .unary(crate::UnOp::Not, trunc(Width::W32, input("rcx_in")))
+            .unwrap(),
+    );
     assert_eq!(direct.regs[&Gpr::Rax], expected);
 }
 
@@ -202,7 +218,10 @@ fn extensions() {
         assert_eq!(reg(&sem, seed, Gpr::Rbx), i64::from(c as i32) as u64);
         assert_eq!(reg(&sem, seed, Gpr::Rdx), c & 0xFFFF);
         // bl was overwritten by movsxd, so its low byte is c's low byte
-        assert_eq!(reg(&sem, seed, Gpr::Rcx), u64::from(i32::from(c as i8) as u32));
+        assert_eq!(
+            reg(&sem, seed, Gpr::Rcx),
+            u64::from(i32::from(c as i8) as u32)
+        );
     }
 }
 
@@ -269,7 +288,10 @@ fn imul_inc_dec_neg() {
         assert_eq!(reg(&sem, seed, Gpr::Rbx), d.wrapping_mul(7));
         let c1 = (c & !0xFF) | u64::from((c as u8).wrapping_add(1));
         assert_eq!(reg(&sem, seed, Gpr::Rcx), c1.wrapping_neg());
-        assert_eq!(reg(&sem, seed, Gpr::Rdx), u64::from((d as u32).wrapping_sub(1)));
+        assert_eq!(
+            reg(&sem, seed, Gpr::Rdx),
+            u64::from((d as u32).wrapping_sub(1))
+        );
     }
 }
 
@@ -285,7 +307,10 @@ fn xchg_swaps_and_zero_extends_32_bit() {
     assert_eq!(mem.writes.len(), 1);
     assert_eq!(mem.writes[0].address, input("rax_in"));
     assert_eq!(mem.writes[0].value, input("rax_in"));
-    assert_eq!(mem.regs[&Gpr::Rax], NativeAlgebra.load(Width::W64, input("rax_in")));
+    assert_eq!(
+        mem.regs[&Gpr::Rax],
+        NativeAlgebra.load(Width::W64, input("rax_in"))
+    );
 }
 
 #[test]
@@ -389,11 +414,10 @@ fn unmodeled_instructions_fail_closed_naming_the_instruction() {
     type Case = (&'static str, Box<dyn FnOnce(&mut CodeAssembler)>);
     let cases: Vec<Case> = vec![
         ("cpuid", Box::new(|a| a.cpuid().unwrap())),
-        ("div", Box::new(|a| a.div(ecx).unwrap())),
-        ("push", Box::new(|a| a.push(rax).unwrap())),
-        ("adc", Box::new(|a| a.adc(eax, ecx).unwrap())),
         ("bsf", Box::new(|a| a.bsf(eax, ecx).unwrap())),
-        ("mul", Box::new(|a| a.mul(rcx).unwrap())),
+        ("bsr", Box::new(|a| a.bsr(eax, ecx).unwrap())),
+        ("cqo", Box::new(|a| a.cqo().unwrap())),
+        ("pushfq", Box::new(|a| a.pushfq().unwrap())),
     ];
     for (name, build) in cases {
         match lift(build) {
@@ -415,8 +439,6 @@ fn unmodeled_instructions_fail_closed_naming_the_instruction() {
         lift_bytes(&NativeAlgebra, &[0x90, 0x06], 0),
         Err(LiftError::Decode { offset: 1 })
     ));
-    let imul1 = lift(|a| a.imul(ecx).unwrap());
-    assert!(matches!(imul1, Err(LiftError::Unsupported { .. })));
 }
 
 #[test]
@@ -426,5 +448,547 @@ fn rip_relative_is_an_absolute_address() {
     assert_eq!(
         sem.reads[0].address,
         NativeAlgebra.constant(Width::W64, 0x1006 + 0x20)
+    );
+}
+
+fn w_of(bits: u32) -> Width {
+    Width::from_bytes((bits / 8) as usize).unwrap()
+}
+
+fn eval_with(expr: &NativeExpr, input: &dyn Fn(&str) -> u64) -> Option<u64> {
+    expr.eval(input, &|addr, _| mix(addr ^ 0xABCD))
+}
+
+fn rsp_off(off: i64) -> NativeExpr {
+    bin(
+        BinOp::Add,
+        input("rsp_in"),
+        NativeAlgebra.constant(Width::W64, off as u64),
+    )
+}
+
+#[test]
+fn push_pop_round_trip_restores_values_and_rsp() {
+    let sem = ok(|a| {
+        a.push(rcx).unwrap();
+        a.push(rdx).unwrap();
+        a.pop(rax).unwrap();
+        a.pop(rbx).unwrap();
+    });
+    assert_eq!(sem.regs[&Gpr::Rsp], input("rsp_in"));
+    assert!(sem.written.contains(&Gpr::Rsp));
+    assert!(sem.reads.is_empty());
+    assert_eq!(sem.writes.len(), 2);
+    assert_eq!(sem.writes[0].address, rsp_off(-8));
+    assert_eq!(sem.writes[1].address, rsp_off(-16));
+    assert_eq!(sem.writes[0].value, input("rcx_in"));
+    assert_eq!(sem.writes[1].value, input("rdx_in"));
+    for seed in SEEDS {
+        assert_eq!(reg(&sem, seed, Gpr::Rax), inp(seed, Gpr::Rdx));
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), inp(seed, Gpr::Rcx));
+    }
+}
+
+#[test]
+fn push_forms_pop_to_memory_and_pop_rsp() {
+    let sem = ok(|a| {
+        a.push(qword_ptr(rbx)).unwrap();
+        a.push(-2i32).unwrap();
+        a.push(rsp).unwrap();
+        a.pop(rsi).unwrap();
+        a.pop(rdi).unwrap();
+        a.pop(rax).unwrap();
+    });
+    assert_eq!(sem.reads.len(), 1);
+    assert_eq!(sem.regs[&Gpr::Rsp], input("rsp_in"));
+    assert_eq!(
+        sem.regs[&Gpr::Rax],
+        NativeAlgebra.load(Width::W64, input("rbx_in"))
+    );
+    for seed in SEEDS {
+        assert_eq!(
+            reg(&sem, seed, Gpr::Rsi),
+            inp(seed, Gpr::Rsp).wrapping_sub(16)
+        );
+        assert_eq!(reg(&sem, seed, Gpr::Rdi), (-2i64) as u64);
+    }
+
+    // Intel: pop [rsp] computes its address after rsp has been incremented.
+    let sem = ok(|a| {
+        a.push(rcx).unwrap();
+        a.pop(qword_ptr(rsp)).unwrap();
+    });
+    assert_eq!(sem.regs[&Gpr::Rsp], input("rsp_in"));
+    assert_eq!(sem.writes.len(), 2);
+    assert_eq!(sem.writes[1].address, input("rsp_in"));
+    assert_eq!(sem.writes[1].value, input("rcx_in"));
+
+    let sem = ok(|a| {
+        a.push(rcx).unwrap();
+        a.pop(rsp).unwrap();
+    });
+    assert_eq!(sem.regs[&Gpr::Rsp], input("rcx_in"));
+    assert!(
+        lift(|a| {
+            a.push(rcx).unwrap();
+            a.pop(rsp).unwrap();
+            a.push(rax).unwrap();
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn push_pop_16_bit_operands() {
+    let sem = ok(|a| {
+        a.push(cx).unwrap();
+        a.pop(bx).unwrap();
+    });
+    assert_eq!(sem.regs[&Gpr::Rsp], input("rsp_in"));
+    assert_eq!(sem.writes[0].width, Width::W16);
+    assert_eq!(sem.writes[0].address, rsp_off(-2));
+    for seed in SEEDS {
+        let (b0, c) = (inp(seed, Gpr::Rbx), inp(seed, Gpr::Rcx));
+        assert_eq!(reg(&sem, seed, Gpr::Rbx), (b0 & !0xFFFF) | (c & 0xFFFF));
+    }
+}
+
+#[test]
+fn rsp_tracks_constant_adjustments_and_fails_closed_otherwise() {
+    let sem = ok(|a| {
+        a.sub(rsp, 0x28).unwrap();
+        a.push(rcx).unwrap();
+        a.mov(rax, qword_ptr(rsp)).unwrap();
+        a.mov(rbx, qword_ptr(rsp + 8)).unwrap();
+        a.add(rsp, 0x28).unwrap();
+    });
+    assert_eq!(sem.regs[&Gpr::Rax], input("rcx_in"));
+    assert_eq!(
+        sem.regs[&Gpr::Rbx],
+        NativeAlgebra.load(Width::W64, rsp_off(-0x28))
+    );
+    assert_eq!(sem.regs[&Gpr::Rsp], rsp_off(-8));
+    assert_eq!(sem.writes[0].address, rsp_off(-0x30));
+    let untracked = lift(|a| {
+        a.mov(rsp, rbp).unwrap();
+        a.push(rax).unwrap();
+    });
+    assert!(matches!(untracked, Err(LiftError::Unsupported { .. })));
+    let masked = lift(|a| {
+        a.and(rsp, -16).unwrap();
+        a.pop(rax).unwrap();
+    });
+    assert!(matches!(masked, Err(LiftError::Unsupported { .. })));
+}
+
+struct Ref {
+    result: u64,
+    cf: u64,
+    of: u64,
+    zf: u64,
+    sf: u64,
+    pf: u64,
+    af: u64,
+}
+
+fn carry_ref(bits: u32, sub: bool, a: u64, b: u64, c: u64) -> Ref {
+    let w = w_of(bits);
+    let (a, b) = (w.truncate(a), w.truncate(b));
+    let (result, cf) = if sub {
+        (
+            w.truncate(a.wrapping_sub(b).wrapping_sub(c)),
+            u128::from(a) < u128::from(b) + u128::from(c),
+        )
+    } else {
+        let full = u128::from(a) + u128::from(b) + u128::from(c);
+        (w.truncate(full as u64), (full >> bits) & 1 == 1)
+    };
+    let top = |x: u64| (x >> (bits - 1)) & 1;
+    let of = if sub {
+        top((a ^ b) & (a ^ result))
+    } else {
+        top((a ^ result) & (b ^ result))
+    };
+    Ref {
+        result,
+        cf: u64::from(cf),
+        of,
+        zf: u64::from(result == 0),
+        sf: top(result),
+        pf: u64::from((result & 0xFF).count_ones().is_multiple_of(2)),
+        af: ((a ^ b ^ result) >> 4) & 1,
+    }
+}
+
+fn check_flags(sem: &Sem, seed: u64, want: &Ref) {
+    for (flag, v) in [
+        (Flag::Cf, want.cf),
+        (Flag::Of, want.of),
+        (Flag::Zf, want.zf),
+        (Flag::Sf, want.sf),
+        (Flag::Pf, want.pf),
+        (Flag::Af, want.af),
+    ] {
+        let FlagState::Value(e) = &sem.flags[&flag] else {
+            panic!("{flag:?}")
+        };
+        assert_eq!(eval_expr(e, seed), v, "{flag:?}");
+    }
+}
+
+#[test]
+fn adc_sbb_use_carry_in_and_set_flags() {
+    let adc32 = ok(|a| a.adc(eax, ecx).unwrap());
+    let sbb64 = ok(|a| a.sbb(rbx, rdx).unwrap());
+    let adc8 = ok(|a| a.adc(cl, dl).unwrap());
+    let sbb8 = ok(|a| a.sbb(al, bl).unwrap());
+    for seed in SEEDS {
+        let cin = input_value(seed, "cf_in");
+        let (a0, b0, c, d) = (
+            inp(seed, Gpr::Rax),
+            inp(seed, Gpr::Rbx),
+            inp(seed, Gpr::Rcx),
+            inp(seed, Gpr::Rdx),
+        );
+        let w = carry_ref(32, false, a0, c, cin);
+        assert_eq!(reg(&adc32, seed, Gpr::Rax), w.result);
+        check_flags(&adc32, seed, &w);
+        let w = carry_ref(64, true, b0, d, cin);
+        assert_eq!(reg(&sbb64, seed, Gpr::Rbx), w.result);
+        check_flags(&sbb64, seed, &w);
+        let w = carry_ref(8, false, c, d, cin);
+        assert_eq!(reg(&adc8, seed, Gpr::Rcx), (c & !0xFF) | w.result);
+        check_flags(&adc8, seed, &w);
+        let w = carry_ref(8, true, a0, b0, cin);
+        assert_eq!(reg(&sbb8, seed, Gpr::Rax), (a0 & !0xFF) | w.result);
+        check_flags(&sbb8, seed, &w);
+    }
+}
+
+#[test]
+fn adc_consumes_an_in_block_carry_and_memory_destination() {
+    let sem = ok(|a| {
+        a.cmp(rax, rcx).unwrap();
+        a.adc(rdx, 0).unwrap();
+    });
+    let mem = ok(|a| a.adc(qword_ptr(rbx), rcx).unwrap());
+    for seed in SEEDS {
+        let (a0, c, d) = (
+            inp(seed, Gpr::Rax),
+            inp(seed, Gpr::Rcx),
+            inp(seed, Gpr::Rdx),
+        );
+        assert_eq!(reg(&sem, seed, Gpr::Rdx), d.wrapping_add(u64::from(a0 < c)));
+        let old = mix(inp(seed, Gpr::Rbx) ^ 0xABCD);
+        let want = old.wrapping_add(c).wrapping_add(input_value(seed, "cf_in"));
+        assert_eq!(eval_expr(&mem.writes[0].value, seed), want);
+    }
+    let shifted = lift(|a| {
+        a.shl(eax, 1).unwrap();
+        a.adc(ebx, ecx).unwrap();
+    });
+    assert!(matches!(shifted, Err(LiftError::Unsupported { .. })));
+    let multiplied = lift(|a| {
+        a.imul_2(eax, ecx).unwrap();
+        a.sbb(ebx, ecx).unwrap();
+    });
+    assert!(matches!(multiplied, Err(LiftError::Unsupported { .. })));
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct CmpFlags {
+    cf: bool,
+    zf: bool,
+    sf: bool,
+    of: bool,
+    pf: bool,
+}
+
+type FlagPred = fn(&CmpFlags) -> bool;
+
+fn cmp_flags(a: u32, c: u32) -> CmpFlags {
+    let r = a.wrapping_sub(c);
+    CmpFlags {
+        cf: a < c,
+        zf: r == 0,
+        sf: r >> 31 == 1,
+        of: (((a ^ c) & (a ^ r)) >> 31) & 1 == 1,
+        pf: (r & 0xFF).count_ones().is_multiple_of(2),
+    }
+}
+
+macro_rules! cc_cases {
+    ($(($cmov:ident, $set:ident, $pred:expr)),* $(,)?) => {
+        vec![$((
+            stringify!($cmov),
+            Box::new(|a: &mut CodeAssembler| {
+                a.cmp(eax, ecx).unwrap();
+                a.$cmov(edx, ebx).unwrap();
+                a.$set(r8b).unwrap();
+            }) as Box<dyn Fn(&mut CodeAssembler)>,
+            $pred as FlagPred,
+        )),*]
+    };
+}
+
+#[test]
+fn cmovcc_and_setcc_follow_every_condition() {
+    let cases = cc_cases![
+        (cmovo, seto, |f| f.of),
+        (cmovno, setno, |f| !f.of),
+        (cmovb, setb, |f| f.cf),
+        (cmovae, setae, |f| !f.cf),
+        (cmove, sete, |f| f.zf),
+        (cmovne, setne, |f| !f.zf),
+        (cmovbe, setbe, |f| f.cf || f.zf),
+        (cmova, seta, |f| !(f.cf || f.zf)),
+        (cmovs, sets, |f| f.sf),
+        (cmovns, setns, |f| !f.sf),
+        (cmovp, setp, |f| f.pf),
+        (cmovnp, setnp, |f| !f.pf),
+        (cmovl, setl, |f| f.sf != f.of),
+        (cmovge, setge, |f| f.sf == f.of),
+        (cmovle, setle, |f| f.zf || f.sf != f.of),
+        (cmovg, setg, |f| !f.zf && f.sf == f.of),
+    ];
+    for (name, build, pred) in cases {
+        let sem = ok(|a| build(a));
+        for seed in SEEDS {
+            // random 32-bit values are never equal, so also force rcx == rax
+            for equal in [false, true] {
+                let f = |n: &str| {
+                    if equal && n == "rcx_in" {
+                        input_value(seed, "rax_in")
+                    } else {
+                        input_value(seed, n)
+                    }
+                };
+                let (a0, c) = (f("rax_in"), f("rcx_in"));
+                let (b, d, r) = (f("rbx_in"), f("rdx_in"), f("r8_in"));
+                let taken = pred(&cmp_flags(a0 as u32, c as u32));
+                let want_d = if taken { b } else { d } & 0xFFFF_FFFF;
+                let got_d = eval_with(&sem.regs[&Gpr::Rdx], &f).unwrap();
+                let got_r = eval_with(&sem.regs[&Gpr::R8], &f).unwrap();
+                assert_eq!(got_d, want_d, "{name} cmov seed {seed} eq {equal}");
+                assert_eq!(
+                    got_r,
+                    (r & !0xFF) | u64::from(taken),
+                    "{name} set seed {seed} eq {equal}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cmov_setcc_read_entry_flags_fold_constants_and_fail_closed() {
+    let sem = ok(|a| {
+        a.cmove(rax, rcx).unwrap();
+        a.sete(byte_ptr(rdx)).unwrap();
+    });
+    assert_eq!(sem.writes[0].width, Width::W8);
+    for seed in SEEDS {
+        let zf = input_value(seed, "zf_in");
+        let want = if zf == 1 {
+            inp(seed, Gpr::Rcx)
+        } else {
+            inp(seed, Gpr::Rax)
+        };
+        assert_eq!(reg(&sem, seed, Gpr::Rax), want);
+        assert_eq!(eval_expr(&sem.writes[0].value, seed), zf);
+    }
+    let sem = ok(|a| {
+        a.xor(eax, eax).unwrap();
+        a.cmovb(ebx, ecx).unwrap();
+        a.cmovae(edx, ecx).unwrap();
+    });
+    assert_eq!(
+        sem.regs[&Gpr::Rbx],
+        zext64(trunc(Width::W32, input("rbx_in")))
+    );
+    assert_eq!(
+        sem.regs[&Gpr::Rdx],
+        zext64(trunc(Width::W32, input("rcx_in")))
+    );
+    let cmov = lift(|a| {
+        a.shl(eax, 1).unwrap();
+        a.cmovb(ebx, ecx).unwrap();
+    });
+    assert!(matches!(cmov, Err(LiftError::Unsupported { .. })));
+    let set = lift(|a| {
+        a.shl(eax, 1).unwrap();
+        a.sete(dl).unwrap();
+    });
+    assert!(matches!(set, Err(LiftError::Unsupported { .. })));
+}
+
+fn wide_mul_ref(bits: u32, signed: bool, a: u64, b: u64) -> (u64, u64) {
+    let w = w_of(bits);
+    let p: u128 = if signed {
+        (i128::from(w.sign_extend(a) as i64) * i128::from(w.sign_extend(b) as i64)) as u128
+    } else {
+        u128::from(w.truncate(a)) * u128::from(w.truncate(b))
+    };
+    (w.truncate(p as u64), w.truncate((p >> bits) as u64))
+}
+
+type Build = Box<dyn Fn(&mut CodeAssembler)>;
+
+#[test]
+fn one_operand_mul_and_imul_write_the_wide_product() {
+    let cases: Vec<(u32, bool, Build)> = vec![
+        (8, false, Box::new(|a| a.mul(cl).unwrap())),
+        (16, false, Box::new(|a| a.mul(cx).unwrap())),
+        (32, false, Box::new(|a| a.mul(ecx).unwrap())),
+        (64, false, Box::new(|a| a.mul(rcx).unwrap())),
+        (8, true, Box::new(|a| a.imul(cl).unwrap())),
+        (16, true, Box::new(|a| a.imul(cx).unwrap())),
+        (32, true, Box::new(|a| a.imul(ecx).unwrap())),
+        (64, true, Box::new(|a| a.imul(rcx).unwrap())),
+    ];
+    let corners = [
+        (u64::MAX, u64::MAX, 7),
+        (1 << 63, u64::MAX, 7),
+        (0x8000_0000, 0x8000_0000, 7),
+        (0x80, 0x80, 7),
+        (0x8000, 0xFFFF, 7),
+    ];
+    for (bits, signed, build) in &cases {
+        let sem = ok(|a| build(a));
+        assert!(matches!(sem.flags[&Flag::Cf], FlagState::Clobbered));
+        let mut inputs: Vec<(u64, u64, u64)> = corners.to_vec();
+        inputs.extend(SEEDS.map(|s| (mix(s), mix(s + 100), mix(s + 200))));
+        for (a0, c, d) in inputs {
+            let f = |n: &str| match n {
+                "rax_in" => a0,
+                "rcx_in" => c,
+                "rdx_in" => d,
+                _ => 0,
+            };
+            let (lo, hi) = wide_mul_ref(*bits, *signed, a0, c);
+            let got = |g: Gpr| eval_with(&sem.regs[&g], &f).unwrap();
+            let ctx = format!("{bits} {signed} {a0:x} {c:x}");
+            match bits {
+                8 => {
+                    assert_eq!(got(Gpr::Rax), (a0 & !0xFFFF) | (hi << 8) | lo, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), d, "{ctx}");
+                }
+                16 => {
+                    assert_eq!(got(Gpr::Rax), (a0 & !0xFFFF) | lo, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), (d & !0xFFFF) | hi, "{ctx}");
+                }
+                _ => {
+                    assert_eq!(got(Gpr::Rax), lo, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), hi, "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn div_and_idiv_consume_the_wide_dividend() {
+    let cases: Vec<(u32, bool, Build)> = vec![
+        (8, false, Box::new(|a| a.div(cl).unwrap())),
+        (16, false, Box::new(|a| a.div(cx).unwrap())),
+        (32, false, Box::new(|a| a.div(ecx).unwrap())),
+        (64, false, Box::new(|a| a.div(rcx).unwrap())),
+        (8, true, Box::new(|a| a.idiv(cl).unwrap())),
+        (16, true, Box::new(|a| a.idiv(cx).unwrap())),
+        (32, true, Box::new(|a| a.idiv(ecx).unwrap())),
+        (64, true, Box::new(|a| a.idiv(rcx).unwrap())),
+    ];
+    for (bits, signed, build) in &cases {
+        let w = w_of(*bits);
+        let sem = ok(|a| build(a));
+        let mut checked = 0;
+        for s in 0..64u64 {
+            let (r1, r2, r3) = (mix(s), mix(s + 1000), mix(s + 2000));
+            let (j1, j2, j3) = (mix(s + 3000), mix(s + 4000), mix(s + 5000));
+            let d = w.truncate(r1).max(1);
+            // dividend = q*d + r (feasible quotient by construction); expected values come from Rust division
+            let (dividend, q, r) = if *signed {
+                let dsx = i128::from(w.sign_extend(d) as i64);
+                let qsx = i128::from(w.sign_extend(r2) as i64);
+                let prod = qsx * dsx;
+                let mag = i128::from(r3) % dsx.abs();
+                let n = prod + if prod < 0 { -mag } else { mag };
+                let half = 1i128 << (bits - 1);
+                if n / dsx < -half || n / dsx >= half {
+                    continue;
+                }
+                (
+                    n as u128,
+                    w.truncate((n / dsx) as u64),
+                    w.truncate((n % dsx) as u64),
+                )
+            } else {
+                let n = u128::from(w.truncate(r2)) * u128::from(d) + u128::from(r3) % u128::from(d);
+                (
+                    n,
+                    w.truncate((n / u128::from(d)) as u64),
+                    w.truncate((n % u128::from(d)) as u64),
+                )
+            };
+            let (hi, lo) = (
+                w.truncate((dividend >> bits) as u64),
+                w.truncate(dividend as u64),
+            );
+            let (rax_in, rdx_in) = match bits {
+                8 => ((j1 & !0xFFFF) | (hi << 8) | lo, j2),
+                16 => ((j1 & !0xFFFF) | lo, (j2 & !0xFFFF) | hi),
+                32 => ((j1 << 32) | lo, (j2 << 32) | hi),
+                _ => (lo, hi),
+            };
+            let rcx_in = (j3 & !w.mask()) | d;
+            let f = |n: &str| match n {
+                "rax_in" => rax_in,
+                "rdx_in" => rdx_in,
+                "rcx_in" => rcx_in,
+                _ => 0,
+            };
+            let got = |g: Gpr| eval_with(&sem.regs[&g], &f).unwrap();
+            let ctx = format!("{bits} {signed} seed {s}");
+            match bits {
+                8 => {
+                    assert_eq!(got(Gpr::Rax), (rax_in & !0xFFFF) | (r << 8) | q, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), rdx_in, "{ctx}");
+                }
+                16 => {
+                    assert_eq!(got(Gpr::Rax), (rax_in & !0xFFFF) | q, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), (rdx_in & !0xFFFF) | r, "{ctx}");
+                }
+                _ => {
+                    assert_eq!(got(Gpr::Rax), q, "{ctx}");
+                    assert_eq!(got(Gpr::Rdx), r, "{ctx}");
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 20, "{bits} {signed}: only {checked} cases");
+    }
+}
+
+#[test]
+fn div_is_undefined_where_hardware_faults() {
+    let udiv = ok(|a| a.div(ecx).unwrap());
+    let idiv = ok(|a| a.idiv(ecx).unwrap());
+    let eval = |sem: &Sem, rax_in: u64, rdx_in: u64, rcx_in: u64| {
+        let f = |n: &str| match n {
+            "rax_in" => rax_in,
+            "rdx_in" => rdx_in,
+            "rcx_in" => rcx_in,
+            _ => 0,
+        };
+        eval_with(&sem.regs[&Gpr::Rax], &f)
+    };
+    assert_eq!(eval(&udiv, 100, 0, 7), Some(14));
+    assert_eq!(eval(&udiv, 100, 0, 0), None);
+    assert_eq!(eval(&udiv, 0, 5, 3), None);
+    assert_eq!(eval(&idiv, 0x8000_0000, 0, 1), None);
+    assert_eq!(eval(&idiv, 0x8000_0000, 0xFFFF_FFFF, 0xFFFF_FFFF), None);
+    assert_eq!(
+        eval(&idiv, u64::from((-100i32) as u32), 0xFFFF_FFFF, 7),
+        Some(u64::from((-14i32) as u32))
     );
 }

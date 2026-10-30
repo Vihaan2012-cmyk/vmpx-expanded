@@ -153,7 +153,11 @@ pub(crate) fn eval_binary(op: BinOp, width: Width, left: u64, right: u64) -> u64
             } else {
                 (bits - k) % bits
             };
-            if k == 0 { l } else { (l << k) | (l >> (bits - k)) }
+            if k == 0 {
+                l
+            } else {
+                (l << k) | (l >> (bits - k))
+            }
         }
     };
     width.truncate(result)
@@ -171,6 +175,11 @@ fn sign_bit(width: Width, value: u64) -> u64 {
     (width.truncate(value) >> (width.bits() - 1)) & 1
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)]
 fn eval_intrinsic(name: &str, args: &[(Width, u64)]) -> Option<u64> {
     let flag = u64::from;
     match (name, args) {
@@ -198,8 +207,79 @@ fn eval_intrinsic(name: &str, args: &[(Width, u64)]) -> Option<u64> {
             let r = w.truncate(a.wrapping_sub(*b));
             Some(((a ^ b ^ r) >> 4) & 1)
         }
+        ("cf_adc", [(w, a), (_, b), (_, c)]) => {
+            let sum = u128::from(w.truncate(*a)) + u128::from(w.truncate(*b)) + u128::from(*c & 1);
+            Some(flag((sum >> w.bits()) & 1 == 1))
+        }
+        ("of_adc", [(w, a), (_, b), (_, c)]) => {
+            let r = w.truncate(a.wrapping_add(*b).wrapping_add(*c & 1));
+            Some(sign_bit(*w, (a ^ r) & (b ^ r)))
+        }
+        ("af_adc", [(w, a), (_, b), (_, c)]) => {
+            let r = w.truncate(a.wrapping_add(*b).wrapping_add(*c & 1));
+            Some(((a ^ b ^ r) >> 4) & 1)
+        }
+        ("cf_sbb", [(w, a), (_, b), (_, c)]) => Some(flag(
+            u128::from(w.truncate(*a)) < u128::from(w.truncate(*b)) + u128::from(*c & 1),
+        )),
+        ("of_sbb", [(w, a), (_, b), (_, c)]) => {
+            let r = w.truncate(a.wrapping_sub(*b).wrapping_sub(*c & 1));
+            Some(sign_bit(*w, (a ^ b) & (a ^ r)))
+        }
+        ("af_sbb", [(w, a), (_, b), (_, c)]) => {
+            let r = w.truncate(a.wrapping_sub(*b).wrapping_sub(*c & 1));
+            Some(((a ^ b ^ r) >> 4) & 1)
+        }
+        ("mulhi_u", [(w, a), (_, b)]) => {
+            let p = u128::from(w.truncate(*a)) * u128::from(w.truncate(*b));
+            Some((p >> w.bits()) as u64)
+        }
+        ("mulhi_s", [(w, a), (_, b)]) => {
+            let p = i128::from(w.sign_extend(*a).cast_signed())
+                * i128::from(w.sign_extend(*b).cast_signed());
+            Some((p >> w.bits()) as u64)
+        }
+        ("udiv_q" | "udiv_r" | "sdiv_q" | "sdiv_r", [(w, hi), (_, lo), (_, d)]) => {
+            eval_div(name, *w, *hi, *lo, *d)
+        }
         _ => None,
     }
+}
+
+/// `hi:lo / d` at width `w`. `None` where hardware raises #DE (zero divisor or
+/// quotient overflow), so the value is simply undefined there.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn eval_div(name: &str, w: Width, hi: u64, lo: u64, d: u64) -> Option<u64> {
+    let bits = w.bits();
+    let lo = w.truncate(lo);
+    if name.starts_with('u') {
+        let (hi, d) = (w.truncate(hi), w.truncate(d));
+        let dividend = (u128::from(hi) << bits) | u128::from(lo);
+        let q = dividend.checked_div(u128::from(d))?;
+        let r = dividend.checked_rem(u128::from(d))?;
+        if q > u128::from(w.mask()) {
+            return None;
+        }
+        return Some(if name.ends_with('q') {
+            q as u64
+        } else {
+            r as u64
+        });
+    }
+    let hi = i128::from(w.sign_extend(hi).cast_signed());
+    let d = i128::from(w.sign_extend(d).cast_signed());
+    let dividend = (hi << bits) | i128::from(lo);
+    let q = dividend.checked_div(d)?;
+    let r = dividend.checked_rem(d)?;
+    let half = 1i128 << (bits - 1);
+    if q < -half || q >= half {
+        return None;
+    }
+    Some(if name.ends_with('q') {
+        q as u64
+    } else {
+        r as u64
+    })
 }
 
 /// Default [`Algebra`] with constant folding and a few identity rewrites.
