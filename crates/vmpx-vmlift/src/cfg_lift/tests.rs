@@ -751,14 +751,16 @@ fn a_loop_with_phi_dependent_updates_emits_both_back_edge_variables() {
 }
 
 #[test]
-fn a_multi_exit_loop_fails_closed() {
-    // Reducible, so the header is accepted, but the body branches out a second
-    // time: not a structured single-exit loop, so the lift refuses.
+fn a_reducible_two_exit_loop_emits_both_exits() {
+    // A `while` test at the header (exit to 0xD0) and a conditional break in the
+    // body (exit to 0xE0), both leaving the same reducible loop. The body still
+    // carries a real per-iteration update (slot 0x28: 0 -> 0x55), so each exit's
+    // loop-carried state is the phi value at its own point.
     let looping = cfg(
         vec![
             loop_entry(0xA0, 0x900),
             branch_block(0xB0, LOOP_HEADER_ADDR),
-            branch_block(0xC0, LOOP_BODY_ADDR),
+            loop_body_const(0xC0, LOOP_BODY_ADDR),
             returns_constant(0xD0, 0x930, 111),
             returns_constant(0xE0, 0x940, 222),
         ],
@@ -772,10 +774,86 @@ fn a_multi_exit_loop_fails_closed() {
         ],
         0xA0,
     );
-    let error = lift(&looping, &constant_frame(), &BTreeMap::new())
-        .expect_err("a multi-exit loop must refuse");
+    let lifted = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect("a reducible two-exit loop lifts");
+    assert_eq!(lifted.loops, 1, "one natural loop emitted");
+    assert_eq!(lifted.exit_paths, 2, "both exit continuations are lifted");
+    assert_eq!(lifted.conditional_branches, 2, "both exit branches are emitted");
+    let operations = &lifted.replacement.function.operations;
+    // One back-edge jump closes the loop; each exit is a conditional break.
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::Jump(_))),
+        1,
+        "exactly one back-edge jump"
+    );
+    assert_eq!(
+        count(operations, |o| matches!(
+            o,
+            Operation::BranchIf {
+                condition: Condition::NotEqual,
+                ..
+            }
+        )),
+        2,
+        "two conditional-break branches"
+    );
+    // Each exit dispatches on its own in-loop continue address: the body for the
+    // header test, the header itself for the body break.
+    for continue_addr in [LOOP_BODY_ADDR, LOOP_HEADER_ADDR] {
+        assert!(
+            count(operations, |o| matches!(
+                o,
+                Operation::MoveImmediate { value, .. } if *value == continue_addr
+            )) >= 1,
+            "dispatches on continue address {continue_addr:#x}"
+        );
+    }
+    // The real per-iteration update still runs on the back-edge.
     assert!(
-        error.to_string().contains("more than one exit branch"),
+        count(operations, |o| matches!(
+            o,
+            Operation::MoveImmediate { value, .. } if *value == 0x55
+        )) >= 1,
+        "emits the per-iteration update"
+    );
+    // Both continuations return.
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::ReturnPopping { .. })),
+        2,
+        "each exit continuation returns"
+    );
+}
+
+#[test]
+fn an_in_loop_branch_fails_closed() {
+    // Reducible (0xB0 dominates the whole body), but the header forks to two
+    // in-loop blocks: an internal branch diamond, not the single-cycle body the
+    // structured form supports. It must fail closed rather than mis-recover it.
+    let looping = cfg(
+        vec![
+            branch_block(0xA0, 0x900),
+            branch_block(0xB0, 0x910),
+            branch_block(0xC0, 0x920),
+            branch_block(0xD0, 0x930),
+            branch_block(0xE0, 0x940),
+            returns_constant(0xF0, 0x950, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xE0, CfgEdgeKind::Branch),
+            edge(0xD0, 0xE0, CfgEdgeKind::Branch),
+            edge(0xE0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xE0, 0xF0, CfgEdgeKind::GuardedBranch),
+            edge(0xE0, 0xB0, CfgEdgeKind::LoopBack),
+        ],
+        0xA0,
+    );
+    let error = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect_err("an in-loop branch must refuse");
+    assert!(
+        error.to_string().contains("unsupported branching"),
         "{error}"
     );
 }

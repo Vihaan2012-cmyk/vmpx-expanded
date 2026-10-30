@@ -138,29 +138,39 @@ struct LoopPhi {
     next: Expr,
 }
 
-/// A natural (reducible) loop: a header with `phi` loop variables, a branch at
-/// the loop-exit site that dispatches on `condition`, and the continuation once
-/// the loop is left. Besides the pure state transform in `phis`, the body may
-/// carry external stores (in `steps`) that are reproduced in order at the top of
-/// each iteration, before the exit branch, exactly as the original ran them.
+/// A natural (reducible) loop: a header with `phi` loop variables, one or more
+/// exit branches along the body, and each exit's continuation once the loop is
+/// left. Besides the pure state transform in `phis`, the body may carry external
+/// stores (in `steps`) that are reproduced in order each iteration, exactly as
+/// the original ran them.
 struct LoopLeaf {
     phis: Vec<LoopPhi>,
     /// Side effects (external stores, and their captured reads) the body runs,
     /// in native (epoch) order. Their address/value expressions are over the
     /// current `phi`s and entry inputs, so each iteration reproduces the exact
-    /// per-iteration store. Steps committing at or before `exit_epoch` run every
-    /// iteration (emitted before the exit branch); later steps run only when the
-    /// back-edge is taken (emitted on the continue path).
+    /// per-iteration store. A step committing at or before an exit's epoch runs
+    /// before that exit's branch (so on the iteration that takes it); a step
+    /// past the last exit runs only when the back-edge is taken.
     steps: Vec<Step>,
-    /// Memory epoch of the exit branch: the split between those two step groups.
-    exit_epoch: u64,
-    /// The loop-exit branch selector over the current `phi`s.
+    /// The loop's exits in body (epoch-ascending) order; at least one. Each is a
+    /// conditional break reproduced in turn; the back-edge is taken when none
+    /// fires.
+    exits: Vec<LoopExit>,
+}
+
+/// One exit of a reducible loop: a conditional branch in the body that leaves the
+/// loop under its own condition, with the continuation that runs when it is taken.
+struct LoopExit {
+    /// Memory epoch at which this exit's branch is evaluated: the split in the
+    /// body's steps between those emitted before this branch and those after.
+    epoch: u64,
+    /// The exit branch selector over the current `phi`s.
     condition: Expr,
-    /// Recovered address of the in-loop (continue) successor: the back-edge is
-    /// taken when `condition` dispatches to it.
+    /// Recovered address of the in-loop (continue) successor: the branch stays in
+    /// the loop when `condition` dispatches to it, and leaves otherwise.
     continue_value: u64,
-    /// Where control goes when the loop is left, with the `phi`s left live.
-    exit: Box<Node>,
+    /// Where control goes when this exit is taken, with the `phi`s left live.
+    continuation: Box<Node>,
 }
 
 enum End {
@@ -438,39 +448,30 @@ fn recover_natural_loops(cfg: &VmCfg) -> BTreeMap<Va, BTreeSet<Va>> {
 struct BodyRun {
     /// State flowing back into the header along the back-edge.
     reentry: SymbolicVmInitialState,
-    /// Loop-exit branch selector.
-    condition: Expr,
-    /// Recovered address of the in-loop (continue) successor.
-    continue_value: u64,
-    /// Block the loop leaves to.
-    exit_key: Va,
-    /// State the exit branch leaves for the continuation.
-    exit_state: SymbolicVmInitialState,
-    guarded: bool,
-    /// Memory epoch at which the exit branch is evaluated. A body step committing
-    /// at or before it runs on every iteration (including the exiting one); a
-    /// later step runs only when the back-edge is taken.
-    exit_epoch: u64,
+    /// The loop's exits in body (epoch-ascending) order; at least one.
+    exits: Vec<PendingExit>,
     /// Prepared body side effects (stores and their captured reads), in native
     /// (epoch) order. Populated only on the collecting iteration; empty otherwise.
     body_steps: Vec<Step>,
-    /// The path as of the exit branch: its `stores`/`barrier` carry the effects
-    /// that precede the exit, so the exit continuation orders its reads against
-    /// exactly what ran before the loop was left.
-    exit_path: Path,
     /// The path after the whole iteration (back-edge taken): carries every body
     /// store, so the per-iteration `next` phi values order their reads correctly.
     body_path: Path,
 }
 
-/// The loop's single exit, recovered at the exit-branch block.
+/// One exit of the loop, recovered at its exit-branch block. A loop may have
+/// several; each carries the state and effects as of its own branch.
 struct PendingExit {
     condition: Expr,
     continue_value: u64,
     exit_key: Va,
+    /// State the exit branch leaves for the continuation.
     exit_state: SymbolicVmInitialState,
     guarded: bool,
+    /// Memory epoch at which this exit's branch is evaluated.
     epoch: u64,
+    /// The path as of this exit branch: its `stores`/`barrier` carry the effects
+    /// that precede the exit, so its continuation orders its reads against
+    /// exactly what ran before the loop was left here.
     path: Path,
 }
 
@@ -1204,7 +1205,7 @@ impl Builder<'_> {
         // unrecognized: fail closed.
         verify_closure(header, &phi_state, &run.reentry, &specs)?;
 
-        if run.guarded
+        if run.exits.iter().any(|exit| exit.guarded)
             && self
                 .input
                 .cfg
@@ -1214,14 +1215,15 @@ impl Builder<'_> {
             self.assume(LiftAssumption::PreferredImageBase);
         }
 
-        // The per-iteration `next` phi values and exit `condition` are recovered
-        // in the body node's context (its entry epoch and the stores threaded
-        // through the body) so a read a body store precedes is captured in order
-        // rather than re-issued unsoundly. `next` is read at the end of the
-        // iteration (`body_path`, every store); `condition` at the exit branch
-        // (`exit_path`, only the stores that precede it).
+        // The per-iteration `next` phi values and every exit `condition` are
+        // recovered in the body node's context (its entry epoch and the stores
+        // threaded through the body) so a read a body store precedes is captured
+        // in order rather than re-issued unsoundly. `next` is read at the end of
+        // the iteration (`body_path`, every store); each `condition` at its exit
+        // branch (its own `path`, only the stores that precede it). All of this
+        // happens before any exit continuation is walked below, since walking
+        // resets the node context the prepares depend on.
         let body_path = run.body_path;
-        let exit_path = run.exit_path;
         let mut body_steps = run.body_steps;
         self.node_base_epoch = phi_state.memory_epoch;
         self.node_call_barrier = path.call_barrier;
@@ -1242,30 +1244,47 @@ impl Builder<'_> {
                 next,
             });
         }
-        let condition =
-            self.prepare(header, &run.condition, exit_path.barrier, &exit_path, &mut body_steps)?;
-        self.branches += 1;
+        let mut conditions = Vec::with_capacity(run.exits.len());
+        for pending in &run.exits {
+            conditions.push(self.prepare(
+                header,
+                &pending.condition,
+                pending.path.barrier,
+                &pending.path,
+                &mut body_steps,
+            )?);
+            self.branches += 1;
+        }
         self.loops += 1;
-        // The exit continuation runs when the loop is left, so it inherits only
-        // the stores that precede the exit branch (via `exit_path`), not those on
-        // the back-edge-only tail of the body.
-        let exit = self.walk(run.exit_key, run.exit_state, exit_path, Vec::new())?;
+        // Each exit continuation runs when the loop is left there, so it inherits
+        // only the stores that precede its branch (via its own `path`), not those
+        // on the body's tail past it.
+        let mut exits = Vec::with_capacity(run.exits.len());
+        for (pending, condition) in run.exits.into_iter().zip(conditions) {
+            let continuation = self.walk(pending.exit_key, pending.exit_state, pending.path, Vec::new())?;
+            exits.push(LoopExit {
+                epoch: pending.epoch,
+                condition,
+                continue_value: pending.continue_value,
+                continuation: Box::new(continuation),
+            });
+        }
         Ok(Node {
             steps,
             end: End::Loop(LoopLeaf {
                 phis,
                 steps: body_steps,
-                exit_epoch: run.exit_epoch,
-                condition,
-                continue_value: run.continue_value,
-                exit: Box::new(exit),
+                exits,
             }),
         })
     }
 
     /// Runs one iteration of a loop body from `start`, following single in-loop
-    /// successors and the loop's one exit branch, back to the header. Refuses any
-    /// side effect, non-branch block, or branching the structured form forbids.
+    /// successors and the loop's exit branches, back to the header. The body is a
+    /// single cycle: each block has exactly one in-loop successor it follows, but
+    /// may also branch out of the loop (an exit). Every exit is collected in body
+    /// order. Refuses any side effect, non-branch block, in-loop forking, or
+    /// branching the structured form forbids.
     ///
     /// When `collect` is set this is the emitting iteration: the body's external
     /// stores are prepared (address and value over the current `phi`s and entry
@@ -1295,7 +1314,7 @@ impl Builder<'_> {
         let mut work_path = path.clone();
         let mut body_steps: Vec<Step> = Vec::new();
         let mut state = start;
-        let mut exit: Option<PendingExit> = None;
+        let mut exits: Vec<PendingExit> = Vec::new();
         let mut budget = body_set.len() + 1;
         loop {
             budget = budget.checked_sub(1).ok_or_else(|| DecodedLiftError::Cfg {
@@ -1373,20 +1392,13 @@ impl Builder<'_> {
             match (inside.as_slice(), outside.as_slice()) {
                 ([(_, continue_key)], []) => {
                     if *continue_key == header {
-                        let exit = exit.ok_or_else(|| DecodedLiftError::Cfg {
-                            block: key,
-                            reason: "loop has no exit branch".to_owned(),
-                        })?;
+                        if exits.is_empty() {
+                            return refuse(key, "loop has no exit branch");
+                        }
                         return Ok(BodyRun {
                             reentry: next,
-                            condition: exit.condition,
-                            continue_value: exit.continue_value,
-                            exit_key: exit.exit_key,
-                            exit_state: exit.exit_state,
-                            guarded: exit.guarded,
-                            exit_epoch: exit.epoch,
+                            exits,
                             body_steps,
-                            exit_path: exit.path,
                             body_path: work_path,
                         });
                     }
@@ -1394,16 +1406,15 @@ impl Builder<'_> {
                     state = next;
                 }
                 ([(continue_value, continue_key)], [(_, exit_key)]) => {
-                    if exit.is_some() {
-                        return refuse(key, "loop body has more than one exit branch");
-                    }
                     if successors.len() != 2 {
                         return refuse(key, "loop exit branch is not two-way");
                     }
                     let Some(target) = report.branch_target.as_ref() else {
                         return refuse(key, "loop exit branch has no symbolic target");
                     };
-                    let pending = PendingExit {
+                    // Each exit is a conditional break reproduced in turn; the
+                    // body stays a single cycle, so epochs rise in body order.
+                    exits.push(PendingExit {
                         condition: target.clone(),
                         continue_value: *continue_value,
                         exit_key: *exit_key,
@@ -1411,22 +1422,15 @@ impl Builder<'_> {
                         guarded,
                         epoch: report.memory_epoch,
                         path: work_path.clone(),
-                    };
+                    });
                     if *continue_key == header {
                         return Ok(BodyRun {
                             reentry: next,
-                            condition: pending.condition,
-                            continue_value: pending.continue_value,
-                            exit_key: pending.exit_key,
-                            exit_state: pending.exit_state,
-                            guarded: pending.guarded,
-                            exit_epoch: pending.epoch,
+                            exits,
                             body_steps,
-                            exit_path: pending.path,
                             body_path: work_path,
                         });
                     }
-                    exit = Some(pending);
                     key = *continue_key;
                     state = next;
                 }
@@ -1977,13 +1981,17 @@ impl Emitter<'_> {
         }
     }
 
+    fn emit_step(&mut self, step: &Step) -> Result<(), ReplacementError> {
+        match &step.kind {
+            StepKind::Store(store) => self.emit_store(store),
+            StepKind::Call(call) => self.emit_call(call),
+            StepKind::Load(read) => self.emit_load(read),
+        }
+    }
+
     fn emit_steps(&mut self, steps: &[Step]) -> Result<(), ReplacementError> {
         for step in steps {
-            match &step.kind {
-                StepKind::Store(store) => self.emit_store(store)?,
-                StepKind::Call(call) => self.emit_call(call)?,
-                StepKind::Load(read) => self.emit_load(read)?,
-            }
+            self.emit_step(step)?;
         }
         Ok(())
     }
@@ -2041,9 +2049,13 @@ impl Emitter<'_> {
     }
 
     /// Emits a natural loop. The `phi` slots are seeded before the header label;
-    /// each iteration dispatches the exit branch on the continue address, falls
-    /// through to the exit continuation when the loop is left, and otherwise
-    /// updates the `phi` slots from their per-iteration values and jumps back.
+    /// each iteration runs the body interleaved with its exit branches, in epoch
+    /// order. An exit branch stays in the loop (falls through to the next segment)
+    /// when the selector picks the continue address and leaves to that exit's
+    /// continuation otherwise. When no exit fires, the `phi` slots are updated
+    /// from their per-iteration values and control jumps back to the header. Each
+    /// exit's continuation is emitted past the back-edge and reached only by its
+    /// own branch (it ends in a transfer, so control never falls between them).
     fn emit_loop(&mut self, leaf: &LoopLeaf) -> Result<(), ReplacementError> {
         for phi in &leaf.phis {
             let value = self.lower(&phi.init)?;
@@ -2055,57 +2067,56 @@ impl Emitter<'_> {
         let header = Label(self.next_label);
         self.next_label += 1;
         self.operations.push(Operation::Label(header));
-        // Steps at or before the exit epoch run on every iteration, including the
-        // one that leaves the loop: emit them before the exit branch. Steps past
-        // it run only when the back-edge is taken: emit them on the continue path.
-        let (pre_exit, post_exit): (Vec<&Step>, Vec<&Step>) = leaf
-            .steps
-            .iter()
-            .partition(|step| step.epoch <= leaf.exit_epoch);
-        for step in &pre_exit {
-            match &step.kind {
-                StepKind::Store(store) => self.emit_store(store)?,
-                StepKind::Call(call) => self.emit_call(call)?,
-                StepKind::Load(read) => self.emit_load(read)?,
-            }
+        // One forward label per exit; its continuation is emitted past the
+        // back-edge below.
+        let mut exit_labels = Vec::with_capacity(leaf.exits.len());
+        for _ in &leaf.exits {
+            let label = Label(self.next_label);
+            self.next_label += 1;
+            exit_labels.push(label);
         }
-        let selector = self.lower(&leaf.condition)?;
-        let held = self.scratch(0);
-        self.operations.push(Operation::SpillStore {
-            slot: held,
-            source: selector,
-        });
-        let selector = self.register(PhysicalRegister::R10);
-        let constant = self.register(PhysicalRegister::R11);
-        self.operations.push(Operation::SpillLoad {
-            destination: selector,
-            slot: held,
-        });
-        self.operations.push(Operation::MoveImmediate {
-            destination: constant,
-            value: leaf.continue_value,
-        });
-        self.operations.push(Operation::Compare {
-            left: selector,
-            right: BinarySource::Register(constant),
-        });
-        let body = Label(self.next_label);
-        self.next_label += 1;
-        self.operations.push(Operation::BranchIf {
-            condition: Condition::Equal,
-            target: body,
-        });
-        // Fall through: the loop is left. The continuation ends in returns, so
-        // control never reaches the body label below except via the back-edge.
-        self.emit_node(&leaf.exit)?;
-        self.operations.push(Operation::Label(body));
-        // Back-edge taken: run the body's continue-only stores, then update phis.
-        for step in &post_exit {
-            match &step.kind {
-                StepKind::Store(store) => self.emit_store(store)?,
-                StepKind::Call(call) => self.emit_call(call)?,
-                StepKind::Load(read) => self.emit_load(read)?,
+        // Body steps interleave with the exit branches by epoch: before each
+        // exit's branch, emit every not-yet-emitted step committing at or before
+        // its epoch (so it runs on the iteration that takes that exit); steps past
+        // the last exit run only when the back-edge is taken.
+        let mut emitted = 0;
+        for (exit, &label) in leaf.exits.iter().zip(&exit_labels) {
+            while emitted < leaf.steps.len() && leaf.steps[emitted].epoch <= exit.epoch {
+                self.emit_step(&leaf.steps[emitted])?;
+                emitted += 1;
             }
+            let selector = self.lower(&exit.condition)?;
+            let held = self.scratch(0);
+            self.operations.push(Operation::SpillStore {
+                slot: held,
+                source: selector,
+            });
+            let selector = self.register(PhysicalRegister::R10);
+            let constant = self.register(PhysicalRegister::R11);
+            self.operations.push(Operation::SpillLoad {
+                destination: selector,
+                slot: held,
+            });
+            self.operations.push(Operation::MoveImmediate {
+                destination: constant,
+                value: exit.continue_value,
+            });
+            self.operations.push(Operation::Compare {
+                left: selector,
+                right: BinarySource::Register(constant),
+            });
+            // Leave through this exit when the selector is not the continue
+            // address; otherwise fall through to the next segment.
+            self.operations.push(Operation::BranchIf {
+                condition: Condition::NotEqual,
+                target: label,
+            });
+        }
+        // Back-edge taken: run the body's continue-only (post-last-exit) steps,
+        // then update phis and jump back.
+        while emitted < leaf.steps.len() {
+            self.emit_step(&leaf.steps[emitted])?;
+            emitted += 1;
         }
         // Stage every next value from the current phis before overwriting any.
         for phi in &leaf.phis {
@@ -2127,6 +2138,11 @@ impl Emitter<'_> {
             });
         }
         self.operations.push(Operation::Jump(header));
+        // Each exit's continuation, reached only by its branch above.
+        for (exit, label) in leaf.exits.iter().zip(exit_labels) {
+            self.operations.push(Operation::Label(label));
+            self.emit_node(&exit.continuation)?;
+        }
         Ok(())
     }
 }
