@@ -67,6 +67,9 @@ fn main() {
                 .filter(|block| block.vm_exit.is_some())
                 .count()
         );
+        if !cfg.assumptions.is_empty() {
+            println!("  assumptions={:?}", cfg.assumptions);
+        }
         for stall in &cfg.stalls {
             println!(
                 "  STALL block={} vip={}: {}",

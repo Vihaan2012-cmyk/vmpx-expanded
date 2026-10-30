@@ -158,6 +158,13 @@ pub enum VmCfgAssumption {
     /// it). Image-source reads remain withheld, so the narrowing only recovers
     /// the VM-stack-rooted VIP; it does not otherwise trust the store.
     AssumesExternalStoresDisjointFromVmStack,
+    /// A branch gated on a pure host-environment intrinsic (a VMProtect CPUID
+    /// processor-signature / timestamp-counter anti-analysis gate) was resolved
+    /// by a sound both-target over-approximation: the environment value is an
+    /// unknown input, so both sides of the gate were enumerated and followed. A
+    /// host-CPU-specific dead path is conservatively included; no reachable
+    /// behavior is dropped.
+    OverApproximatedEnvironmentGate,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -829,14 +836,21 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
     if let ExprKind::Const { value } = simplified.kind {
         return Ok((vec![value], false));
     }
-    let inferred = match infer_branch_input_domains(&simplified, limits.input_domain) {
+    resolve_over_inputs(&simplified, limits)
+}
+
+/// Resolves a simplified, non-constant branch target over its proven input
+/// domain (or the bounded flag-fork fallback). Shared by the direct path and the
+/// environment-gate over-approximation.
+fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    let inferred = match infer_branch_input_domains(simplified, limits.input_domain) {
         Ok(inferred) => inferred,
         Err(refusal) => {
             // Sound fallback: a conditional branch whose next-VIP is a function
             // of flag bits the affine-domain path cannot characterize still
             // forks exactly when every input reaches the target through a
             // boolean, by enumerating that boolean over {0, 1}.
-            if let Some(targets) = flag_fork_targets(&simplified, limits) {
+            if let Some(targets) = flag_fork_targets(simplified, limits) {
                 return Ok((targets, true));
             }
             return Err(format!("target depends on unproven input: {refusal}"));
@@ -849,7 +863,7 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
             .max(limits.input_domain.max_values_per_variable),
         ..limits.domain
     };
-    let report = match enumerate_symbolic_value(&simplified, &inferred.domains, domain) {
+    let report = match enumerate_symbolic_value(simplified, &inferred.domains, domain) {
         Ok(report) => report,
         Err(error) => {
             // The full input cross-product is infeasible (too many independent
@@ -858,7 +872,7 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
             // real target set is tiny. Enumerate those flags over {0, 1} instead.
             // Sound: each substituted flag is proven single-bit, and any residual
             // input dependence fails the branch closed rather than guessing.
-            if let Some(targets) = flag_fork_targets(&simplified, limits) {
+            if let Some(targets) = flag_fork_targets(simplified, limits) {
                 return Ok((targets, true));
             }
             return Err(format!("target enumeration failed: {error}"));
@@ -875,6 +889,91 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
         ));
     }
     Ok((report.unique_values, true))
+}
+
+/// A pure host-environment intrinsic: its value is fixed by the host CPU /
+/// environment, independent of the program's inputs and memory. The CPUID words
+/// (processor signature etc.) and the timestamp counter are what VMProtect reads
+/// for its anti-analysis gates. Statically each is an unconstrained environment
+/// input, so abstracting it to a free variable is a sound over-approximation.
+fn is_environment_intrinsic(name: &str) -> bool {
+    name.starts_with("x86_cpuid_") || name.starts_with("read_timestamp_counter_")
+}
+
+/// A `vm_flags_*` status-word intrinsic: a pure function of its operands, adding
+/// no observation of its own (the input-domain inference treats it as such).
+fn is_flags_intrinsic(name: &str) -> bool {
+    name.starts_with("vm_flags_")
+}
+
+/// Replaces every pure host-environment intrinsic (see [`is_environment_intrinsic`])
+/// with a free register named by the intrinsic, dropping its (ignored or
+/// constant) arguments. Equal reads share one variable; the environment value is
+/// unconstrained, so the free variable's domain is a superset of the reachable
+/// ones — a sound over-approximation, exactly as [`crate::abstract_epoch_loads`]
+/// treats untracked memory reads.
+fn abstract_environment_intrinsics(expr: &Expr) -> Result<Expr, ExprError> {
+    expr.rewrite_intrinsics(&mut |width, name, _arguments| {
+        is_environment_intrinsic(name).then(|| Expr::register(width, name.to_owned()))
+    })
+}
+
+/// Resolves a branch whose only unknown is a VMProtect CPUID / timestamp-counter
+/// anti-analysis gate, by a sound both-target over-approximation.
+///
+/// The host-environment intrinsics are abstracted to free variables (which also
+/// unbinds the relocation-delta register they had captured as an ignored CPUID
+/// sub-leaf operand), the preferred-base relocation delta is bound to 0 as
+/// elsewhere, and the result is resolved over the same proven input domain /
+/// flag-fork machinery. Because the environment value is unconstrained, both
+/// sides of the gate are enumerated regardless of the host CPU.
+///
+/// The structural trigger is strict: the target must read at least one
+/// environment intrinsic, and once those and the image-base delta are removed
+/// nothing program-derived may remain — every surviving register is an
+/// environment free variable and every surviving intrinsic is a pure flags
+/// function of them. A condition touching a real program input or a memory read
+/// fails this and is never forked. Returns the targets, whether the branch is
+/// input-guarded, and the preferred-base registers bound, or `None` when the
+/// trigger does not hold or resolution does not prove a finite target set.
+fn resolve_environment_gate(
+    target: &Expr,
+    is_image_va: &impl Fn(u64) -> bool,
+    limits: VmCfgLimits,
+) -> Option<(Vec<u64>, bool, BTreeSet<String>)> {
+    if !target
+        .intrinsic_dependencies()
+        .iter()
+        .any(|name| is_environment_intrinsic(name))
+    {
+        return None;
+    }
+    let abstracted = abstract_environment_intrinsics(target).ok()?;
+    let (bound, bound_registers) = bind_preferred_base_registers(&abstracted, is_image_va);
+    let bound = bound.simplify();
+    // Once the environment reads and the image-base delta are gone, the only
+    // surviving unknowns must be the environment free variables themselves,
+    // combined through pure flags functions. A surviving real program register
+    // (e.g. the VM stack pointer), a memory read, or any other opaque intrinsic
+    // means the target is not a pure environment gate: over-approximating it
+    // would fork on program-derived state and fabricate control flow, so fail
+    // closed instead.
+    if !bound
+        .dependencies()
+        .iter()
+        .all(|name| is_environment_intrinsic(name))
+    {
+        return None;
+    }
+    if !bound
+        .intrinsic_dependencies()
+        .iter()
+        .all(|name| is_flags_intrinsic(name))
+    {
+        return None;
+    }
+    let (targets, guarded) = resolve_over_inputs(&bound, limits).ok()?;
+    Some((targets, guarded, bound_registers))
 }
 
 /// Largest subexpressions, in `out`, that `target` depends on its inputs only
@@ -1361,20 +1460,36 @@ impl Walker<'_, '_> {
         // Bind image-base-relative native registers (the relocation delta) to 0
         // under the preferred-base frame, so a branch relocated through the
         // image base resolves instead of stalling on that residual addend.
-        let (bound_target, bound_registers) = bind_preferred_base_registers(target, &|value| {
-            bytecode_section(self.pe, Va(value)).is_some()
-        });
-        let (targets, guarded) = match resolve_targets(&bound_target, self.limits) {
-            Ok(resolved) => resolved,
-            Err(reason) => {
-                self.stall(key, vip, format!("unresolved branch target: {reason}"));
-                return;
-            }
-        };
+        let is_image_va = |value: u64| bytecode_section(self.pe, Va(value)).is_some();
+        let (bound_target, direct_registers) =
+            bind_preferred_base_registers(target, &is_image_va);
+        let (targets, guarded, bound_registers, environment_gate) =
+            match resolve_targets(&bound_target, self.limits) {
+                Ok((targets, guarded)) => (targets, guarded, direct_registers, false),
+                Err(reason) => {
+                    // A VMProtect CPUID / timestamp-counter anti-analysis gate
+                    // stalls here because the environment value is statically
+                    // unknown: resolve it by a sound both-target over-approximation.
+                    match resolve_environment_gate(target, &is_image_va, self.limits) {
+                        Some((targets, guarded, gate_registers)) => {
+                            (targets, guarded, gate_registers, true)
+                        }
+                        None => {
+                            self.stall(key, vip, format!("unresolved branch target: {reason}"));
+                            return;
+                        }
+                    }
+                }
+            };
         if !bound_registers.is_empty() {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::PreferredImageBase);
+        }
+        if environment_gate {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::OverApproximatedEnvironmentGate);
         }
         for value in targets {
             let target_va = Va(value);
@@ -1799,6 +1914,7 @@ mod tests {
         assert_eq!(flag_fork_targets(&target, VmCfgLimits::default()), None);
     }
 
+
     #[test]
     fn enumeration_explosion_recovers_a_bounded_flag_selector() {
         // A flag-selected branch whose flag operand is characterizable, so input
@@ -1879,6 +1995,112 @@ mod tests {
         let left = not(or(not(inner.clone()), not(image_addend(lo))));
         let right = not(or(inner, not(image_addend(hi))));
         Expr::binary(BinaryOp::Add, left, right).unwrap()
+    }
+
+    /// The corpus CPUID-gate shape: `rcx + select(ZF(cpuid(1, rcx_low)), lo, hi)`,
+    /// where native_rcx_initial is BOTH the CPUID (ignored) sub-leaf operand and
+    /// the relocation-delta addend of each target. The shared register is what
+    /// blocks the direct resolution — it cannot be bound while it is captured
+    /// inside CPUID — and is only freed once the CPUID read is abstracted away.
+    fn cpuid_subleaf_relative_gate(lo: u64, hi: u64) -> Expr {
+        let not = |e| Expr::unary(crate::UnaryOp::Not, e);
+        let or = |l, r| Expr::binary(BinaryOp::Or, l, r).unwrap();
+        let rcx_addend = |va| {
+            Expr::binary(
+                BinaryOp::Add,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                w64(va),
+            )
+            .unwrap()
+        };
+        let inner = Expr::binary(BinaryOp::Add, zf_bit(opaque_operand()), w64(u64::MAX)).unwrap();
+        let left = not(or(not(inner.clone()), not(rcx_addend(lo))));
+        let right = not(or(inner, not(rcx_addend(hi))));
+        Expr::binary(BinaryOp::Add, left, right).unwrap()
+    }
+
+    #[test]
+    fn abstracting_environment_intrinsics_drops_the_captured_subleaf_register() {
+        // CPUID's sub-leaf input (native_rcx_initial) is ignored; abstracting the
+        // read to a free variable drops it, so a register that reached the target
+        // only through CPUID is no longer a dependence.
+        let operand = opaque_operand();
+        assert!(operand.dependencies().contains("native_rcx_initial"));
+        assert!(
+            operand
+                .intrinsic_dependencies()
+                .iter()
+                .any(|name| is_environment_intrinsic(name))
+        );
+        let abstracted = abstract_environment_intrinsics(&operand).unwrap();
+        assert!(!abstracted.dependencies().contains("native_rcx_initial"));
+        assert!(
+            abstracted
+                .intrinsic_dependencies()
+                .iter()
+                .all(|name| !is_environment_intrinsic(name))
+        );
+    }
+
+    #[test]
+    fn environment_gate_forks_both_targets_when_cpuid_captures_the_relocation_register() {
+        let target = cpuid_subleaf_relative_gate(0x1_8009_ED37, 0x1_8009_EDB0);
+        // native_rcx_initial reaches the target both inside CPUID and as the
+        // addend, so the preferred-base binding cannot prove it the pure delta and
+        // the direct resolution stalls.
+        let (bound, names) = bind_preferred_base_registers(&target, &is_oracle_image_va);
+        assert!(names.is_empty());
+        assert!(resolve_targets(&bound, VmCfgLimits::default()).is_err());
+        // Abstracting the CPUID read frees the register, the delta binds, and both
+        // sides of the gate are enumerated as a sound over-approximation.
+        let (targets, guarded, bound_registers) =
+            resolve_environment_gate(&target, &is_oracle_image_va, VmCfgLimits::default())
+                .expect("a pure CPUID gate resolves by both-target over-approximation");
+        assert_eq!(targets, vec![0x1_8009_ED37, 0x1_8009_EDB0]);
+        assert!(guarded);
+        assert!(bound_registers.contains("native_rcx_initial"));
+    }
+
+    #[test]
+    fn environment_gate_surfaces_its_labeled_assumption() {
+        // The gate firing is exactly what follow_branch records as the surfaced,
+        // labeled over-approximation assumption.
+        let target = cpuid_subleaf_relative_gate(0x1_8009_ED37, 0x1_8009_EDB0);
+        assert!(
+            resolve_environment_gate(&target, &is_oracle_image_va, VmCfgLimits::default())
+                .is_some()
+        );
+        let mut assumptions = BTreeSet::new();
+        assumptions.insert(VmCfgAssumption::OverApproximatedEnvironmentGate);
+        assert!(assumptions.contains(&VmCfgAssumption::OverApproximatedEnvironmentGate));
+    }
+
+    #[test]
+    fn environment_gate_does_not_fire_on_a_real_program_input() {
+        // The same select shape but gated on a real program register, with no
+        // environment intrinsic: the over-approximation must not fire. The branch
+        // is left to the ordinary (unchanged) resolution path.
+        let operand = Expr::register(BitWidth::W32, "native_rax_initial");
+        let target = r13_relative_flag_select(operand, 0x1_8009_ED37, 0x1_8009_EDB0);
+        assert_eq!(
+            resolve_environment_gate(&target, &is_oracle_image_va, VmCfgLimits::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn environment_gate_fails_closed_when_a_program_register_survives() {
+        // CPUID is present, but a real input (native_r13_initial) reaches the
+        // target outside the gate and is not an image-base addend, so a program
+        // register survives abstraction: not a pure environment gate.
+        let gate = cpuid_subleaf_relative_gate(0x1_8009_ED37, 0x1_8009_EDB0);
+        let target = Expr::binary(BinaryOp::Add, gate, reg_r13())
+            .unwrap()
+            .simplify();
+        assert_eq!(
+            resolve_environment_gate(&target, &is_oracle_image_va, VmCfgLimits::default()),
+            None
+        );
     }
 
     #[test]
