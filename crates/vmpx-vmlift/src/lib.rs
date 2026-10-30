@@ -761,6 +761,8 @@ mod tests {
             memory_values: Vec::new(),
             memory_epoch: 1,
             memory_tainted: true,
+            image_reads_suppressed: false,
+            assumed_external_disjoint_from_vm_stack: false,
             external_writes: vec![SymbolicMemoryWrite {
                 instruction_index: 2,
                 address: address.clone(),

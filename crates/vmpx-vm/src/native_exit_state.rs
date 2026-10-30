@@ -177,6 +177,8 @@ mod tests {
             memory_values,
             memory_epoch: 0,
             memory_tainted: false,
+            image_reads_suppressed: false,
+            assumed_external_disjoint_from_vm_stack: false,
             external_writes: Vec::new(),
             memory_havocs: Vec::new(),
             native_calls: Vec::new(),

@@ -87,6 +87,16 @@ pub struct SymbolicVmExecutionReport {
     /// True after an external store with an address that could alias any
     /// tracked VM-memory cell. Precise pre-store memory is discarded then.
     pub memory_tainted: bool,
+    /// True once image-source reads can no longer be trusted because an external
+    /// store to a non-VM-stack address may have overwritten an in-image byte.
+    /// Unlike `memory_tainted` this does not block branch resolution or resume:
+    /// the VM-private operand stack is intact, only original image bytes are
+    /// withheld (const loads return fresh unknowns). Carried across blocks.
+    pub image_reads_suppressed: bool,
+    /// True when this block narrowed an unprovable external store under the
+    /// labeled `AssumesExternalStoresDisjointFromVmStack` assumption instead of
+    /// the broad havoc. Surfaced so the CFG can record the assumption.
+    pub assumed_external_disjoint_from_vm_stack: bool,
     pub external_writes: Vec<SymbolicMemoryWrite>,
     pub memory_havocs: Vec<SymbolicMemoryHavoc>,
     pub native_calls: Vec<SymbolicNativeCall>,
@@ -115,6 +125,10 @@ pub struct SymbolicVmInitialState {
     pub memory_values: Vec<(Expr, Expr)>,
     pub memory_epoch: u64,
     pub memory_tainted: bool,
+    /// See `SymbolicVmExecutionReport::image_reads_suppressed`: carried into a
+    /// successor block so its image-source reads stay withheld after a narrowed
+    /// external store.
+    pub image_reads_suppressed: bool,
     pub next_native_call_epoch: u64,
     pub fresh_allocations: Vec<SymbolicFreshAllocation>,
 }
@@ -128,6 +142,7 @@ impl Default for SymbolicVmInitialState {
             memory_values: Vec::new(),
             memory_epoch: 0,
             memory_tainted: false,
+            image_reads_suppressed: false,
             next_native_call_epoch: 0,
             fresh_allocations: Vec::new(),
         }
@@ -163,6 +178,7 @@ impl SymbolicVmInitialState {
                 .collect::<Result<_, ExprError>>()?,
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
+            image_reads_suppressed: self.image_reads_suppressed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self
                 .fresh_allocations
@@ -192,6 +208,7 @@ impl SymbolicVmExecutionReport {
             memory_values: self.memory_values.clone(),
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
+            image_reads_suppressed: self.image_reads_suppressed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self.fresh_allocations.clone(),
         }
@@ -369,6 +386,8 @@ struct SymbolicMachine<'a> {
     memory_source: Option<&'a dyn SymbolicMemorySource>,
     memory_epoch: u64,
     memory_tainted: bool,
+    image_reads_suppressed: bool,
+    assumed_external_disjoint_from_vm_stack: bool,
     checksum_byte_limit: usize,
 }
 
@@ -448,6 +467,8 @@ impl<'a> SymbolicMachine<'a> {
             memory_source,
             memory_epoch: initial.memory_epoch,
             memory_tainted: initial.memory_tainted,
+            image_reads_suppressed: initial.image_reads_suppressed,
+            assumed_external_disjoint_from_vm_stack: false,
             checksum_byte_limit: limits.max_memory_bytes,
         };
         for (offset, value) in &initial.context_values {
@@ -506,6 +527,7 @@ impl<'a> SymbolicMachine<'a> {
                 bytes.push(value.clone());
             } else if let ExprKind::Const { value } = byte_address.kind
                 && !self.memory_tainted
+                && !self.image_reads_suppressed
             {
                 let byte_va = Va(value);
                 if let Some(byte) = self
@@ -568,16 +590,50 @@ impl<'a> SymbolicMachine<'a> {
     }
 
     /// Sound over-approximation of a store whose address cannot be placed in a
-    /// tracked region: discard the byte-addressed tracked memory it may alias
-    /// and taint it. Loads afterwards return fresh unknowns, never a stale
-    /// cached or image-source byte. The vreg file is untouched.
-    fn havoc_external_store(&mut self, instruction_index: usize) -> Result<(), String> {
+    /// tracked region.
+    ///
+    /// When the address could reach the VM's private operand stack (it still
+    /// references `vsp_initial`), the whole byte-addressed memory is discarded
+    /// and tainted: loads afterwards return fresh unknowns, never a stale cached
+    /// or image-source byte, and the block cannot resume or branch. This is the
+    /// unconditional sound fallback.
+    ///
+    /// Otherwise the address is native-register-rooted or opaque. Under the
+    /// labeled assumption that external stores do not alias the VM's private
+    /// operand stack (its internal stack is private; caller/parameter pointers
+    /// do not point into it), only the cells that could genuinely alias such a
+    /// pointer are discarded (concrete/image/allocation cells); the vsp-rooted
+    /// VM operand-stack cells are preserved, so the post-store VIP stays precise.
+    /// Image-source reads are still withheld (the store may hit an in-image
+    /// byte), but branch resolution and resume continue because the VM stack is
+    /// intact. The vreg file is a separate namespace and is untouched either way.
+    fn havoc_external_store(
+        &mut self,
+        instruction_index: usize,
+        address: &Expr,
+    ) -> Result<(), String> {
         self.advance_memory_epoch()?;
-        self.memory.clear();
-        self.memory_tainted = true;
+        if address.dependencies().contains("vsp_initial") {
+            // The address may alias the VM operand stack itself; keep the broad,
+            // assumption-free havoc.
+            self.memory.clear();
+            self.memory_tainted = true;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index,
+                cause: "external store address may alias tracked VM memory".to_owned(),
+            });
+            return Ok(());
+        }
+        // Preserve the provably vsp-rooted cells, discard the rest.
+        self.memory
+            .retain(|cell_address, _| pointer_offset(cell_address).is_some());
+        self.image_reads_suppressed = true;
+        self.assumed_external_disjoint_from_vm_stack = true;
         self.memory_havocs.push(SymbolicMemoryHavoc {
             instruction_index,
-            cause: "external store address may alias tracked VM memory".to_owned(),
+            cause: "external store assumed disjoint from the VM operand stack; non-vsp-rooted \
+                    cells discarded, vsp-rooted cells preserved"
+                .to_owned(),
         });
         Ok(())
     }
@@ -611,10 +667,12 @@ impl<'a> SymbolicMachine<'a> {
             // precise byte-addressed memory and mark it tainted. Tainting
             // disables image-source reads (so a later load cannot read a stale
             // original image byte for an address this write may have changed)
-            // and refuses cross-block resumption. The VM-private vreg file is a
+            // and refuses cross-block resumption. Where the address cannot reach
+            // the VM operand stack it narrows this under a labeled assumption and
+            // preserves the vsp-rooted cells. The VM-private vreg file is a
             // separate namespace the store path cannot reach, so it is kept.
             // The write itself is still recorded below, so the lift preserves it.
-            self.havoc_external_store(instruction_index)?;
+            self.havoc_external_store(instruction_index, &address)?;
         }
         self.external_writes.push(SymbolicMemoryWrite {
             instruction_index,
@@ -1883,6 +1941,9 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         memory_values,
         memory_epoch: machine.memory_epoch,
         memory_tainted: machine.memory_tainted,
+        image_reads_suppressed: machine.image_reads_suppressed,
+        assumed_external_disjoint_from_vm_stack: machine
+            .assumed_external_disjoint_from_vm_stack,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -1969,6 +2030,9 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         memory_values,
         memory_epoch: machine.memory_epoch,
         memory_tainted: machine.memory_tainted,
+        image_reads_suppressed: machine.image_reads_suppressed,
+        assumed_external_disjoint_from_vm_stack: machine
+            .assumed_external_disjoint_from_vm_stack,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -1996,6 +2060,7 @@ mod tests {
             memory_values: vec![(dependency.clone(), dependency.clone())],
             memory_epoch: 3,
             memory_tainted: false,
+            image_reads_suppressed: false,
             next_native_call_epoch: 5,
             fresh_allocations: vec![SymbolicFreshAllocation {
                 allocation: dependency.clone(),
@@ -2562,42 +2627,78 @@ mod tests {
         assert!(matches!(seeded.kind, ExprKind::Const { value: 9 }));
     }
 
-    // A store whose address cannot be placed in a tracked region may alias any
-    // tracked cell. Rather than assume no alias, the executor over-approximates:
-    // it records the write, discards and taints precise memory, and continues.
+    // (a) An external store whose address is native-register-rooted or opaque
+    // cannot reach the VM's private operand stack. Under the labeled
+    // `AssumesExternalStoresDisjointFromVmStack` assumption the executor discards
+    // only the non-vsp-rooted cells the store could alias, preserves the
+    // vsp-rooted VM operand stack so the post-store VIP stays precise, records
+    // the assumption, and continues without tainting (branch resolution and
+    // resume remain possible). The write is still recorded for the lift.
     #[test]
-    fn symbolic_store_that_may_alias_havocs_and_continues() {
+    fn external_store_disjoint_from_vm_stack_preserves_stack_under_assumption() {
         let mut machine = default_machine();
         machine
             .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
-            .expect("seed precise VM stack");
+            .expect("seed precise VM-stack cell");
+        machine
+            .store_memory(
+                &Expr::constant(BitWidth::W64, 0x1_4000_1000),
+                &Expr::constant(BitWidth::W64, 0x77),
+            )
+            .expect("seed precise non-vsp cell");
         let address = Expr::register(BitWidth::W64, "native_rcx_initial");
         machine
             .store_external(7, address.clone(), Expr::constant(BitWidth::W64, 0x55))
-            .expect("unproven store is over-approximated, not refused");
-        assert!(machine.memory_tainted);
+            .expect("disjoint external store is narrowed, not refused");
+        assert!(!machine.memory_tainted);
+        assert!(machine.image_reads_suppressed);
+        assert!(machine.assumed_external_disjoint_from_vm_stack);
         assert_eq!(machine.memory_havocs.len(), 1);
         assert_eq!(machine.memory_havocs[0].instruction_index, 7);
-        // The write is preserved for the lift.
         assert_eq!(machine.external_writes.len(), 1);
         assert_eq!(machine.external_writes[0].address, address);
+        // The vsp-rooted VM operand-stack cell survives precisely.
+        let preserved = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load preserved VM-stack cell");
+        assert!(matches!(preserved.kind, ExprKind::Const { value: 9 }));
+        // The non-vsp cell the store could alias is discarded.
+        let discarded = machine
+            .load_memory(Expr::constant(BitWidth::W64, 0x1_4000_1000), BitWidth::W64)
+            .expect("load discarded non-vsp cell");
+        assert!(is_free_read(&discarded));
     }
 
-    // After an aliasing store the previously-precise cell must read back as a
+    // (b) An external store whose address still references the VM stack pointer
+    // could alias the VM's private operand stack, so no assumption applies: the
+    // broad, assumption-free havoc discards all tracked cells and taints memory.
+    // No false preservation — the previously-precise vsp cell reads back as a
     // fresh unknown, never the stale pre-store value.
     #[test]
-    fn load_after_aliasing_store_is_a_fresh_unknown() {
+    fn external_store_that_may_reach_vm_stack_broadly_havocs() {
         let mut machine = default_machine();
         machine
             .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
-            .expect("seed precise VM stack");
+            .expect("seed precise VM-stack cell");
+        // `vsp_initial + vsp_initial` references the VM stack but is not a proven
+        // region pointer (coefficient 2), so it reaches the havoc still carrying
+        // a vsp dependency.
+        let address = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "vsp_initial"),
+            Expr::register(BitWidth::W64, "vsp_initial"),
+        )
+        .expect("same-width pointer expression");
+        assert!(!is_proven_region_pointer(&address));
         machine
-            .store_external(
-                0,
-                Expr::register(BitWidth::W64, "native_rcx_initial"),
-                Expr::constant(BitWidth::W64, 0x55),
-            )
-            .expect("over-approximated store");
+            .store_external(3, address.clone(), Expr::constant(BitWidth::W64, 0x55))
+            .expect("unproven store is over-approximated, not refused");
+        assert!(machine.memory_tainted);
+        assert!(!machine.image_reads_suppressed);
+        assert!(!machine.assumed_external_disjoint_from_vm_stack);
+        assert_eq!(machine.memory_havocs.len(), 1);
+        assert_eq!(machine.external_writes.len(), 1);
+        assert_eq!(machine.external_writes[0].address, address);
         let reloaded = machine
             .load_memory(stack_address(16), BitWidth::W64)
             .expect("load");

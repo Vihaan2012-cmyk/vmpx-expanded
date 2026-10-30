@@ -151,6 +151,13 @@ pub enum VmCfgAssumption {
     /// bound to 0 for branch resolution: the image-base / relocation delta,
     /// which is 0 at the preferred base every image read already assumes.
     PreferredImageBase,
+    /// An external store to a native-register-rooted or opaque address was
+    /// narrowed to discard only the non-vsp-rooted tracked cells, preserving the
+    /// VM's private operand stack, under the assumption that external stores do
+    /// not alias that private stack (caller/parameter pointers do not point into
+    /// it). Image-source reads remain withheld, so the narrowing only recovers
+    /// the VM-stack-rooted VIP; it does not otherwise trust the store.
+    AssumesExternalStoresDisjointFromVmStack,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -591,6 +598,7 @@ fn widen_state(
         memory_values,
         memory_epoch: a.memory_epoch.max(r.memory_epoch),
         memory_tainted: false,
+        image_reads_suppressed: a.image_reads_suppressed || r.image_reads_suppressed,
         next_native_call_epoch: a.next_native_call_epoch.max(r.next_native_call_epoch),
         fresh_allocations: a.fresh_allocations.clone(),
     }))
@@ -1114,6 +1122,11 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        if symbolic.assumed_external_disjoint_from_vm_stack {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
         match boundary {
             Some(VmHandlerSemantic::VmExit) => {
                 self.follow_nested_entry(key, final_state.vip, &symbolic, pending);
