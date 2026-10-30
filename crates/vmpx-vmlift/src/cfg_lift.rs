@@ -140,10 +140,20 @@ struct LoopPhi {
 
 /// A natural (reducible) loop: a header with `phi` loop variables, a branch at
 /// the loop-exit site that dispatches on `condition`, and the continuation once
-/// the loop is left. The body carries no side effects (no external store or
-/// native call), so the whole iteration is the pure state transform in `phis`.
+/// the loop is left. Besides the pure state transform in `phis`, the body may
+/// carry external stores (in `steps`) that are reproduced in order at the top of
+/// each iteration, before the exit branch, exactly as the original ran them.
 struct LoopLeaf {
     phis: Vec<LoopPhi>,
+    /// Side effects (external stores, and their captured reads) the body runs,
+    /// in native (epoch) order. Their address/value expressions are over the
+    /// current `phi`s and entry inputs, so each iteration reproduces the exact
+    /// per-iteration store. Steps committing at or before `exit_epoch` run every
+    /// iteration (emitted before the exit branch); later steps run only when the
+    /// back-edge is taken (emitted on the continue path).
+    steps: Vec<Step>,
+    /// Memory epoch of the exit branch: the split between those two step groups.
+    exit_epoch: u64,
     /// The loop-exit branch selector over the current `phi`s.
     condition: Expr,
     /// Recovered address of the in-loop (continue) successor: the back-edge is
@@ -437,6 +447,31 @@ struct BodyRun {
     /// State the exit branch leaves for the continuation.
     exit_state: SymbolicVmInitialState,
     guarded: bool,
+    /// Memory epoch at which the exit branch is evaluated. A body step committing
+    /// at or before it runs on every iteration (including the exiting one); a
+    /// later step runs only when the back-edge is taken.
+    exit_epoch: u64,
+    /// Prepared body side effects (stores and their captured reads), in native
+    /// (epoch) order. Populated only on the collecting iteration; empty otherwise.
+    body_steps: Vec<Step>,
+    /// The path as of the exit branch: its `stores`/`barrier` carry the effects
+    /// that precede the exit, so the exit continuation orders its reads against
+    /// exactly what ran before the loop was left.
+    exit_path: Path,
+    /// The path after the whole iteration (back-edge taken): carries every body
+    /// store, so the per-iteration `next` phi values order their reads correctly.
+    body_path: Path,
+}
+
+/// The loop's single exit, recovered at the exit-branch block.
+struct PendingExit {
+    condition: Expr,
+    continue_value: u64,
+    exit_key: Va,
+    exit_state: SymbolicVmInitialState,
+    guarded: bool,
+    epoch: u64,
+    path: Path,
 }
 
 /// The loop-carried cells: those whose value differs between the pre-loop state
@@ -1127,7 +1162,7 @@ impl Builder<'_> {
         }
         // Iteration one, exact: the cells whose value differs between the loop
         // entry and the back-edge re-entry are the loop-carried variables.
-        let exact = self.run_loop_body(header, body_set, pre_state.clone())?;
+        let exact = self.run_loop_body(header, body_set, pre_state.clone(), &path, false)?;
         let cells = loop_cells(header, &pre_state, &exact.reentry)?;
 
         // Iteration two, over a fresh phi per loop-carried cell.
@@ -1147,7 +1182,22 @@ impl Builder<'_> {
             set_cell(&mut phi_state, &cell, Expr::register(width, name));
             specs.push((cell, id, width));
         }
-        let run = self.run_loop_body(header, body_set, phi_state.clone())?;
+
+        // Phi inits run before the loop, in the pre-header node this `steps` feeds
+        // and over the pre-loop path, so they are recovered before the body's node
+        // context is established below.
+        let mut inits = Vec::with_capacity(specs.len());
+        for (cell, _, _) in &specs {
+            let init_value = get_cell(&pre_state, cell).ok_or_else(|| DecodedLiftError::Cfg {
+                block: header,
+                reason: "loop-carried cell has no pre-loop value".to_owned(),
+            })?;
+            inits.push(self.prepare(header, init_value, path.barrier, &path, &mut steps)?);
+        }
+
+        // Iteration two also prepares the body's stores into `body_steps`, over
+        // the fresh phi inputs, and threads them through `body_path`.
+        let run = self.run_loop_body(header, body_set, phi_state.clone(), &path, true)?;
 
         // The body must change exactly the recognized loop-carried cells and
         // leave every other cell at its invariant value, or a carried value went
@@ -1164,13 +1214,19 @@ impl Builder<'_> {
             self.assume(LiftAssumption::PreferredImageBase);
         }
 
+        // The per-iteration `next` phi values and exit `condition` are recovered
+        // in the body node's context (its entry epoch and the stores threaded
+        // through the body) so a read a body store precedes is captured in order
+        // rather than re-issued unsoundly. `next` is read at the end of the
+        // iteration (`body_path`, every store); `condition` at the exit branch
+        // (`exit_path`, only the stores that precede it).
+        let body_path = run.body_path;
+        let exit_path = run.exit_path;
+        let mut body_steps = run.body_steps;
+        self.node_base_epoch = phi_state.memory_epoch;
+        self.node_call_barrier = path.call_barrier;
         let mut phis = Vec::with_capacity(specs.len());
-        for (cell, id, width) in &specs {
-            let init_value = get_cell(&pre_state, cell).ok_or_else(|| DecodedLiftError::Cfg {
-                block: header,
-                reason: "loop-carried cell has no pre-loop value".to_owned(),
-            })?;
-            let init = self.prepare(header, init_value, path.barrier, &path, &mut steps)?;
+        for ((cell, id, width), init) in specs.iter().zip(inits) {
             let next_value = get_cell(&run.reentry, cell).ok_or_else(|| DecodedLiftError::Cfg {
                 block: header,
                 reason: "loop-carried cell has no re-entry value".to_owned(),
@@ -1178,21 +1234,28 @@ impl Builder<'_> {
             if next_value.width != *width {
                 return refuse(header, "a loop-carried cell changes width");
             }
-            let next = self.prepare(header, next_value, path.barrier, &path, &mut steps)?;
+            let next =
+                self.prepare(header, next_value, body_path.barrier, &body_path, &mut body_steps)?;
             phis.push(LoopPhi {
                 id: *id,
                 init,
                 next,
             });
         }
-        let condition = self.prepare(header, &run.condition, path.barrier, &path, &mut steps)?;
+        let condition =
+            self.prepare(header, &run.condition, exit_path.barrier, &exit_path, &mut body_steps)?;
         self.branches += 1;
         self.loops += 1;
-        let exit = self.walk(run.exit_key, run.exit_state, path.clone(), Vec::new())?;
+        // The exit continuation runs when the loop is left, so it inherits only
+        // the stores that precede the exit branch (via `exit_path`), not those on
+        // the back-edge-only tail of the body.
+        let exit = self.walk(run.exit_key, run.exit_state, exit_path, Vec::new())?;
         Ok(Node {
             steps,
             end: End::Loop(LoopLeaf {
                 phis,
+                steps: body_steps,
+                exit_epoch: run.exit_epoch,
                 condition,
                 continue_value: run.continue_value,
                 exit: Box::new(exit),
@@ -1203,16 +1266,36 @@ impl Builder<'_> {
     /// Runs one iteration of a loop body from `start`, following single in-loop
     /// successors and the loop's one exit branch, back to the header. Refuses any
     /// side effect, non-branch block, or branching the structured form forbids.
+    ///
+    /// When `collect` is set this is the emitting iteration: the body's external
+    /// stores are prepared (address and value over the current `phi`s and entry
+    /// inputs) into `body_steps` in native order and threaded through `work_path`,
+    /// so the returned [`BodyRun`] carries exactly what each iteration must
+    /// reproduce, tagged by epoch so the emitter can tell the stores that run
+    /// every iteration from those taken only on the back-edge. Any native call,
+    /// allocation, or store that could alias tracked VM memory (havoc/taint) is
+    /// not cleanly re-expressible per iteration and fails closed.
     fn run_loop_body(
         &mut self,
         header: Va,
         body_set: &BTreeSet<Va>,
         start: SymbolicVmInitialState,
+        path: &Path,
+        collect: bool,
     ) -> Result<BodyRun, DecodedLiftError> {
         let input = self.input;
         let mut key = header;
+        if collect {
+            // The whole body is one emitted node: its reads order against the
+            // state it enters with and the stores it makes, never reordered past
+            // an ancestor call.
+            self.node_base_epoch = start.memory_epoch;
+            self.node_call_barrier = path.call_barrier;
+        }
+        let mut work_path = path.clone();
+        let mut body_steps: Vec<Step> = Vec::new();
         let mut state = start;
-        let mut exit: Option<(Expr, u64, Va, SymbolicVmInitialState, bool)> = None;
+        let mut exit: Option<PendingExit> = None;
         let mut budget = body_set.len() + 1;
         loop {
             budget = budget.checked_sub(1).ok_or_else(|| DecodedLiftError::Cfg {
@@ -1239,13 +1322,47 @@ impl Builder<'_> {
                 block: key,
                 reason: format!("symbolic execution failed: {error}"),
             })?;
-            if !report.external_writes.is_empty()
-                || !report.memory_havocs.is_empty()
+            // A native call, allocation, or any store that could alias tracked VM
+            // memory (havoc/taint) is not re-expressible as a clean per-iteration
+            // effect: fail closed. Precise external stores are emitted instead.
+            if !report.memory_havocs.is_empty()
                 || !report.native_calls.is_empty()
                 || !report.fresh_allocations.is_empty()
                 || report.memory_tainted
             {
-                return refuse(key, "loop body has side effects (store, call or havoc)");
+                return refuse(key, "loop body calls natively, allocates, or havocs memory");
+            }
+            if collect && !report.external_writes.is_empty() {
+                let entry_barrier = work_path.barrier;
+                for (index, write) in report.external_writes.iter().enumerate() {
+                    let barrier = if index == 0 {
+                        entry_barrier
+                    } else {
+                        report.memory_epoch
+                    };
+                    if write.value.dependencies().contains("vsp_initial") {
+                        work_path.root_escaped = true;
+                    }
+                    let address =
+                        self.prepare(key, &write.address, barrier, &work_path, &mut body_steps)?;
+                    let value =
+                        self.prepare(key, &write.value, barrier, &work_path, &mut body_steps)?;
+                    let width = value.width;
+                    work_path.stores.push(PathStore {
+                        end_epoch: write.epoch,
+                        address: write.address.clone(),
+                        bytes: write.value.width.bytes(),
+                    });
+                    body_steps.push(Step {
+                        epoch: write.epoch,
+                        kind: StepKind::Store(EffectStore {
+                            address,
+                            value,
+                            width,
+                        }),
+                    });
+                }
+                work_path.barrier = work_path.barrier.max(report.memory_epoch);
             }
             self.expanded += 1;
             let next = report.continuation_state();
@@ -1256,18 +1373,21 @@ impl Builder<'_> {
             match (inside.as_slice(), outside.as_slice()) {
                 ([(_, continue_key)], []) => {
                     if *continue_key == header {
-                        let (condition, continue_value, exit_key, exit_state, g) =
-                            exit.ok_or_else(|| DecodedLiftError::Cfg {
-                                block: key,
-                                reason: "loop has no exit branch".to_owned(),
-                            })?;
+                        let exit = exit.ok_or_else(|| DecodedLiftError::Cfg {
+                            block: key,
+                            reason: "loop has no exit branch".to_owned(),
+                        })?;
                         return Ok(BodyRun {
                             reentry: next,
-                            condition,
-                            continue_value,
-                            exit_key,
-                            exit_state,
-                            guarded: g,
+                            condition: exit.condition,
+                            continue_value: exit.continue_value,
+                            exit_key: exit.exit_key,
+                            exit_state: exit.exit_state,
+                            guarded: exit.guarded,
+                            exit_epoch: exit.epoch,
+                            body_steps,
+                            exit_path: exit.path,
+                            body_path: work_path,
                         });
                     }
                     key = *continue_key;
@@ -1283,24 +1403,30 @@ impl Builder<'_> {
                     let Some(target) = report.branch_target.as_ref() else {
                         return refuse(key, "loop exit branch has no symbolic target");
                     };
-                    let record = (
-                        target.clone(),
-                        *continue_value,
-                        *exit_key,
-                        next.clone(),
+                    let pending = PendingExit {
+                        condition: target.clone(),
+                        continue_value: *continue_value,
+                        exit_key: *exit_key,
+                        exit_state: next.clone(),
                         guarded,
-                    );
+                        epoch: report.memory_epoch,
+                        path: work_path.clone(),
+                    };
                     if *continue_key == header {
                         return Ok(BodyRun {
                             reentry: next,
-                            condition: record.0,
-                            continue_value: record.1,
-                            exit_key: record.2,
-                            exit_state: record.3,
-                            guarded: record.4,
+                            condition: pending.condition,
+                            continue_value: pending.continue_value,
+                            exit_key: pending.exit_key,
+                            exit_state: pending.exit_state,
+                            guarded: pending.guarded,
+                            exit_epoch: pending.epoch,
+                            body_steps,
+                            exit_path: pending.path,
+                            body_path: work_path,
                         });
                     }
-                    exit = Some(record);
+                    exit = Some(pending);
                     key = *continue_key;
                     state = next;
                 }
@@ -1851,14 +1977,19 @@ impl Emitter<'_> {
         }
     }
 
-    fn emit_node(&mut self, node: &Node) -> Result<(), ReplacementError> {
-        for step in &node.steps {
+    fn emit_steps(&mut self, steps: &[Step]) -> Result<(), ReplacementError> {
+        for step in steps {
             match &step.kind {
                 StepKind::Store(store) => self.emit_store(store)?,
                 StepKind::Call(call) => self.emit_call(call)?,
                 StepKind::Load(read) => self.emit_load(read)?,
             }
         }
+        Ok(())
+    }
+
+    fn emit_node(&mut self, node: &Node) -> Result<(), ReplacementError> {
+        self.emit_steps(&node.steps)?;
         match &node.end {
             End::Exit(leaf) => self.emit_exit(leaf),
             End::Region(leaf) => self.emit_region(leaf),
@@ -1924,6 +2055,20 @@ impl Emitter<'_> {
         let header = Label(self.next_label);
         self.next_label += 1;
         self.operations.push(Operation::Label(header));
+        // Steps at or before the exit epoch run on every iteration, including the
+        // one that leaves the loop: emit them before the exit branch. Steps past
+        // it run only when the back-edge is taken: emit them on the continue path.
+        let (pre_exit, post_exit): (Vec<&Step>, Vec<&Step>) = leaf
+            .steps
+            .iter()
+            .partition(|step| step.epoch <= leaf.exit_epoch);
+        for step in &pre_exit {
+            match &step.kind {
+                StepKind::Store(store) => self.emit_store(store)?,
+                StepKind::Call(call) => self.emit_call(call)?,
+                StepKind::Load(read) => self.emit_load(read)?,
+            }
+        }
         let selector = self.lower(&leaf.condition)?;
         let held = self.scratch(0);
         self.operations.push(Operation::SpillStore {
@@ -1954,6 +2099,14 @@ impl Emitter<'_> {
         // control never reaches the body label below except via the back-edge.
         self.emit_node(&leaf.exit)?;
         self.operations.push(Operation::Label(body));
+        // Back-edge taken: run the body's continue-only stores, then update phis.
+        for step in &post_exit {
+            match &step.kind {
+                StepKind::Store(store) => self.emit_store(store)?,
+                StepKind::Call(call) => self.emit_call(call)?,
+                StepKind::Load(read) => self.emit_load(read)?,
+            }
+        }
         // Stage every next value from the current phis before overwriting any.
         for phi in &leaf.phis {
             let value = self.lower(&phi.next)?;

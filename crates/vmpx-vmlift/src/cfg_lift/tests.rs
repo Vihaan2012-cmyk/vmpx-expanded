@@ -780,6 +780,135 @@ fn a_multi_exit_loop_fails_closed() {
     );
 }
 
+/// A loop body that updates the counter in slot `0x28` (init 0, next 0x55) and
+/// also writes a constant through a VM-stack pointer (`Push` materialises the
+/// current VSP), a precise external store below the live top. VSP-neutral apart
+/// from the shared `-8` branch-target push, so the iteration stays balanced.
+fn loop_body_with_store(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    use VmHandlerSemantic as S;
+    block(
+        key,
+        Some(address),
+        vec![
+            ins(S::ConstantPush, Some(0x55), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(0xAB), -8),
+            ins(S::Push, None, -8),
+            ins(S::MemoryStore, None, 16),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    )
+}
+
+#[test]
+fn a_single_exit_loop_with_a_body_store_emits_it_each_iteration() {
+    let looping = cfg(
+        vec![
+            loop_entry(0xA0, 0x900),
+            branch_block(0xB0, LOOP_HEADER_ADDR),
+            loop_body_with_store(0xC0, LOOP_BODY_ADDR),
+            returns_constant(0xD0, 0x930, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+        ],
+        0xA0,
+    );
+    let lifted = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect("a single-exit loop with a precise body store lifts");
+    assert_eq!(lifted.loops, 1, "one natural loop emitted");
+    let operations = &lifted.replacement.function.operations;
+    // The body's external store is reproduced as a native store.
+    let store_at = operations
+        .iter()
+        .position(|o| matches!(o, Operation::Store { .. }))
+        .expect("the per-iteration body store is emitted");
+    // It runs inside the loop: after the header label and before the back-edge.
+    let first_label = operations
+        .iter()
+        .position(|o| matches!(o, Operation::Label(_)))
+        .expect("the loop has a header label");
+    let back_edge = operations
+        .iter()
+        .position(|o| matches!(o, Operation::Jump(_)))
+        .expect("the loop closes with a back-edge jump");
+    assert!(
+        first_label < store_at && store_at < back_edge,
+        "the store is emitted in the loop body each iteration (label {first_label}, store {store_at}, jump {back_edge})"
+    );
+    assert!(
+        mnemonics(&lifted).contains(&Mnemonic::Jmp),
+        "a back-edge jump closes the loop"
+    );
+}
+
+#[test]
+fn a_loop_body_store_through_an_opaque_pointer_fails_closed() {
+    // The store goes through a pointer loaded from memory (opaque / havocs the
+    // tracked model), so it cannot be reproduced as a sound per-iteration effect:
+    // the lift must refuse rather than drop or mis-place the store.
+    use VmHandlerSemantic as S;
+    let body = block(
+        0xC0,
+        Some(LOOP_BODY_ADDR),
+        vec![
+            ins(S::ConstantPush, Some(0x55), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(0xAB), -8),
+            ins(S::ConstantPush, Some(0x4000), -8),
+            ins(S::MemoryLoad, None, 0),
+            ins(S::MemoryStore, None, 16),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    );
+    let looping = cfg(
+        vec![
+            loop_entry(0xA0, 0x900),
+            branch_block(0xB0, LOOP_HEADER_ADDR),
+            body,
+            returns_constant(0xD0, 0x930, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+        ],
+        0xA0,
+    );
+    let error = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect_err("a loop body store through an opaque pointer must refuse");
+    assert!(
+        error.to_string().contains("havocs")
+            || error.to_string().contains("side effects"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_pure_body_loop_emits_no_store() {
+    // Regression: a loop whose body only transforms VM state carries no side
+    // effects, so no native store is emitted.
+    let lifted = lift(&reducible_loop_cfg(), &constant_frame(), &BTreeMap::new())
+        .expect("a pure-body loop lifts");
+    assert_eq!(lifted.loops, 1);
+    assert_eq!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::Store { .. }
+        )),
+        0,
+        "a pure loop body emits no store"
+    );
+}
+
 #[test]
 fn an_irreducible_loop_fails_closed() {
     // Two entries into the cycle (entry reaches both A and B), so the back-edge
