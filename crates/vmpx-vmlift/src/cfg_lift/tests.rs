@@ -303,6 +303,39 @@ fn a_two_block_conditional_branch_lifts_to_a_native_compare_and_jump() {
     assert_eq!(decoded.iter().filter(|m| **m == Mnemonic::Ret).count(), 2);
 }
 
+/// Like `constant_frame`, but the flags cell carries a computed value, so the
+/// VM-exit hands the caller flags that differ from the entry flags.
+fn computed_flags_frame() -> Vec<NativeFrameSource> {
+    let mut cells = constant_frame();
+    *cells.last_mut().expect("flags cell") = NativeFrameSource::Constant { value: 0x44 };
+    cells
+}
+
+#[test]
+fn a_flag_carrying_popping_return_exit_is_accepted_and_restores_the_flags() {
+    // The conditional CFG's two VM exits are callee (popping) returns; the
+    // computed-flags frame makes them carry flags that differ from entry.
+    let lifted = lift(&conditional_cfg(), &computed_flags_frame(), &BTreeMap::new())
+        .expect("a flag-carrying popping return lifts");
+    assert_eq!(lifted.exit_paths, 2);
+    // The carried flags are the real result; they are restored, not abandoned as
+    // volatile, because the popping return now preserves them.
+    assert!(
+        !lifted
+            .assumptions
+            .contains(&LiftAssumption::FlagsVolatileAtReturn)
+    );
+    let operations = &lifted.replacement.function.operations;
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::RestoreFlags { .. })),
+        2
+    );
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::ReturnPopping { .. })),
+        2
+    );
+}
+
 fn call_frame_cfg() -> (VmCfg, BTreeMap<Va, NativeCallSelectorOutcome>) {
     let cfg = cfg(
         vec![
@@ -474,6 +507,7 @@ fn identity_exit() -> Node {
                     )
                 })
                 .collect(),
+            rflags: None,
             return_pop: 8,
         }),
     }

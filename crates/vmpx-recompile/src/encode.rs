@@ -1104,12 +1104,22 @@ pub fn compile(
                 })?;
             }
             Operation::ReturnPopping { bytes } => {
-                emit_frame_teardown(&mut output, function, address, operation_index)?;
-                if *bytes != 0 {
-                    let bytes = i32::try_from(*bytes)
-                        .map_err(|_| CompileError::StackAllocationTooLarge { bytes: *bytes })?;
+                // Release the whole frame and `bytes` further caller stack in a
+                // single `lea`, so the flags the exit carries out survive to the
+                // `ret`. Mirrors `ReturnRetaining`; the pushes are discarded, as a
+                // tail-transfer teardown already does.
+                let pushed = u32::try_from(function.frame.preserve.len())
+                    .map_err(|_| CompileError::CodeSizeOverflow)?
+                    .saturating_mul(8);
+                let total = pushed.saturating_add(function.frame.stack_allocation);
+                let release = total
+                    .checked_add(*bytes)
+                    .ok_or(CompileError::StackAllocationTooLarge { bytes: *bytes })?;
+                if release != 0 {
+                    let release = i32::try_from(release)
+                        .map_err(|_| CompileError::StackAllocationTooLarge { bytes: release })?;
                     append_assembled(&mut output, address, operation_index, |assembler| {
-                        assembler.add(rsp, bytes)
+                        assembler.lea(rsp, qword_ptr(rsp + release))
                     })?;
                 }
                 append_assembled(&mut output, address, operation_index, CodeAssembler::ret)?;

@@ -91,6 +91,9 @@ enum Step {
 
 struct ExitLeaf {
     registers: BTreeMap<X64NativeRegister, Expr>,
+    /// Flags carried out to the caller; `None` leaves them clobbered (entry
+    /// flags, volatile across a Win64 return).
+    rflags: Option<Expr>,
     return_pop: u32,
 }
 
@@ -505,13 +508,19 @@ impl Builder<'_> {
                             });
                         }
                     };
-                    if !is_native_rflags_initial(&exit.rflags) {
-                        return refuse(
-                            key,
-                            "the exit flags differ from the entry flags; the frame teardown cannot preserve them",
-                        );
-                    }
-                    self.assume(LiftAssumption::FlagsVolatileAtReturn);
+                    // A popping return lowers to a flag-preserving `lea; ret`, so
+                    // flags the exit carries out reach the caller intact. When they
+                    // differ from the entry flags they are the real result: capture
+                    // and restore them. Entry flags stay volatile per Win64.
+                    let rflags = if is_native_rflags_initial(&exit.rflags) {
+                        self.assume(LiftAssumption::FlagsVolatileAtReturn);
+                        None
+                    } else {
+                        if symbolic_pointer_offset(&exit.rflags, "vsp_initial").is_some() {
+                            return refuse(key, "the exit flags are a stack pointer");
+                        }
+                        Some(self.prepare(key, &exit.rflags, path.barrier, &path)?)
+                    };
                     let mut registers = BTreeMap::new();
                     for (register, value) in &exit.registers {
                         registers.insert(*register, self.prepare(key, value, path.barrier, &path)?);
@@ -521,6 +530,7 @@ impl Builder<'_> {
                         steps,
                         end: End::Exit(ExitLeaf {
                             registers,
+                            rflags,
                             return_pop: exit.return_pop,
                         }),
                     });
@@ -1068,6 +1078,12 @@ impl Emitter<'_> {
 
     fn emit_exit(&mut self, leaf: &ExitLeaf) -> Result<(), ReplacementError> {
         self.stash_exit_registers(&leaf.registers)?;
+        // Materialise the carried flags after the register stash clobbers them and
+        // before the flag-preserving load and popping return.
+        if let Some(rflags) = &leaf.rflags {
+            let value = self.lower(rflags)?;
+            self.operations.push(Operation::RestoreFlags { value });
+        }
         self.load_exit_registers();
         self.operations.push(Operation::ReturnPopping {
             bytes: leaf.return_pop,

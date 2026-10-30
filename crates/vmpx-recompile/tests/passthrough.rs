@@ -245,11 +245,20 @@ fn entry_stack_pointer_and_popping_return_account_for_the_frame() {
     // 16 bytes of allocation, no preserved registers.
     assert_eq!(instructions[1].mnemonic(), Mnemonic::Lea);
     assert_eq!(instructions[1].memory_displacement64(), 16);
-    let adds: Vec<_> = instructions
+    // The popping return adjusts the stack with a single flag-preserving `lea`
+    // (allocation 16 + popped 40 = 56), never a flag-clobbering `add rsp`.
+    assert!(
+        !instructions
+            .iter()
+            .any(|i| i.mnemonic() == Mnemonic::Add && i.op0_register() == Register::RSP),
+        "the popping return must not clobber flags with `add rsp`"
+    );
+    let release = instructions
         .iter()
-        .filter(|i| i.mnemonic() == Mnemonic::Add && i.op0_register() == Register::RSP)
-        .map(|i| i.immediate(1))
-        .collect();
-    assert_eq!(adds, vec![16, 40]);
+        .rev()
+        .find(|i| i.mnemonic() == Mnemonic::Lea && i.op0_register() == Register::RSP)
+        .expect("the frame is released with a `lea rsp`");
+    assert_eq!(release.memory_base(), Register::RSP);
+    assert_eq!(release.memory_displacement64(), 56);
     assert_eq!(instructions.last().map(iced_x86::Instruction::mnemonic), Some(Mnemonic::Ret));
 }
