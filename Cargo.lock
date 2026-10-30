@@ -2754,6 +2754,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-emulate"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+]
+
+[[package]]
 name = "vmpx-pe"
 version = "0.1.0"
 dependencies = [
