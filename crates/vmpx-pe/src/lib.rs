@@ -2,10 +2,14 @@ mod address;
 mod error;
 mod model;
 mod reader;
+mod strip;
 
 pub use address::{FileOffset, ImageBase, Rva, Va};
 pub use error::PeError;
 pub use model::*;
+pub use strip::{
+    DanglingRef, SectionSelector, StripError, StripRequest, StrippedPe, strip_sections,
+};
 
 use std::collections::HashMap;
 
