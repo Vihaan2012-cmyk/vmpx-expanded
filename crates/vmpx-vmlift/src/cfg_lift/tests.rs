@@ -570,6 +570,242 @@ fn a_loop_and_an_incomplete_cfg_refuse() {
     assert!(error.to_string().contains("incomplete"), "{error}");
 }
 
+/// A block that pushes `target` and branches: with two CFG edges it is a two-way
+/// branch, with one it is an unconditional jump. Address `address`, key `key`.
+fn branch_block(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    block(
+        key,
+        Some(address),
+        vec![ins(VmHandlerSemantic::ConstantPush, Some(0x900), -8)],
+        BlockExit::Branch,
+    )
+}
+
+/// Entry that consumes the two scratch frame cells (so the exit frame lines up),
+/// seeds context slot `0x28` to 0, then branches to the header.
+fn loop_entry(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    use VmHandlerSemantic as S;
+    block(
+        key,
+        Some(address),
+        vec![
+            ins(S::VirtualRegisterWrite, Some(0x10), 8),
+            ins(S::VirtualRegisterWrite, Some(0x18), 8),
+            ins(S::ConstantPush, Some(0), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    )
+}
+
+/// Loop body that writes a fresh constant into slot `0x28` each iteration, then
+/// branches back to the header: a real per-iteration update (init 0, next 0x55).
+fn loop_body_const(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    use VmHandlerSemantic as S;
+    block(
+        key,
+        Some(address),
+        vec![
+            ins(S::ConstantPush, Some(0x55), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    )
+}
+
+const LOOP_HEADER_ADDR: u64 = 0x910;
+const LOOP_BODY_ADDR: u64 = 0x920;
+
+/// A reducible natural loop: entry seeds the counter, the header tests it and
+/// either runs the body (back-edge) or leaves to a VM-exit.
+fn reducible_loop_cfg() -> VmCfg {
+    cfg(
+        vec![
+            loop_entry(0xA0, 0x900),
+            branch_block(0xB0, LOOP_HEADER_ADDR),
+            loop_body_const(0xC0, LOOP_BODY_ADDR),
+            returns_constant(0xD0, 0x930, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+        ],
+        0xA0,
+    )
+}
+
+#[test]
+fn a_reducible_loop_emits_a_native_back_edge_not_a_refusal() {
+    let lifted = lift(&reducible_loop_cfg(), &constant_frame(), &BTreeMap::new())
+        .expect("a reducible natural loop lifts");
+    assert_eq!(lifted.loops, 1, "one natural loop emitted");
+    assert_eq!(lifted.exit_paths, 1);
+    let operations = &lifted.replacement.function.operations;
+    // A backward jump closes the loop; the acyclic emitter never emits `Jump`.
+    assert_eq!(
+        count(operations, |o| matches!(o, Operation::Jump(_))),
+        1,
+        "the loop back-edge is a native jump"
+    );
+    // The loop-exit branch dispatches on the body (continue) address.
+    assert!(
+        count(operations, |o| matches!(
+            o,
+            Operation::MoveImmediate { value, .. } if *value == LOOP_BODY_ADDR
+        )) >= 1,
+        "dispatches on the recovered continue address"
+    );
+    // The per-iteration value is the real body constant, not a widened unknown.
+    assert!(
+        count(operations, |o| matches!(
+            o,
+            Operation::MoveImmediate { value, .. } if *value == 0x55
+        )) >= 1,
+        "emits the real per-iteration update"
+    );
+    let decoded = mnemonics(&lifted);
+    assert!(decoded.contains(&Mnemonic::Jmp), "a back-edge jump: {decoded:?}");
+}
+
+/// Entry seeding two loop-carried slots to distinct constants, consuming the
+/// scratch frame cells, then branching to the header.
+fn swap_entry(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    use VmHandlerSemantic as S;
+    block(
+        key,
+        Some(address),
+        vec![
+            ins(S::VirtualRegisterWrite, Some(0x10), 8),
+            ins(S::VirtualRegisterWrite, Some(0x18), 8),
+            ins(S::ConstantPush, Some(0), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(7), -8),
+            ins(S::VirtualRegisterWrite, Some(0x30), 8),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    )
+}
+
+/// Body that swaps slots `0x28` and `0x30` each iteration: each slot's next
+/// value is the other's current value, so emitting it must read the phi slots.
+fn swap_body(key: u64, address: u64) -> (Va, VmBasicBlock) {
+    use VmHandlerSemantic as S;
+    block(
+        key,
+        Some(address),
+        vec![
+            ins(S::VirtualRegisterRead, Some(0x28), -8),
+            ins(S::VirtualRegisterRead, Some(0x30), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::VirtualRegisterWrite, Some(0x30), 8),
+            ins(S::ConstantPush, Some(0x900), -8),
+        ],
+        BlockExit::Branch,
+    )
+}
+
+#[test]
+fn a_loop_with_phi_dependent_updates_emits_both_back_edge_variables() {
+    let looping = cfg(
+        vec![
+            swap_entry(0xA0, 0x900),
+            branch_block(0xB0, LOOP_HEADER_ADDR),
+            swap_body(0xC0, LOOP_BODY_ADDR),
+            returns_constant(0xD0, 0x930, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+        ],
+        0xA0,
+    );
+    let lifted =
+        lift(&looping, &constant_frame(), &BTreeMap::new()).expect("a phi-dependent loop lifts");
+    assert_eq!(lifted.loops, 1);
+    // Two loop-carried cells, each seeded to its own constant before the loop.
+    for seed in [0_u64, 7] {
+        assert!(
+            count(&lifted.replacement.function.operations, |o| matches!(
+                o,
+                Operation::MoveImmediate { value, .. } if *value == seed
+            )) >= 1,
+            "seeds loop variable to {seed}"
+        );
+    }
+    assert_eq!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::Jump(_)
+        )),
+        1
+    );
+}
+
+#[test]
+fn a_multi_exit_loop_fails_closed() {
+    // Reducible, so the header is accepted, but the body branches out a second
+    // time: not a structured single-exit loop, so the lift refuses.
+    let looping = cfg(
+        vec![
+            loop_entry(0xA0, 0x900),
+            branch_block(0xB0, LOOP_HEADER_ADDR),
+            branch_block(0xC0, LOOP_BODY_ADDR),
+            returns_constant(0xD0, 0x930, 111),
+            returns_constant(0xE0, 0x940, 222),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xB0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+            edge(0xC0, 0xE0, CfgEdgeKind::GuardedBranch),
+        ],
+        0xA0,
+    );
+    let error = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect_err("a multi-exit loop must refuse");
+    assert!(
+        error.to_string().contains("more than one exit branch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_irreducible_loop_fails_closed() {
+    // Two entries into the cycle (entry reaches both A and B), so the back-edge
+    // target does not dominate its source: not a natural loop, refused.
+    let looping = cfg(
+        vec![
+            branch_block(0xA0, 0x900),
+            branch_block(0xB0, 0x910),
+            branch_block(0xC0, 0x920),
+            returns_constant(0xD0, 0x930, 111),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xA0, 0xC0, CfgEdgeKind::GuardedBranch),
+            edge(0xB0, 0xC0, CfgEdgeKind::Branch),
+            edge(0xC0, 0xB0, CfgEdgeKind::Branch),
+            edge(0xC0, 0xB0, CfgEdgeKind::LoopBack),
+            edge(0xB0, 0xD0, CfgEdgeKind::GuardedBranch),
+        ],
+        0xA0,
+    );
+    let error = lift(&looping, &constant_frame(), &BTreeMap::new())
+        .expect_err("an irreducible loop must refuse");
+    assert!(error.to_string().contains("loop"), "{error}");
+}
+
 fn identity_exit() -> Node {
     Node {
         steps: Vec::new(),
@@ -627,7 +863,7 @@ fn a_three_way_branch_and_a_narrow_store_keep_program_order() {
         },
     };
     let replacement =
-        build_tree_replacement(&root, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
+        build_tree_replacement(&root, 0, 0, None, None, &tree_config(), CodeAddress(ADDRESS))
             .expect("emit");
     let operations = &replacement.function.operations;
     assert_eq!(
@@ -708,9 +944,13 @@ fn prepare_read(path: &Path, epoch: u64, offset: u64) -> Result<Expr, DecodedLif
         region_exits: 0,
         retained_bytes: 0,
         branches: 0,
+        loops: 0,
         call_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
+        loop_bodies: BTreeMap::new(),
+        loop_phis: 0,
+        active_phis: BTreeSet::new(),
     };
     let read = Expr::intrinsic(
         BitWidth::W32,

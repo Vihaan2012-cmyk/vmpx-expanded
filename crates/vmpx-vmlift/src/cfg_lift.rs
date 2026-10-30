@@ -73,6 +73,8 @@ pub struct LiftedCfgFunction {
     pub expanded_blocks: usize,
     pub exit_paths: usize,
     pub conditional_branches: usize,
+    /// Natural loops emitted as native back-edges.
+    pub loops: usize,
     pub native_calls: usize,
     /// Nested VM entries inlined into the function.
     pub nested_entries: usize,
@@ -109,6 +111,30 @@ struct RegionLeaf {
     slot_offset: u32,
 }
 
+/// One loop-carried cell, emitted as a frame slot (`phi`) live across the
+/// back-edge. `init` is the pre-loop value over entry inputs; `next` is the
+/// per-iteration value over the current `phi`s (and entry inputs).
+struct LoopPhi {
+    id: u16,
+    init: Expr,
+    next: Expr,
+}
+
+/// A natural (reducible) loop: a header with `phi` loop variables, a branch at
+/// the loop-exit site that dispatches on `condition`, and the continuation once
+/// the loop is left. The body carries no side effects (no external store or
+/// native call), so the whole iteration is the pure state transform in `phis`.
+struct LoopLeaf {
+    phis: Vec<LoopPhi>,
+    /// The loop-exit branch selector over the current `phi`s.
+    condition: Expr,
+    /// Recovered address of the in-loop (continue) successor: the back-edge is
+    /// taken when `condition` dispatches to it.
+    continue_value: u64,
+    /// Where control goes when the loop is left, with the `phi`s left live.
+    exit: Box<Node>,
+}
+
 enum End {
     Exit(ExitLeaf),
     Region(RegionLeaf),
@@ -117,11 +143,93 @@ enum End {
         condition: Expr,
         arms: Vec<(u64, Node)>,
     },
+    Loop(LoopLeaf),
 }
 
 struct Node {
     steps: Vec<Step>,
     end: End,
+}
+
+/// Name of the frame-slot input backing loop `phi` variable `id`.
+fn loop_phi_name(id: u16) -> String {
+    format!("__loop_phi_{id}")
+}
+
+/// A loop-carried VM-state cell, addressed in the symbolic state.
+#[derive(Clone)]
+enum Cell {
+    Flags,
+    Context(i64),
+    Memory(Expr),
+}
+
+/// Stable string key for a cell, comparing structurally between states.
+fn cell_key(cell: &Cell) -> String {
+    match cell {
+        Cell::Flags => "flags".to_owned(),
+        Cell::Context(offset) => format!("c{offset}"),
+        Cell::Memory(address) => format!("m{address:?}"),
+    }
+}
+
+/// Every live cell of `state` keyed stably, so two states' live cells compare.
+/// A VM-stack cell below the live top (already popped) is dead: subsequent code
+/// cannot read it without first overwriting it, so it is not loop-carried state.
+fn cell_map(state: &SymbolicVmInitialState) -> BTreeMap<String, (Cell, Expr)> {
+    let top = symbolic_pointer_offset(&state.vsp, "vsp_initial");
+    let mut map = BTreeMap::new();
+    map.insert("flags".to_owned(), (Cell::Flags, state.flags.clone()));
+    for (offset, value) in &state.context_values {
+        map.insert(
+            format!("c{offset}"),
+            (Cell::Context(*offset), value.clone()),
+        );
+    }
+    for (address, value) in &state.memory_values {
+        if let (Some(top), Some(cell)) = (top, symbolic_pointer_offset(address, "vsp_initial"))
+            && cell < top
+        {
+            continue;
+        }
+        map.insert(
+            format!("m{address:?}"),
+            (Cell::Memory(address.clone()), value.clone()),
+        );
+    }
+    map
+}
+
+fn get_cell<'a>(state: &'a SymbolicVmInitialState, cell: &Cell) -> Option<&'a Expr> {
+    match cell {
+        Cell::Flags => Some(&state.flags),
+        Cell::Context(offset) => state.context_values.get(offset),
+        Cell::Memory(address) => state
+            .memory_values
+            .iter()
+            .find(|(candidate, _)| candidate == address)
+            .map(|(_, value)| value),
+    }
+}
+
+fn set_cell(state: &mut SymbolicVmInitialState, cell: &Cell, value: Expr) {
+    match cell {
+        Cell::Flags => state.flags = value,
+        Cell::Context(offset) => {
+            state.context_values.insert(*offset, value);
+        }
+        Cell::Memory(address) => {
+            if let Some(entry) = state
+                .memory_values
+                .iter_mut()
+                .find(|(candidate, _)| candidate == address)
+            {
+                entry.1 = value;
+            } else {
+                state.memory_values.push((address.clone(), value));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -159,9 +267,218 @@ struct Builder<'a> {
     /// Largest staged continuation stack over all region exits, in bytes.
     retained_bytes: u32,
     branches: usize,
+    loops: usize,
     call_sites: usize,
     uses_root: bool,
     assumptions: Vec<LiftAssumption>,
+    /// Natural-loop bodies keyed by header, recovered up front.
+    loop_bodies: BTreeMap<Va, BTreeSet<Va>>,
+    /// Loop `phi` slots allocated so far; also the next slot id.
+    loop_phis: u16,
+    /// Active `phi` input names a prepared expression may legitimately read.
+    active_phis: BTreeSet<String>,
+}
+
+/// Forward (non-back-edge) predecessors of each block. A `(from, to)` pair that
+/// carries a `LoopBack` edge is a back-edge and is excluded whatever other kind
+/// also joins it, since the walk records the back-edge's `Branch` twin too.
+fn forward_predecessors(cfg: &VmCfg) -> BTreeMap<Va, Vec<Va>> {
+    let back: BTreeSet<(Va, Va)> = cfg
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == CfgEdgeKind::LoopBack)
+        .map(|edge| (edge.from, edge.to))
+        .collect();
+    let mut preds: BTreeMap<Va, Vec<Va>> = BTreeMap::new();
+    for edge in &cfg.edges {
+        if back.contains(&(edge.from, edge.to)) {
+            continue;
+        }
+        preds.entry(edge.to).or_default().push(edge.from);
+    }
+    preds
+}
+
+/// Dominator sets over the forward CFG from the entry (iterative fixpoint).
+/// Unreachable blocks keep the full node set and never found a loop.
+fn dominators(cfg: &VmCfg, preds: &BTreeMap<Va, Vec<Va>>) -> BTreeMap<Va, BTreeSet<Va>> {
+    let all: BTreeSet<Va> = cfg.blocks.keys().copied().collect();
+    let mut dom: BTreeMap<Va, BTreeSet<Va>> = all
+        .iter()
+        .map(|&node| {
+            let set = if node == cfg.entry {
+                BTreeSet::from([node])
+            } else {
+                all.clone()
+            };
+            (node, set)
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &node in &all {
+            if node == cfg.entry {
+                continue;
+            }
+            let incoming = preds.get(&node).map(Vec::as_slice).unwrap_or_default();
+            let mut new: Option<BTreeSet<Va>> = None;
+            for pred in incoming {
+                let pred_dom = &dom[pred];
+                new = Some(match new {
+                    None => pred_dom.clone(),
+                    Some(acc) => acc.intersection(pred_dom).copied().collect(),
+                });
+            }
+            let mut new = new.unwrap_or_default();
+            new.insert(node);
+            if new != dom[&node] {
+                dom.insert(node, new);
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
+/// Nodes of the natural loop of back-edge `source` -> `header`: the header plus
+/// every node that reaches `source` without passing through the header.
+fn natural_loop_body(
+    header: Va,
+    source: Va,
+    preds: &BTreeMap<Va, Vec<Va>>,
+) -> BTreeSet<Va> {
+    let mut body = BTreeSet::from([header]);
+    if source != header {
+        body.insert(source);
+        let mut worklist = vec![source];
+        while let Some(node) = worklist.pop() {
+            for &pred in preds.get(&node).map(Vec::as_slice).unwrap_or_default() {
+                if body.insert(pred) {
+                    worklist.push(pred);
+                }
+            }
+        }
+    }
+    body
+}
+
+/// Reducible natural loops keyed by header. A header reached by more than one
+/// back-edge, or whose back-edge source it does not dominate, is dropped so the
+/// walk fails closed on it.
+fn recover_natural_loops(cfg: &VmCfg) -> BTreeMap<Va, BTreeSet<Va>> {
+    let preds = forward_predecessors(cfg);
+    let dom = dominators(cfg, &preds);
+    let mut map: BTreeMap<Va, BTreeSet<Va>> = BTreeMap::new();
+    let mut invalid: BTreeSet<Va> = BTreeSet::new();
+    for edge in &cfg.edges {
+        if edge.kind != CfgEdgeKind::LoopBack {
+            continue;
+        }
+        let (source, header) = (edge.from, edge.to);
+        if invalid.contains(&header) {
+            continue;
+        }
+        let reducible = dom.get(&source).is_some_and(|set| set.contains(&header));
+        if map.contains_key(&header) || !reducible {
+            // A second back-edge to this header or an irreducible one: refuse it.
+            map.remove(&header);
+            invalid.insert(header);
+            continue;
+        }
+        let body = natural_loop_body(header, source, &preds);
+        if body
+            .iter()
+            .all(|node| dom.get(node).is_some_and(|set| set.contains(&header)))
+        {
+            map.insert(header, body);
+        } else {
+            invalid.insert(header);
+        }
+    }
+    map
+}
+
+/// The outcome of one symbolic iteration of a loop body.
+struct BodyRun {
+    /// State flowing back into the header along the back-edge.
+    reentry: SymbolicVmInitialState,
+    /// Loop-exit branch selector.
+    condition: Expr,
+    /// Recovered address of the in-loop (continue) successor.
+    continue_value: u64,
+    /// Block the loop leaves to.
+    exit_key: Va,
+    /// State the exit branch leaves for the continuation.
+    exit_state: SymbolicVmInitialState,
+    guarded: bool,
+}
+
+/// The loop-carried cells: those whose value differs between the pre-loop state
+/// `pre` and the back-edge re-entry state `reentry`. The stack pointer, fresh
+/// allocations, memory precision and live-cell set must be loop-invariant.
+fn loop_cells(
+    header: Va,
+    pre: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> Result<Vec<(Cell, BitWidth)>, DecodedLiftError> {
+    if pre.memory_tainted || reentry.memory_tainted {
+        return refuse(header, "loop follows an imprecise external-memory store");
+    }
+    if pre.vsp != reentry.vsp {
+        return refuse(header, "loop changes the VM stack pointer");
+    }
+    if pre.fresh_allocations != reentry.fresh_allocations {
+        return refuse(header, "loop changes the fresh allocations");
+    }
+    let (pre_cells, reentry_cells) = (cell_map(pre), cell_map(reentry));
+    if pre_cells.keys().ne(reentry_cells.keys()) {
+        return refuse(header, "loop changes its set of live cells");
+    }
+    let mut cells = Vec::new();
+    for (key, (cell, pre_value)) in &pre_cells {
+        let (_, reentry_value) = &reentry_cells[key];
+        if pre_value != reentry_value {
+            if pre_value.width != reentry_value.width {
+                return refuse(header, "a loop-carried cell changes width");
+            }
+            // The phi lives in a 64-bit frame slot; a narrower carried cell would
+            // leave the slot's upper bytes undefined. Fail closed on it.
+            if pre_value.width != BitWidth::W64 {
+                return refuse(header, "a loop-carried cell is not 64 bits wide");
+            }
+            cells.push((cell.clone(), pre_value.width));
+        }
+    }
+    Ok(cells)
+}
+
+/// Proves the phi iteration closes: it changes exactly the recognized loop-
+/// carried cells and leaves every other cell at its invariant value. A cell that
+/// moves but was not recognized means a loop-carried value went uncaptured.
+fn verify_closure(
+    header: Va,
+    phi_state: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+    specs: &[(Cell, u16, BitWidth)],
+) -> Result<(), DecodedLiftError> {
+    if phi_state.vsp != reentry.vsp || phi_state.fresh_allocations != reentry.fresh_allocations {
+        return refuse(header, "loop changes the stack pointer or allocations");
+    }
+    let (before, after) = (cell_map(phi_state), cell_map(reentry));
+    if before.keys().ne(after.keys()) {
+        return refuse(header, "loop changes its set of live cells under iteration");
+    }
+    let carried: BTreeSet<String> = specs.iter().map(|(cell, _, _)| cell_key(cell)).collect();
+    for (key, (_, before_value)) in &before {
+        if carried.contains(key) {
+            continue;
+        }
+        if before_value != &after[key].1 {
+            return refuse(header, "loop carries a cell not recognized as loop-carried");
+        }
+    }
+    Ok(())
 }
 
 fn refuse<T>(block: Va, reason: impl Into<String>) -> Result<T, DecodedLiftError> {
@@ -262,6 +579,7 @@ impl Builder<'_> {
             .map(|register| register.symbolic_name())
             .chain(std::iter::once("vsp_initial"))
             .chain(results.values().map(String::as_str))
+            .chain(self.active_phis.iter().map(String::as_str))
             .collect();
         let dependencies = rewritten.dependencies();
         let foreign: Vec<&String> = dependencies
@@ -359,6 +677,9 @@ impl Builder<'_> {
             }
             path.trail.push(key);
             self.blocks.insert(key);
+            if let Some(body) = self.loop_bodies.get(&key).cloned() {
+                return self.lift_loop(key, state, path, steps, &body);
+            }
             let Some(block) = input.cfg.blocks.get(&key) else {
                 return refuse(key, "block is not in the recovered CFG");
             };
@@ -652,6 +973,207 @@ impl Builder<'_> {
         }
     }
 
+    /// Lifts a reducible natural loop reached at its header with the exact
+    /// pre-loop state. One exact iteration identifies the loop-carried cells; a
+    /// second iteration over fresh `phi` inputs recovers their closed per-
+    /// iteration update and the exit condition, proving the body closes over the
+    /// `phi`s alone. Anything not provably a clean single-exit side-effect-free
+    /// natural loop fails closed.
+    fn lift_loop(
+        &mut self,
+        header: Va,
+        pre_state: SymbolicVmInitialState,
+        path: Path,
+        steps: Vec<Step>,
+        body_set: &BTreeSet<Va>,
+    ) -> Result<Node, DecodedLiftError> {
+        for &node in body_set {
+            self.blocks.insert(node);
+        }
+        // Iteration one, exact: the cells whose value differs between the loop
+        // entry and the back-edge re-entry are the loop-carried variables.
+        let exact = self.run_loop_body(header, body_set, pre_state.clone())?;
+        let cells = loop_cells(header, &pre_state, &exact.reentry)?;
+
+        // Iteration two, over a fresh phi per loop-carried cell.
+        let mut phi_state = pre_state.clone();
+        let mut specs: Vec<(Cell, u16, BitWidth)> = Vec::new();
+        for (cell, width) in cells {
+            let id = self.loop_phis;
+            self.loop_phis = self
+                .loop_phis
+                .checked_add(1)
+                .ok_or_else(|| DecodedLiftError::Cfg {
+                    block: header,
+                    reason: "too many loop-carried cells".to_owned(),
+                })?;
+            let name = loop_phi_name(id);
+            self.active_phis.insert(name.clone());
+            set_cell(&mut phi_state, &cell, Expr::register(width, name));
+            specs.push((cell, id, width));
+        }
+        let run = self.run_loop_body(header, body_set, phi_state.clone())?;
+
+        // The body must change exactly the recognized loop-carried cells and
+        // leave every other cell at its invariant value, or a carried value went
+        // unrecognized: fail closed.
+        verify_closure(header, &phi_state, &run.reentry, &specs)?;
+
+        if run.guarded
+            && self
+                .input
+                .cfg
+                .assumptions
+                .contains(&VmCfgAssumption::PreferredImageBase)
+        {
+            self.assume(LiftAssumption::PreferredImageBase);
+        }
+
+        let mut phis = Vec::with_capacity(specs.len());
+        for (cell, id, width) in &specs {
+            let init_value = get_cell(&pre_state, cell).ok_or_else(|| DecodedLiftError::Cfg {
+                block: header,
+                reason: "loop-carried cell has no pre-loop value".to_owned(),
+            })?;
+            let init = self.prepare(header, init_value, path.barrier, &path)?;
+            let next_value = get_cell(&run.reentry, cell).ok_or_else(|| DecodedLiftError::Cfg {
+                block: header,
+                reason: "loop-carried cell has no re-entry value".to_owned(),
+            })?;
+            if next_value.width != *width {
+                return refuse(header, "a loop-carried cell changes width");
+            }
+            let next = self.prepare(header, next_value, path.barrier, &path)?;
+            phis.push(LoopPhi {
+                id: *id,
+                init,
+                next,
+            });
+        }
+        let condition = self.prepare(header, &run.condition, path.barrier, &path)?;
+        self.branches += 1;
+        self.loops += 1;
+        let exit = self.walk(run.exit_key, run.exit_state, path.clone(), Vec::new())?;
+        Ok(Node {
+            steps,
+            end: End::Loop(LoopLeaf {
+                phis,
+                condition,
+                continue_value: run.continue_value,
+                exit: Box::new(exit),
+            }),
+        })
+    }
+
+    /// Runs one iteration of a loop body from `start`, following single in-loop
+    /// successors and the loop's one exit branch, back to the header. Refuses any
+    /// side effect, non-branch block, or branching the structured form forbids.
+    fn run_loop_body(
+        &mut self,
+        header: Va,
+        body_set: &BTreeSet<Va>,
+        start: SymbolicVmInitialState,
+    ) -> Result<BodyRun, DecodedLiftError> {
+        let input = self.input;
+        let mut key = header;
+        let mut state = start;
+        let mut exit: Option<(Expr, u64, Va, SymbolicVmInitialState, bool)> = None;
+        let mut budget = body_set.len() + 1;
+        loop {
+            budget = budget.checked_sub(1).ok_or_else(|| DecodedLiftError::Cfg {
+                block: key,
+                reason: "loop body is not a simple cycle".to_owned(),
+            })?;
+            let Some(block) = input.cfg.blocks.get(&key) else {
+                return refuse(key, "loop body block is not in the recovered CFG");
+            };
+            if block.exit != BlockExit::Branch {
+                return refuse(key, "loop body block does not end in a branch");
+            }
+            if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
+                return refuse(key, format!("instruction {index} ({semantic:?}): {reason}"));
+            }
+            let report = execute_symbolic_linear_block_with_initial_state(
+                &block.instructions,
+                Some(VmHandlerSemantic::UnconditionalBranch),
+                input.limits,
+                &state,
+                input.memory,
+            )
+            .map_err(|error| DecodedLiftError::Cfg {
+                block: key,
+                reason: format!("symbolic execution failed: {error}"),
+            })?;
+            if !report.external_writes.is_empty()
+                || !report.memory_havocs.is_empty()
+                || !report.native_calls.is_empty()
+                || !report.fresh_allocations.is_empty()
+                || report.memory_tainted
+            {
+                return refuse(key, "loop body has side effects (store, call or havoc)");
+            }
+            self.expanded += 1;
+            let next = report.continuation_state();
+            let (successors, guarded) = self.branch_successors(key)?;
+            let (inside, outside): (Vec<_>, Vec<_>) = successors
+                .iter()
+                .partition(|(_, successor)| body_set.contains(successor));
+            match (inside.as_slice(), outside.as_slice()) {
+                ([(_, continue_key)], []) => {
+                    if *continue_key == header {
+                        let (condition, continue_value, exit_key, exit_state, g) =
+                            exit.ok_or_else(|| DecodedLiftError::Cfg {
+                                block: key,
+                                reason: "loop has no exit branch".to_owned(),
+                            })?;
+                        return Ok(BodyRun {
+                            reentry: next,
+                            condition,
+                            continue_value,
+                            exit_key,
+                            exit_state,
+                            guarded: g,
+                        });
+                    }
+                    key = *continue_key;
+                    state = next;
+                }
+                ([(continue_value, continue_key)], [(_, exit_key)]) => {
+                    if exit.is_some() {
+                        return refuse(key, "loop body has more than one exit branch");
+                    }
+                    if successors.len() != 2 {
+                        return refuse(key, "loop exit branch is not two-way");
+                    }
+                    let Some(target) = report.branch_target.as_ref() else {
+                        return refuse(key, "loop exit branch has no symbolic target");
+                    };
+                    let record = (
+                        target.clone(),
+                        *continue_value,
+                        *exit_key,
+                        next.clone(),
+                        guarded,
+                    );
+                    if *continue_key == header {
+                        return Ok(BodyRun {
+                            reentry: next,
+                            condition: record.0,
+                            continue_value: record.1,
+                            exit_key: record.2,
+                            exit_state: record.3,
+                            guarded: record.4,
+                        });
+                    }
+                    exit = Some(record);
+                    key = *continue_key;
+                    state = next;
+                }
+                _ => return refuse(key, "loop body has unsupported branching"),
+            }
+        }
+    }
+
     /// The state the nested entry starts from after the exit at `key` returns
     /// into it, or `None` when the resolver cannot prove the entry (the exit is
     /// then lowered as an ordinary exit).
@@ -811,9 +1333,13 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         region_exits: 0,
         retained_bytes: 0,
         branches: 0,
+        loops: 0,
         call_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
+        loop_bodies: recover_natural_loops(input.cfg),
+        loop_phis: 0,
+        active_phis: BTreeSet::new(),
     };
     let stop = builder
         .walk(input.cfg.entry, initial, Path::default(), Vec::new())
@@ -886,9 +1412,13 @@ fn lift_with_nested(
         region_exits: 0,
         retained_bytes: 0,
         branches: 0,
+        loops: 0,
         call_sites: 0,
         uses_root: false,
         assumptions: Vec::new(),
+        loop_bodies: recover_natural_loops(cfg),
+        loop_phis: 0,
+        active_phis: BTreeSet::new(),
     };
     let root = builder.walk(cfg.entry, initial, Path::default(), Vec::new())?;
 
@@ -913,6 +1443,7 @@ fn lift_with_nested(
     let replacement = build_tree_replacement(
         &root,
         builder.call_sites,
+        builder.loop_phis,
         frame_bytes,
         region,
         &config,
@@ -924,6 +1455,7 @@ fn lift_with_nested(
         expanded_blocks: builder.expanded,
         exit_paths: builder.exit_paths,
         conditional_branches: builder.branches,
+        loops: builder.loops,
         native_calls: builder.call_sites,
         nested_entries: builder.nested_entries,
         assumptions: builder.assumptions,
@@ -947,6 +1479,10 @@ struct Emitter<'c> {
     /// Spill slot holding the flags the function was entered with; present
     /// only when a region exit must hand them to its continuation.
     flags_slot: Option<SpillSlot>,
+    /// Base slot of the loop `phi` variables (live across back-edges).
+    phi_base: u16,
+    /// Base slot of the per-iteration staging slots for loop `phi` updates.
+    phi_temp_base: u16,
 }
 
 impl Emitter<'_> {
@@ -1204,7 +1740,76 @@ impl Emitter<'_> {
                 }
                 Ok(())
             }
+            End::Loop(leaf) => self.emit_loop(leaf),
         }
+    }
+
+    /// Emits a natural loop. The `phi` slots are seeded before the header label;
+    /// each iteration dispatches the exit branch on the continue address, falls
+    /// through to the exit continuation when the loop is left, and otherwise
+    /// updates the `phi` slots from their per-iteration values and jumps back.
+    fn emit_loop(&mut self, leaf: &LoopLeaf) -> Result<(), ReplacementError> {
+        for phi in &leaf.phis {
+            let value = self.lower(&phi.init)?;
+            self.operations.push(Operation::SpillStore {
+                slot: SpillSlot(self.phi_base + phi.id),
+                source: value,
+            });
+        }
+        let header = Label(self.next_label);
+        self.next_label += 1;
+        self.operations.push(Operation::Label(header));
+        let selector = self.lower(&leaf.condition)?;
+        let held = self.scratch(0);
+        self.operations.push(Operation::SpillStore {
+            slot: held,
+            source: selector,
+        });
+        let selector = self.register(PhysicalRegister::R10);
+        let constant = self.register(PhysicalRegister::R11);
+        self.operations.push(Operation::SpillLoad {
+            destination: selector,
+            slot: held,
+        });
+        self.operations.push(Operation::MoveImmediate {
+            destination: constant,
+            value: leaf.continue_value,
+        });
+        self.operations.push(Operation::Compare {
+            left: selector,
+            right: BinarySource::Register(constant),
+        });
+        let body = Label(self.next_label);
+        self.next_label += 1;
+        self.operations.push(Operation::BranchIf {
+            condition: Condition::Equal,
+            target: body,
+        });
+        // Fall through: the loop is left. The continuation ends in returns, so
+        // control never reaches the body label below except via the back-edge.
+        self.emit_node(&leaf.exit)?;
+        self.operations.push(Operation::Label(body));
+        // Stage every next value from the current phis before overwriting any.
+        for phi in &leaf.phis {
+            let value = self.lower(&phi.next)?;
+            self.operations.push(Operation::SpillStore {
+                slot: SpillSlot(self.phi_temp_base + phi.id),
+                source: value,
+            });
+        }
+        for phi in &leaf.phis {
+            let moved = self.register(PhysicalRegister::R10);
+            self.operations.push(Operation::SpillLoad {
+                destination: moved,
+                slot: SpillSlot(self.phi_temp_base + phi.id),
+            });
+            self.operations.push(Operation::SpillStore {
+                slot: SpillSlot(self.phi_base + phi.id),
+                source: moved,
+            });
+        }
+        self.operations.push(Operation::Jump(header));
+        Ok(())
     }
 }
 
@@ -1214,6 +1819,7 @@ impl Emitter<'_> {
 fn build_tree_replacement(
     root: &Node,
     call_count: usize,
+    loop_phis: u16,
     stack_root_bytes: Option<u32>,
     region_retained: Option<u32>,
     config: &ReplacementConfig,
@@ -1251,9 +1857,15 @@ fn build_tree_replacement(
     let register_count = u16::try_from(X64NativeRegister::ALL.len()).unwrap_or(u16::MAX);
     let scratch_base = result_base + register_count;
     let flags_slot = region_retained.map(|_| SpillSlot(scratch_base + CALL_SCRATCH_SLOTS));
-    let shared_end = scratch_base + CALL_SCRATCH_SLOTS + u16::from(flags_slot.is_some());
+    let phi_base = scratch_base + CALL_SCRATCH_SLOTS + u16::from(flags_slot.is_some());
+    let phi_temp_base = phi_base
+        .checked_add(loop_phis)
+        .ok_or(ReplacementError::TooManyInputs)?;
+    let shared_end = phi_temp_base
+        .checked_add(loop_phis)
+        .ok_or(ReplacementError::TooManyInputs)?;
 
-    let mut inputs = Vec::with_capacity(config.inputs.len() + call_count);
+    let mut inputs = Vec::with_capacity(config.inputs.len() + call_count + usize::from(loop_phis));
     for (index, (name, _)) in config.inputs.iter().enumerate() {
         inputs.push(ExpressionInput::slot(
             name.clone(),
@@ -1266,6 +1878,13 @@ fn build_tree_replacement(
             call_result_name(index),
             BitWidth::W64,
             SpillSlot(call_result_base + u16::try_from(index).unwrap_or(u16::MAX)),
+        ));
+    }
+    for id in 0..loop_phis {
+        inputs.push(ExpressionInput::slot(
+            loop_phi_name(id),
+            BitWidth::W64,
+            SpillSlot(phi_base + id),
         ));
     }
 
@@ -1284,6 +1903,8 @@ fn build_tree_replacement(
         result_base,
         scratch_base,
         flags_slot,
+        phi_base,
+        phi_temp_base,
     };
     for (index, (name, physical)) in config.inputs.iter().enumerate() {
         let source = emitter.register(*physical);
