@@ -5,22 +5,24 @@ use eframe::egui::{
 
 use crate::runner::PathOpt;
 
-pub const ACCENT: Color32 = Color32::from_rgb(86, 182, 194);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(38, 86, 94);
+// Stock egui-dark palette (no custom recolor): neutral grays + the default
+// egui selection blue. Only OK/BAD/WARN stay as semantic status colors.
+pub const ACCENT: Color32 = Color32::from_rgb(90, 170, 255);
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(0, 92, 128);
 pub const OK: Color32 = Color32::from_rgb(90, 200, 120);
 pub const BAD: Color32 = Color32::from_rgb(232, 104, 104);
 pub const WARN: Color32 = Color32::from_rgb(224, 176, 80);
-pub const BG_SIDE: Color32 = Color32::from_rgb(20, 22, 27);
-pub const BG_MAIN: Color32 = Color32::from_rgb(26, 28, 34);
-pub const BG_RAISED: Color32 = Color32::from_rgb(33, 36, 43);
-const LINE: Color32 = Color32::from_rgb(50, 54, 63);
+pub const BG_SIDE: Color32 = Color32::from_gray(24);
+pub const BG_MAIN: Color32 = Color32::from_gray(27);
+pub const BG_RAISED: Color32 = Color32::from_gray(32);
+const LINE: Color32 = Color32::from_gray(55);
 
 pub fn apply(ctx: &Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG_MAIN;
     v.window_fill = BG_RAISED;
-    v.extreme_bg_color = Color32::from_rgb(16, 18, 22);
-    v.faint_bg_color = Color32::from_rgb(31, 34, 41);
+    v.extreme_bg_color = Color32::from_gray(10);
+    v.faint_bg_color = Color32::from_gray(34);
     v.selection.bg_fill = ACCENT_DIM;
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     v.hyperlink_color = ACCENT;
@@ -28,8 +30,8 @@ pub fn apply(ctx: &Context) {
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, LINE);
     let radius = Rounding::same(5.0);
     for (widget, fill) in [
-        (&mut v.widgets.inactive, Color32::from_rgb(45, 49, 58)),
-        (&mut v.widgets.hovered, Color32::from_rgb(58, 64, 76)),
+        (&mut v.widgets.inactive, Color32::from_gray(48)),
+        (&mut v.widgets.hovered, Color32::from_gray(64)),
         (&mut v.widgets.active, ACCENT_DIM),
     ] {
         widget.rounding = radius;
