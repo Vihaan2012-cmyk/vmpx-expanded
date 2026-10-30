@@ -1,0 +1,90 @@
+Attacking Mutation
+==================
+
+*Mechanism:* :doc:`/vmprotect/mutation`
+
+Mutation preserves semantics, and a semantic analysis can therefore see through any
+mutation in principle. The question is whether it can do so at acceptable cost and
+without being fooled. The method is to treat the mutated code as a **program**, not a
+pattern.
+
+Principle: reason about effects, not shapes
+-------------------------------------------
+
+A pattern-based deobfuscator carries a library of "this junk sequence means that
+instruction" rules. Every new build can invalidate the library. An effect-based one
+never asks what a sequence *looks like*; it asks what it **defines**. A computation
+whose result reaches no live-out register, no flag and no memory is junk by definition,
+whatever it looks like.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 36 36
+
+   * - Mutation
+     - Pattern approach
+     - Effect approach (vmpx)
+   * - Junk arithmetic
+     - Match known junk idioms
+     - Backward slice from live-out registers drops anything that does not feed them
+   * - Equivalent instruction sequences
+     - Maintain a substitution table
+     - Evaluate over a bit-vector IR; equal expressions simplify to the same normal
+       form
+   * - Unfolded constants
+     - Constant-propagate known idioms
+     - The expression folder evaluates the arithmetic
+   * - Register renaming
+     - Normalise register names
+     - Recover the role of each register from behaviour
+   * - Fragmentation
+     - Follow jumps heuristically
+     - Trace direct-jump chains with explicit limits; linearize by reachability
+   * - Opaque predicates
+     - Recognise known predicates
+     - Simplify the predicate symbolically; if it reduces to a constant, one edge dies
+   * - Pushes and pops that cancel
+     - Peephole rules
+     - Exact byte-addressed stack memory in the symbolic state
+
+The backward slice
+------------------
+
+The most important single tool is the slice. For a handler's dispatch tail, vmpx keeps
+only the instructions that:
+
+* define a live-out register (the VIP, the key or the handler pointer), or
+* define a flag a later instruction reads, or
+* access memory (kept conservatively), or
+* are calls or exception-like transfers (barriers that retain all predecessors).
+
+Direct jumps that only connect fragments are labelled *structural*. After slicing, a
+mutated handler's tail has the size of the unmutated one, up to a bounded amount of
+noise.
+
+Keeping the slice conservative is deliberate: an instruction that is kept unnecessarily
+costs a little analysis time, while an instruction dropped wrongly changes the recovered
+semantics.
+
+Idioms the folder knows
+-----------------------
+
+Some constructs are not mutation but the VM's own arithmetic. The expression folder
+encodes one explicitly: ``not(not(x) + a) + b`` is a plain pointer adjustment and folds
+to ``x + (b - a)``. Without that rule, every stack-relative address the VM builds would
+stay an opaque expression and memory could not be tracked exactly.
+
+Where it can go wrong
+---------------------
+
+* **State explosion.** Heavy junk with data-dependent branches can multiply paths. The
+  limits (4,096 instructions per block, 1 MiB tracked memory, 200,000 expression
+  nodes) make this a reported failure rather than a hang.
+* **Predicates over memory.** An opaque predicate whose outcome depends on memory the
+  analysis treats as unknown cannot be proven constant. The path is explored in both
+  directions; if the extra path cannot be resolved it is a blocker.
+* **Aliasing.** A store to an address that could alias tracked memory discards precise
+  memory (a *havoc*). Mutation that stores through computed pointers can force havocs,
+  which in turn make later loads opaque.
+
+All three are reported, not hidden.

@@ -1,0 +1,77 @@
+Attacking the Packer
+====================
+
+*Mechanism:* :doc:`/vmprotect/packing`   *Implemented by:* :doc:`/tool/pipeline/unpacking`
+
+The packer is the easiest protection to remove and the one a static analysis must
+remove first, because everything else is inside it.
+
+The attack
+----------
+
+Packing is a data-hiding technique. The decompressor, its parameters and the
+compressed data must all be in the file for the program to run, so a static analyst
+can always find them. The attack is therefore: **find the table, decode it, run the
+decompressor**, without running the program.
+
+#. *Find the table.* Scan the whole file for an array of 8-byte entries whose source
+   RVAs each point at a ``0x00`` byte (the first byte of a raw LZMA stream).
+   Require exactly one validated position.
+#. *Decode the table.* For the legacy layout, nothing to decode. For the encoded
+   layout, recover the rotating key from the observation that entry 0 is
+   unrotated, then validate the whole decoded set as a permutation of the
+   destination sections.
+#. *Decompress.* Wrap each raw stream in a synthetic 13-byte header with unknown
+   size, decode to the end marker, and retry with the exact consumed length if the
+   decoder objects to trailing bytes.
+#. *Rebuild the image.* Place headers and file-backed sections at their virtual
+   addresses, expand each stream into its destination section and rewrite the section
+   headers into RVA layout.
+
+Why it works
+------------
+
+Each defense is answered by an *invariant that a correct answer must satisfy and a
+wrong guess almost never will*:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Defence
+     - Invariant that defeats it
+   * - No fixed table offset
+     - Every ``source_rva`` must map to a ``0x00`` byte, for every entry
+   * - Encoded destination RVAs
+     - The decoded set must be a permutation of the destination sections
+   * - Key not stored
+     - Entry 0 is rotated by zero bits, so the key follows from one candidate
+       destination
+   * - LZMA properties omitted
+     - A fixed default is used, and a wrong choice fails to decode to the end marker
+   * - Trailing bytes after the stream
+     - The first pass reports how many bytes it consumed; retry with exactly that
+       length
+
+When to refuse
+--------------
+
+The unpacker reports ambiguity or absence rather than choosing. More than one
+validated table, a block that fails to decode, a section whose span is smaller than
+its virtual size, or an overflowing range are all errors. A block that decompresses to
+*fewer* bytes than the virtual size is a warning, not an error, because the remainder
+is legitimately zero in many programs.
+
+What is left after unpacking
+----------------------------
+
+The result is the memory image the program would have *after* the packer finished, but
+before the rest of its initialization:
+
+* the original sections are present, but their imports are still protector-era (see
+  :doc:`attacking-imports`);
+* the VM, its bytecode and the entry stubs are all present and, now readable,
+  analysable;
+* the header entry still points into the protector.
+
+The next step is to understand the VM (:doc:`attacking-the-vm`).

@@ -1,0 +1,161 @@
+Reintegration
+=============
+
+*Crate:* :doc:`/tool/crates/rebuild`  *Module:* ``reintegrate.rs``
+
+Reintegration splices compiled replacement code into the image and redirects
+control to it. It is the stage that finally produces a changed binary, and it is
+the reason ``--experimental`` exists.
+
+Design: append, do not patch
+----------------------------
+
+The core of reintegration is *non-destructive*. It does not patch any ``.vmp`` byte:
+
+* A new executable section (default name ``.vmpx0``, characteristics
+  ``IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE``) is appended
+  at ``next_section_rva``, without moving existing bytes.
+* The header ``AddressOfEntryPoint`` is rewritten to the dispatcher (or sole body).
+* Each protected TLS callback slot in the TLS callback array is rewritten to the
+  replacement's VA.
+
+``reintegrate`` chains the steps and records the result:
+
+.. code-block:: rust
+
+    pub struct ReintegrationRequest<'a> {
+        pub section_name: [u8; 8],
+        pub payload: &'a [u8],
+        pub entry_redirect: Option<Rva>,
+        pub tls_redirects: &'a [(usize, Rva)],
+    }
+
+    pub struct ReintegrationReport {
+        pub section: AppendedSection,
+        pub entry_redirected: bool,
+        pub tls_redirected: usize,
+        pub loader_valid: bool,
+        pub diagnostics: Vec<String>,
+    }
+
+It appends the payload section, applies the entry redirect, applies each TLS
+redirect, then runs loader validation and records the result as a flag *without*
+failing on an invalid image. It takes already-rendered bytes, so the crate has no
+code-generation dependency.
+
+``append_section`` constraints
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Appending one file-backed section to a PE32+ image requires:
+
+* an unused 40-byte section-table slot before ``SizeOfHeaders`` and the first raw
+  section, with all-zero slack;
+* no overlap with a data directory;
+* no security (certificate) directory, since certificate relocation is not
+  implemented.
+
+When there is no room for another ``IMAGE_SECTION_HEADER`` the call returns a
+typed error, which surfaces as a reintegration diagnostic and never a panic.
+Rebuilding the headers to make room is a possible future enhancement.
+``next_section_rva`` reports where the section will land so RVA-sensitive payloads
+can be built first.
+
+Layout contract
+---------------
+
+Bodies are compiled assuming they start at ``next_section_rva`` and pack
+sequentially. The section is therefore laid out *bodies first, dispatchers after*:
+
+.. code-block:: text
+
+    [ body0 ][ body1 ] ... [ bodyN ][ dispatcher_a ][ dispatcher_b ] ...
+    ^ next_section_rva
+
+* Body addresses are left untouched, so their RIP-relative references and
+  continuation tail-jumps stay valid.
+* Each dispatcher is compiled at its own known RVA after the bodies, because its
+  ``je``/``jmp`` targets are rel32 from its own location.
+* Entries are redirected to their dispatcher RVA or, for a single-body domain,
+  directly to the body.
+
+A failed group rolls the layout cursor back, so a dispatcher that cannot be
+assembled never leaves a gap or shifts later bodies.
+
+Groups and dispatchers
+----------------------
+
+An entry can recover several paths, one per value of its finite input domain
+(for ``DllMain``, the reason in ``rdx``, 0 through 3). At runtime the replacement
+must select the right body, so the dispatcher compares the domain register to each
+recovered value and jumps to the matching body. A single-body group whose domain
+is not provably complete still receives a dispatcher with a fallback, rather than a
+direct redirect that would run the body on out-of-domain inputs.
+
+The fallback ``jmp`` goes to the preserved original entry. It is only a safety net
+for inputs outside the recovered domain; if the domain is proven complete, it is
+unreachable.
+
+Redirecting function stubs
+--------------------------
+
+For single-body virtualized functions (input-closed routines and the executable
+entry), ``redirect_vm_stub`` overwrites the first five bytes of the VM entry stub
+with a near ``jmp rel32`` to the replacement body and reparses to confirm the
+bytes landed:
+
+.. code-block:: rust
+
+    pub fn redirect_vm_stub(
+        input: &[u8],
+        stub_rva: Rva,
+        target_rva: Rva,
+    ) -> Result<Vec<u8>, RebuildError>;
+
+Unlike the append-only header and TLS redirects, this edits existing code bytes
+of the rebuilt output. It therefore belongs to the ``--experimental`` image only,
+and it interacts with integrity checks (see :doc:`verification`). It refuses:
+
+* a stub that is not in an executable, file-backed section with at least five
+  bytes left to the end of its raw data;
+* a target that is not in an executable section;
+* a displacement that does not fit ``rel32``;
+* any write that does not survive reparse.
+
+A failed redirect leaves the original stub in place and records a diagnostic.
+
+Entry and TLS redirects
+-----------------------
+
+``set_entry_point`` requires the target RVA to be in an executable, file-backed
+section. ``set_tls_callback`` rewrites one slot of the TLS callback array with the
+same checks, plus a PE32+ and file-backed guard.
+
+Nested continuations
+--------------------
+
+Where a VM exit continues into another VM entry, the nested entry needs its own
+replacement. Nested-continuation redirects remain deferred: they are counted but
+not appended. The ``reintegration`` stage diagnostics say so
+("nested-continuation redirects remain deferred").
+
+Output, loader validation and layout
+------------------------------------
+
+After reintegration, ``relayout_conventional`` converts to a conventional file
+and ``validate_for_loader`` walks every directory the Windows loader walks:
+
+* the entry point is in an executable, file-backed section;
+* import module names end in ``.dll`` and every symbol has a name or ordinal;
+* the TLS callback array and each callback are file-backed;
+* every relocation target is mapped;
+* every non-forwarded export is file-backed.
+
+It returns counts for imports, exports, TLS callbacks and relocations. The CLI
+reports the outcome as ``loader validation passed`` or ``FAILED``.
+
+.. note::
+
+    Layout is not devirtualization. A conventional relayout produces a loadable,
+    structurally valid file that still contains every protector section and VM
+    handler. The CLI says so on its output ("conventional layout, not
+    devirtualized").

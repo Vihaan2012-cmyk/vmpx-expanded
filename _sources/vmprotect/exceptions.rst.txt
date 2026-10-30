@@ -1,0 +1,93 @@
+Exception-Driven Control Flow
+=============================
+
+Normal control flow is branches, calls and returns. Exceptions are a second,
+rarely-analysed channel: a faulting instruction transfers control to a handler that
+the operating system finds by walking unwind metadata. A protector that routes its
+real control flow through this channel leaves no ``jmp`` or ``call`` for a
+disassembler to follow.
+
+How x64 exception dispatch works
+--------------------------------
+
+On x64 Windows, exception handling is table driven. The ``.pdata`` section holds an
+array of ``RUNTIME_FUNCTION`` entries, one per function, each pointing at an
+``UNWIND_INFO`` record. When an exception occurs at some instruction:
+
+#. the OS looks up the ``RUNTIME_FUNCTION`` covering the faulting instruction;
+#. if its ``UNWIND_INFO`` names a **language-specific handler** (flag
+   ``UNW_FLAG_EHANDLER``), the OS calls that handler with ``(ExceptionRecord,
+   EstablisherFrame, ContextRecord, DispatcherContext)`` in ``RCX``, ``RDX``,
+   ``R8`` and ``R9``;
+
+#. the handler may modify the ``CONTEXT`` (including ``Rsp`` and ``Rip``) and return
+   ``ExceptionContinueExecution``, in which case execution resumes at the
+   (modified) context.
+
+The ``CONTEXT`` argument is in ``R8`` and ``CONTEXT.Rsp`` is at offset ``0x98``.
+
+How a protector uses it
+-----------------------
+
+A VM handler that reads memory (a ``MemoryLoad``) may read an address that is
+*deliberately invalid*. The read faults; the OS finds the handler's
+``RUNTIME_FUNCTION``; the language-specific handler runs and changes ``CONTEXT`` so
+that execution resumes somewhere else, usually into the next stage of the VM or
+back into the caller. Seen from the instruction stream, the fault-causing load is
+followed by code that looks as though it should never run, and the real continuation
+is invisible.
+
+vmpx's ``exception_flow`` module recognises this in three steps:
+
+#. For a handler classified as a VM memory load, collect the **external reads**
+   (not VM stack, not context). Each is a *fault site*.
+#. Match each fault site against the image's exception table: it needs a covering
+   ``RUNTIME_FUNCTION`` whose ``UNWIND_INFO`` names a language-specific handler.
+#. Analyse each such handler as a **stack sled builder**. The recognizer requires it
+   to load ``CONTEXT.Rsp`` through the context argument in ``R8``, then copy a
+   continuation seed and a validated ``ret`` gadget through a cursor to build a
+   bounded virtual-unwind stack. It classifies by register and memory effects and
+   control flow, never by bytes or addresses.
+
+Continuation sources
+--------------------
+
+Three continuation sources are modelled:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Source
+     - Meaning
+   * - Non-zero seed
+     - The handler writes a seed into the sled; the ``ret`` gadgets lead to it
+   * - Cursor memory
+     - The continuation is read from memory the handler walks with a cursor
+   * - Zero-seed unwind
+     - The stack is filled with ``ret`` gadgets and control unwinds through the
+       original native frame to the caller's saved return address. **No dispatch
+       address exists on this path**
+
+What it means for analysis
+--------------------------
+
+* **A faulting read can be intended.** Execution does not fall through a faulting
+  instruction; it continues through the exception handler. Treating the fault as an
+  error silently drops the real path.
+* **The unwind tables are a map.** Every handler registered with a language-specific
+  handler is a candidate function range, and the table gives its extent even when the
+  code is obfuscated. The ``imports`` scan uses the same table.
+* **Exactness is required.** vmpx reports whether all external reads route through
+  language handlers and whether continuations are recovered, and refuses to claim a
+  continuation without an exact pre-fault state. The ``exception_coverage`` field of
+  each path in the clean report carries that result.
+
+The report fields
+-----------------
+
+``CleanVmPathReport.exception_coverage`` and
+``CleanNestedContinuationReport.exception_coverage`` list a
+``VmMemoryExceptionCoverageReport`` per memory-load handler. A path whose coverage is
+incomplete cannot have its continuation proven, and the corresponding blocker stays.
+See :doc:`/tool/cli/reports`.

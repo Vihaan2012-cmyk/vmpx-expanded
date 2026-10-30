@@ -1,0 +1,53 @@
+Attacking Import Protection
+===========================
+
+*Mechanism:* :doc:`/vmprotect/imports`
+*Implemented by:* :doc:`/tool/cli/imports`, :doc:`/tool/pipeline/imports-and-stripping`
+
+Import protection hides which APIs a program uses. The attack has three tasks: gather
+every candidate reference, resolve each to one API, and rebuild a table the Windows
+loader can consume.
+
+1. Gather the references
+------------------------
+
+Imports that are still referenced *directly* (a RIP-relative operand naming an exact
+IAT slot) are found by scanning code. Obfuscation shifts instruction boundaries, so one
+linear pass is not enough:
+
+* Scan the byte ranges named by the exception table, which give function boundaries
+  that survive obfuscation.
+* Scan the remaining executable bytes independently from many starting points
+  (resynchronizing).
+
+Every finding is tagged with how it was found. Both scans are budgeted at 30,000,000
+candidate decodes and report truncation.
+
+2. Resolve identity
+-------------------
+
+A slot is trusted only if it carries *exactly one* name or ordinal. Duplicates are not
+merged; ambiguity is reported with a reason. A virtualized call goes through the native
+call bridge, where the call target is matched against the parsed imports by lookup value,
+IAT RVA and preferred-base IAT VA.
+
+3. Rebuild the directory
+------------------------
+
+Build a conventional import table at a chosen section RVA from semantic specifications
+only: no original layout RVAs or raw thunk values are trusted, names are restricted to
+non-empty ASCII, and each source slot maps to exactly one rebuilt slot. Then install
+the directories and verify that the reparsed list equals the serialized one.
+
+What is not solved
+------------------
+
+* An import used only from **mutated thunks** or **dynamic resolution** in the
+  protector's runtime has no direct reference to find. Proving it unused is the
+  difficulty: the report always states that absence of a direct reference does not
+  prove an import unused.
+* Retargeting the references in recovered code to the rebuilt slots is the remaining
+  integration step. The slot-remap structure exists for exactly this.
+
+These are why the "application import set is not proven independently reconstructed"
+blocker is still raised by ``clean``.

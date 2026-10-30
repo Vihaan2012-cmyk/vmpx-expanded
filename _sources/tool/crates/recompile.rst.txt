@@ -1,0 +1,71 @@
+vmpx-recompile
+===============
+
+Conservative AMD64 code generation for lowered VM semantics. It is a small
+width-aware integer IR with its own register-allocation and ABI validation, and
+nothing else. *Depends on:* ``iced-x86``.
+
+Unsupported operations and unsafe ABI states are rejected instead of
+approximated.
+
+Compilation
+-----------
+
+.. code-block:: rust
+
+    pub fn compile(
+        function: &Function,
+        address: CodeAddress,
+    ) -> Result<CompiledFunction, CompileError>;
+
+``CompiledFunction`` carries the encoded bytes and label offsets, ``CodeAddress``
+is the VA at which the function will live (needed because branches and
+RIP-relative operands are resolved against it), and ``CompileError`` enumerates
+the reasons a function was rejected.
+
+ABI validation
+--------------
+
+``validate_function`` checks, before encoding:
+
+* the register assignment (``RegisterAssignment``): one virtual register per
+  physical register;
+* the stack frame (``StackFrame``): Win64 alignment and shadow space.
+
+Composition
+-----------
+
+``compose`` stitches ``Fragment`` values into a ``Composition``; errors are
+``ComposeError``.
+
+The domain dispatcher
+---------------------
+
+.. code-block:: rust
+
+    pub fn emit_domain_dispatcher(
+        domain: PhysicalRegister,
+        arms: &[DispatchArm],
+        fallback: u64,
+        dispatcher_va: u64,
+    ) -> Result<Vec<u8>, DispatchError>;
+
+``DispatchArm`` pairs an input ``value`` with the absolute ``target`` it jumps
+to; ``fallback`` and ``dispatcher_va`` are absolute addresses.
+
+A naked trampoline: for each arm ``cmp reg, imm; je body``, then ``jmp fallback``.
+It is hand-encoded with iced's ``code_asm`` because ``compile`` always emits a
+Win64 frame, and a dispatcher must not clobber any incoming register. See
+:doc:`/tool/pipeline/lifting-recompilation`.
+
+IR
+--
+
+``Function``, ``Operation``, ``VirtualRegister``, ``PhysicalRegister``, ``Width``,
+``Label``, ``SpillSlot``, ``Address``, ``NativeAddress``, ``CallTarget``,
+``Condition``, ``BinaryOp``, ``BinarySource``, ``UnaryOp``, ``ShiftOp``,
+``ShiftCount`` and ``ResizeOp``.
+
+The operations cover: add, sub, mul, xor, and, or; not, neg; shifts and rotates;
+resize; load and store; spill; Win64 call; compare; branch; return; tail jump;
+and flags restore.

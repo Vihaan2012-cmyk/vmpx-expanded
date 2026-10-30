@@ -1,0 +1,141 @@
+Anatomy of a Protected Binary
+=============================
+
+How a binary becomes protected
+------------------------------
+
+VMProtect operates on an *already linked* executable. It is not a compiler plug-in;
+it takes a finished PE and produces a new PE. The sequence is, in outline:
+
+#. **Choose what to protect.** The user marks regions either in the VMProtect
+   GUI (selecting functions from the disassembly or from a map file) or in the
+   source with the SDK markers. The markers are function-like macros that bracket a
+   region: ``VMProtectBegin`` / ``VMProtectEnd`` (plain virtualization),
+   ``VMProtectBeginVirtualization``, ``VMProtectBeginMutation`` and
+   ``VMProtectBeginUltra``, each paired with ``VMProtectEnd``. The markers compile
+   to calls into a stub that the protector recognises and removes.
+#. **Disassemble each chosen region** and translate its instructions into the
+   protector's internal representation.
+#. **Generate a virtual machine.** The set of handlers, their encoding and their
+   register allocation are randomised for each build. The region's code is
+   compiled into bytecode for that VM (virtualization), or rewritten into
+   larger-but-equivalent native code (mutation), or both (the "ultra" mode).
+#. **Overwrite the original region.** The first bytes are replaced by an *entry
+   stub* that transfers control into the VM (see :doc:`vm/entry`). The rest of the
+   region is erased, so the original instructions are gone from the file.
+#. **Apply file-level protections.** Import protection, resource protection,
+   memory-integrity checks, anti-debug and anti-VM checks, and optionally packing
+   (:doc:`packing`).
+#. **Emit the new PE.** New sections hold the runtime support, the VM handlers,
+   the bytecode and the compressed original sections (:doc:`layout`).
+
+The consequence that drives everything in the rest of this reference is step 4:
+*the original instructions are not hidden, they are destroyed.* The bytecode holds
+the information needed to reproduce their **behaviour**, not their bytes. A
+devirtualizer therefore recovers semantics, and a recompiled function will not
+match the original compiler's output.
+
+What runs when the program starts
+---------------------------------
+
+For a packed and virtualized program the control flow at load time is:
+
+.. code-block:: text
+
+    loader maps the file
+        |
+        v
+    TLS callbacks (if any)          -- run before the module entry, per thread
+        |
+        v
+    module entry point (header)     -- protector stub, NOT the original entry
+        |  packer runtime: decompress sections, fix up imports,
+        |  run integrity and environment checks
+        v
+    original entry point (OEP)      -- the program's real startup code
+        |
+        v
+    ... program code ...
+        |  calls into virtualized functions:
+        |      push seed ; call vm_entry
+        v
+    virtual machine runs bytecode, then returns to native code
+
+Three places matter to an analyst:
+
+* The **header entry** is a protector stub. In a DLL, the loader calls it with
+  ``DllMain`` arguments and the stub must preserve the contract, eventually
+  transferring to the original ``DllMain``.
+* The **OEP** is where the unprotected program would have started. Finding it is
+  step one of any unpacking. For a statically unpacked image it is the native code
+  to which the protector's initialization finally returns (see
+  :doc:`devirtualization/index`).
+* A **virtualized function** keeps its address and its call sites, but its body
+  is now a stub into the VM.
+
+The protection options
+----------------------
+
+The options below are those exposed by the product. A given binary may use any
+subset.
+
+Virtualization
+    Translate the chosen code to bytecode. See :doc:`vm/index`.
+
+Mutation
+    Rewrite the chosen code into an obfuscated native form. See :doc:`mutation`.
+
+Ultra
+    Mutation and virtualization together; the virtualized code is itself mutated,
+    and so is the VM.
+
+Pack the output file
+    Compress the original sections. See :doc:`packing`.
+
+Import protection
+    Hide the import table and calls to imported APIs. See :doc:`imports`.
+
+Resource protection
+    Encrypt resources until first use.
+
+Memory protection
+    Verify at run time that code sections have not been modified. See
+    :doc:`integrity`.
+
+Debugger detection
+    Check for debuggers and refuse to run, or fail later in a non-obvious way. See
+    :doc:`anti-analysis`.
+
+Virtualization-tools detection
+    Check for virtual machines and sandboxes. See :doc:`anti-analysis`.
+
+Strip debug information, strip relocations
+    Remove debug directories; optionally remove the relocation directory and set
+    ``IMAGE_FILE_RELOCS_STRIPPED`` in the file header. (This flag is why vmpx's
+    conventional relayout normalizes the characteristics when a relocation
+    directory still exists; see :doc:`/tool/pipeline/unpacking`.)
+
+The SDK also exposes run-time services that the protected program can call: licence
+and serial-number checks, string decryption (``VMProtectDecryptStringA`` and its
+wide variant), and queries such as ``VMProtectIsDebuggerPresent``,
+``VMProtectIsVirtualMachinePresent`` and ``VMProtectIsValidImageCRC``. In a
+protected build these resolve to intrinsics in the protector's runtime; they are a
+reminder that anti-debug and integrity checks can be *invoked by the application*
+as well as being injected by the protector.
+
+Why the pieces reinforce each other
+-----------------------------------
+
+Each protection defends the others:
+
+* Packing hides the VM and its bytecode from a static file scan.
+* The VM hides the semantics of the protected functions even from a memory dump.
+* Mutation hides the VM's own handlers and the entry stubs from signature matching.
+* Import protection hides what the program does at its boundary with the system.
+* Integrity checks make patching the previous layers fail.
+* Anti-debug and anti-VM make *dynamic* analysis of all of the above expensive.
+
+The static approach taken by vmpx is a response to the last item: if no code is
+ever run, none of the dynamic defences can fire. The price is that the analysis
+has to understand the VM itself, because nothing is left to observe. See
+:doc:`devirtualization/index`.

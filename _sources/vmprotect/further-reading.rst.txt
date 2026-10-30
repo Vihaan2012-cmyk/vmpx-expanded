@@ -1,0 +1,46 @@
+Further Reading
+===============
+
+Published work on virtualization-based obfuscation and its analysis. The list is short
+and limited to sources whose subject is well established.
+
+Papers
+------
+
+* Rolf Rolles, *Unpacking Virtualization Obfuscators*, 3rd USENIX Workshop on
+  Offensive Technologies (WOOT), 2009. An early, influential treatment of recovering
+  semantics from a virtualization obfuscator by analysing the interpreter's
+  structure.
+* Jonathan Salwan, Sébastien Bardin and Marie-Laure Potet, *Symbolic Deobfuscation:
+  From Virtualized Code Back to the Original*, DIMVA 2018. Symbolic execution and taint
+  analysis applied to virtualized code, including commercial protectors.
+
+Open-source projects
+--------------------
+
+* `VTIL <https://github.com/vtil-project/VTIL-Core>`_, a virtual-machine-translation
+  intermediate language, with an optimizer, designed for lifting and simplifying
+  obfuscated code. vmpx's optional optimizer bridge (:doc:`/tool/crates/vtil-sys`) wraps
+  it.
+* `NoVmp <https://github.com/can1357/NoVmp>`_, a devirtualizer for VMProtect 3 built on
+  VTIL. A useful comparison for the instruction-set vocabulary used in this
+  reference.
+
+Platform references
+-------------------
+
+* The PE/COFF specification, for the header, section, import, TLS, exception and
+  relocation structures that every page here relies on.
+* Microsoft's documentation of x64 exception handling and unwind data
+  (``RUNTIME_FUNCTION``, ``UNWIND_INFO``, language-specific handlers).
+* The LZMA specification and reference decoder, for the raw stream format and the
+  13-byte ``.lzma`` header.
+
+In this repository
+------------------
+
+* ``docs/superpowers/specs/`` holds the design specifications for each sub-project:
+  SP1 (native reintegration) and SP2 (OEP and generalized recovery).
+* ``docs/superpowers/plans/`` holds the corresponding implementation plans.
+* The module documentation at the top of ``crates/vmpx-vm/src/*.rs`` states, in the
+  words of the implementers, the invariants that each recovery step relies on.

@@ -1,0 +1,879 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reintegration &mdash; vmpx documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=03e43079" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Imports and Stripping" href="imports-and-stripping.html" />
+    <link rel="prev" title="Lifting and Recompilation" href="lifting-recompilation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            vmpx
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">The Tool</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#goals">Goals</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#what-recovered-means">What “recovered” means</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#anatomy-of-a-run">Anatomy of a run</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#scope-and-non-goals">Scope and non-goals</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../getting-started.html">Getting Started</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#building">Building</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../getting-started.html#running-through-cargo">Running through cargo</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#your-first-analysis">Your first analysis</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#workspace-layout">Workspace layout</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#building-this-documentation">Building this documentation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started.html#large-fixture-tests">Large-fixture tests</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../cli/index.html">Command-Line Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../cli/clean.html">clean</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#arguments">Arguments</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#what-it-does">What it does</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#the-proof-gate">The proof gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../cli/clean.html#protected-input">Protected input</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/clean.html#clean-input">Clean input</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#experimental-output">Experimental output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#output">Output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/clean.html#examples">Examples</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/info.html">info</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/info.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/info.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/info.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/info.html#json-output">JSON output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/info.html#notes">Notes</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/verify.html">verify</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/verify.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/verify.html#behaviour">Behaviour</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/verify.html#what-counts-as-a-diagnostic">What counts as a diagnostic</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/compare.html">compare</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/compare.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/compare.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/compare.html#what-is-compared">What is compared</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/compare.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/compare.html#json-output">JSON output</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/unpack.html">unpack</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/unpack.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/unpack.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/unpack.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/unpack.html#unpackreport"><code class="docutils literal notranslate"><span class="pre">UnpackReport</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/unpack.html#failure-modes">Failure modes</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/detect.html">detect</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#the-evidence-model">The evidence model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#image-layout">Image layout</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#json-schema">JSON schema</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/vm-list.html">vm-list</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#how-discovery-works">How discovery works</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#json-schema">JSON schema</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/vm-list.html#default-limits-vmdiscoverylimits">Default limits (<code class="docutils literal notranslate"><span class="pre">VmDiscoveryLimits</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/imports.html">imports</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#method">Method</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#json-schema">JSON schema</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#warnings">Warnings</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/imports.html#relation-to-import-reconstruction">Relation to import reconstruction</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/oep.html">oep</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#method">Method</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#json-schema">JSON schema</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/oep.html#limitations">Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/reports.html">The CleanReport Schema</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/reports.html#top-level">Top level</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#pe"><code class="docutils literal notranslate"><span class="pre">pe</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#stage-reports">Stage reports</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/reports.html#reading-a-report">Reading a report</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/index.html#summary">Summary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/index.html#conventions">Conventions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/index.html#input-is-identified-by-content">Input is identified by content</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/index.html#text-and-json-output">Text and JSON output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/index.html#exit-status">Exit status</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/index.html#write-safety">Write safety</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="reference internal" href="index.html">The Recovery Pipeline</a><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="unpacking.html">Unpacking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="unpacking.html#destination-sections">Destination sections</a></li>
+<li class="toctree-l3"><a class="reference internal" href="unpacking.html#locating-packer-info">Locating <code class="docutils literal notranslate"><span class="pre">PACKER_INFO</span></code></a><ul>
+<li class="toctree-l4"><a class="reference internal" href="unpacking.html#the-rotating-key-scheme">The rotating-key scheme</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="unpacking.html#decompression">Decompression</a></li>
+<li class="toctree-l3"><a class="reference internal" href="unpacking.html#reconstructing-the-mapped-image">Reconstructing the mapped image</a></li>
+<li class="toctree-l3"><a class="reference internal" href="unpacking.html#conventional-relayout">Conventional relayout</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vm-recovery.html">VM Recovery</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#the-model">The model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#entry-discovery">Entry discovery</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#bootstrap-and-mutated-register-roles">Bootstrap and mutated register roles</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#dispatch-extraction-and-handler-slices">Dispatch extraction and handler slices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#the-stateful-decoder">The stateful decoder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#operand-and-effect-extraction">Operand and effect extraction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#discovery-limits">Discovery limits</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="symbolic-execution.html">Symbolic Execution</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#the-expression-ir">The expression IR</a></li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#chaining-blocks-the-profile-explorer">Chaining blocks: the profile explorer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#resolving-branches-with-finite-input-domains">Resolving branches with finite input domains</a></li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#image-backed-loads">Image-backed loads</a></li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#native-transitions-native-calls-and-vm-exit">Native transitions, native calls and VM exit</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#native-call-bridge">Native-call bridge</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#call-summaries">Call summaries</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#vm-exit">VM exit</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#native-exit-state">Native exit state</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#vm-to-vm-chaining">VM-to-VM chaining</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#native-continuation">Native continuation</a></li>
+<li class="toctree-l4"><a class="reference internal" href="symbolic-execution.html#timestamp-counter">Timestamp counter</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#exception-flow">Exception flow</a></li>
+<li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#checksum-and-integrity-handlers">Checksum and integrity handlers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="oep-recovery.html">OEP Recovery</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="oep-recovery.html#approach">Approach</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="oep-recovery.html#decide-oep"><code class="docutils literal notranslate"><span class="pre">decide_oep</span></code></a></li>
+<li class="toctree-l4"><a class="reference internal" href="oep-recovery.html#why-so-strict">Why so strict</a></li>
+<li class="toctree-l4"><a class="reference internal" href="oep-recovery.html#what-it-unlocks">What it unlocks</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="oep-recovery.html#limitations">Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="function-recovery.html">Generalized Function Recovery</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#the-vm-entry-inventory">1. The VM-entry inventory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#live-in-and-calling-convention-inference">2. Live-in and calling-convention inference</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#input-closed-functions">3. Input-closed functions</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="function-recovery.html#the-executable-entry">The executable entry</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#branching-functions-and-proven-exhaustive-domains">4. Branching functions and proven-exhaustive domains</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="function-recovery.html#refusals">Refusals</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="lifting-recompilation.html#lifting">Lifting</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="lifting-recompilation.html#readiness-gate">Readiness gate</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="lifting-recompilation.html#the-replacement-function">The replacement function</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="lifting-recompilation.html#imports-in-replacements">Imports in replacements</a></li>
+<li class="toctree-l4"><a class="reference internal" href="lifting-recompilation.html#constant-dispatch">Constant dispatch</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="lifting-recompilation.html#the-back-end">The back end</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="lifting-recompilation.html#the-domain-dispatcher">The domain dispatcher</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="lifting-recompilation.html#where-vtil-fits">Where VTIL fits</a></li>
+</ul>
+</li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">Reintegration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#design-append-do-not-patch">Design: append, do not patch</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#append-section-constraints"><code class="docutils literal notranslate"><span class="pre">append_section</span></code> constraints</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="#layout-contract">Layout contract</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#groups-and-dispatchers">Groups and dispatchers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#entry-and-tls-redirects">Entry and TLS redirects</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#nested-continuations">Nested continuations</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="imports-and-stripping.html">Imports and Stripping</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="imports-and-stripping.html#application-import-set-reconstruction-sp3">Application import-set reconstruction (SP3)</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="imports-and-stripping.html#soundness-rule">Soundness rule</a></li>
+<li class="toctree-l4"><a class="reference internal" href="imports-and-stripping.html#building-the-table">Building the table</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="imports-and-stripping.html#dangling-vmp-references-sp4">Dangling <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> references (SP4)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="imports-and-stripping.html#strict-coverage-decision">Strict coverage decision</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="verification.html">Verification and Anti-Debug Policy</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="verification.html#differential-equivalence">Differential equivalence</a></li>
+<li class="toctree-l3"><a class="reference internal" href="verification.html#anti-debug-policy">Anti-debug policy</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="verification.html#the-neutralize-transform">The neutralize transform</a></li>
+<li class="toctree-l4"><a class="reference internal" href="verification.html#why-neutralization-is-safe-to-offer">Why neutralization is safe to offer</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="verification.html#integrity-interaction">Integrity interaction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="verification.html#vtil-optimization">VTIL optimization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#sub-projects">Sub-projects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="index.html#design-rules-shared-by-every-stage">Design rules shared by every stage</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../soundness.html">The Soundness Model</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#sound-output-and-experimental-output">Sound output and experimental output</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#behaviour-changing-modes">Behaviour-changing modes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../soundness.html#where-soundness-still-has-gaps">Where soundness still has gaps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../dll-support.html">DLL Support</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#why-dlls-are-tractable">Why DLLs are tractable</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../dll-support.html#recovery-limits-for-the-dll-entry">Recovery limits for the DLL entry</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#from-paths-to-a-replacement">From paths to a replacement</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#the-original-entry-point">The original entry point</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#tls-callbacks">TLS callbacks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#exports">Exports</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#addressing-and-relocations">Addressing and relocations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../dll-support.html#executables">Executables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../crates/index.html">Crate Reference</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../crates/pe.html">vmpx-pe</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/pe.html#address-types">Address types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/pe.html#the-parser">The parser</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/pe.html#model-types">Model types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/pe.html#directory-constants">Directory constants</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/pe.html#the-mapped-span-and-raw-virtual-geometry">The mapped span and raw/virtual geometry</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/detect.html">vmpx-detect</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/detect.html#api">API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/detect.html#types">Types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/detect.html#design">Design</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/disasm.html">vmpx-disasm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#decoding">Decoding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#control-flow-recovery">Control-flow recovery</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#iat-references">IAT references</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#direct-jump-tracing">Direct-jump tracing</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#dispatch-proof">Dispatch proof</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/disasm.html#dangling-references">Dangling references</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/unpack.html">vmpx-unpack</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/unpack.html#api">API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/unpack.html#types">Types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/unpack.html#algorithm">Algorithm</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/vm.html">vmpx-vm</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#discovery">Discovery</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#bootstrap-and-profile">Bootstrap and profile</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#handler-analysis">Handler analysis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#decoding">Decoding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#model">Model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#symbolic-execution">Symbolic execution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#native-boundary">Native boundary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#exceptions">Exceptions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#checksum-handlers">Checksum handlers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#oep-input-closure-and-input-domains-sp2">OEP, input-closure and input domains (SP2)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#anti-debug-neutralization-sp5">Anti-debug neutralization (SP5)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#module-map">Module map</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/vmlift.html">vmpx-vmlift</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#lifting">Lifting</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#readiness-audit">Readiness audit</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#code-generation">Code generation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#live-in-inference-sp2">Live-in inference (SP2)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#differential-equivalence-sp5">Differential equivalence (SP5)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#module-map">Module map</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/recompile.html">vmpx-recompile</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/recompile.html#compilation">Compilation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/recompile.html#abi-validation">ABI validation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/recompile.html#composition">Composition</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/recompile.html#the-domain-dispatcher">The domain dispatcher</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/recompile.html#ir">IR</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/rebuild.html">vmpx-rebuild</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/rebuild.html#section-mutation">Section mutation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/rebuild.html#reintegration">Reintegration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/rebuild.html#layout">Layout</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/rebuild.html#imports">Imports</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/cli.html">vmpx-cli</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/cli.html#modules">Modules</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/cli.html#key-functions-in-clean-rs">Key functions in <code class="docutils literal notranslate"><span class="pre">clean.rs</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/cli.html#write-safety">Write safety</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/cli.html#process-behaviour">Process behaviour</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/vtil-sys.html">vmpx-vtil-sys</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vtil-sys.html#why-a-bridge">Why a bridge</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vtil-sys.html#the-c-interface">The C interface</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vtil-sys.html#the-rust-api">The Rust API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vtil-sys.html#building-with-the-native-library">Building with the native library</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vtil-sys.html#status">Status</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/index.html#dependency-summary">Dependency summary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../crates/index.html#workspace-wide-settings">Workspace-wide settings</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../ui.html">The vmpx-ui Front End</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../ui.html#using-it">Using it</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../ui.html#options">Options</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../ui.html#what-it-shows">What it shows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ui.html#design-notes">Design notes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ui.html#dependencies">Dependencies</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../testing.html">Testing and Verification Strategy</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../testing.html#primary-oracle-synthetic-fixtures">Primary oracle: synthetic fixtures</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../testing.html#test-style">Test style</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../testing.html#secondary-oracle-local-samples">Secondary oracle: local samples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../testing.html#what-each-level-proves">What each level proves</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../testing.html#quality-gates">Quality gates</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">VMProtect Knowledge</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/index.html">Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/index.html#how-to-use-this-part">How to use this part</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/index.html#what-the-sources-of-this-knowledge-are">What the sources of this knowledge are</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/overview.html">Anatomy of a Protected Binary</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/overview.html#how-a-binary-becomes-protected">How a binary becomes protected</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/overview.html#what-runs-when-the-program-starts">What runs when the program starts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/overview.html#the-protection-options">The protection options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/overview.html#why-the-pieces-reinforce-each-other">Why the pieces reinforce each other</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/packing.html">Packing</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#what-the-file-looks-like">What the file looks like</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#the-packer-info-table">The <code class="docutils literal notranslate"><span class="pre">PACKER_INFO</span></code> table</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/packing.html#legacy-plaintext-layout">Legacy plaintext layout</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/packing.html#encoded-layout-with-a-rotating-key">Encoded layout with a rotating key</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#lzma-framing">LZMA framing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/packing.html#bounds">Bounds</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#restoring-the-image">Restoring the image</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#post-conditions-in-the-real-loader">Post-conditions in the real loader</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/packing.html#why-static-unpacking-works">Why static unpacking works</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/layout.html">Sections and Image Layout</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/layout.html#section-anatomy">Section anatomy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/layout.html#the-memory-image-versus-the-file">The memory image versus the file</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/layout.html#directories-that-the-protector-touches">Directories that the protector touches</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/layout.html#header-edits-worth-knowing">Header edits worth knowing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/layout.html#reading-the-layout-quickly">Reading the layout quickly</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/vm/index.html">The Virtual Machine</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/architecture.html">Architecture</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#the-machine-model">The machine model</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#mapping-to-native-registers">Mapping to native registers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#direction">Direction</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#native-code-and-vm-code-never-share-a-stack-discipline">Native code and VM code never share a stack discipline</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#the-instruction-set-in-families">The instruction set, in families</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/architecture.html#which-operations-vmpx-recognises">Which operations vmpx recognises</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/entry.html">Entry Stubs and Bootstraps</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/entry.html#the-entry-stub">The entry stub</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/entry.html#what-the-bootstrap-does">What the bootstrap does</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/entry.html#why-a-fresh-bootstrap-per-vm-instance">Why a fresh bootstrap per VM instance</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/entry.html#roots">Roots</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/entry.html#the-vm-exit-as-the-mirror-image">The VM exit as the mirror image</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/bytecode.html">Bytecode and the Rolling Key</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/bytecode.html#why-rolling-key-encryption">Why rolling-key encryption</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/bytecode.html#decoding-one-value">Decoding one value</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/bytecode.html#instruction-format">Instruction format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/bytecode.html#block-structure">Block structure</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/bytecode.html#consequences-for-analysis">Consequences for analysis</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/dispatch.html">Dispatch</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#two-dispatch-styles">Two dispatch styles</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#table-dispatch">Table dispatch</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#threaded-dispatch-with-relative-displacement">Threaded dispatch with relative displacement</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#why-scattered-code-defeats-linear-disassembly">Why scattered code defeats linear disassembly</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#recovering-the-dispatch">Recovering the dispatch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#a-subtlety-calls-and-flags-inside-handlers">A subtlety: calls and flags inside handlers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/handlers.html">Handlers</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/handlers.html#anatomy-of-a-handler">Anatomy of a handler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/handlers.html#illustrative-handlers">Illustrative handlers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/handlers.html#classifying-a-handler-without-signatures">Classifying a handler without signatures</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/handlers.html#handler-fragments-and-scattering">Handler fragments and scattering</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/handlers.html#special-handlers">Special handlers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/context-switch.html">Crossing the Boundary</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#entering">Entering</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#leaving-the-vm-exit">Leaving: the VM exit</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#where-does-the-ret-go">Where does the <code class="docutils literal notranslate"><span class="pre">ret</span></code> go?</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#the-exit-state">The exit state</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#calling-native-code-from-the-vm">Calling native code from the VM</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#virtual-flags">Virtual flags</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/context-switch.html#native-transitions-between-vm-profiles">Native transitions between VM profiles</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/instances.html">Multiple VMs and Versions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/instances.html#several-vm-instances-per-file">Several VM instances per file</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/instances.html#the-unprotected-program-and-the-vm-boundary">The unprotected program and the VM boundary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/instances.html#versions">Versions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/instances.html#practical-triage-of-an-unknown-sample">Practical triage of an unknown sample</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/index.html#what-makes-vmprotect-s-vm-hard">What makes VMProtect’s VM hard</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/mutation.html">Mutation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/mutation.html#the-transformations">The transformations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#instruction-substitution">Instruction substitution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#constant-unfolding">Constant unfolding</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#junk-code-and-dead-stores">Junk code and dead stores</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#opaque-predicates">Opaque predicates</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#register-renaming-and-swapping">Register renaming and swapping</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#control-flow-fragmentation">Control-flow fragmentation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/mutation.html#mutation-of-stack-discipline">Mutation of stack discipline</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/mutation.html#ultra">Ultra</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/mutation.html#what-mutation-does-not-change">What mutation does <em>not</em> change</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/mutation.html#how-vmpx-handles-it">How vmpx handles it</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/anti-analysis.html">Anti-Debug, Anti-VM and Anti-Dump</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#why-static-analysis-sidesteps-most-of-this">Why static analysis sidesteps most of this</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#anti-debug">Anti-debug</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/anti-analysis.html#user-mode-debugger-detection">User-mode debugger detection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/anti-analysis.html#kernel-mode-debugger-detection">Kernel-mode debugger detection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/anti-analysis.html#integrity-based-detection">Integrity-based detection</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#anti-vm-and-anti-sandbox">Anti-VM and anti-sandbox</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#anti-dump">Anti-dump</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#integrating-the-checks-into-the-protected-code">Integrating the checks into the protected code</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/anti-analysis.html#how-vmpx-treats-it">How vmpx treats it</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/integrity.html">Integrity Checks</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/integrity.html#the-checksum-handler">The checksum handler</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/integrity.html#what-is-checked">What is checked</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/integrity.html#sdk-level-integrity">SDK-level integrity</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/integrity.html#how-a-static-recovery-recognises-it">How a static recovery recognises it</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/integrity.html#why-it-matters-for-a-rebuilt-binary">Why it matters for a rebuilt binary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/integrity.html#lifting-status">Lifting status</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/imports.html">Import Protection</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/imports.html#what-is-hidden">What is hidden</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/imports.html#typical-mechanics">Typical mechanics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/imports.html#duplicate-and-aliased-imports">Duplicate and aliased imports</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/imports.html#how-vmpx-inventories-imports">How vmpx inventories imports</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/imports.html#reconstructing-the-application-s-import-set">Reconstructing the application’s import set</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/exceptions.html">Exception-Driven Control Flow</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/exceptions.html#how-x64-exception-dispatch-works">How x64 exception dispatch works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/exceptions.html#how-a-protector-uses-it">How a protector uses it</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/exceptions.html#continuation-sources">Continuation sources</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/exceptions.html#what-it-means-for-analysis">What it means for analysis</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/exceptions.html#the-report-fields">The report fields</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/devirtualization/index.html">Devirtualization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/devirtualization/index.html#the-problem-precisely">The problem, precisely</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/devirtualization/index.html#three-strategies">Three strategies</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/devirtualization/index.html#the-static-semantic-pipeline">The static semantic pipeline</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-packing.html">Attacking the Packer</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-packing.html#the-attack">The attack</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-packing.html#why-it-works">Why it works</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-packing.html#when-to-refuse">When to refuse</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-packing.html#what-is-left-after-unpacking">What is left after unpacking</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html">Attacking the Virtual Machine</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-1-find-the-entries">Step 1: find the entries</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-2-recover-the-roles">Step 2: recover the roles</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-3-recover-the-dispatch-codec">Step 3: recover the dispatch codec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-4-decode-the-bytecode">Step 4: decode the bytecode</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-5-extract-what-each-handler-does">Step 5: extract what each handler does</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-6-execute-symbolically">Step 6: execute symbolically</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-7-prove-the-exit">Step 7: prove the exit</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#step-8-lift-and-recompile">Step 8: lift and recompile</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#what-the-symbolic-representation-buys">What the symbolic representation buys</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-the-vm.html#control-flow-in-the-recovered-semantics">Control flow in the recovered semantics</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-mutation.html">Attacking Mutation</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-mutation.html#principle-reason-about-effects-not-shapes">Principle: reason about effects, not shapes</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-mutation.html#the-backward-slice">The backward slice</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-mutation.html#idioms-the-folder-knows">Idioms the folder knows</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-mutation.html#where-it-can-go-wrong">Where it can go wrong</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html">Attacking Anti-Analysis</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html#what-a-static-analysis-neutralises-by-construction">What a static analysis neutralises by construction</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html#what-remains-the-checks-as-semantics">What remains: the checks as semantics</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html#neutralizing">Neutralizing</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html#exceptions-and-anti-analysis">Exceptions and anti-analysis</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-anti-analysis.html#integrity-in-the-rebuilt-file">Integrity in the rebuilt file</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-imports.html">Attacking Import Protection</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-imports.html#gather-the-references">1. Gather the references</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-imports.html#resolve-identity">2. Resolve identity</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-imports.html#rebuild-the-directory">3. Rebuild the directory</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/attacking-imports.html#what-is-not-solved">What is not solved</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html">Limits and Open Problems</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html#fundamental-limits">Fundamental limits</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html#current-implementation-gaps">Current implementation gaps</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html#validation-limits">Validation limits</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html#what-would-change-the-picture">What would change the picture</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/devirtualization/index.html#how-to-read-a-result">How to read a result</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/glossary.html">Glossary</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../vmprotect/further-reading.html">Further Reading</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/further-reading.html#papers">Papers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/further-reading.html#open-source-projects">Open-source projects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/further-reading.html#platform-references">Platform references</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../vmprotect/further-reading.html#in-this-repository">In this repository</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Project</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../project/roadmap.html">Roadmap</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#sub-projects">Sub-projects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#definition-of-done-ladder">Definition-of-done ladder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#cross-cutting-rules">Cross-cutting rules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#risks">Risks</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="../../project/log.html">Development Log</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#origin">Origin</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp1-native-reintegration">SP1: Native reintegration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">vmpx</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="index.html">The Recovery Pipeline</a></li>
+      <li class="breadcrumb-item active">Reintegration</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/tool/pipeline/reintegration.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="reintegration">
+<h1>Reintegration<a class="headerlink" href="#reintegration" title="Link to this heading"></a></h1>
+<p><em>Crate:</em> <a class="reference internal" href="../crates/rebuild.html"><span class="doc">vmpx-rebuild</span></a>  <em>Module:</em> <code class="docutils literal notranslate"><span class="pre">reintegrate.rs</span></code></p>
+<p>Reintegration splices compiled replacement code into the image and redirects
+control to it. It is the stage that finally produces a changed binary, and it is
+the reason <code class="docutils literal notranslate"><span class="pre">--experimental</span></code> exists.</p>
+<section id="design-append-do-not-patch">
+<h2>Design: append, do not patch<a class="headerlink" href="#design-append-do-not-patch" title="Link to this heading"></a></h2>
+<p>The core of reintegration is <em>non-destructive</em>. It does not patch any <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> byte:</p>
+<ul class="simple">
+<li><p>A new executable section (default name <code class="docutils literal notranslate"><span class="pre">.vmpx0</span></code>, characteristics
+<code class="docutils literal notranslate"><span class="pre">IMAGE_SCN_MEM_READ</span> <span class="pre">|</span> <span class="pre">IMAGE_SCN_MEM_EXECUTE</span> <span class="pre">|</span> <span class="pre">IMAGE_SCN_CNT_CODE</span></code>) is appended
+at <code class="docutils literal notranslate"><span class="pre">next_section_rva</span></code>, without moving existing bytes.</p></li>
+<li><p>The header <code class="docutils literal notranslate"><span class="pre">AddressOfEntryPoint</span></code> is rewritten to the dispatcher (or sole body).</p></li>
+<li><p>Each protected TLS callback slot in the TLS callback array is rewritten to the
+replacement’s VA.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">reintegrate</span></code> chains the steps and records the result:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ReintegrationRequest</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">section_name</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">;</span><span class="w"> </span><span class="mi">8</span><span class="p">],</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">payload</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">entry_redirect</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Rva</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">tls_redirects</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="p">[(</span><span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">Rva</span><span class="p">)],</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ReintegrationReport</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">section</span><span class="p">:</span><span class="w"> </span><span class="nc">AppendedSection</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">entry_redirected</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">tls_redirected</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">loader_valid</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">diagnostics</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>It appends the payload section, applies the entry redirect, applies each TLS
+redirect, then runs loader validation and records the result as a flag <em>without</em>
+failing on an invalid image. It takes already-rendered bytes, so the crate has no
+code-generation dependency.</p>
+<section id="append-section-constraints">
+<h3><code class="docutils literal notranslate"><span class="pre">append_section</span></code> constraints<a class="headerlink" href="#append-section-constraints" title="Link to this heading"></a></h3>
+<p>Appending one file-backed section to a PE32+ image requires:</p>
+<ul class="simple">
+<li><p>an unused 40-byte section-table slot before <code class="docutils literal notranslate"><span class="pre">SizeOfHeaders</span></code> and the first raw
+section, with all-zero slack;</p></li>
+<li><p>no overlap with a data directory;</p></li>
+<li><p>no security (certificate) directory, since certificate relocation is not
+implemented.</p></li>
+</ul>
+<p>When there is no room for another <code class="docutils literal notranslate"><span class="pre">IMAGE_SECTION_HEADER</span></code> the call returns a
+typed error, which surfaces as a reintegration diagnostic and never a panic.
+Rebuilding the headers to make room is a possible future enhancement.
+<code class="docutils literal notranslate"><span class="pre">next_section_rva</span></code> reports where the section will land so RVA-sensitive payloads
+can be built first.</p>
+</section>
+</section>
+<section id="layout-contract">
+<h2>Layout contract<a class="headerlink" href="#layout-contract" title="Link to this heading"></a></h2>
+<p>Bodies are compiled assuming they start at <code class="docutils literal notranslate"><span class="pre">next_section_rva</span></code> and pack
+sequentially. The section is therefore laid out <em>bodies first, dispatchers after</em>:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>[ body0 ][ body1 ] ... [ bodyN ][ dispatcher_a ][ dispatcher_b ] ...
+^ next_section_rva
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Body addresses are left untouched, so their RIP-relative references and
+continuation tail-jumps stay valid.</p></li>
+<li><p>Each dispatcher is compiled at its own known RVA after the bodies, because its
+<code class="docutils literal notranslate"><span class="pre">je</span></code>/<code class="docutils literal notranslate"><span class="pre">jmp</span></code> targets are rel32 from its own location.</p></li>
+<li><p>Entries are redirected to their dispatcher RVA or, for a single-body domain,
+directly to the body.</p></li>
+</ul>
+<p>A failed group rolls the layout cursor back, so a dispatcher that cannot be
+assembled never leaves a gap or shifts later bodies.</p>
+</section>
+<section id="groups-and-dispatchers">
+<h2>Groups and dispatchers<a class="headerlink" href="#groups-and-dispatchers" title="Link to this heading"></a></h2>
+<p>An entry can recover several paths, one per value of its finite input domain
+(for <code class="docutils literal notranslate"><span class="pre">DllMain</span></code>, the reason in <code class="docutils literal notranslate"><span class="pre">rdx</span></code>, 0 through 3). At runtime the replacement
+must select the right body, so the dispatcher compares the domain register to each
+recovered value and jumps to the matching body. A single-body group whose domain
+is not provably complete still receives a dispatcher with a fallback, rather than a
+direct redirect that would run the body on out-of-domain inputs.</p>
+<p>The fallback <code class="docutils literal notranslate"><span class="pre">jmp</span></code> goes to the preserved original entry. It is only a safety net
+for inputs outside the recovered domain; if the domain is proven complete, it is
+unreachable.</p>
+</section>
+<section id="redirecting-function-stubs">
+<h2>Redirecting function stubs<a class="headerlink" href="#redirecting-function-stubs" title="Link to this heading"></a></h2>
+<p>For single-body virtualized functions (input-closed routines and the executable
+entry), <code class="docutils literal notranslate"><span class="pre">redirect_vm_stub</span></code> overwrites the first five bytes of the VM entry stub
+with a near <code class="docutils literal notranslate"><span class="pre">jmp</span> <span class="pre">rel32</span></code> to the replacement body and reparses to confirm the
+bytes landed:</p>
+<div class="highlight-rust notranslate"><div class="highlight"><pre><span></span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">redirect_vm_stub</span><span class="p">(</span>
+<span class="w">    </span><span class="n">input</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">],</span>
+<span class="w">    </span><span class="n">stub_rva</span><span class="p">:</span><span class="w"> </span><span class="nc">Rva</span><span class="p">,</span>
+<span class="w">    </span><span class="n">target_rva</span><span class="p">:</span><span class="w"> </span><span class="nc">Rva</span><span class="p">,</span>
+<span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">RebuildError</span><span class="o">&gt;</span><span class="p">;</span>
+</pre></div>
+</div>
+<p>Unlike the append-only header and TLS redirects, this edits existing code bytes
+of the rebuilt output. It therefore belongs to the <code class="docutils literal notranslate"><span class="pre">--experimental</span></code> image only,
+and it interacts with integrity checks (see <a class="reference internal" href="verification.html"><span class="doc">Verification and Anti-Debug Policy</span></a>). It refuses:</p>
+<ul class="simple">
+<li><p>a stub that is not in an executable, file-backed section with at least five
+bytes left to the end of its raw data;</p></li>
+<li><p>a target that is not in an executable section;</p></li>
+<li><p>a displacement that does not fit <code class="docutils literal notranslate"><span class="pre">rel32</span></code>;</p></li>
+<li><p>any write that does not survive reparse.</p></li>
+</ul>
+<p>A failed redirect leaves the original stub in place and records a diagnostic.</p>
+</section>
+<section id="entry-and-tls-redirects">
+<h2>Entry and TLS redirects<a class="headerlink" href="#entry-and-tls-redirects" title="Link to this heading"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">set_entry_point</span></code> requires the target RVA to be in an executable, file-backed
+section. <code class="docutils literal notranslate"><span class="pre">set_tls_callback</span></code> rewrites one slot of the TLS callback array with the
+same checks, plus a PE32+ and file-backed guard.</p>
+</section>
+<section id="nested-continuations">
+<h2>Nested continuations<a class="headerlink" href="#nested-continuations" title="Link to this heading"></a></h2>
+<p>Where a VM exit continues into another VM entry, the nested entry needs its own
+replacement. Nested-continuation redirects remain deferred: they are counted but
+not appended. The <code class="docutils literal notranslate"><span class="pre">reintegration</span></code> stage diagnostics say so
+(“nested-continuation redirects remain deferred”).</p>
+</section>
+<section id="output-loader-validation-and-layout">
+<h2>Output, loader validation and layout<a class="headerlink" href="#output-loader-validation-and-layout" title="Link to this heading"></a></h2>
+<p>After reintegration, <code class="docutils literal notranslate"><span class="pre">relayout_conventional</span></code> converts to a conventional file
+and <code class="docutils literal notranslate"><span class="pre">validate_for_loader</span></code> walks every directory the Windows loader walks:</p>
+<ul class="simple">
+<li><p>the entry point is in an executable, file-backed section;</p></li>
+<li><p>import module names end in <code class="docutils literal notranslate"><span class="pre">.dll</span></code> and every symbol has a name or ordinal;</p></li>
+<li><p>the TLS callback array and each callback are file-backed;</p></li>
+<li><p>every relocation target is mapped;</p></li>
+<li><p>every non-forwarded export is file-backed.</p></li>
+</ul>
+<p>It returns counts for imports, exports, TLS callbacks and relocations. The CLI
+reports the outcome as <code class="docutils literal notranslate"><span class="pre">loader</span> <span class="pre">validation</span> <span class="pre">passed</span></code> or <code class="docutils literal notranslate"><span class="pre">FAILED</span></code>.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Layout is not devirtualization. A conventional relayout produces a loadable,
+structurally valid file that still contains every protector section and VM
+handler. The CLI says so on its output (“conventional layout, not
+devirtualized”).</p>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="lifting-recompilation.html" class="btn btn-neutral float-left" title="Lifting and Recompilation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="imports-and-stripping.html" class="btn btn-neutral float-right" title="Imports and Stripping" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, vmpx contributors.</p>
+  </div>
+
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

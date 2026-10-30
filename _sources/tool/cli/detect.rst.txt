@@ -1,0 +1,154 @@
+detect
+======
+
+.. program:: vmpx detect
+
+Profiles VMProtect evidence and the packed or mapped layout of an image. It
+looks only at structure (section geometry, entropy, directory placement), never
+at a single mandatory byte signature, and it ignores the file extension.
+
+Synopsis
+--------
+
+.. code-block:: console
+
+    vmpx detect <INPUT> [--json]
+
+Options
+-------
+
+.. option:: INPUT
+
+   The PE to profile.
+
+.. option:: --json
+
+   Emit the full ``ProtectionReport``.
+
+Text output
+-----------
+
+.. code-block:: text
+
+    [vmp] verdict=<verdict> confidence=<0-100> layout=<layout>
+      +20 vmp_section_names: <statement>
+      +25 packed_virtual_sections: <statement>
+    [region] .text    rva=0x1000 size=0x... entropy=... entry=false
+    [vmp] warning: <warning>
+
+One weighted evidence line per finding (``+weight id: statement``), one
+``[region]`` line per executable section (RVA, size, Shannon entropy and whether
+it owns the entry point), and then any warnings.
+
+The evidence model
+------------------
+
+Each finding adds points. The total, capped at 100, is the confidence.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 8 54
+
+   * - Evidence id
+     - Weight
+     - Condition
+   * - ``vmp_section_names``
+     - +20
+     - Section names starting with ``.vmp`` (case-insensitive). Weak evidence, because names can be changed.
+   * - ``packed_virtual_sections``
+     - +25
+     - Three or more initialized virtual-only sections.
+   * - ``rva_mapped_analysis_image``
+     - +10
+     - The image is already an RVA-layout analysis image.
+   * - ``high_entropy_entry_region``
+     - +20
+     - The section owning the entry point has entropy of at least 7.2 bits per byte.
+   * - ``entry_in_shared_protector_candidate``
+     - +5
+     - The entry-owning section is both readable and executable.
+   * - ``multiple_high_entropy_executable_regions``
+     - +10
+     - Two or more executable sections with entropy at least 7.2.
+   * - ``imports_in_entry_region``
+     - +5
+     - The import directory lives inside the entry-owning executable section.
+   * - ``exceptions_in_entry_region``
+     - +5
+     - The exception directory lives inside the entry-owning executable section.
+   * - ``entry_and_tls_share_protector_region``
+     - +10
+     - The entry point and the first TLS callback fall in the same executable region.
+
+An *initialized virtual-only section* has ``PointerToRawData == 0``,
+``SizeOfRawData == 0``, a non-zero ``VirtualSize`` and no uninitialized-data
+flag. It has no bytes on disk; the protector's loader code fills it at runtime.
+
+Verdict thresholds:
+
+* ``VmprotectLikely`` at confidence 60 or more;
+* ``Suspicious`` at 30 or more;
+* ``NoStrongEvidence`` otherwise.
+
+When the verdict is ``VmprotectLikely`` but no ``.vmp`` names exist, a warning
+states that the classification is structural because randomized section names
+prevent name confirmation.
+
+Image layout
+------------
+
+The same pass classifies how the file is laid out, which decides whether
+unpacking is required:
+
+``RvaMappedAnalysisImage``
+    At least 80% of sections have raw pointer equal to RVA and raw size equal
+    to virtual size. This is the shape ``vmpx unpack`` produces.
+``PackedVirtualSections``
+    Otherwise, three or more initialized virtual-only sections.
+``ConventionalFile``
+    Otherwise, zero initialized virtual-only sections.
+``Ambiguous``
+    Anything else (one or two virtual-only sections).
+
+JSON schema
+-----------
+
+``ProtectionReport``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Field
+     - Contents
+   * - ``schema_version``
+     - Report format version
+   * - ``verdict``
+     - ``no_strong_evidence``, ``suspicious`` or ``vmprotect_likely``
+   * - ``confidence``
+     - Integer 0 to 100
+   * - ``image_layout``
+     - ``conventional_file``, ``packed_virtual_sections``, ``rva_mapped_analysis_image`` or ``ambiguous``
+   * - ``entry_point``
+     - Entry RVA
+   * - ``entry_section``
+     - Index of the section owning the entry, or null
+   * - ``initialized_virtual_only_sections``
+     - Count
+   * - ``rva_mapped_sections``
+     - Count of sections with raw pointer equal to RVA
+   * - ``executable_regions``
+     - ``{section_index, section_name, start, size, entropy, owns_entry_point}`` per executable section
+   * - ``evidence``
+     - ``{id, weight, statement}`` per finding
+   * - ``warnings``
+     - Strings
+
+.. note::
+
+    Detection is a triage tool, not a classifier of record. An unprotected
+    program with a packed, high-entropy ``.text`` can score as
+    ``Suspicious``; a protected file whose sections were rearranged can score
+    lower than its content deserves. The ``clean`` pipeline therefore treats
+    ``NoStrongEvidence`` together with ``ConventionalFile`` as the only
+    combination eligible for the verified no-op.

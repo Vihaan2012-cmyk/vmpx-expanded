@@ -1,0 +1,94 @@
+vmpx-vmlift
+===========
+
+The semantic-lifting readiness gate between recovered VM instructions and native
+code generation, plus expression lowering, whole-routine replacement,
+per-function live-in inference and the differential equivalence core.
+*Depends on:* ``vmpx-vm``, ``vmpx-recompile``.
+
+Lifting
+-------
+
+``lift_symbolic_block``, ``lift_profile_chain`` and ``lift_profile_path_family``
+produce ``LiftedSemanticBlock``, ``LiftedSemanticRoutine``,
+``LiftedSemanticPath`` and ``LiftedSemanticPathFamily`` values. Effects are
+``LiftedEffect`` (``MemoryWrite``, ``MemoryHavoc``, ``NativeCall``). Failures are
+``LiftError``.
+
+Readiness audit
+---------------
+
+``audit_instructions``, ``audit_profile_chain``, ``audit_entry_effect_liveness``
+and ``collect_path_effects``, with ``LiftabilityReport``, ``LoweringCapability``,
+``EntryEffectLivenessReport``, ``PathEffectLivenessReport`` and
+``CollectedEffects`` (``CollectedStore`` and ``CollectedCall`` entries).
+
+Code generation
+---------------
+
+.. code-block:: rust
+
+    pub fn lower_expression(...)  -> Result<LoweredExpression, ExpressionCodegenError>;
+    pub fn compile_expression(...) -> Result<..., ExpressionCodegenError>;
+    pub fn compile_constant_dispatch(...) -> Result<..., ConstantDispatchError>;
+    pub fn build_replacement(
+        registers: &BTreeMap<X64NativeRegister, Expr>,
+        config: &ReplacementConfig,
+        address: CodeAddress,
+    ) -> Result<Replacement, ReplacementError>;
+
+Configuration and result types: ``ExpressionCodegenConfig``, ``ExpressionInput``,
+``LoweredExpression``, ``ImportCall``, ``ConstantDispatchConfig``,
+``ReplacementConfig``, ``Replacement``, ``EffectCall`` and ``EffectStore``.
+
+Live-in inference (SP2)
+-----------------------
+
+.. code-block:: rust
+
+    pub enum AccessKind { Read, Write }
+    pub struct RegisterAccess { /* register, kind */ }
+
+    pub fn infer_live_in(accesses: &[RegisterAccess]) -> BTreeSet<X64NativeRegister>;
+    pub fn calling_convention(/* recovered path family */) -> EntryCallingConvention;
+
+A register is live-in when its first access is a read. See
+:doc:`/tool/pipeline/function-recovery`.
+
+Differential equivalence (SP5)
+------------------------------
+
+.. code-block:: rust
+
+    pub type Assignment = BTreeMap<String, u64>;
+
+    pub fn compare_exits(vm: &ExitSemantics, replacement: &ExitSemantics) -> Vec<Divergence>;
+    pub fn verify_over_domain<F>(domain: &[Assignment], model: F) -> VerificationReport;
+
+``Divergence``, ``AssignmentDivergence``, ``Side`` (``Vm`` or ``Replacement``),
+``Verdict`` (``Equivalent``, ``Divergent`` or ``EmptyDomain``) and
+``VerificationReport``. See :doc:`/tool/pipeline/verification`.
+
+Module map
+----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Module
+     - Responsibility
+   * - ``lib.rs``
+     - Lifting and the readiness audit
+   * - ``expr_codegen``
+     - Expression lowering to the recompile IR
+   * - ``replacement``
+     - Whole-routine replacement functions
+   * - ``constant_dispatch``
+     - Constant-result input dispatch
+   * - ``effect_liveness``
+     - Effect liveness and collection
+   * - ``live_in``
+     - Calling-convention inference
+   * - ``equivalence``
+     - Differential comparison

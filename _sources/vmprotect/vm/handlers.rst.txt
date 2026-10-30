@@ -1,0 +1,136 @@
+Handlers
+========
+
+A handler is the native code that implements one virtual operation and then
+dispatches onward (:doc:`dispatch`). A VM has a few dozen distinct handlers, but a
+build may contain several *copies* of the same operation, each with different
+mutation, and all of them scattered.
+
+Anatomy of a handler
+--------------------
+
+Every handler has the same three parts, in this order:
+
+#. **Operand fetch** (optional). Decode an immediate or an index from the bytecode
+   (:doc:`bytecode`).
+#. **Semantic body.** The actual work: pop operands from the VM stack, compute,
+   push the result or write a virtual register or memory. This is the part that
+   differs between operations.
+#. **Dispatch tail.** Decode the displacement to the next handler and jump.
+
+vmpx splits a handler at the first encoded-dispatch load. The *semantic prefix*
+(everything before it) is what the effect extractor reads; the *tail* is what the
+dispatch codec extractor reads.
+
+Illustrative handlers
+---------------------
+
+The bodies below are what the semantic prefix looks like **before mutation**.
+Real handlers are the same operations hidden in junk (see :doc:`../mutation`).
+
+**Push a constant** (``LCONST``)
+
+.. code-block:: nasm
+
+    ; operand fetch gave eax = value
+    sub     rbp, 8                 ; VSP -= 8
+    mov     [rbp], rax             ; push value
+
+**Add** (``ADD``)
+
+.. code-block:: nasm
+
+    mov     rax, [rbp]             ; pop a
+    mov     rdx, [rbp+8]           ; pop b
+    add     rax, rdx
+    mov     [rbp+8], rax           ; push a + b
+    pushfq
+    pop     qword [rbp]            ; push the resulting flags
+
+The final two instructions are how the VM obtains *virtual flags*: the native ``add``
+sets the real ``RFLAGS`` and the handler captures them onto the VM stack
+(:doc:`context-switch`).
+
+**Load a virtual register** (``LREG``)
+
+.. code-block:: nasm
+
+    ; operand fetch gave eax = register index
+    mov     rdx, [rdi + rax]       ; read from the context (rdi = context base)
+    sub     rbp, 8
+    mov     [rbp], rdx
+
+**NOR**
+
+.. code-block:: nasm
+
+    mov     rax, [rbp]
+    mov     rdx, [rbp+8]
+    or      rax, rdx
+    not     rax
+    mov     [rbp+8], rax
+
+Classifying a handler without signatures
+----------------------------------------
+
+Because the exact instructions are mutated, a recognizer cannot match bytes. vmpx
+classifies a handler by its **effects**:
+
+* native memory reads and writes, grouped by region (VM stack, context, external);
+* the VSP adjustment;
+* arithmetic over the values read;
+* VM-visible flag effects.
+
+``classify_handler_effects`` assigns a semantic only for families whose normalized
+shape is unambiguous. Everything else is ``Unknown`` and carries its evidence. A
+second, independent check, ``prove_handler_value_flow``, adds a *def-use proof*:
+the value that ends up in the destination really is derived from the sources the
+classification claims, because "shape agreement alone is not sufficient".
+
+Operand codecs are found separately. They are the VIP-relative load intervals that
+are *not* part of the dispatch decode, and the cursor timing of a proven profile
+decides which load is which.
+
+Handler fragments and scattering
+--------------------------------
+
+A handler is rarely one contiguous block. The protector splits it into fragments,
+joins them with direct jumps and distributes them through the section. For analysis
+this has two consequences. First, a handler's size and boundaries are not visible
+from addresses; they come from the control-flow chain. Second, because fragments are
+shared in the mutation process, a fragment can belong to more than one handler's
+chain, so tracing must be per entry rather than by marking address ranges.
+
+Special handlers
+----------------
+
+A few handler kinds deserve separate mention because the analysis treats them
+differently.
+
+*Branches.*
+    A virtual jump replaces the VIP with an address popped from the VM stack. A
+    conditional branch is a computation that produces one of two addresses, then a
+    virtual jump. Branches end a linear block and are handled by the virtual-CFG
+    explorer, not by the threaded decoder.
+
+*Native transition and native call.*
+    The handler hands control to native code and resumes afterwards (:doc:`context-switch`).
+
+*VM exit.*
+    The terminal handler: restore the native state and return.
+
+*Context initialize.*
+    Handlers that set up the context at the start of a block.
+
+*Timestamp counter.*
+    An ``rdtsc`` whose two result halves are pushed as separate dwords. It is the
+    raw material of timing-based anti-debug checks (:doc:`../anti-analysis`). vmpx
+    represents it as an opaque ``read_timestamp_counter_*`` intrinsic and makes no
+    claim about its purpose.
+
+*Checksum.*
+    A table-driven byte loop over program memory; see :doc:`../integrity`.
+
+All of these "end a linear block" in vmpx's terminology (``ends_linear_block``): the
+straight-line decoder stops at them and hands over to a component that understands
+what follows.

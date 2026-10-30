@@ -1,0 +1,89 @@
+Limits and Open Problems
+========================
+
+An honest account of what static devirtualization cannot do, and what vmpx has not
+done yet.
+
+Fundamental limits
+------------------
+
+Information is destroyed
+    Virtualization is lossy. Original instruction encodings, register allocation,
+    function boundaries, padding and the compiler's code layout are gone. Output
+    reproduces behaviour only.
+
+General input-dependent control flow is undecidable
+    When a virtual branch depends on a runtime input, the set of paths is the set of
+    values the input can take, which is not finite in general. vmpx implements a
+    decidable subset (low slices up to 8 bits and add-status-flags covers) and refuses
+    jump tables, memory-dependent targets, loops on inputs, nested input branches,
+    mixed widths, ``nor``/``nand`` use and opaque intrinsics.
+
+Memory is not fully modelled
+    The model tracks the VM stack and external stores exactly, but a store to an address
+    that could alias tracked memory discards precision (a *havoc*), and an unknown native
+    call does the same. Programs that depend on such memory cannot be proven closed.
+
+Equivalence is over a finite domain
+    The differential verifier proves equivalence over the recovered input domain, not
+    universally.
+
+Behaviour is not bytes
+    A clean output will not hash like the original.
+
+Current implementation gaps
+---------------------------
+
+These are implementation status, not theory:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Gap
+     - State
+   * - Executable (non-DLL) OEP from the continuation
+     - Not implemented; the executable entry is recovered as a single input-closed path
+   * - Nested-continuation redirects
+     - Counted, not appended
+   * - ``TableChecksum`` lowering
+     - Recognised and evaluated, not compiled back
+   * - Application import set
+     - Evidence scan, reduction and serializer exist; thunk and bridge resolution is not
+       connected
+   * - Dangling ``.vmp`` references and stripping
+     - Checker exists; not wired to clear the blocker or strip
+   * - Coverage gate
+     - Implemented as a pure decision; not yet consumed by ``clean``
+   * - VTIL optimization
+     - Binding exists, feature-gated; not in the pipeline
+   * - ``--neutralize``
+     - Library transform; not a ``clean`` flag
+   * - Header room for a new section
+     - ``append_section`` fails cleanly when the section table is full
+   * - PE32 reintegration
+     - PE32+ only
+   * - Signed images
+     - Section appending refuses a security directory
+
+Validation limits
+-----------------
+
+* No protected corpus in continuous integration.
+* Synthetic fixtures can be unrepresentative of real protector output.
+* Real-sample checks are out-of-band and local.
+
+What would change the picture
+-----------------------------
+
+*A larger decidable subset of input-dependent control flow.* Jump tables and bounded
+loops are the next shapes by frequency.
+
+*Memory modelling with stronger aliasing.* Proving more stores independent of tracked
+memory reduces havocs.
+
+*An end-to-end corpus.* Original-and-protected pairs with oracle outputs would convert
+"passed synthetic verification" into "observed equivalent".
+
+*Optimization with a trusted verifier.* Routing lifted IR through VTIL would make the
+output read like compiler output, once each pass is verified.

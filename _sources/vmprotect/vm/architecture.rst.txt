@@ -1,0 +1,154 @@
+Architecture
+============
+
+The machine model
+-----------------
+
+VMProtect's VM is a **stack machine** with a small bank of memory-resident virtual
+registers. Almost every operation takes its operands from the VM stack and pushes
+its result back; a virtual register is only a place to spill a value between
+operations.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Component
+     - Description
+   * - VM stack
+     - A region of native stack memory addressed by the VSP. Operands and results
+       live here. Values are typically 8, 16, 32 or 64 bits wide, and the stack
+       pointer moves in matching steps.
+   * - Virtual registers
+     - A fixed-size array of 64-bit slots in the VM context, reached by an index
+       carried in the bytecode. Published analyses of the 3.x series describe a
+       bank of 16 such slots; the exact count and layout are a property of the
+       version and the build.
+   * - Virtual flags
+     - The x86 status flags as a value in the VM. They are not a separate register
+       file: flags are produced by executing a native flag-setting instruction and
+       capturing ``RFLAGS`` (see :doc:`context-switch`).
+   * - Bytecode cursor
+     - The VIP, which advances through the bytecode as operands are fetched.
+   * - Rolling key
+     - A register that is combined with each fetched operand and updated after
+       each fetch, so no operand can be decoded out of order (:doc:`bytecode`).
+
+vmpx's ``VmContextLayout`` records exactly this set of roles: the VIP register, an
+optional VSP register, the rolling-key register, the handler register, the
+native-context register, the context base register, the allocation size and the
+bytecode direction.
+
+Mapping to native registers
+---------------------------
+
+The VM has no registers of its own; its VIP, VSP and key are ordinary x86-64
+registers that the bootstrap dedicates to those roles for the duration of the VM's
+execution. Which native register plays which role **varies per VM instance**,
+because register allocation is one of the things the protector mutates. A
+descriptive example of what is commonly reported for 3.x (not a fixed rule) is:
+
+.. code-block:: text
+
+    rsi   VIP         walks the bytecode
+    rbp   VSP         the VM operand stack (some builds use rsp)
+    rdi   context     base of the virtual register file
+    rbx   key         rolling decryption key
+    rax   scratch / handler address
+
+An analysis must therefore *recover* the assignment. vmpx does it by enumerating
+role assignments and keeping only those that form a behaviourally valid dispatch
+slice, and it states that "no handler bytes, addresses, or fixed register
+allocation are assumed".
+
+Direction
+---------
+
+The bytecode cursor may advance *upward* through memory or *downward*. In a
+descending VM the VIP is pre-decremented before each read. The direction is a
+property of the VM instance and is recovered, not assumed (``BytecodeDirection`` in
+vmpx).
+
+Native code and VM code never share a stack discipline
+------------------------------------------------------
+
+While the VM runs, the native ``RSP`` is not the VM's stack pointer in general; the
+bootstrap saves the whole native state first so that the VM is free to use the
+registers as it likes, and the exit sequence restores it. This separation is what
+makes it possible to analyse a virtualized function as a function of its inputs:
+the native state on entry is fully captured, and the native state on exit is fully
+specified by what the exit sequence pops back. The two together define a *native
+exit state*, the central result of vmpx's symbolic execution
+(:doc:`/tool/pipeline/symbolic-execution`).
+
+The instruction set, in families
+--------------------------------
+
+A virtual instruction set of a few dozen primitive operations is reported for the
+3.x series. They fall into families, and any complete x86-64 function can be
+expressed with them:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Family
+     - Operations
+   * - Constants
+     - Push an immediate of a given width, with sign-extension variants
+   * - Register traffic
+     - Load a virtual register onto the stack; pop the stack into a virtual
+       register
+   * - Arithmetic
+     - Add; multiply, unsigned and signed; unsigned and signed divide
+   * - Logic
+     - **NOR** and **NAND** as primitives (everything else is built from them);
+       shifts, rotates and double-width shifts
+   * - Memory
+     - Read and write through a pointer taken from the stack, optionally with a
+       segment override
+   * - Stack pointer
+     - Load and store the VSP itself, so that the virtual stack can be addressed
+   * - Control
+     - Jump (set the VIP from the stack); exit the VM
+   * - Machine
+     - Read the timestamp counter; execute ``cpuid``; load the flags
+   * - Native bridge
+     - Hand control to a native routine and come back (:doc:`context-switch`)
+
+Two points are worth stating plainly.
+
+*Logic is built from NOR/NAND.* The VM does not have separate AND, OR, XOR and NOT
+operations; it has one or two universal gates, and every logical operation in the
+original program becomes a short sequence of them. This is a major source of
+bytecode inflation, and it is why the pattern ``not(not(x) + a) + b`` appears in
+the expressions vmpx recovers: that is how the VM expresses a plain pointer
+adjustment, and vmpx's expression folder rewrites it to ``x + (b - a)`` so that
+stack-relative addresses stay analysable.
+
+*Conditional branches are computed, not primitive.* In the instruction set as
+published for the 3.x series, control flow is built from data: a conditional jump
+computes the address of one of two target blocks from flag values using arithmetic
+and masking, then performs an unconditional virtual jump. (vmpx's classifier also
+has ``ConditionalBranch`` and ``UnconditionalBranch`` semantics, for handlers whose
+effect is to select the next VIP.) The consequence for analysis is that a "branch"
+is a computation whose result is an address. See :doc:`/tool/pipeline/function-recovery` for how vmpx enumerates the
+possible values.
+
+Which operations vmpx recognises
+--------------------------------
+
+For comparison, vmpx's ``VmHandlerSemantic`` set is:
+
+``Dispatch``, ``Push``, ``Pop``, ``ConstantPush``, ``VirtualRegisterRead``,
+``VirtualRegisterWrite``, ``MemoryLoad``, ``MemoryStore``, ``TableChecksum``,
+``ReadTimestampCounter``, ``UnsignedDivide``, ``Add``, ``Sub``, ``Mul``, ``Xor``,
+``And``, ``Or``, ``Nor``, ``Nand``, ``Not``, ``Neg``, shifts and rotates,
+``Compare``, ``Flags``, ``SignExtend``, ``ZeroExtend``, ``StackAdjust``,
+``ConditionalBranch``, ``UnconditionalBranch``, ``NativeTransition``,
+``NativeCall``, ``VmExit``, ``ContextInitialize`` and ``Unknown``.
+
+The set is larger than the minimal family list above because a recovered handler is
+classified by the shape of its *effects*, and several distinct native shapes can
+implement the same primitive. Anything not unambiguously classifiable stays
+``Unknown`` and keeps its evidence.
