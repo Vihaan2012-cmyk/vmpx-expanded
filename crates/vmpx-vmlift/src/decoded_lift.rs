@@ -105,6 +105,11 @@ pub enum LiftAssumption {
     /// the VM stack or context. Applied only when neither the target nor any
     /// argument can carry a pointer into the VM stack.
     VmStateSurvivesNativeCall,
+    /// A branch was resolved by the walk under its preferred-base frame: a
+    /// register used only to relocate in-image addresses was bound to 0 (the
+    /// relocation delta, 0 at the preferred base). Carried over from the CFG's
+    /// `VmCfgAssumption::PreferredImageBase` when a guarded branch is reused.
+    PreferredImageBase,
 }
 
 #[derive(Debug, Error)]

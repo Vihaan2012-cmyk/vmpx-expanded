@@ -21,13 +21,12 @@ use vmpx_recompile::{
 };
 use vmpx_vm::{
     BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeCallMemoryDecision,
-    NativeCallSelectorOutcome, NativeExitState, NativeFrameSource, SymbolicDomainLimits,
-    SymbolicExecutionLimits, SymbolicMemorySource, SymbolicVmExecutionReport,
-    SymbolicVmInitialState, VmCfg, VmCfgLimits, VmExitReport, VmHandlerSemantic, X64NativeRegister,
-    canonicalize_symbolic_pointer, enumerate_symbolic_value,
+    NativeCallSelectorOutcome, NativeExitState, NativeFrameSource, SymbolicExecutionLimits,
+    SymbolicMemorySource, SymbolicVmExecutionReport, SymbolicVmInitialState, VmCfg, VmCfgAssumption,
+    VmCfgLimits, VmExitReport, VmHandlerSemantic, X64NativeRegister, canonicalize_symbolic_pointer,
     execute_symbolic_linear_block_with_initial_state,
-    execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
-    recover_native_exit_state, symbolic_pointer_offset,
+    execute_symbolic_native_call_boundary_with_initial_state, recover_native_exit_state,
+    symbolic_pointer_offset,
 };
 
 use crate::decoded_lift::{
@@ -176,40 +175,6 @@ fn call_result_name(index: usize) -> String {
     format!("__call_result_{index}")
 }
 
-/// Targets a branch can take: the constant it simplifies to, or its image over
-/// a proven-exhaustive input domain (`true` when guarded by inputs).
-fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
-    let simplified = target.simplify();
-    if let ExprKind::Const { value } = simplified.kind {
-        return Ok((vec![value], false));
-    }
-    let inferred = infer_branch_input_domains(&simplified, limits.input_domain)
-        .map_err(|refusal| format!("target depends on unproven input: {refusal}"))?;
-    let domain = SymbolicDomainLimits {
-        max_values_per_variable: limits
-            .domain
-            .max_values_per_variable
-            .max(limits.input_domain.max_values_per_variable),
-        ..limits.domain
-    };
-    let report = enumerate_symbolic_value(&simplified, &inferred.domains, domain)
-        .map_err(|error| format!("target enumeration failed: {error}"))?;
-    if !report.complete || report.unique_values.is_empty() {
-        return Err("target domain is incomplete".to_owned());
-    }
-    if report.unique_values.len() > limits.max_targets {
-        return Err(format!(
-            "branch has {} targets, exceeding limit {}",
-            report.unique_values.len(),
-            limits.max_targets
-        ));
-    }
-    let mut values = report.unique_values;
-    values.sort_unstable();
-    values.dedup();
-    Ok((values, true))
-}
-
 /// Both addresses are fixed offsets from the entry stack pointer and their byte
 /// ranges do not overlap.
 fn provably_disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
@@ -317,32 +282,49 @@ impl Builder<'_> {
         Ok(rewritten)
     }
 
-    fn successor_for(&self, block: Va, value: u64) -> Result<Va, DecodedLiftError> {
+    /// The branch's proven successors, taken straight from the walk's CFG edges
+    /// rather than re-derived: each `Branch`/`GuardedBranch` edge from this
+    /// block is a successor the walk already resolved, and the successor block's
+    /// recorded address is the value the native branch dispatches on. `guarded`
+    /// is true when any such edge was forked over a proven input domain or
+    /// boolean flag. Returned ascending by value, matching the emitter's arm
+    /// order. Fails closed on an edge whose target is not a recovered block or
+    /// carries no address; `LoopBack` edges (handled by the walk's repeat guard)
+    /// and non-branch edges are ignored.
+    fn branch_successors(&self, block: Va) -> Result<(Vec<(u64, Va)>, bool), DecodedLiftError> {
         let cfg = self.input.cfg;
-        let Some(successor) = cfg
-            .blocks
-            .values()
-            .find(|candidate| candidate.address == Some(Va(value)))
-        else {
-            return refuse(
-                block,
-                format!("branch target {value:#x} is not a recovered block"),
-            );
-        };
-        let key = successor.start.vip;
-        let proven = cfg.edges.iter().any(|edge| {
-            edge.from == block
-                && edge.to == key
-                && matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch)
-        });
-        if proven {
-            Ok(key)
-        } else {
-            refuse(
-                block,
-                format!("branch target {value:#x} has no proven CFG edge from this block"),
-            )
+        let mut successors: Vec<(u64, Va)> = Vec::new();
+        let mut guarded = false;
+        for edge in &cfg.edges {
+            if edge.from != block {
+                continue;
+            }
+            match edge.kind {
+                CfgEdgeKind::Branch => {}
+                CfgEdgeKind::GuardedBranch => guarded = true,
+                _ => continue,
+            }
+            let Some(successor) = cfg.blocks.get(&edge.to) else {
+                return refuse(
+                    block,
+                    format!("branch edge target {} is not a recovered block", edge.to),
+                );
+            };
+            let Some(address) = successor.address else {
+                return refuse(
+                    block,
+                    format!("branch successor {} has no recorded target address", edge.to),
+                );
+            };
+            if !successors.iter().any(|(_, key)| *key == edge.to) {
+                successors.push((address.0, edge.to));
+            }
         }
+        if successors.is_empty() {
+            return refuse(block, "branch has no proven CFG edge from this block");
+        }
+        successors.sort_by_key(|(value, _)| *value);
+        Ok((successors, guarded))
     }
 
     fn call_return_block(&self, block: Va) -> Result<Va, DecodedLiftError> {
@@ -541,17 +523,11 @@ impl Builder<'_> {
                     let Some(target) = report.branch_target.as_ref() else {
                         return refuse(key, "branch has no symbolic target");
                     };
-                    let (values, guarded) =
-                        resolve_targets(target, input.target_limits).map_err(|reason| {
-                            DecodedLiftError::Cfg {
-                                block: key,
-                                reason: format!("unresolved branch target: {reason}"),
-                            }
-                        })?;
-                    let mut successors = Vec::with_capacity(values.len());
-                    for value in &values {
-                        successors.push((*value, self.successor_for(key, *value)?));
-                    }
+                    // Reuse the walk's already-resolved edges: the branch targets
+                    // are exactly the recovered CFG successors, so the lift never
+                    // re-derives them (and so inherits the walk's flag-fork and
+                    // preferred-base resolutions instead of refusing without them).
+                    let (successors, guarded) = self.branch_successors(key)?;
                     let next = report.continuation_state();
                     if let [(_, only)] = successors[..] {
                         if guarded {
@@ -560,6 +536,13 @@ impl Builder<'_> {
                         key = only;
                         state = next;
                         continue;
+                    }
+                    // The runtime branch expression is dispatched against each
+                    // resolved value; a value proven only under the preferred-base
+                    // frame makes the lifted function carry that assumption too.
+                    if guarded && input.cfg.assumptions.contains(&VmCfgAssumption::PreferredImageBase)
+                    {
+                        self.assume(LiftAssumption::PreferredImageBase);
                     }
                     let condition = self.prepare(key, target, path.barrier, &path)?;
                     self.branches += 1;

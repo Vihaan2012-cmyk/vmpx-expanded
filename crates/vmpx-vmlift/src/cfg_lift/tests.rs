@@ -433,11 +433,13 @@ fn a_native_call_that_may_receive_a_vm_stack_pointer_refuses() {
 }
 
 #[test]
-fn a_branch_target_without_a_proven_edge_refuses_cleanly() {
+fn a_branch_without_any_proven_edge_refuses_cleanly() {
+    // With the branch targets taken from the CFG edges, a branch block that
+    // carries no proven edge has no successors to dispatch on and fails closed.
     let mut broken = conditional_cfg();
-    broken.edges.retain(|edge| edge.to != Va(0xC0));
+    broken.edges.retain(|edge| edge.from != Va(0xA0));
     let error = lift(&broken, &constant_frame(), &BTreeMap::new())
-        .expect_err("an unproven edge must refuse");
+        .expect_err("a branch with no proven edge must refuse");
     assert!(error.to_string().contains("no proven CFG edge"), "{error}");
 }
 
@@ -454,8 +456,9 @@ fn a_target_that_is_not_a_recovered_block_refuses() {
 }
 
 #[test]
-fn an_unproven_branch_condition_refuses() {
-    // The target is a raw register, with no finite proven domain.
+fn a_guarded_branch_with_a_single_proven_edge_refuses() {
+    // A forked branch that resolved to only one successor is not exhaustively
+    // covered, so the lift refuses rather than dispatch on a lone arm.
     let cfg = cfg(
         vec![
             block(0xA0, Some(0x900), Vec::new(), BlockExit::Branch),
@@ -465,8 +468,79 @@ fn an_unproven_branch_condition_refuses() {
         0xA0,
     );
     let error = lift(&cfg, &constant_frame(), &BTreeMap::new())
-        .expect_err("an unproven condition must refuse");
-    assert!(error.to_string().contains("branch target"), "{error}");
+        .expect_err("a single-target guarded branch must refuse");
+    assert!(error.to_string().contains("single target"), "{error}");
+}
+
+#[test]
+fn a_guarded_branch_lifts_from_its_cfg_edges_and_carries_the_preferred_base_assumption() {
+    // The branch dispatches on the successor addresses recovered by the walk,
+    // taken straight from the two GuardedBranch edges rather than re-derived.
+    // To prove the values come from the edges, the successor blocks are given
+    // addresses that differ from what the branch expression enumerates to; the
+    // arm compared against is the lower successor address, not the expression's
+    // own constant. The CFG resolved the branch under its preferred-base frame,
+    // so the lifted function inherits that assumption.
+    const LOW_TARGET: u64 = 0x7000;
+    const HIGH_TARGET: u64 = 0x7100;
+    let mut cfg = cfg(
+        vec![
+            block(
+                0xA0,
+                Some(0x900),
+                zero_flag_target_program(),
+                BlockExit::Branch,
+            ),
+            returns_constant(0xB0, LOW_TARGET, 111),
+            returns_constant(0xC0, HIGH_TARGET, 222),
+        ],
+        vec![
+            edge(0xA0, 0xB0, CfgEdgeKind::GuardedBranch),
+            edge(0xA0, 0xC0, CfgEdgeKind::GuardedBranch),
+        ],
+        0xA0,
+    );
+    cfg.assumptions
+        .insert(vmpx_vm::VmCfgAssumption::PreferredImageBase);
+    let lifted = lift(&cfg, &constant_frame(), &BTreeMap::new())
+        .expect("a guarded branch lifts from its proven edges");
+    assert_eq!(lifted.conditional_branches, 1);
+    assert_eq!(lifted.exit_paths, 2);
+    assert!(
+        lifted
+            .assumptions
+            .contains(&LiftAssumption::PreferredImageBase)
+    );
+    let operations = &lifted.replacement.function.operations;
+    assert_eq!(
+        count(operations, |o| matches!(
+            o,
+            Operation::BranchIf {
+                condition: Condition::Equal,
+                ..
+            }
+        )),
+        1
+    );
+    // The arm dispatches on the recovered successor address, not on a value the
+    // branch expression itself resolves to.
+    assert!(
+        count(operations, |o| matches!(
+            o,
+            Operation::MoveImmediate { value, .. } if *value == LOW_TARGET
+        )) >= 1,
+        "dispatches on the recovered successor address"
+    );
+    for leaf in [111_u64, 222] {
+        assert_eq!(
+            count(operations, |o| matches!(
+                o,
+                Operation::MoveImmediate { value, .. } if *value == leaf
+            )),
+            1,
+            "leaf constant {leaf}"
+        );
+    }
 }
 
 #[test]
