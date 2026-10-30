@@ -15,6 +15,7 @@ vmpx-solvers = { path = "../vmpx-solvers" }
 vmpx-verify = { path = "../vmpx-verify" }
 vmpx-tournament = { path = "../vmpx-tournament" }
 vmpx-vm = { path = "../vmpx-vm" }
+vmpx-pe = { path = "../vmpx-pe" }
 
 [lints]
 workspace = true

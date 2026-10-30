@@ -2,10 +2,12 @@
 //! tournament runner (input-test scored, ELO ranked) and the `demutate` pipeline.
 
 pub mod bench;
+pub mod binary;
 pub mod pipeline;
 pub mod registry;
 pub mod tournament;
 
+pub use binary::{BinaryReport, demutate_binary};
 pub use pipeline::{Demutated, Tier, demutate, demutate_verified};
 
 use vmpx_vm::{BinaryOp, Expr, ExprKind, UnaryOp};

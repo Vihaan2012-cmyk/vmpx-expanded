@@ -1,7 +1,8 @@
 use std::process::ExitCode;
 
 use vmpx_demutate::tournament::{self, Config};
-use vmpx_demutate::{Tier, demutate_verified, fmt_expr};
+use vmpx_demutate::{BinaryReport, Tier, demutate_binary, demutate_verified, fmt_expr};
+use vmpx_pe::{PeImage, Rva};
 use vmpx_mutation::{BitWidth, Expr, ProblemClass};
 use vmpx_vm::{BinaryOp, ExprKind, ExprRef, UnaryOp};
 
@@ -120,10 +121,85 @@ fn demo(cfg: &Config) {
     }
 }
 
+fn binary(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("usage: vmpx-demutate binary <dll> [export|rva|--all]")?;
+    let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let pe = PeImage::parse(&data).map_err(|e| format!("{path}: {e}"))?;
+    let rep = pe.report();
+    let exports = rep.exports.map(|d| d.symbols).unwrap_or_default();
+    let all = args.get(1).map(String::as_str) == Some("--all");
+    let targets: Vec<(String, Rva)> = match args.get(1) {
+        Some(_) if all => rep
+            .exception_functions
+            .iter()
+            .map(|f| {
+                let name = exports
+                    .iter()
+                    .find(|x| x.rva == f.begin)
+                    .and_then(|x| x.name.clone())
+                    .unwrap_or(format!("sub_{:X}", f.begin.0));
+                (name, f.begin)
+            })
+            .collect(),
+        Some(sel) => {
+            let hex = sel.strip_prefix("0x").or_else(|| sel.strip_prefix("0X"));
+            if let Some(v) = hex.and_then(|h| u32::from_str_radix(h, 16).ok()) {
+                vec![(sel.clone(), Rva(v))]
+            } else {
+                let x = exports
+                    .iter()
+                    .find(|x| x.name.as_deref() == Some(sel))
+                    .ok_or(format!("no export named {sel}"))?;
+                vec![(sel.clone(), x.rva)]
+            }
+        }
+        None => exports
+            .iter()
+            .filter(|x| x.forwarder.is_none())
+            .map(|x| (x.name.clone().unwrap_or(format!("#{}", x.ordinal)), x.rva))
+            .collect(),
+    };
+    let elo = tournament::run(&Config {
+        gate: false,
+        per_class: 4,
+        ..Config::default()
+    })
+    .elo;
+    let mut total = BinaryReport::default();
+    for (name, rva) in &targets {
+        let r = demutate_binary(&pe, *rva, &elo);
+        if all {
+            println!(
+                "{name} @ {rva}: blocks {}/{} lifted, exprs {}/{} simplified, nodes {}->{}, fails {:?}",
+                r.blocks_lifted, r.blocks, r.exprs_simplified, r.exprs_attempted,
+                r.nodes_before, r.nodes_after, r.unsupported
+            );
+        } else {
+            println!("== {name} @ {rva}");
+            print!("{}", r.render());
+        }
+        total.merge(&r);
+    }
+    if targets.len() > 1 {
+        println!("== TOTAL ({} entries)", targets.len());
+        print!("{}", total.render());
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("binary") {
+        return match binary(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("usage: vmpx-demutate <tournament|demo> [--seed N] [--per-class N] [--width 8|16|32|64] [--no-gate]");
+        eprintln!("usage: vmpx-demutate <tournament|demo|binary> [--seed N] [--per-class N] [--width 8|16|32|64] [--no-gate]");
         return ExitCode::from(2);
     };
     let cfg = match parse_cfg(rest) {

@@ -2748,6 +2748,7 @@ name = "vmpx-demutate"
 version = "0.1.0"
 dependencies = [
  "vmpx-mutation",
+ "vmpx-pe",
  "vmpx-solvers",
  "vmpx-tournament",
  "vmpx-verify",
