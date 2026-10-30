@@ -226,6 +226,7 @@ pub(crate) fn lift_entry(pe: &PeImage<'_>, rva: Rva, address: u64) -> Result<Spl
         cfg: &cfg,
         frame: &frame,
         top_offset,
+        image_base: pe.optional.image_base.0,
         exits: &exits,
         native_calls: &calls,
         memory: Some(&image),

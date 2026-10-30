@@ -52,6 +52,11 @@ pub struct DecodedCfgInput<'a> {
     pub frame: &'a [NativeFrameSource],
     /// VSP-to-top-cell byte offset from [`crate::recover_entry_frame`].
     pub top_offset: u64,
+    /// Preferred image base of the module being lifted. Used only to materialize
+    /// the caller's pushed return address (an in-image continuation) in a region
+    /// exit; that materialization is preferred-base-only and is surfaced through
+    /// [`LiftAssumption::PreferredImageBase`].
+    pub image_base: u64,
     /// Recovered VM-exit layouts, keyed by the exit handler's address.
     pub exits: &'a BTreeMap<Va, VmExitReport>,
     /// Proven call frames, keyed by the key of the block that ends in the call.
@@ -79,6 +84,24 @@ pub struct LiftedCfgFunction {
     /// Nested VM entries inlined into the function.
     pub nested_entries: usize,
     pub assumptions: Vec<LiftAssumption>,
+}
+
+/// The preferred-base VA of the caller's pushed return address when the entry
+/// frame proves exactly one `ReturnAddress` cell: the runtime value of
+/// `native_return_address_initial` at the preferred image base. `None` (no such
+/// cell, or more than one) leaves the symbol unmaterializable so the lift fails
+/// closed rather than inventing a continuation address.
+fn return_address_va(frame: &[NativeFrameSource], image_base: u64) -> Option<u64> {
+    let mut found = None;
+    for cell in frame {
+        if let NativeFrameSource::ReturnAddress { continuation, .. } = cell {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(image_base.wrapping_add(u64::from(continuation.0)));
+        }
+    }
+    found
 }
 
 struct CallSite {
@@ -311,6 +334,11 @@ struct Builder<'a> {
     /// In-place captured reads allocated so far; also the next slot id.
     read_sites: usize,
     uses_root: bool,
+    /// Preferred-base VA of the caller's pushed return address (the entry frame's
+    /// `ReturnAddress` continuation), when the frame proves one. A region exit may
+    /// materialize `native_return_address_initial` as this constant; `None` keeps
+    /// the symbol unreadable so the lift fails closed.
+    return_address_va: Option<u64>,
     assumptions: Vec<LiftAssumption>,
     /// Natural-loop bodies keyed by header, recovered up front.
     loop_bodies: BTreeMap<Va, BTreeSet<Va>>,
@@ -816,10 +844,16 @@ impl Builder<'_> {
                 "a memory read predates a store or native call that precedes its use",
             );
         }
+        // The caller's pushed return address is readable only when the entry
+        // frame proved its continuation; it then materializes as a preferred-base
+        // constant (see `build_tree_replacement`), which the `PreferredImageBase`
+        // label flags as valid only at the preferred image base.
+        let allows_return_address = self.return_address_va.is_some();
         let allowed: BTreeSet<&str> = X64NativeRegister::ALL
             .iter()
             .map(|register| register.symbolic_name())
             .chain(std::iter::once("vsp_initial"))
+            .chain(allows_return_address.then_some("native_return_address_initial"))
             .chain(results.values().map(String::as_str))
             .chain(self.active_phis.iter().map(String::as_str))
             .collect();
@@ -837,6 +871,9 @@ impl Builder<'_> {
                     "value depends on {foreign:?}, which a callee-style replacement cannot read"
                 ),
             );
+        }
+        if dependencies.contains("native_return_address_initial") {
+            self.assume(LiftAssumption::PreferredImageBase);
         }
         if dependencies.contains("vsp_initial") || captured_uses_root {
             self.uses_root = true;
@@ -1738,6 +1775,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         call_sites: 0,
         read_sites: 0,
         uses_root: false,
+        return_address_va: return_address_va(input.frame, input.image_base),
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
@@ -1821,6 +1859,7 @@ fn lift_with_nested(
         call_sites: 0,
         read_sites: 0,
         uses_root: false,
+        return_address_va: return_address_va(input.frame, input.image_base),
         assumptions: Vec::new(),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
@@ -1831,6 +1870,17 @@ fn lift_with_nested(
     };
     let root = builder.walk(cfg.entry, initial, Path::default(), Vec::new())?;
 
+    // The caller's pushed return address resolves to a preferred-base constant
+    // (its in-image continuation VA). A region exit that threads it to its
+    // continuation reads it through this rewrite; `prepare` gates that any value
+    // using it carries the `PreferredImageBase` label.
+    let mut symbol_rewrites = BTreeMap::new();
+    if let Some(va) = builder.return_address_va {
+        symbol_rewrites.insert(
+            "native_return_address_initial".to_owned(),
+            Expr::constant(BitWidth::W64, va),
+        );
+    }
     let config = ReplacementConfig {
         inputs: X64NativeRegister::ALL
             .iter()
@@ -1843,7 +1893,7 @@ fn lift_with_nested(
         effects: Vec::new(),
         effect_calls: Vec::new(),
         rflags: None,
-        symbol_rewrites: BTreeMap::new(),
+        symbol_rewrites,
     };
     let frame_bytes = builder
         .uses_root

@@ -133,6 +133,7 @@ fn main() {
             cfg: &cfg,
             frame: &frame,
             top_offset,
+            image_base: pe.optional.image_base.0,
             exits: &exits,
             native_calls: &calls,
             memory: Some(&pe),

@@ -204,6 +204,7 @@ fn lift_with(
         cfg,
         frame,
         top_offset: 0,
+        image_base: 0,
         exits,
         native_calls: calls,
         memory: None,
@@ -220,6 +221,26 @@ fn lift(
     calls: &BTreeMap<Va, NativeCallSelectorOutcome>,
 ) -> Result<LiftedCfgFunction, DecodedLiftError> {
     lift_with(cfg, frame, &exits(), calls)
+}
+
+fn lift_with_base(
+    cfg: &VmCfg,
+    frame: &[NativeFrameSource],
+    image_base: u64,
+) -> Result<LiftedCfgFunction, DecodedLiftError> {
+    let input = DecodedCfgInput {
+        cfg,
+        frame,
+        top_offset: 0,
+        image_base,
+        exits: &exits(),
+        native_calls: &BTreeMap::new(),
+        memory: None,
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: VmCfgLimits::default(),
+        max_expanded_blocks: 64,
+    };
+    lift_decoded_cfg(&input, CodeAddress(ADDRESS))
 }
 
 fn mnemonics(lifted: &LiftedCfgFunction) -> Vec<Mnemonic> {
@@ -1148,6 +1169,7 @@ fn prepare_read_in_node(
         cfg: &cfg,
         frame: &frame,
         top_offset: 0,
+        image_base: 0,
         exits: &exits,
         native_calls: &calls,
         memory: None,
@@ -1169,6 +1191,7 @@ fn prepare_read_in_node(
         call_sites: 0,
         read_sites: 0,
         uses_root: false,
+        return_address_va: None,
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
@@ -1205,6 +1228,7 @@ fn prepare_read_with_ancestor(
         cfg: &cfg,
         frame: &frame,
         top_offset: 0,
+        image_base: 0,
         exits: &exits,
         native_calls: &calls,
         memory: None,
@@ -1226,6 +1250,7 @@ fn prepare_read_with_ancestor(
         call_sites: 0,
         read_sites: 0,
         uses_root: false,
+        return_address_va: None,
         assumptions: Vec::new(),
         loop_bodies: BTreeMap::new(),
         loop_phis: 0,
@@ -1570,14 +1595,6 @@ fn an_unproven_computed_return_refuses() {
         description: "unproven".to_owned(),
     };
     let cases = [
-        // The protector's own return address is not a value the lift can read.
-        region_frame(
-            NativeFrameSource::ReturnAddress {
-                call_site: Rva(0x10),
-                continuation: Rva(0x20),
-            },
-            word.clone(),
-        ),
         // A staged continuation word the entry frame never proved.
         region_frame(
             NativeFrameSource::Constant {
@@ -1592,6 +1609,63 @@ fn an_unproven_computed_return_refuses() {
         let error = lift(&region_cfg(), &frame, &BTreeMap::new()).expect_err("must refuse");
         assert!(matches!(error, DecodedLiftError::Cfg { .. }), "{error}");
     }
+}
+
+// The caller's pushed return address (the entry frame's single `ReturnAddress`
+// continuation) materializes as a preferred-base constant, so a region exit that
+// threads it lifts and carries the `PreferredImageBase` label. Without a single
+// proven continuation (here, an ambiguous second `ReturnAddress`) the symbol
+// stays unreadable and the lift fails closed.
+#[test]
+fn a_proven_caller_return_materializes_under_preferred_base() {
+    const BASE: u64 = 0x1_4000_0000;
+    let frame = region_frame(
+        NativeFrameSource::ReturnAddress {
+            call_site: Rva(0x10),
+            continuation: Rva(0x20),
+        },
+        NativeFrameSource::Constant { value: REGION_WORD },
+    );
+    let lifted = lift_with_base(&region_cfg(), &frame, BASE).expect("caller return materializes");
+    assert!(
+        lifted.assumptions.contains(&LiftAssumption::PreferredImageBase),
+        "{:?}",
+        lifted.assumptions
+    );
+    assert_eq!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::MoveImmediate { value, .. } if *value == BASE + 0x20
+        )),
+        1,
+        "materialized caller-return constant"
+    );
+    assert_eq!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::ReturnRetaining { .. }
+        )),
+        1
+    );
+}
+
+#[test]
+fn an_unprovable_caller_return_still_refuses() {
+    // Two `ReturnAddress` cells: the continuation is ambiguous, so
+    // `native_return_address_initial` cannot be materialized and must refuse.
+    let frame = region_frame(
+        NativeFrameSource::ReturnAddress {
+            call_site: Rva(0x10),
+            continuation: Rva(0x20),
+        },
+        NativeFrameSource::ReturnAddress {
+            call_site: Rva(0x30),
+            continuation: Rva(0x40),
+        },
+    );
+    let error =
+        lift_with_base(&region_cfg(), &frame, 0x1_4000_0000).expect_err("ambiguous return refuses");
+    assert!(matches!(error, DecodedLiftError::Cfg { .. }), "{error}");
 }
 
 #[test]
@@ -1693,6 +1767,7 @@ fn lift_nested(
         cfg,
         frame,
         top_offset: 0,
+        image_base: 0,
         exits: &exits,
         native_calls: &calls,
         memory: None,
