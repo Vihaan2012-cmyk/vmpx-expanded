@@ -15,7 +15,10 @@ describes each stage: what it takes in, what it proves, and what it refuses.
     unpack ---------- RVA-layout analysis image            (PackedVirtualSections only)
        |
        v
-    VM recovery ----- entries, bootstrap, handler codecs
+    VM recovery ----- entries, bootstrap, dispatch, handler codecs
+       |
+       v
+    stream decode --- linear VM stream, then CFG walk over branches
        |
        v
     symbolic exec --- native exit states per path
@@ -24,7 +27,7 @@ describes each stage: what it takes in, what it proves, and what it refuses.
        +--> function inventory, live-in, input domains
        |
        v
-    lift + recompile  native replacement bodies
+    lift + recompile  native replacement bodies (linear and branching)
        |
        v
     reintegrate ----- append .vmpx0, redirect entry / TLS / VM stubs
@@ -37,13 +40,27 @@ describes each stage: what it takes in, what it proves, and what it refuses.
 
    unpacking
    vm-recovery
+   compact-vm
    symbolic-execution
    oep-recovery
    function-recovery
    lifting-recompilation
+   function-lift
    reintegration
    imports-and-stripping
    verification
+
+Where it stands on a real sample
+--------------------------------
+
+On a VMProtect 3.11 "Compact" sample the pipeline reaches detect, bootstrap,
+dispatch, handlers, stream decode, CFG walk and lift. All 256 handlers are
+classified (:doc:`compact-vm`). Linear functions devirtualize fully to native
+x86-64. Branching functions decode through the CFG with branches resolved by
+symbolic execution and proven input domains, and the CFG-level lift is landing
+(:doc:`function-lift`). What the static pipeline refuses is described in
+:doc:`/vmprotect/devirtualization/static-frontier`. These stages are exercised
+from the libraries and examples; ``clean`` does not yet drive them.
 
 Sub-projects
 ------------

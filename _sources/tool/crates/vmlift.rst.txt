@@ -41,6 +41,14 @@ Configuration and result types: ``ExpressionCodegenConfig``, ``ExpressionInput``
 ``LoweredExpression``, ``ImportCall``, ``ConstantDispatchConfig``,
 ``ReplacementConfig``, ``Replacement``, ``EffectCall`` and ``EffectStore``.
 
+Decoded-stream and CFG lift
+---------------------------
+
+``semantic_lowering`` (``SemanticLowering``), ``first_unliftable``,
+``recover_stub_exit``, ``lift_decoded_linear`` and ``lift_decoded_cfg``
+(``DecodedCfgInput``, ``LiftedCfgFunction``), with ``LiftAssumption`` and
+``DecodedLiftError``. See :doc:`/tool/pipeline/function-lift`.
+
 Live-in inference (SP2)
 -----------------------
 
@@ -88,6 +96,8 @@ Module map
      - Constant-result input dispatch
    * - ``effect_liveness``
      - Effect liveness and collection
+   * - ``decoded_lift``, ``cfg_lift``
+     - Decoded linear stream and recovered CFG to a native replacement
    * - ``live_in``
      - Calling-convention inference
    * - ``equivalence``

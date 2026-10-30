@@ -194,6 +194,20 @@
 <li class="toctree-l3"><a class="reference internal" href="vm-recovery.html#discovery-limits">Discovery limits</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="compact-vm.html">The VMProtect 3.11 Compact VM</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="compact-vm.html#result">Result</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compact-vm.html#table-indexed-keyless-dispatch">Table-indexed keyless dispatch</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="compact-vm.html#keyless-operand-recovery">Keyless operand recovery</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="compact-vm.html#the-handler-semantic-set">The handler semantic set</a></li>
+<li class="toctree-l3"><a class="reference internal" href="compact-vm.html#stream-decode-and-the-cfg-walk">Stream decode and the CFG walk</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="compact-vm.html#native-calls">Native calls</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="compact-vm.html#what-it-does-not-yet-do">What it does not yet do</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="symbolic-execution.html">Symbolic Execution</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#the-expression-ir">The expression IR</a></li>
 <li class="toctree-l3"><a class="reference internal" href="symbolic-execution.html#chaining-blocks-the-profile-explorer">Chaining blocks: the profile explorer</a></li>
@@ -257,6 +271,14 @@
 <li class="toctree-l3"><a class="reference internal" href="lifting-recompilation.html#where-vtil-fits">Where VTIL fits</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="function-lift.html">Lifting Decoded Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="function-lift.html#pipeline-reached">Pipeline reached</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-lift.html#semantic-lowering">Semantic lowering</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-lift.html#linear-functions">Linear functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-lift.html#branching-functions">Branching functions</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-lift.html#the-back-end">The back end</a></li>
+</ul>
+</li>
 <li class="toctree-l2"><a class="reference internal" href="reintegration.html">Reintegration</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#design-append-do-not-patch">Design: append, do not patch</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="reintegration.html#append-section-constraints"><code class="docutils literal notranslate"><span class="pre">append_section</span></code> constraints</a></li>
@@ -294,6 +316,7 @@
 <li class="toctree-l3"><a class="reference internal" href="verification.html#vtil-optimization">VTIL optimization</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#where-it-stands-on-a-real-sample">Where it stands on a real sample</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#sub-projects">Sub-projects</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#design-rules-shared-by-every-stage">Design rules shared by every stage</a></li>
 </ul>
@@ -359,6 +382,7 @@
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#discovery">Discovery</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#bootstrap-and-profile">Bootstrap and profile</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#handler-analysis">Handler analysis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#compact-vm-and-cfg">Compact VM and CFG</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#decoding">Decoding</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#model">Model</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vm.html#symbolic-execution">Symbolic execution</a></li>
@@ -374,6 +398,7 @@
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#lifting">Lifting</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#readiness-audit">Readiness audit</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#code-generation">Code generation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#decoded-stream-and-cfg-lift">Decoded-stream and CFG lift</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#live-in-inference-sp2">Live-in inference (SP2)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#differential-equivalence-sp5">Differential equivalence (SP5)</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../crates/vmlift.html#module-map">Module map</a></li>
@@ -499,9 +524,10 @@
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../../vmprotect/vm/dispatch.html">Dispatch</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#two-dispatch-styles">Two dispatch styles</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#dispatch-styles">Dispatch styles</a><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#table-dispatch">Table dispatch</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#threaded-dispatch-with-relative-displacement">Threaded dispatch with relative displacement</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#keyless-table-indexed-dispatch-the-compact-vm">Keyless table-indexed dispatch (the Compact VM)</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../../vmprotect/vm/dispatch.html#why-scattered-code-defeats-linear-disassembly">Why scattered code defeats linear disassembly</a></li>
@@ -649,6 +675,13 @@
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/limits.html#what-would-change-the-picture">What would change the picture</a></li>
 </ul>
 </li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html">The Static Frontier</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#what-is-decidable">What is decidable</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#what-is-refused">What is refused</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#why-refusal-is-the-answer">Why refusal is the answer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
 </ul>
 </li>
@@ -667,6 +700,7 @@
 <p class="caption" role="heading"><span class="caption-text">Project</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../../project/roadmap.html">Roadmap</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#real-sample-status">Real-sample status</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#sub-projects">Sub-projects</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#definition-of-done-ladder">Definition-of-done ladder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#cross-cutting-rules">Cross-cutting rules</a></li>
@@ -678,6 +712,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp1-native-reintegration">SP1: Native reintegration</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -721,7 +756,10 @@ detect ---------- verdict, layout
 unpack ---------- RVA-layout analysis image            (PackedVirtualSections only)
    |
    v
-VM recovery ----- entries, bootstrap, handler codecs
+VM recovery ----- entries, bootstrap, dispatch, handler codecs
+   |
+   v
+stream decode --- linear VM stream, then CFG walk over branches
    |
    v
 symbolic exec --- native exit states per path
@@ -730,7 +768,7 @@ symbolic exec --- native exit states per path
    +--&gt; function inventory, live-in, input domains
    |
    v
-lift + recompile  native replacement bodies
+lift + recompile  native replacement bodies (linear and branching)
    |
    v
 reintegrate ----- append .vmpx0, redirect entry / TLS / VM stubs
@@ -743,15 +781,28 @@ relayout + loader validation  --&gt; proof gate --&gt; OUTPUT
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="unpacking.html">Unpacking</a></li>
 <li class="toctree-l1"><a class="reference internal" href="vm-recovery.html">VM Recovery</a></li>
+<li class="toctree-l1"><a class="reference internal" href="compact-vm.html">The VMProtect 3.11 Compact VM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="symbolic-execution.html">Symbolic Execution</a></li>
 <li class="toctree-l1"><a class="reference internal" href="oep-recovery.html">OEP Recovery</a></li>
 <li class="toctree-l1"><a class="reference internal" href="function-recovery.html">Generalized Function Recovery</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="function-lift.html">Lifting Decoded Functions</a></li>
 <li class="toctree-l1"><a class="reference internal" href="reintegration.html">Reintegration</a></li>
 <li class="toctree-l1"><a class="reference internal" href="imports-and-stripping.html">Imports and Stripping</a></li>
 <li class="toctree-l1"><a class="reference internal" href="verification.html">Verification and Anti-Debug Policy</a></li>
 </ul>
 </div>
+<section id="where-it-stands-on-a-real-sample">
+<h2>Where it stands on a real sample<a class="headerlink" href="#where-it-stands-on-a-real-sample" title="Link to this heading"></a></h2>
+<p>On a VMProtect 3.11 “Compact” sample the pipeline reaches detect, bootstrap,
+dispatch, handlers, stream decode, CFG walk and lift. All 256 handlers are
+classified (<a class="reference internal" href="compact-vm.html"><span class="doc">The VMProtect 3.11 Compact VM</span></a>). Linear functions devirtualize fully to native
+x86-64. Branching functions decode through the CFG with branches resolved by
+symbolic execution and proven input domains, and the CFG-level lift is landing
+(<a class="reference internal" href="function-lift.html"><span class="doc">Lifting Decoded Functions</span></a>). What the static pipeline refuses is described in
+<a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html"><span class="doc">The Static Frontier</span></a>. These stages are exercised
+from the libraries and examples; <code class="docutils literal notranslate"><span class="pre">clean</span></code> does not yet drive them.</p>
+</section>
 <section id="sub-projects">
 <h2>Sub-projects<a class="headerlink" href="#sub-projects" title="Link to this heading"></a></h2>
 <p>The pipeline was built as a sequence of sub-projects, each with its own design

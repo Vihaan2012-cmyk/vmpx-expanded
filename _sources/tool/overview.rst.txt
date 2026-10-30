@@ -54,6 +54,10 @@ testable milestones rather than a single finish line:
 
 See :doc:`/project/roadmap` for the detailed status of each sub-project.
 
+Separately from the rungs, the VMProtect 3.11 Compact VM is now fully decoded
+(256 of 256 handlers classified) and linear functions lift to native x86-64;
+see :doc:`pipeline/compact-vm` and :doc:`pipeline/function-lift`.
+
 What "recovered" means
 ----------------------
 
