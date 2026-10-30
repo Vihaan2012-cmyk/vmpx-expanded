@@ -79,8 +79,8 @@ A *blocker* is a statement of a proof that does not yet exist. ``clean`` collect
 them in ``CleanReport.blockers``. ``ready_to_write`` is true only if the list is
 empty, and the sound ``OUTPUT`` is written only then.
 
-Unconditional blockers on a protected input
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Blockers on a protected input
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
@@ -91,11 +91,16 @@ Unconditional blockers on a protected input
    * - ``original module entry point is not recovered``
      - A successful OEP decision (:doc:`pipeline/oep-recovery`)
    * - ``application import set is not proven independently reconstructed``
-     - Import-set reconstruction wired into ``clean`` (SP3)
+     - Never, today. The import reduction is wired in, but the set of referenced
+       IAT slots it consumes is intentionally empty (there is no sound static way to
+       compute it yet), so this blocker always stays. The reconstruction is proven
+       incomplete by design, not unimplemented
    * - ``native code reintegration has not produced a devirtualized replacement image``
-     - Complete reintegration of all recovered routines
+     - A reintegrated image was produced
    * - ``VMProtect sections remain referenced by unresolved paths``
-     - A passing coverage gate and empty dangling-reference set (SP4)
+     - The coverage gate passes (every inventory entry covered, none dropped), a
+       reintegrated image exists, and the dangling-reference checker reports no
+       unresolved reference (SP4)
 
 Conditional blockers
 ~~~~~~~~~~~~~~~~~~~~
@@ -179,15 +184,18 @@ change the semantics of the sound ``OUTPUT``:
     Gate-relaxed emission. Implemented on ``clean``.
 
 ``--neutralize``
-    Anti-debug stripping. The transform is implemented as a library function; it
-    is not yet a ``clean`` flag.
+    Anti-debug stripping. The transform is a library function. ``clean`` surfaces
+    only a *recognition-only* ``anti_debug`` report field (``applied: false``);
+    neutralization is never applied in the sound path.
 
 Where soundness still has gaps
 ------------------------------
 
 The tool is explicit about its limits:
 
-* no protected corpus in CI, so synthetic fixtures may be unrepresentative;
+* no protected corpus in CI, so synthetic fixtures may be unrepresentative, and the
+  full blocker-clearing path has not been exercised end-to-end on real protected
+  input;
 * a missed VM entry (false negative) leaves a ``.vmp`` reference, so the sound
   mode correctly refuses;
 * a mis-identified VM entry (false positive) must not produce a wrong

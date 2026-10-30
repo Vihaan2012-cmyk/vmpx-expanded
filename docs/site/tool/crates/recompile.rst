@@ -53,6 +53,14 @@ The domain dispatcher
 ``DispatchArm`` pairs an input ``value`` with the absolute ``target`` it jumps
 to; ``fallback`` and ``dispatcher_va`` are absolute addresses.
 
+``emit_value_dispatcher(&ValueDispatch, dispatcher_va)`` is the variant for a
+*computed* selector: it saves registers, calls a ``compute`` function that leaves the
+selector in a register, compares against each arm value, and restores the saved
+registers on every exit before jumping. ``emit_displaced_stub`` copies the leading
+position-independent instructions of a VM stub so a dispatcher's fallback can still
+reach the original behaviour after the stub is overwritten
+(:doc:`/tool/pipeline/reintegration`).
+
 A naked trampoline: for each arm ``cmp reg, imm; je body``, then ``jmp fallback``.
 It is hand-encoded with iced's ``code_asm`` because ``compile`` always emits a
 Win64 frame, and a dispatcher must not clobber any incoming register. See

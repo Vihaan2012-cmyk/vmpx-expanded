@@ -28,7 +28,7 @@ Arguments
 .. option:: --report PATH
 
    Write the versioned JSON recovery report (``CleanReport``, currently
-   ``schema_version`` 2; see :doc:`reports`) even when the proof gate refuses
+   ``schema_version`` 3; see :doc:`reports`) even when the proof gate refuses
    output.
 
 .. option:: --reconstructed PATH
@@ -60,7 +60,10 @@ What it does
 #. Appends a ``.vmpx0`` section with the replacements, redirects the header
    entry and TLS callbacks, redirects single-body function stubs, converts to
    a conventional layout and validates it for the Windows loader
-   (:doc:`/tool/crates/rebuild`).
+   (:doc:`/tool/crates/rebuild`). Recovered branching functions are redirected to
+   a value dispatcher.
+#. Evaluates the coverage gate (``decide_coverage``) and the dangling-reference
+   checker, and the import reduction, to decide which blockers can drop.
 #. Applies the proof gate.
 
 .. _clean-proof-gate:
@@ -82,14 +85,23 @@ No ``OUTPUT`` file is created.
 Protected input
 ~~~~~~~~~~~~~~~
 
-For an input with VMProtect evidence the code unconditionally adds these
-blockers, each of which clears only when the corresponding proof exists:
+For an input with VMProtect evidence the pipeline evaluates these four blockers.
+Each is dropped only when its proof holds, decided by the coverage gate
+(``decide_coverage``) in ``clean_wiring.rs``:
 
-* ``original module entry point is not recovered`` (cleared when
-  :ref:`OEP recovery <oep-recovery>` succeeds)
-* ``application import set is not proven independently reconstructed``
-* ``native code reintegration has not produced a devirtualized replacement image``
-* ``VMProtect sections remain referenced by unresolved paths``
+* ``original module entry point is not recovered``: dropped when the strict
+  :ref:`OEP decision <oep-recovery>` succeeds.
+* ``native code reintegration has not produced a devirtualized replacement image``:
+  dropped when a reintegrated image was produced.
+* ``VMProtect sections remain referenced by unresolved paths``: dropped only when
+  every inventory entry is *covered* (see :ref:`coverage-gate`), nothing was
+  dropped from the inventory, a reintegrated image exists, and the dangling-reference
+  checker reports no unresolved reference.
+* ``application import set is not proven independently reconstructed``: always
+  kept today. The import reduction is wired in, but the set of referenced IAT slots
+  it consumes is intentionally empty, because there is no sound static way to
+  compute it yet. The reconstruction is therefore proven incomplete by design,
+  not unimplemented.
 
 Further blockers are added per case: a non-DLL header entry whose recovery
 fails (or whose VM-entry confidence is below 60), unresolved TLS VM entries, incomplete entry path recovery, and a header

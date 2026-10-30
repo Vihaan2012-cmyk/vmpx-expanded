@@ -123,6 +123,38 @@ and it interacts with integrity checks (see :doc:`verification`). It refuses:
 
 A failed redirect leaves the original stub in place and records a diagnostic.
 
+Branching functions: the value dispatcher
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A recovered *branching* function (one whose first virtual branch depends on its
+inputs, with a proven-exhaustive finite domain; see :doc:`function-recovery`) has
+several path bodies, and the value that selects a body is *computed*, not already in
+a register. ``emit_value_dispatcher`` (in :doc:`/tool/crates/recompile`) encodes:
+
+.. code-block:: nasm
+
+    push    saved_0 ... saved_n
+    call    compute                 ; leaves the selector in `value`
+    cmp     value, target_i         ; one pair per recovered target
+    je      arm_i                   ; (wide constants go through a scratch register)
+    ...
+    pop     saved_n ... saved_0
+    jmp     fallback
+    arm_i:
+    pop     saved_n ... saved_0
+    jmp     body_i
+
+Every exit restores the saved registers first, so the chosen body (or the fallback)
+sees the registers the dispatcher was entered with. Duplicate arm values and an
+unsaved ``value`` or ``scratch`` register are rejected. The function's VM entry stub
+is redirected to this dispatcher with ``redirect_vm_stub``.
+
+Because a redirect overwrites the first bytes of the stub, the fallback must still
+reach the original behaviour. ``emit_displaced_stub`` copies the leading whole
+instructions of the stub elsewhere, followed by a ``jmp`` to the rest of the stub.
+It accepts only position-independent, non-branching instructions (so the copy means
+the same thing wherever it runs) and otherwise reports ``StubNotRelocatable``.
+
 Entry and TLS redirects
 -----------------------
 
@@ -135,7 +167,7 @@ Nested continuations
 
 Where a VM exit continues into another VM entry, the nested entry needs its own
 replacement. Nested-continuation redirects remain deferred: they are counted but
-not appended. The ``reintegration`` stage diagnostics say so
+not appended, so a nested entry never counts as covered. The ``reintegration`` stage diagnostics say so
 ("nested-continuation redirects remain deferred").
 
 Output, loader validation and layout

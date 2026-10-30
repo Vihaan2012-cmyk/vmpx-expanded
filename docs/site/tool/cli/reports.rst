@@ -2,7 +2,7 @@ The CleanReport Schema
 ======================
 
 ``vmpx clean --report`` writes a ``CleanReport`` as pretty-printed JSON. The
-current ``schema_version`` is **2**. The report is the complete, machine-readable
+current ``schema_version`` is **3**. The report is the complete, machine-readable
 record of a run, and it is written even when the proof gate refuses output.
 :doc:`/tool/ui` renders it.
 
@@ -16,7 +16,7 @@ Top level
    * - Field
      - Contents
    * - ``schema_version``
-     - ``2``
+     - ``3``
    * - ``input``
      - ``{path, sha256, file_size}``
    * - ``pe``
@@ -29,7 +29,7 @@ Top level
    * - ``oep``
      - ``{protected_header_entry, recovered_entry, complete}``
    * - ``imports``
-     - ``{parsed_modules, parsed_symbols, reconstruction_complete, unresolved}``
+     - ``{parsed_modules, parsed_symbols, reconstruction_complete, proven_modules, proven_symbols, unresolved}``
    * - ``vm_instances``
      - VM instances (bootstrap, entry RVAs, distinct seeds)
    * - ``vm_entries``
@@ -56,6 +56,10 @@ Top level
      - Stage report for native code generation
    * - ``reintegration``
      - Stage report for section append and redirects
+   * - ``coverage``
+     - Coverage-gate verdict (below), or null when no gate was evaluated
+   * - ``anti_debug``
+     - Recognition-only anti-debug report (below)
    * - ``reconstruction``
      - Stage report for the overall reconstruction proof
    * - ``layout``
@@ -99,7 +103,8 @@ Several fields share the ``CleanStageReport`` shape:
      - A string-to-integer map. ``reintegration`` carries ``section_rva``,
        ``section_size``, ``entries_redirected``, ``dispatchers``,
        ``single_body_candidates``, ``single_body_redirected``,
-       ``single_body_bytes`` and ``tls_redirected``. ``recompilation`` carries
+       ``single_body_bytes``, ``branching_built``, ``branching_redirected``,
+       ``branching_bytes`` and ``tls_redirected``. ``recompilation`` carries
        ``emitted`` and ``bytes``.
    * - ``diagnostics``
      - Human-readable lines, including where each replacement body was placed.
@@ -165,6 +170,43 @@ value of the finite input domain (the ``DllMain`` reason).
 ``stop_reason``, ``native_exit_recovered`` and ``issues``. A TLS callback is a
 blocker only if its VM behaviour is still unknown; analysing each turns "N
 protected TLS entries" into per-entry evidence.
+
+``coverage`` (``CleanCoverageReport``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The verdict of the coverage gate (``decide_coverage``) for a protected input.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Field
+     - Contents
+   * - ``can_clear_oep``
+     - The OEP was proven
+   * - ``can_clear_vmp_referenced``
+     - Every inventory entry is covered, nothing was dropped, and no unresolved
+       dangling reference exists
+   * - ``covered_entries``
+     - RVAs of VM-entry stubs actually redirected to an emitted replacement
+       (group entries count only when their family is domain-complete)
+   * - ``dangling_refs``
+     - Number of remaining references into ``.vmp*`` sections with a known target
+   * - ``has_unresolved_dangling``
+     - True if any reference or code region could not be resolved
+   * - ``dropped_entries``
+     - Discoveries known to have been lost before reaching the inventory
+   * - ``reasons``
+     - One line per doubt that keeps a blocker
+
+``anti_debug`` (``CleanAntiDebugReport``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``guards_examined``, ``recognized`` (a ``NeutralizeAction`` per recognised guard),
+``applied`` and ``note``. This is **recognition only**: ``applied`` is always
+``false``, and the pipeline does not rewrite any guard. The note records that the
+pipeline does not yet extract conditional guards from recovered paths, so
+``guards_examined`` is currently ``0``.
 
 ``exports`` (``CleanExportReport``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

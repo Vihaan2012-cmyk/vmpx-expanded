@@ -41,16 +41,16 @@ testable milestones rather than a single finish line:
      - Implemented; behind ``--experimental``
    * - L2
      - Proven original entry point and every reachable virtualized routine recovered
-     - Analysis implemented; emission partial
+     - Analysis and the coverage gate implemented and wired; the full clearing path is unexercised end-to-end
    * - L3
      - Imports reduced to the proven application set
-     - Library implemented; not wired into ``clean``
+     - Wired into ``clean`` as an always-incomplete proof: the referenced-slot set is intentionally empty, so the import blocker stays
    * - L4
      - Dangling ``.vmp`` references resolved and sections stripped
-     - Reference checker implemented
+     - Reference checker wired in as a backstop for the ``.vmp`` blocker; stripping not performed
    * - L5
      - Optimized recompilation and differential verification
-     - Verifier and neutralize transform implemented
+     - Equivalence verifier is library-only; anti-debug recognition is reported (nothing is applied in the sound path)
 
 See :doc:`/project/roadmap` for the detailed status of each sub-project.
 

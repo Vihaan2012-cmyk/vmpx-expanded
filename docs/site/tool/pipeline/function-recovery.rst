@@ -143,15 +143,22 @@ stays a blocker for:
 * any cover larger than the limit (``TooManyValues``).
 
 ``recover_branching`` then recovers a routine only if the first branch's inputs
-have a proven-exhaustive domain *and* every resulting path is closed.
+have a proven-exhaustive domain *and* every resulting path is closed. A recovered
+branching function is reintegrated by redirecting its VM stub to a *value dispatcher*
+that computes the selector and jumps to the matching path body
+(:doc:`reintegration`).
+
+
+.. _coverage-gate:
 
 Coverage gate
 -------------
 
-*Module:* ``coverage_gate.rs`` in :doc:`/tool/crates/cli`.
+*Modules:* ``coverage_gate.rs`` and ``clean_wiring.rs`` in :doc:`/tool/crates/cli`.
 
 ``decide_coverage`` is the strict gate that decides whether the OEP blocker and
-the "VMProtect sections remain referenced" blocker may clear. Every doubt keeps
+the "VMProtect sections remain referenced" blocker may clear, and it is wired into
+``clean`` (``analyze_clean_with_image``) through ``clean_wiring``. Every doubt keeps
 its blocker:
 
 * the OEP was not proven;
@@ -161,9 +168,27 @@ its blocker:
 * entries were dropped before reaching the inventory;
 * dangling ``.vmp`` references remain (see :doc:`imports-and-stripping`).
 
+What counts as *covered*
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``covered`` set the gate receives contains only VM-entry stubs that were
+actually redirected to an emitted replacement:
+
+* a single-body or branching function's stub counts only when ``redirect_vm_stub``
+  succeeded (a function that was compiled but whose redirect failed is excluded);
+* a header-entry or TLS group counts only when its redirect landed **and** its path
+  family was proven domain-complete, because otherwise the dispatcher falls back to
+  the original VM stub for unmatched inputs;
+* nested continuations are never counted.
+
+The gate's verdict is reported in ``CleanReport.coverage`` (:doc:`/tool/cli/reports`),
+and ``coverage_blockers`` turns it into blockers: the OEP blocker stays unless the OEP
+was proven; the reintegration blocker stays unless an image was produced; the
+``.vmp`` blocker stays unless the gate clears *and* a reintegrated image exists *and*
+the dangling-reference checker found no unresolved reference.
+
 .. note::
 
-    The coverage gate, the dangling-reference checker and the import
-    reconstruction exist as tested library components. They are not yet wired
-    to clear blockers inside ``clean``: the pipeline still adds the
-    corresponding blockers unconditionally. See :doc:`/project/roadmap`.
+    The whole clearing path is covered by unit tests of each helper, but, with no
+    real VMProtect corpus in CI, it is unexercised end-to-end: no protected sample has
+    been shown to drive every blocker to empty.

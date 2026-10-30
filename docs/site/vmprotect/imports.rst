@@ -101,5 +101,8 @@ The remaining hard part, resolving **indirect** use (a protector thunk or a call
 inside virtualized code) to a concrete API name, is why the pipeline still lists
 "application import set is not proven independently reconstructed" as a blocker.
 The pieces that exist today are the evidence scan, the soundness-preserving
-reduction and the table serializer; connecting thunk and bridge resolution to them
-is the open work.
+reduction (wired into ``clean``) and the table serializer. The set of referenced slots
+that feeds the reduction is intentionally left empty, because a partial native scan
+cannot prove completeness (protector-resident code also uses the table); so the
+blocker always stays, by design. Connecting thunk and bridge resolution to produce a
+*complete* referenced set is the open work.

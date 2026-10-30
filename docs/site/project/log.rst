@@ -109,6 +109,18 @@ Task 6: strict coverage gate
     A pure ``decide_coverage`` where every doubt keeps its blocker. Commit ``1452bb8``. The
     UI was updated to surface the SP2 fields (commit ``31d4d53``).
 
+Value dispatcher for branching functions
+    ``emit_value_dispatcher`` and ``emit_displaced_stub`` in ``vmpx-recompile``, used by
+    ``clean`` to reintegrate recovered branching functions. Commit ``4ef23a2``.
+
+Wiring the soundness cores into ``clean``
+    ``clean_wiring.rs`` connects the coverage gate, the dangling-reference checker and
+    the import reduction to the pipeline (commit ``5b96caa``, ``CleanReport`` schema 3).
+    The OEP, reintegration and ``.vmp`` blockers now drop only when their proof holds.
+    The import blocker always stays, because the referenced-IAT-slot set is intentionally
+    empty. Anti-debug is reported recognition-only. The full clearing path is
+    unexercised end-to-end, since no real VMProtect corpus is available in CI.
+
 Synthetic end-to-end fixture
     A synthetic VM-entry fixture and pipeline test (commit ``7946fd8``).
 
@@ -116,7 +128,7 @@ SP3, SP4, SP5 cores
 -------------------
 
 SP3: application import-set reconstruction
-    ``import_reconstruct.rs`` (commit ``d12fc16``).
+    ``import_reconstruct.rs`` (commit ``d12fc16``), later wired into ``clean``.
 
 SP4: dangling ``.vmp`` reference checker
     ``dangling.rs`` (commit ``4bbc81f``).
