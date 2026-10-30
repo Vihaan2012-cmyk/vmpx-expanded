@@ -130,14 +130,17 @@ fn stage(ui: &mut Ui, name: &str, json: &Value) {
         Some(false) => (BAD, "incomplete"),
         None => (Color32::GRAY, "unknown"),
     };
-    ui.collapsing(RichText::new(format!("{name}: {text}")).color(color), |ui| {
-        if let Some(metrics) = stage.get("metrics").and_then(Value::as_object) {
-            for (key, value) in metrics {
-                field(ui, key, Some(value));
+    ui.collapsing(
+        RichText::new(format!("{name}: {text}")).color(color),
+        |ui| {
+            if let Some(metrics) = stage.get("metrics").and_then(Value::as_object) {
+                for (key, value) in metrics {
+                    field(ui, key, Some(value));
+                }
             }
-        }
-        list(ui, "Diagnostics", stage.get("diagnostics"));
-    });
+            list(ui, "Diagnostics", stage.get("diagnostics"));
+        },
+    );
 }
 
 fn clean(ui: &mut Ui, json: &Value) {
@@ -184,6 +187,7 @@ fn clean(ui: &mut Ui, json: &Value) {
             ui.label(format!("- {}", scalar(blocker)));
         }
     });
+    sp2_sections(ui, json);
     egui::CollapsingHeader::new("Stages")
         .default_open(true)
         .show(ui, |ui| {
@@ -200,6 +204,135 @@ fn clean(ui: &mut Ui, json: &Value) {
     }
     list(ui, "Warnings", json.get("warnings"));
     list(ui, "Errors", json.get("errors"));
+}
+
+fn rva_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "-".into(),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map_or_else(|| n.to_string(), |v| format!("0x{v:08X}")),
+        Some(other) => scalar(other),
+    }
+}
+
+fn metric(stage: Option<&Value>, key: &str) -> Option<u64> {
+    stage?.get("metrics")?.get(key)?.as_u64()
+}
+
+/// Sections for fields added in report schema 2; each degrades to nothing or
+/// "-" when the field is absent.
+fn sp2_sections(ui: &mut Ui, json: &Value) {
+    if let Some(oep) = json.get("oep") {
+        egui::CollapsingHeader::new("OEP")
+            .default_open(true)
+            .show(ui, |ui| {
+                let recovered = oep.get("recovered_entry").filter(|v| !v.is_null());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Recovered entry:").strong());
+                    match recovered {
+                        Some(v) => ui.colored_label(OK, rva_text(Some(v))),
+                        None => ui.colored_label(BAD, "not recovered"),
+                    };
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Complete:").strong());
+                    match oep.get("complete").and_then(Value::as_bool) {
+                        Some(true) => ui.colored_label(OK, "yes"),
+                        Some(false) => ui.colored_label(BAD, "no"),
+                        None => ui.weak("-"),
+                    };
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Protected header entry:").strong());
+                    ui.label(rva_text(oep.get("protected_header_entry")));
+                });
+            });
+    }
+    if json.get("vm_inventory").is_some() {
+        vm_inventory(ui, items(json.get("vm_inventory")));
+    }
+    if let Some(stage) = json.get("input_closed_functions") {
+        let recovered = metric(Some(stage), "recovered");
+        let title = format!(
+            "Input-closed functions (recovered: {})",
+            recovered.map_or_else(|| "-".into(), |n| n.to_string())
+        );
+        egui::CollapsingHeader::new(title)
+            .default_open(recovered.unwrap_or(0) > 0)
+            .show(ui, |ui| {
+                if let Some(metrics) = stage.get("metrics").and_then(Value::as_object) {
+                    for (key, value) in metrics {
+                        field(ui, key, Some(value));
+                    }
+                }
+                list(ui, "Per-entry diagnostics", stage.get("diagnostics"));
+            });
+    }
+    if let Some(stage) = json.get("reintegration") {
+        egui::CollapsingHeader::new("Reintegration metrics")
+            .default_open(true)
+            .show(ui, |ui| {
+                let metrics = stage.get("metrics").and_then(Value::as_object);
+                if metrics.is_none_or(serde_json::Map::is_empty) {
+                    ui.weak("no metrics");
+                }
+                for (key, value) in metrics.into_iter().flatten() {
+                    if key == "section_rva" {
+                        field(ui, key, Some(&Value::String(rva_text(Some(value)))));
+                    } else {
+                        field(ui, key, Some(value));
+                    }
+                }
+            });
+    }
+}
+
+fn vm_inventory(ui: &mut Ui, entries: &[Value]) {
+    let exported = entries
+        .iter()
+        .filter(|e| e.get("reachable_from_export").and_then(Value::as_bool) == Some(true))
+        .count();
+    egui::CollapsingHeader::new(format!(
+        "VM-entry inventory ({}, {exported} export-reachable)",
+        entries.len()
+    ))
+    .default_open(true)
+    .show(ui, |ui| {
+        if entries.is_empty() {
+            ui.weak("none");
+            return;
+        }
+        egui::Grid::new("vm_inventory_grid")
+            .striped(true)
+            .num_columns(4)
+            .show(ui, |ui| {
+                for head in ["rva", "confidence", "sources", "reachable_from_export"] {
+                    ui.strong(head);
+                }
+                ui.end_row();
+                for entry in entries {
+                    ui.monospace(rva_text(entry.get("rva")));
+                    ui.label(entry.get("confidence").map_or_else(|| "-".into(), scalar));
+                    let sources = items(entry.get("sources"))
+                        .iter()
+                        .map(scalar)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ui.label(if sources.is_empty() {
+                        "-".into()
+                    } else {
+                        sources
+                    });
+                    match entry.get("reachable_from_export").and_then(Value::as_bool) {
+                        Some(true) => ui.colored_label(OK, "yes"),
+                        Some(false) => ui.label("no"),
+                        None => ui.weak("-"),
+                    };
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 fn vm_list(ui: &mut Ui, json: &Value) {
