@@ -22,6 +22,7 @@ mod native_context;
 mod native_continuation;
 mod native_exit_state;
 mod native_vm_chain;
+mod neutralize;
 mod oep;
 mod operand_extract;
 mod path_graph;
@@ -132,6 +133,10 @@ pub use native_exit_state::{
 };
 pub use native_vm_chain::{
     NativeVmEntryContinuation, NativeVmEntryContinuationError, continue_through_native_vm_entry,
+};
+pub use neutralize::{
+    DetectedWhen, INTEGRITY_CHECKSUM_INTRINSIC, NeutralizeAction, NeutralizeConstruct,
+    NeutralizeOptions, RecoveredGuard, TIMESTAMP_COUNTER_INTRINSIC_PREFIX, neutralize,
 };
 pub use oep::{OepDecision, decide_oep};
 pub use operand_extract::{
