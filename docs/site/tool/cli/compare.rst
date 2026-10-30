@@ -1,0 +1,82 @@
+compare
+=======
+
+.. program:: vmpx compare
+
+A research-only structural comparison of two PE files. Its output is
+explicitly "never used as recovery input": it exists to help a human compare a
+protected binary with its unprotected original, or an analysis image with its
+conventional-layout counterpart.
+
+Synopsis
+--------
+
+.. code-block:: console
+
+    vmpx compare <LEFT> <RIGHT> [--json]
+
+Options
+-------
+
+.. option:: LEFT
+.. option:: RIGHT
+
+   The two files to compare.
+
+.. option:: --json
+
+   Emit a JSON object.
+
+What is compared
+----------------
+
+* file size
+* PE kind and machine
+* image base, entry point and size of image
+* per section: name, virtual geometry, raw geometry and characteristics, plus
+  sections present in only one image
+* data directories
+* the counts of imports, exports, TLS callbacks and exception functions
+
+Text output
+-----------
+
+Two ``[compare]`` lines naming the files, then either
+``[compare] no modeled structural differences`` or
+``[compare] N modeled structural differences`` followed by one indented line
+per difference, each formatted ``<field>: <left> -> <right>``. Differences do
+not change the exit status.
+
+JSON output
+-----------
+
+.. code-block:: json
+
+    {
+      "schema_version": 1,
+      "left":  { },
+      "right": { },
+      "differences": [ "file_size: 1048576 -> 913408" ]
+    }
+
+``left`` and ``right`` are file summaries:
+
+=======================  ==================================================
+Field                    Contents
+=======================  ==================================================
+``path``, ``sha256``     Identity of the file
+``file_size``            Size in bytes
+``kind``, ``machine``    Image kind and machine code
+``image_base``           Preferred image base
+``entry_point``          Entry RVA
+``size_of_image``        Size of image in memory
+``section_count``        Number of sections
+``import_modules``       Count of import modules
+``import_symbols``       Count of imported symbols
+``exports``              Count of exports
+``tls_callbacks``        Count of TLS callbacks
+``exception_functions``  Count of x64 runtime functions
+``relocation_blocks``    Count of relocation blocks
+``relocation_entries``   Count of relocation entries
+``diagnostics``          Count of structural diagnostics
+=======================  ==================================================

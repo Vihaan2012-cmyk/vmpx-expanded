@@ -1,0 +1,50 @@
+verify
+======
+
+.. program:: vmpx verify
+
+Performs structural validation of a PE without executing it.
+
+Synopsis
+--------
+
+.. code-block:: console
+
+    vmpx verify <INPUT> [--json]
+
+Behaviour
+---------
+
+``verify`` prints the same report as :doc:`info` (text or, with
+:option:`--json`, the same JSON object), then exits with an error
+(``structural verification reported diagnostics``) if the report contains any
+diagnostic. It is therefore suitable as a gate in scripts:
+
+.. code-block:: console
+
+    $ vmpx verify candidate.dll && echo structurally sound
+
+.. option:: INPUT
+
+   The file to validate.
+
+.. option:: --json
+
+   Emit the ``info`` JSON object.
+
+What counts as a diagnostic
+---------------------------
+
+Diagnostics are produced by the parser in :doc:`/tool/crates/pe` wherever a
+directory, table or array disagrees with the rest of the image: a directory
+that points outside the image, a malformed import descriptor, a relocation
+block whose size is inconsistent, an unwind info record that cannot be parsed,
+and similar. Each diagnostic names the stage that found it, for example
+``[imports]`` or ``[tls]``.
+
+.. note::
+
+    ``verify`` does not prove that a file will load. A parseable PE can still
+    fail in the Windows loader, which is why :doc:`/tool/crates/rebuild`
+    provides ``validate_for_loader``, a stricter check used on every image
+    ``clean`` and ``unpack --conventional`` produce.

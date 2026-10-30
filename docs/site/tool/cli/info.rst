@@ -1,0 +1,99 @@
+info
+====
+
+.. program:: vmpx info
+
+Inspects a PE-family file by content, regardless of its extension. It is the
+read-only structural view that every other command builds on.
+
+Synopsis
+--------
+
+.. code-block:: console
+
+    vmpx info <INPUT> [--json]
+
+Options
+-------
+
+.. option:: INPUT
+
+   The file to inspect.
+
+.. option:: --json
+
+   Emit a JSON object instead of the text report.
+
+Text output
+-----------
+
+The text report is a sequence of tagged sections:
+
+``[pe]``
+    Image kind (``Pe32`` or ``Pe32Plus``) and machine name (``x86``,
+    ``x86-64``, ``ARM``, ``ARMv7``, ``ARM64`` or ``unknown``).
+``[file]``
+    The path that was read.
+``[hash]``
+    SHA-256 of the file as uppercase hexadecimal.
+``[headers]``
+    ``image_base``, ``entry_rva``, ``entry_va`` (or ``unrepresentable``),
+    ``size_of_image``, ``section_alignment``, ``file_alignment`` and the
+    subsystem name.
+``[sections]``
+    A count, then one line per section with index, name, virtual address,
+    virtual size, raw pointer, raw size and characteristics.
+``[directories]``
+    Each data directory that is present, with its address kind (RVA or file
+    offset), address and size.
+``[imports]``, ``[exports]``, ``[tls]``, ``[exceptions]``, ``[relocations]``
+    Counts: import modules and symbols, export symbols, TLS callbacks, x64
+    runtime functions, and relocation blocks and entries.
+``[verify]``
+    ``no structural diagnostics`` or a count followed by one
+    ``[stage] message`` line per diagnostic.
+
+JSON output
+-----------
+
+.. code-block:: json
+
+    {
+      "schema_version": 1,
+      "path": "sample.dll",
+      "sha256": "…",
+      "pe": { }
+    }
+
+``pe`` is a ``PeReport``:
+
+====================  ====================================================
+Field                 Contents
+====================  ====================================================
+``schema_version``    Report format version
+``file_size``         Size of the file in bytes
+``nt_headers_offset`` File offset of the NT headers
+``coff``              COFF header (machine, section count, characteristics)
+``optional``          Optional header (kind, image base, entry point,
+                      alignments, size of image, subsystem)
+``entry_point_va``    Entry point as a VA, or null when unrepresentable
+``sections``          Section headers with ``name``, ``virtual_size``,
+                      ``virtual_address``, ``size_of_raw_data``,
+                      ``pointer_to_raw_data`` and ``characteristics``
+``directories``       The 16 data directories
+``imports``           Import modules with their symbols (by name or ordinal)
+``exports``           Export directory with symbols and forwarders, or null
+``tls``               TLS directory with callback VAs, or null
+``exception_functions``  x64 ``RUNTIME_FUNCTION`` table
+``relocations``       Base relocation blocks and entries
+``debug_entries``     Debug directory entries
+``load_config``       Load configuration directory, or null
+``diagnostics``       Structural diagnostics, each ``{stage, message}``
+====================  ====================================================
+
+Notes
+-----
+
+The parser is strict and bounds-checked. A file that violates a structural
+rule does not produce a partial report; it produces a diagnostic, and
+:doc:`verify` turns the presence of diagnostics into a failing exit status.

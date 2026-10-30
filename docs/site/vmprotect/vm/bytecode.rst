@@ -1,0 +1,102 @@
+Bytecode and the Rolling Key
+============================
+
+The bytecode of a virtualized function is a byte stream that the VIP walks. It is
+not stored as a sequence of plain opcodes and operands. Each value is **encrypted**,
+and the decryption of each depends on every value read before it.
+
+Why rolling-key encryption
+--------------------------
+
+A static analyst's first move against any interpreter is to find the bytecode and
+decode it at leisure. A rolling key defeats the "decode it at leisure" part: to
+decode instruction *n* you must have decoded instructions 0 to *n-1*, because
+the key that decrypts *n* was derived from their plaintext. A mere dump of the
+bytecode section is meaningless without simulating the decoder from the start of
+each block.
+
+The same property also gives one useful thing to the analyst: the decoding
+procedure is a pure function of ``(VIP, key, current handler)``, so it can be
+simulated exactly, which is what vmpx does.
+
+Decoding one value
+------------------
+
+To fetch a value of width *w* the handler:
+
+#. reads *w* bits from ``[VIP]`` and advances (or retreats) the VIP;
+#. optionally **combines** the value with the low bits of the key by add,
+   subtract or xor, with the key on either side of the operation;
+#. applies a **chain of reversible transforms**; and
+#. **updates the key** from the decoded value, using a partial-width operation so
+   that only the low *w* bits of the key change.
+
+The reversible transforms vmpx models are ``Add``, ``Sub``, ``Xor``, ``Not``,
+``Neg``, ``Rol``, ``Ror`` and ``Bswap``. Every one is width-truncated and
+invertible, which is what allows the tool to describe the decoder symbolically.
+(``Bswap`` is rejected at 8 bits, where it is the identity.) The chain is different
+in every handler, so the compiler of the protector picks, per handler, a random
+sequence of these.
+
+.. code-block:: nasm
+
+    ; illustrative: fetch a 32-bit operand
+    mov     eax, [rsi]          ; read encrypted dword
+    add     rsi, 4              ; advance VIP
+    xor     eax, ebx            ; combine with the low bits of the key
+    neg     eax                 ; transform chain: neg ...
+    rol     eax, 13             ;                  ... then rol
+    add     eax, 0x5B8E2A17     ;                  ... then add
+    xor     ebx, eax            ; update the key with the decoded value
+    ; eax now holds the plaintext operand
+
+Because the update ``ebx ^= eax`` uses the decoded value, a one-bit change in any
+earlier operand scrambles every later one.
+
+Instruction format
+------------------
+
+Under the relative threaded dispatch that vmpx models (:doc:`dispatch`), one virtual
+instruction is:
+
+#. an optional **operand**, decoded as above; then
+#. a signed **displacement** to the *next handler*, decoded as above.
+
+There is no opcode field. The "opcode" is implicit in which handler is running, and
+the identity of the next handler is carried by the displacement from the current
+one. Writing the current handler's address as *h* and the decoded displacement as *d*:
+
+.. code-block:: text
+
+    next_handler = h + sign_extend(d)
+
+So **handler addresses are never stored in bytecode**; they are reconstructed from
+the chain of displacements, starting from the anchor produced by the bootstrap. A
+handler can also establish a static *handler base* that later displacements are
+relative to.
+
+Block structure
+---------------
+
+The virtualized function is divided into **virtual basic blocks**. Each block is a
+contiguous stretch of bytecode that ends in a virtual jump. A jump's target is an
+address computed on the VM stack. In the 3.x series as published, entering a new
+block re-derives the rolling key from the block's address, so a block cannot be
+decoded out of context, and the same plaintext instruction sequence appears with
+different ciphertext in different blocks.
+
+Consequences for analysis
+-------------------------
+
+* **Bytecode is confined to a section.** A VM's bytecode lives in one section, so a
+  VIP that leaves it proves the decoder state has drifted. vmpx stops with
+  ``BytecodeSectionEscape`` in that case.
+* **No handler table is required.** Because every handler's decoder can be
+  recovered from its own code, vmpx recovers a handler's codec on demand
+  (``recover_and_decode_linear_vm_stream``). A handler with no recoverable codec
+  yields ``MissingHandlerSpec`` rather than an invented operation.
+* **Direction is part of the state.** Ascending and descending VMs are both
+  decoded; the direction is recovered per instance.
+* **The state space is small.** The decoder state is ``(VIP, key, handler)``. If the
+  same state recurs, the decode is in a loop, which vmpx detects
+  (``RepeatedState``).

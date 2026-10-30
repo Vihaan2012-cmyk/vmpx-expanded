@@ -1,0 +1,125 @@
+Entry Stubs and Bootstraps
+==========================
+
+The entry stub
+--------------
+
+When a function is virtualized, its original body is overwritten. At its start the
+protector writes a short **entry stub**; the remaining bytes of the old body are
+erased. The stub is the only part of the function that is still native, and its
+shape is the same across protected functions:
+
+.. code-block:: nasm
+
+    push    0xDEADBEEF          ; per-entry seed (an immediate)
+    call    bootstrap           ; shared by every entry of the same VM instance
+
+The immediate is the **seed**. It is not a pointer; it is an encoded value from
+which the bootstrap derives the initial position and initial key of the bytecode
+for *this* function. Two functions that share a VM share a bootstrap, and differ
+only in their seeds. The call pushes a return address, which, as described below,
+is the continuation of the stub, not an address the VM returns to.
+
+This shape is the reason the stub is detectable even though the rest of the
+function is gone. vmpx scans for it and scores each candidate; the evidence
+weights are listed in :doc:`/tool/cli/vm-list`:
+
+.. code-block:: text
+
+    +10  loader-reachable root
+    +15  immediate-seed push
+    +15  direct call
+    +15  downstream chain saves at least 8 distinct registers
+     +5  saves flags
+    +20  reserves 0x80..0x1000 bytes of stack
+     +5  aligns the stack
+     +5  builds a pointer from a high aligned base
+     +5  state-dependent memory fetches
+    +10  ends in an indirect dispatch
+    --------------------------------------------------
+    an entry needs a total of 60 or more
+
+(The stub itself is only the first two weights; the rest are properties of the
+*bootstrap chain* the call leads to.)
+
+What the bootstrap does
+-----------------------
+
+The bootstrap is where native execution becomes virtual execution. In order:
+
+#. **Save the native state.** Every general-purpose register and the flags are
+   pushed. vmpx requires all fifteen non-``RSP`` registers and an unmodified
+   ``RFLAGS`` to be saved before the frame pointer is captured; this is how it
+   tells a real VM frame from other code that merely pushes registers.
+#. **Reserve the VM frame.** The stack pointer is lowered by a fixed amount
+   (commonly in the range of a few hundred bytes; vmpx accepts 0x80 to 0x1000) to
+   make room for the virtual registers and VM temporaries. The stack is aligned
+   so that native calls from handlers see a conforming ABI.
+#. **Scatter the saved registers into the VM context.** The pushed native values
+   are copied into the context slots. Duplicate slots are legal and the last write
+   wins; this is part of the mutation.
+#. **Decode the seed.** The seed that the stub pushed is read back from the stack
+   at ``[RSP + 8]`` (above the return address pushed by the call). Run through the
+   bootstrap's arithmetic, it yields the initial VIP (typically an offset added to
+   the image base, so the bytecode address is position independent), the initial rolling key and
+   the handler anchor used for the first dispatch.
+#. **Dispatch.** An indirect jump (or the equivalent ``push reg; ret``) enters the
+   first handler.
+
+The seed is evaluated by vmpx on a small concrete machine: it places the seed at
+``[RSP+8]`` at the call target and executes the bootstrap, producing the three
+initial values.
+
+.. code-block:: nasm
+
+    ; illustrative shape only; every build differs
+    bootstrap:
+        push    r15
+        push    r14
+        ...                         ; all other GPRs
+        pushfq
+        mov     rbp, rsp            ; capture the frame
+        sub     rsp, 0x140          ; VM frame
+        and     rsp, -16
+        mov     rax, [rbp+0x80]     ; the seed pushed by the entry stub
+        ; ... arithmetic on rax, image base and a constant ...
+        mov     rsi, rax            ; VIP
+        mov     rbx, <derived>      ; initial rolling key
+        jmp     dispatch
+
+Why a fresh bootstrap per VM instance
+-------------------------------------
+
+Bootstraps are mutated, so two VM instances in one binary do not share bootstrap
+code, and often not the shape of it. vmpx groups entry stubs by the stack
+reservation instruction they reach; stubs that reach the same one share a bootstrap
+and form a ``VmInstance``, whose set of distinct seeds is recorded
+(``distinct_seeds``). See :doc:`instances`.
+
+Roots
+-----
+
+Entry stubs can sit anywhere in code, so discovery needs starting points. vmpx uses:
+
+* the **PE entry point**, for the module's own initialization;
+* every **TLS callback**;
+* an **executable scan** of sections that own the entry point or have entropy of at
+  least 7.0, prefiltered on the opcodes ``0x68`` (``push imm32``) and ``0x6A``
+  (``push imm8``) and then confirmed by decoding;
+* **call-site cross-references** from exported functions, followed through the
+  control-flow graph.
+
+Roots found through the loader (entry and TLS) are *loader-reachable*: the
+operating system will run them. A stub found only by scanning is an *unproven
+executable candidate* until a path to it from a root is shown.
+
+The VM exit as the mirror image
+-------------------------------
+
+The exit sequence is the inverse of the bootstrap: switch the stack pointer from
+the VM stack back to the native stack, pop every saved register, ``popfq`` and
+``ret``. The exit is described in :doc:`context-switch`. Because the exit
+reconstructs *every* native register from the stack, a virtualized function's
+effect on the machine is fully described by the values on the VM stack at the
+moment of exit, which is what makes symbolic recovery of the native exit state
+possible.

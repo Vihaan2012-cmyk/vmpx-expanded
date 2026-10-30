@@ -1,0 +1,206 @@
+Packing
+=======
+
+When the "pack the output file" option is enabled, VMProtect compresses the
+original sections of the program and stores them inside its own sections. A small
+runtime stub restores them in memory before the program starts. The result is a
+file whose section table still describes the original program's layout in memory,
+while the bytes for most of that layout are not in the file at all.
+
+.. note::
+
+    Everything on this page about the ``PACKER_INFO`` table, the rotating key and
+    the LZMA framing is derived from ``crates/vmpx-unpack/src/lib.rs``. The
+    algorithm is reproduced by :doc:`/tool/pipeline/unpacking`.
+
+What the file looks like
+------------------------
+
+A packed file has several characteristics, each of which the detector uses as
+evidence (:doc:`/tool/cli/detect`):
+
+*Initialized virtual-only sections.*
+    The destination sections (what would have been ``.text``, ``.rdata``,
+    ``.data`` and so on) are still in the section table with a non-zero
+    ``VirtualSize`` and the normal content flags, but ``PointerToRawData == 0`` and
+    ``SizeOfRawData == 0``. They occupy address space but no file space. The
+    protector's loader fills them at runtime.
+
+*High-entropy executable sections.*
+    The protector's own sections hold compressed and encrypted data and
+    obfuscated code. Their Shannon entropy is close to the 8 bits per byte
+    maximum. vmpx treats 7.2 bits per byte as the threshold.
+
+*An entry point inside a protector section.*
+    The header entry belongs to a ``.vmp*`` section (or a randomly named section),
+    often one that is both readable and executable, which ordinary compilers
+    never produce.
+
+*Imports, exceptions and TLS in the protector section.*
+    The import, exception and TLS directories often live inside the same section
+    as the entry point.
+
+The ``PACKER_INFO`` table
+-------------------------
+
+The table tells the runtime stub which compressed block goes to which destination
+section. It is an array of 8-byte entries:
+
+.. code-block:: c
+
+    struct PACKER_INFO_ENTRY {
+        uint32_t source_rva;        // RVA of the compressed stream
+        uint32_t destination_rva;   // RVA the stream expands to
+    };
+
+There is one entry per destination section, and the table has no fixed offset: it
+is somewhere inside the protector's data, so vmpx *scans the whole file* for it.
+
+A candidate position is accepted only if every ``source_rva`` maps to a file byte
+equal to ``0x00``. This is the signature of a raw LZMA range-coder stream, whose
+first byte is always zero. That single constraint is strong, because a random
+position is unlikely to satisfy it for *every* entry. Up to 16 candidates are
+collected and exactly one must validate; otherwise vmpx reports ambiguity or
+absence rather than guess.
+
+Two encodings of the table exist.
+
+Legacy plaintext layout
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The destination RVAs are stored in the clear. Entry *i* is valid when its
+destination equals the virtual address of destination section *i*. The dword
+located 8 bytes *before* the table is an RVA pointing at the five LZMA property
+bytes, so the compression properties come from the file.
+
+Encoded layout with a rotating key
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The destination RVAs are obfuscated with a key that rotates with the entry index:
+
+.. code-block:: text
+
+    stored[i] = destination[i] XOR rotl32(key, (i * 7) & 31)
+
+The key itself is not stored anywhere. Because entry 0 is rotated by zero bits,
+
+.. code-block:: text
+
+    stored[0] = destination[0] XOR key       =>   key = stored[0] XOR destination[0]
+
+and ``destination[0]`` must be the virtual address of *some* destination section.
+So vmpx tries each destination section's virtual address as the candidate for
+``destination[0]``, derives the candidate key and checks the whole table:
+
+* every decoded destination must equal the virtual address of a destination
+  section; and
+* the decoded set must be a *permutation* of the destination sections: no
+  duplicates, none missing.
+
+A worked example. Take a key of ``0x1A2B3C4D`` and three destination sections at
+virtual addresses ``0x1000``, ``0x5000`` and ``0x9000``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 10 25 25 20
+
+   * - *i*
+     - ``rotl32(key, 7i & 31)``
+     - stored value
+     - decoded
+   * - 0
+     - ``0x1A2B3C4D``
+     - ``0x1A2B2C4D``
+     - ``0x1000``
+   * - 1
+     - ``0x159E268D``
+     - ``0x159E768D``
+     - ``0x5000``
+   * - 2
+     - ``0xCF13468A``
+     - ``0xCF13D68A``
+     - ``0x9000``
+
+Given only the stored column, trying ``key = 0x1A2B2C4D XOR 0x1000`` recovers the
+key, and the decoded column then validates as a permutation of the section
+addresses. A wrong guess for ``destination[0]`` decodes the later entries to
+values that are not section addresses and is rejected.
+
+In this layout the LZMA properties are not stored in the file at all. The fixed
+constant ``5D 00 00 00 04`` is used, which decodes as follows:
+
+.. note::
+
+    The first byte, ``0x5D``, is the standard LZMA default properties byte
+    (``lc=3, lp=0, pb=2``). In the standard ``.lzma`` header the next four bytes
+    are the dictionary size, little-endian. vmpx's constant lists those four bytes
+    as ``00 00 00 04``, which read as ``0x04000000``, a 64 MiB window. The
+    dictionary size only bounds the history window and does not change how a
+    stream that fits in memory decodes.
+
+LZMA framing
+------------
+
+Each block is a headerless raw LZMA stream. Standard decoders expect a 13-byte
+``.lzma`` header: one properties byte, a four-byte dictionary size, and an
+eight-byte uncompressed size. vmpx synthesizes the header from the five property
+bytes and sets the uncompressed size to ``u64::MAX``, which the format defines as
+"unknown", so the decoder runs until it sees the **end marker** in the stream.
+
+A practical complication: the stream is followed by unrelated PE bytes, and a
+standalone LZMA decoder rejects trailing input. vmpx handles this by retrying with
+exactly the number of bytes the first attempt consumed up to the end marker. That
+length is derived from the stream, not guessed.
+
+Bounds
+~~~~~~
+
+Decompression is bounded so a malformed file cannot exhaust memory: output cannot
+exceed the destination span, the LZMA decoder has a 128 MiB memory limit, the
+default maximum image size is 2 GiB and at most 256 packed sections are accepted.
+
+Restoring the image
+-------------------
+
+What the protector's runtime stub does at load time, vmpx does statically:
+
+#. Allocate ``SizeOfImage`` bytes and place the headers.
+#. Copy each file-backed section to its virtual address.
+#. For each table entry, decompress the stream into the destination section.
+
+The span available to a destination section is the distance to the next section's
+start (or to the end of the image for the last section) and must be at least the
+section's ``VirtualSize``. A block that decompresses to fewer bytes than the
+virtual size produces a warning, because the tail of the section is legitimately
+zero in many programs (``.data`` and ``.bss``).
+
+Post-conditions in the real loader
+----------------------------------
+
+The runtime stub does more than decompress. In general it also:
+
+* applies base relocations to the restored sections if the module was not loaded
+  at its preferred base;
+* resolves the original imports (see :doc:`imports`) and writes the import address
+  table;
+* restores per-section memory protection to match the original characteristics;
+* initializes the protector's own state: the VM contexts, integrity-check
+  tables, the anti-debug checks (:doc:`anti-analysis`); and
+* transfers control to the original entry point.
+
+These actions are **not** reproduced by vmpx's unpacker. The static unpacker
+produces the *memory image as it would be after decompression*, with imports still
+in their protector-era form. The remaining steps are addressed separately: imports
+by the import-reconstruction work (:doc:`imports`), the entry by OEP recovery
+(:doc:`devirtualization/index`).
+
+Why static unpacking works
+--------------------------
+
+Packing is a data-hiding technique, not a semantic one. The decompressor and its
+parameters have to be present in the file for the program to run at all, so a
+static analyst can always find them. The defenses VMProtect adds are all about
+making that search tedious: the table has no fixed offset, the destination RVAs are
+encoded, the LZMA properties are omitted, and the stream is followed by unrelated
+bytes. Each is defeated by an invariant that a *correct* table must satisfy and a
+random guess almost never will.

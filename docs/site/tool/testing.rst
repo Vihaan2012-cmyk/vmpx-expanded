@@ -1,0 +1,96 @@
+Testing and Verification Strategy
+=================================
+
+vmpx has no protected corpus in continuous integration: protected binaries are
+proprietary and cannot be redistributed. Correctness is therefore verified at two
+levels, and the project is explicit about which level each claim rests on.
+
+Primary oracle: synthetic fixtures
+----------------------------------
+
+Reproducible, requires no proprietary samples, runs in CI. The fixtures follow the
+repository's existing ``p06_*`` style:
+
+* ``crates/vmpx-vm/tests/p06_bootstrap.rs`` (bootstrap recovery)
+* ``p06_handler_slice.rs``, ``p06_native_context.rs``,
+  ``p06_stateful_decoder.rs``, ``p06_table_checksum.rs``,
+  ``p06_transform_regression.rs``
+* ``fixture_discovery.rs`` and ``call_effects.rs``
+* ``synthetic_pipeline.rs`` with ``tests/support/synth_vm.rs``, a synthetic
+  VM-entry fixture that is built in memory and run through the end-to-end
+  pipeline
+
+The synthetic VM fixture is the strongest in-repo check of the pipeline: a minimal
+PE with a trivial VM entry whose handler chain transitions to a known native RVA,
+used to assert the OEP decision and the recovery of entries.
+
+The full workspace is exercised with:
+
+.. code-block:: console
+
+    $ cargo test --workspace
+
+At the time of writing the sources contain several hundred ``#[test]`` functions
+across the workspace, and the design reviews quote the passing totals at each
+milestone (239 after SP1, 286 after SP2's recovery tasks).
+
+Test style
+~~~~~~~~~~
+
+* Every component gets fixtures *before* its implementation. The TDD red state is
+  verified, for example by stubbing the function.
+* Refusal paths are tested with the same weight as success paths. Where a
+  refusal test originally asserted only ``is_err()``, it was strengthened to
+  assert the specific error.
+* Panic-free scans: the deferred-cleanup pass added tests and a scan that the
+  analysis paths do not panic on malformed input.
+* Decoding tests re-decode emitted machine code and assert that branch targets
+  resolve to the intended absolute addresses (the dispatcher tests).
+
+Secondary oracle: local samples
+-------------------------------
+
+Real VMProtect-protected samples held locally on the author's machine are used
+for behavioural spot-checks only. They are **never committed, never shared and never
+uploaded**. The large-fixture regressions in
+``crates/vmpx-cli/tests/clean_command.rs`` are ``#[ignore]``\ d and read the
+directory named by ``VMPX_FIXTURE_DIR`` (default ``testfilevmp``):
+
+.. code-block:: console
+
+    $ VMPX_FIXTURE_DIR=/path/to/fixtures cargo test -p vmpx-cli -- --ignored
+
+The strongest out-of-band check is to protect unprotected originals that have
+known-good oracle outputs, run ``vmpx clean --experimental`` and compare behaviour.
+Original-and-protected pairs are produced locally; none are in the repository.
+
+What each level proves
+----------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 36 36
+
+   * - Level
+     - Proves
+     - Does not prove
+   * - Unit and synthetic
+     - The implemented logic is correct for the constructed cases and refuses
+       what it should refuse
+     - That real VMProtect output looks like the fixtures
+   * - Differential verifier
+     - A replacement matches its VM routine over the recovered finite domain
+     - Equivalence outside that domain
+   * - Local sample, out-of-band
+     - Observed behaviour on one build of one program
+     - Anything about other builds or programs
+
+Every milestone in the project log states what it proved and what it did not.
+
+Quality gates
+-------------
+
+The workspace enables ``clippy::all`` and ``clippy::pedantic`` as warnings and
+``unsafe_code = "forbid"`` (except in ``vmpx-vtil-sys``). Reviews are done
+task-by-task with a spec-compliance pass and a code-quality pass, then a whole
+branch review before merge.

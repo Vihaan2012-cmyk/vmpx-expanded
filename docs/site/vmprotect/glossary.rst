@@ -1,0 +1,138 @@
+Glossary
+========
+
+.. glossary::
+
+   analysis image
+      The RVA-layout image that ``vmpx unpack`` produces: every section has
+      ``PointerToRawData == VirtualAddress`` and ``SizeOfRawData == VirtualSize``.
+      Not loadable by the Windows loader.
+
+   blocker
+      A statement of a proof that does not yet exist, recorded in
+      ``CleanReport.blockers``. Sound output is written only when none remain.
+
+   bootstrap
+      The native code a VM entry stub calls to save the native state, build the VM
+      frame, decode the seed and begin dispatch.
+
+   bytecode
+      The encoded virtual instructions of a virtualized function.
+
+   codec
+      A recovered description of how a value is decoded from bytecode: optional
+      combination with the rolling key, a chain of reversible transforms and a key
+      update.
+
+   conventional layout
+      An ordinary PE file layout in which each section's raw data sits at a file
+      offset that need not equal its RVA. Loadable by the Windows loader.
+
+   dispatch
+      The step between handlers: determine the next handler and jump to it.
+
+   domain (input domain)
+      The finite set of values an input register can take for the purpose of
+      enumerating a function's paths. For a ``DllMain`` entry, ``rdx`` over 0 to 3.
+
+   entry stub
+      The short native sequence ``push <seed>; call <bootstrap>`` left at the start of
+      a virtualized function.
+
+   epoch
+      A unique identifier given to each dynamic native call or memory snapshot so that
+      two identical calls are never assumed to return the same value.
+
+   experimental output
+      The reintegrated image that ``--experimental`` writes regardless of blockers.
+      Unverified.
+
+   fail closed
+      The design rule that ambiguity yields a report and no result, never a guess.
+
+   handler
+      The native code that implements one virtual operation and dispatches onward.
+
+   havoc
+      The loss of precise knowledge of tracked memory after a store that may alias it or
+      an unknown native call.
+
+   IAT
+      Import address table. The array of pointers the loader fills with the addresses of
+      imported functions.
+
+   initialized virtual-only section
+      A section with a non-zero ``VirtualSize``, no raw data on disk and no
+      uninitialized-data flag. The destination of a packed block.
+
+   input-closed
+      Describes a native exit that is a pure function of the constants, registers and
+      pure intrinsics a replacement provides.
+
+   intrinsic
+      A named opaque or semi-opaque operation in the expression IR, for example
+      ``read_timestamp_counter_*``, ``vm_flags_add_w32`` or
+      ``table_checksum_low_byte_xor_recurrence_w32``.
+
+   live-in
+      A register whose first access in a routine is a read.
+
+   LZMA
+      The compression algorithm the packer uses, as a headerless raw stream terminated
+      by an end marker.
+
+   mutation
+      The transformation of native code into a larger, equivalent, less readable form.
+
+   native exit state
+      The exact value of every native register, the flags and the return address when a
+      VM hands control back to native code, expressed over the inputs.
+
+   OEP
+      Original entry point: where the unprotected program would have begun executing.
+
+   opaque predicate
+      A conditional whose outcome is fixed but not obviously so.
+
+   PACKER_INFO
+      The table of ``{source_rva, destination_rva}`` entries that tells the runtime
+      which compressed block expands to which section.
+
+   profile
+      The recovered register roles, bytecode direction and dispatch codec of one VM
+      instance.
+
+   proof gate
+      The final check in ``clean`` that allows sound output only when the blocker list
+      is empty.
+
+   recovered
+      Passed verification. Never merely asserted.
+
+   rolling key
+      The register combined with each bytecode operand and updated by each decoded
+      value, so operands can only be decoded in order.
+
+   RVA
+      Relative virtual address: an offset from the image base.
+
+   seed
+      The immediate pushed by an entry stub, from which the bootstrap derives the
+      initial VIP and key.
+
+   threaded dispatch
+      A dispatch style in which each handler ends by jumping directly to the next,
+      without a central loop.
+
+   VIP
+      Virtual instruction pointer: the native register that points at the next bytecode.
+
+   VM instance
+      One virtual machine with its own bootstrap, handlers and register roles. A binary
+      may contain several.
+
+   VSP
+      Virtual stack pointer: the native register that addresses the VM operand stack.
+
+   vmp section
+      A section whose name begins with ``.vmp``: the protector's.

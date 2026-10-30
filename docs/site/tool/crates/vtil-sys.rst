@@ -1,0 +1,121 @@
+vmpx-vtil-sys
+=============
+
+A feature-gated FFI binding to the native VTIL optimizer bridge in
+``native/vtil-bridge``. This is the only crate in the workspace that permits
+``unsafe`` code (``unsafe_code = "allow"``); every other crate forbids it.
+
+`VTIL <https://github.com/vtil-project/VTIL-Core>`_ is an intermediate language and
+optimizer designed for exactly this problem: lifting obfuscated and virtualized
+code to a form that an optimizer can reduce to something readable.
+
+Why a bridge
+------------
+
+VTIL is a C++ library with heavy static initialization and exceptions. The bridge
+(``native/vtil-bridge``) is a small ``extern "C"`` layer, so Rust never sees C++
+types or has an exception cross the boundary:
+
+* ``include/vmpx_vtil.h`` declares the C interface;
+* ``src/vmpx_vtil.cpp`` implements it over VTIL;
+* ``CMakeLists.txt`` builds it as the static library ``vmpx-vtil-bridge``.
+
+The C interface
+---------------
+
+.. code-block:: c
+
+    typedef enum vmpx_vtil_status {
+        VMPX_VTIL_OK = 0,
+        VMPX_VTIL_INVALID_ARGUMENT = 1,
+        VMPX_VTIL_INVALID_STATE = 2,
+        VMPX_VTIL_BUFFER_TOO_SMALL = 3,
+        VMPX_VTIL_INTERNAL_ERROR = 4
+    } vmpx_vtil_status;
+
+    typedef struct vmpx_vtil_stats {
+        uint64_t blocks;
+        uint64_t instructions;
+        uint64_t branches;
+        uint64_t local_optimizations;
+    } vmpx_vtil_stats;
+
+    const char* vmpx_vtil_revision(void);
+    vmpx_vtil_status vmpx_vtil_create_amd64(uint64_t entry_vip,
+        vmpx_vtil_routine** output, char* error, size_t error_capacity);
+    void vmpx_vtil_destroy(vmpx_vtil_routine* routine);
+    /* alloc_register, emit_mov_imm, emit_add_imm, finish, optimize, stats, serialize */
+
+Every fallible call takes an error buffer and returns a ``vmpx_vtil_status``.
+
+The Rust API
+------------
+
+The types are always available:
+
+.. code-block:: rust
+
+    pub const NATIVE_LINKED: bool = cfg!(feature = "vtil");
+
+    #[repr(u32)]
+    pub enum Status { Ok, InvalidArgument, InvalidState, BufferTooSmall, InternalError }
+
+    #[repr(C)]
+    pub struct Stats { pub blocks: u64, pub instructions: u64, pub branches: u64, pub local_optimizations: u64 }
+
+    pub struct VtilError { pub status: Status, pub message: String }
+
+With the ``vtil`` feature enabled, the safe wrapper is also exported:
+
+.. code-block:: rust
+
+    pub struct RegisterId(pub u64);       // 1-based handle
+    pub struct Routine { /* owned, freed on drop */ }
+
+    pub fn revision() -> &'static str;    // pinned VTIL-Core revision
+
+    impl Routine {
+        pub fn new_amd64(entry_vip: u64) -> Result<Self, VtilError>;
+        pub fn alloc_register(&mut self, bit_width: u16) -> Result<RegisterId, VtilError>;
+        pub fn emit_mov_imm(&mut self, reg: RegisterId, value: u64) -> Result<(), VtilError>;
+        pub fn emit_add_imm(&mut self, reg: RegisterId, value: u64) -> Result<(), VtilError>;
+        pub fn finish(&mut self, output: RegisterId) -> Result<(), VtilError>;
+        pub fn optimize(&mut self) -> Result<(), VtilError>;
+        pub fn stats(&self) -> Result<Stats, VtilError>;
+        pub fn serialize(&self) -> Result<Vec<u8>, VtilError>;
+    }
+
+``optimize`` runs VTIL's ``optimizer::apply_all`` over the finished block.
+
+Building with the native library
+--------------------------------
+
+The feature is off by default so the workspace builds without the native library.
+To enable it:
+
+#. Build ``native/vtil-bridge`` with CMake (use a Release build on MSVC). It
+   produces ``vmpx-vtil-bridge`` and links against ``VTIL-Compiler``,
+   ``VTIL-SymEx``, ``VTIL-Architecture``, ``VTIL-Common``, ``keystone`` and
+   ``capstone``.
+#. Set ``VMPX_VTIL_LIB_DIRS`` to the directories that hold those static libraries
+   (a platform path list: ``;`` on Windows, ``:`` elsewhere).
+#. Build with the feature:
+
+   .. code-block:: console
+
+       $ cargo build -p vmpx-vtil-sys --features vtil
+
+``build.rs`` panics with an explanatory message if the feature is enabled without
+``VMPX_VTIL_LIB_DIRS``. On MSVC it also links ``shell32`` and ``ole32`` (keystone
+needs them) and passes ``/STACK:67108864`` to tests, because VTIL's static
+initializers overflow the default 1 MiB main stack. Link arguments do not
+propagate to dependents, so any binary that links this crate must pass the same
+flag.
+
+Status
+------
+
+The binding and its round-trip test exist, but the optimizer is not yet part of
+the ``clean`` pipeline; the ``vtil`` stage report is a stub. Wiring it in is
+sequenced behind a trusted differential verifier
+(:doc:`/tool/pipeline/verification`).

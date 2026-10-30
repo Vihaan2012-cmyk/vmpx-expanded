@@ -1,0 +1,74 @@
+vmpx-disasm
+===========
+
+x86-64 decoding, control-flow-graph recovery, IAT-reference scanning, direct-jump
+fragment tracing, register-dispatch proofs and dangling-reference collection.
+*Depends on:* ``vmpx-pe``, ``iced-x86``.
+
+Decoding
+--------
+
+.. code-block:: rust
+
+    pub fn decode_one(pe: &PeImage<'_>, rva: Rva) -> Result<DecodedInstruction, DisasmError>;
+    pub fn is_executable_rva(pe: &PeImage<'_>, rva: Rva) -> bool;
+
+``DecodedInstruction`` carries an ``InstructionSummary`` (mnemonic, operands,
+``RegisterEffect`` and ``MemoryEffect`` lists), ``next_rva`` and
+``direct_target_rva`` for direct branches. ``file_offset_for_instruction`` maps an instruction to its file offset. Decoding is done with ``iced-x86``;
+the summary types are vmpx's own, so downstream crates never depend on ``iced``
+types directly.
+
+Control-flow recovery
+---------------------
+
+``recover_cfg(pe, start, CfgLimits)`` builds a ``ControlFlowGraph`` of
+``BasicBlock`` values. ``CfgLimits`` bounds ``max_blocks``,
+``max_instructions`` and ``max_instructions_per_block``; ``CfgStatus`` records
+whether the graph is ``Complete`` or stopped on a ``ResourceLimit`` or a
+``DecodeError``. The export-dependency walk in
+:doc:`cli` uses limits of 2,048 blocks, 60,000 instructions and 8,192 per block.
+
+IAT references
+--------------
+
+.. code-block:: rust
+
+    pub fn find_ip_relative_references(...);
+    pub fn find_ip_relative_references_resync(...) -> ResyncReferenceReport;
+    pub fn find_ip_relative_references_resync_in_ranges(...) -> ResyncReferenceReport;
+
+The *resync* variants decode from independent start points to recover
+instruction boundaries lost to overlapping or junk-filled code. Findings are
+decoded candidates, not proven-reachable references. See :doc:`/tool/cli/imports`.
+
+Direct-jump tracing
+-------------------
+
+VMProtect scatters code into fragments connected by unconditional jumps.
+``trace_direct_jump_fragments`` follows such chains, bounded by
+``DirectJumpTraceLimits``, and returns a ``DirectJumpTrace`` made of
+``DirectJumpFragment`` values and a ``DirectJumpTraceStop`` (with a
+``DirectJumpTraceStopKind``) that says why tracing ended.
+
+Dispatch proof
+--------------
+
+``prove_register_dispatch_postlude`` proves, over a bounded state space (defaults:
+50,000 states, stack depth 256, ``RegisterDispatchProofLimits``), that every
+direct-flow successor of a handler reaches a dispatch through a given register
+without clobbering it. The result is a ``RegisterDispatchProof``.
+
+Dangling references
+-------------------
+
+.. code-block:: rust
+
+    pub fn collect_dangling_refs(pe: &PeImage<'_>, covered: &BTreeSet<Rva>) -> Vec<DanglingRef>;
+    pub fn collect_dangling_refs_with(...) -> Vec<DanglingRef>;
+    pub fn classify_target(sections: &[Section], covered: &BTreeSet<Rva>, target: Rva) -> TargetClass;
+    pub fn is_vmp_section_name(name: &str) -> bool;
+    pub fn vmp_section_containing(sections: &[Section], rva: Rva) -> Option<&Section>;
+    pub fn first_vmp_overlap(sections: &[Section], start: u32, size: u32) -> Option<Rva>;
+
+See :doc:`/tool/pipeline/imports-and-stripping`.

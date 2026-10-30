@@ -1,0 +1,174 @@
+VM Recovery
+===========
+
+*Crates:* :doc:`/tool/crates/vm`, :doc:`/tool/crates/disasm`
+*Command:* :doc:`/tool/cli/vm-list`
+
+This stage turns "an area of high-entropy code" into a precise model of a
+virtual machine instance: where its entries are, which native registers play
+which role, how bytecode is decoded, and what each handler does. Nothing in it
+is signature-based. As the source puts it, "no handler bytes, addresses, or
+fixed register allocation are assumed."
+
+The model
+---------
+
+The code models a threaded-dispatch virtual machine. A *virtual instruction
+pointer* (VIP) walks encoded bytecode, a *rolling key* decodes it, and each
+decoded token steers a native *handler* that performs one operation on a VM
+stack (addressed by the VSP) and a context. ``VmContextLayout`` records the
+roles: VIP register, optional VSP register, rolling-key register, handler
+register, native-context register, context base register, allocation size and
+bytecode direction.
+
+Entry discovery
+---------------
+
+``discover_vm_entries`` finds stubs of the form ``push <seed>; call
+<bootstrap>`` and scores them with the weights listed in :doc:`/tool/cli/vm-list`.
+``analyze_vm_entry_at`` scores a single address, which the export-dependency
+walk uses. Entries that reach the same stack-reservation instruction share a
+bootstrap and are grouped as one ``VmInstance``.
+
+Bootstrap and mutated register roles
+------------------------------------
+
+*Modules:* ``bootstrap.rs``, ``native_context.rs``.
+
+The bootstrap saves the native state, builds the VM frame and dispatches into
+the first handler. The code requires a saved native frame: all fifteen non-RSP
+general-purpose registers and unmodified ``RFLAGS`` must be saved before a
+full-width ``mov cursor, rsp`` capture. A *context scatter* then copies saved
+values into VM context slots. Duplicate slots are legal, and the last write
+wins.
+
+Which native registers play VIP, rolling key and handler differs per VM
+instance, because register allocation is one of the things the protector
+mutates. The recovery therefore enumerates architectural role assignments and
+accepts only those that form a behaviourally valid dispatch slice.
+
+The terminal dispatch can be an indirect branch through a register or the
+equivalent ``push reg; ret``. Both are accepted, because "which one a given VM
+instance uses is a mutation, not a semantic difference".
+
+The seed is evaluated concretely: a small concrete machine places it at
+``[RSP+8]`` at the call target (it is the ``push`` before the call) and
+executes the bootstrap, yielding the initial VIP, the initial rolling key and
+the handler anchor.
+
+Bytecode direction can be ascending or descending (descending streams
+pre-decrement the VIP before each read). It is a recovered property of the VM
+instance, not an assumption.
+
+Dispatch extraction and handler slices
+--------------------------------------
+
+*Modules:* ``dispatch_extract.rs``, ``handler_slice.rs``, and in
+:doc:`/tool/crates/disasm` ``trace.rs`` and ``dispatch_proof.rs``.
+
+VMProtect scatters handler fragments across the image, so RVA order is not
+execution order. Handlers are traced as direct-jump fragment chains and
+linearized by control-flow reachability.
+
+A conservative *backward slice* keeps only the instructions that define
+live-out registers (the VIP, key and handler registers) or flags. Memory
+accesses are kept. Calls and exception-like transfers are barriers that retain
+all predecessors. Direct jumps that only connect fragments are labelled
+structural.
+
+From the slice, every VIP-relative load is considered independently as a
+candidate *relative-dispatch codec*: how the next handler is computed from
+bytecode. Rejected candidates keep a diagnostic; none are guessed.
+
+A *postlude proof* (``prove_register_dispatch_postlude``) shows that every
+direct-flow successor reaches a dispatch through the handler register without
+clobbering it, over a bounded state space (defaults: 50,000 states, stack
+depth 256).
+
+The stateful decoder
+--------------------
+
+*Modules:* ``decoder.rs``, ``transform.rs``, ``codec_recovery.rs``.
+
+The decoder state is ``(VIP, rolling_key, handler)``
+(``RelativeDispatchState``).
+
+A ``KeyedTransformCodec`` decodes one value of a given width: optionally
+combine the encoded value with the low bits of the rolling key (add, sub or
+xor, with the key on either side), apply a transform chain, then update the
+rolling key with the decoded value using a partial-width operation (only the
+low bits of the key change).
+
+The transform operations are ``Add``, ``Sub``, ``Xor``, ``Not``, ``Neg``,
+``Rol``, ``Ror`` and ``Bswap`` (``Bswap`` is rejected at 8 bits). All are
+width-truncated and reversible, which is what allows the encoded operand to be
+decoded.
+
+One VM instruction is: decode an optional operand, then decode a signed
+displacement. The next handler is::
+
+    next_handler = current_handler + sign_extend(displacement)
+
+The handler address is therefore never stored directly in bytecode. A handler
+may also set a static *handler base* anchor.
+
+``decode_linear_vm_stream`` runs until a stop condition:
+
+``MissingHandlerSpec``
+    No codec could be recovered for the handler. Never filled with an
+    invented operation.
+``ControlFlowBoundary``
+    A branch, native transition, native call or VM exit. These end a linear
+    block and are handled by the virtual-CFG explorer.
+``InvalidHandlerAddress``, ``NativeHandlerError``, ``BytecodeError``
+    The decoded state is outside the image or the handler cannot be analysed.
+``RepeatedState``, ``InstructionLimit``
+    Loop or budget guards.
+``BytecodeSectionEscape``
+    Bytecode for a profile is confined to one section, so a VIP that leaves it
+    "proves the decoder state has drifted".
+
+``recover_and_decode_linear_vm_stream`` recovers each handler's codecs on
+demand, so no external handler table is needed.
+
+Operand and effect extraction
+-----------------------------
+
+*Modules:* ``operand_extract.rs``, ``effect_extract.rs``, ``value_flow.rs``,
+``model.rs``.
+
+Operand codecs are recovered from VIP-relative load intervals, excluding loads
+already proven to be dispatch decodes. The cursor timing of a proven profile
+decides which load is which.
+
+Handler *effects* are extracted from the semantic prefix of a handler
+(everything before the encoded-dispatch load): native memory reads and writes by
+region, VSP adjustment, arithmetic and VM-visible flag effects.
+``classify_handler_effects`` assigns a semantic only for families whose
+normalized shape is unambiguous; everything else stays ``Unknown`` with its
+evidence. ``prove_handler_value_flow`` adds a def-use proof, because "shape
+agreement alone is not sufficient".
+
+The recognized ``VmHandlerSemantic`` set:
+
+* stack and registers: ``Push``, ``Pop``, ``ConstantPush``,
+  ``VirtualRegisterRead``, ``VirtualRegisterWrite``, ``StackAdjust``
+* memory: ``MemoryLoad``, ``MemoryStore``
+* arithmetic and logic: ``Add``, ``Sub``, ``Mul``, ``UnsignedDivide``, ``Xor``,
+  ``And``, ``Or``, ``Nor``, ``Nand``, ``Not``, ``Neg``, shifts and rotates,
+  ``Compare``, ``Flags``, ``SignExtend``, ``ZeroExtend``
+* control: ``Dispatch``, ``ConditionalBranch``, ``UnconditionalBranch``,
+  ``NativeTransition``, ``NativeCall``, ``VmExit``, ``ContextInitialize``
+* integrity and timing: ``TableChecksum``, ``ReadTimestampCounter``
+* ``Unknown``
+
+The expression folder encodes one VMProtect idiom explicitly: the pair
+``not(not(x) + a) + b`` "expresses a plain pointer adjustment" and is folded to
+``x + (b - a)``. Without it, stack-relative addresses stay opaque.
+
+Discovery limits
+----------------
+
+Everything above is bounded so that a hostile or merely unusual binary cannot
+make the analysis run forever. Exceeding a bound is reported as a stop reason
+or a ``resource_limited`` flag, never silently ignored.

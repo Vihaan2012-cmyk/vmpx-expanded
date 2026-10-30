@@ -1,0 +1,94 @@
+Overview
+========
+
+vmpx is an evidence-driven static-analysis toolkit for VMProtect-protected
+Windows PE files. The Rust workspace is edition 2024, ``rust-version = "1.88"``,
+MIT licensed, and forbids ``unsafe`` code workspace-wide (the one exception is
+the feature-gated FFI binding in :doc:`crates/vtil-sys`). The command-line
+binary is named ``vmpx`` (package ``vmpx-cli``); the analysis logic lives in
+library crates that can be used independently.
+
+Everything is static. An input file is parsed, unpacked by re-implementing the
+protector's own decompression, and symbolically executed. No target
+instruction is ever run. Two consequences follow, and they shape the rest of
+the design:
+
+* Runtime defenses never fire. There is no live process, no PEB, no timing
+  source and no breakpoint for an anti-debug check to observe. The checks are
+  still present in the protected code, and the tool recovers the handlers that
+  implement them as static semantics (see :doc:`/vmprotect/anti-analysis`).
+* Nothing is ever observed; everything is proven. A path through a virtualized
+  routine is either decoded and symbolically executed to a native exit state,
+  or it is reported as a blocker with the reason it could not be.
+
+Goals
+-----
+
+The long-term goal is clean, behavior-preserving ("reversible") devirtualized
+output: a PE that does what the protected file did, with the VMProtect
+sections removed. The project reaches that goal as a ladder of independently
+testable milestones rather than a single finish line:
+
+====  =======================================================  ================================
+Rung  Milestone                                                Status
+====  =======================================================  ================================
+L1    Native replacements spliced into a new section, entry    Implemented; behind
+      and TLS callbacks redirected                             ``--experimental``
+L2    Proven original entry point and every reachable          Analysis implemented; emission
+      virtualized routine recovered                            partial
+L3    Imports reduced to the proven application set            Library implemented; not wired
+                                                               into ``clean``
+L4    Dangling ``.vmp`` references resolved and sections       Reference checker implemented
+      stripped
+L5    Optimized recompilation and differential verification    Verifier and neutralize
+                                                               transform implemented
+====  =======================================================  ================================
+
+See :doc:`/project/roadmap` for the detailed status of each sub-project.
+
+What "recovered" means
+----------------------
+
+Without a protected corpus in continuous integration, "recovered" does not mean
+that a behaviour was observed. It means the result passed synthetic
+verification and review. Recovery is deliberately strict: where soundness is
+not provable the tool refuses and keeps a *blocker* rather than guessing.
+Ambiguity is preserved in a report and produces no result. Many doc comments in
+the code say this explicitly, for example "no unknown value is invented" and
+"it never guesses a missing operation".
+
+The full model, including the proof gate, the two kinds of output and the list
+of blockers, is described in :doc:`soundness`.
+
+Anatomy of a run
+----------------
+
+The ``clean`` subcommand chains the libraries in a fixed order:
+
+#. :doc:`crates/detect` classifies the input and its layout.
+#. :doc:`crates/unpack` restores packed sections when the layout is
+   ``PackedVirtualSections``; otherwise the input is analysed as-is.
+#. :doc:`crates/vm` discovers VM entries, recovers the bootstrap and handler
+   codecs, and symbolically executes VM paths to native exit states.
+#. :doc:`crates/vmlift` collects the path effects and builds replacements;
+   :doc:`crates/recompile` lowers them to x86-64.
+#. :doc:`crates/rebuild` relayouts the image to a conventional PE, validates
+   it for the Windows loader, and, when replacements exist, appends a section
+   and redirects entry points.
+
+Each stage is described in :doc:`pipeline/index`.
+
+Scope and non-goals
+-------------------
+
+* vmpx targets PE32+ (x86-64) images. PE32 files parse, but the reintegration
+  machinery is PE32+ only.
+* "Any binary" is a direction, not a guarantee. Correctness is proven on the
+  synthetic fixtures the repository constructs and confirmed out-of-band on
+  local samples. Coverage is bounded by the VMProtect constructs that have been
+  lifted and proved; outside that, the sound path refuses.
+* Behavior-reversible, not bit-reversible. See the note on the front page.
+* vmpx is a research and malware-analysis tool. It does not execute the input
+  and the CLI and library crates have no network, process-spawning or
+  dynamic-loading surface (only the optional :doc:`ui` launches a process:
+  the ``vmpx`` CLI itself).

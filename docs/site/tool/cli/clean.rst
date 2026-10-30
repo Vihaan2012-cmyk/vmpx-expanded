@@ -1,0 +1,184 @@
+clean
+=====
+
+.. program:: vmpx clean
+
+Runs the complete proof-gated recovery pipeline and emits a clean PE only when
+it is safe to do so.
+
+Synopsis
+--------
+
+.. code-block:: console
+
+    vmpx clean <INPUT> <OUTPUT> [--report <PATH>] [--reconstructed <PATH>] [--experimental <PATH>]
+
+Arguments
+---------
+
+.. option:: INPUT
+
+   The PE to analyse.
+
+.. option:: OUTPUT
+
+   Where the clean PE would be written. It is written only when the proof gate
+   clears (see :ref:`clean-proof-gate`).
+
+.. option:: --report PATH
+
+   Write the versioned JSON recovery report (``CleanReport``, currently
+   ``schema_version`` 2; see :doc:`reports`) even when the proof gate refuses
+   output.
+
+.. option:: --reconstructed PATH
+
+   Also write the conventional-layout image of the unpacked analysis image. It
+   is loadable and structurally valid but not devirtualized: protector
+   sections and VM handlers remain. It is written, and reparsed from disk,
+   before the gate decision, so it is produced even when the gate refuses.
+
+.. option:: --experimental PATH
+
+   Write the reintegrated image to ``PATH`` regardless of the proof gate, with
+   a warning on standard error. The report gains ``experimental: true``. This
+   does not relax the gate: the sound ``OUTPUT`` is still written only when
+   the proof gate clears. See :ref:`experimental-output`.
+
+What it does
+------------
+
+#. Detects VMProtect evidence and classifies the layout (:doc:`/tool/crates/detect`).
+#. Unpacks the packed virtual sections if present (:doc:`/tool/crates/unpack`).
+#. Discovers VM entries, builds a deduplicated inventory that merges the
+   executable scan with export cross-references, and recovers the header
+   entry, TLS callbacks and input-closed functions (:doc:`/tool/crates/vm`).
+#. Decides the original entry point from the proven native continuation
+   (:doc:`/tool/pipeline/oep-recovery`).
+#. Lifts every recovered path to a semantic routine and compiles native
+   replacements (:doc:`/tool/crates/vmlift`, :doc:`/tool/crates/recompile`).
+#. Appends a ``.vmpx0`` section with the replacements, redirects the header
+   entry and TLS callbacks, redirects single-body function stubs, converts to
+   a conventional layout and validates it for the Windows loader
+   (:doc:`/tool/crates/rebuild`).
+#. Applies the proof gate.
+
+.. _clean-proof-gate:
+
+The proof gate
+--------------
+
+The report carries a ``blockers`` list; ``ready_to_write`` is true only when
+that list is empty. If blockers remain, ``clean`` prints each as
+``[clean] blocker: ...``, writes the report if requested, and exits with an
+error:
+
+.. code-block:: text
+
+    clean proof gate refused <INPUT>; output <OUTPUT> was not written
+
+No ``OUTPUT`` file is created.
+
+Protected input
+~~~~~~~~~~~~~~~
+
+For an input with VMProtect evidence the code unconditionally adds these
+blockers, each of which clears only when the corresponding proof exists:
+
+* ``original module entry point is not recovered`` (cleared when
+  :ref:`OEP recovery <oep-recovery>` succeeds)
+* ``application import set is not proven independently reconstructed``
+* ``native code reintegration has not produced a devirtualized replacement image``
+* ``VMProtect sections remain referenced by unresolved paths``
+
+Further blockers are added per case: a non-DLL header entry whose recovery
+fails, unresolved TLS VM entries, incomplete entry path recovery, and a header
+entry with no recovered VM profile. See :doc:`/tool/soundness` for the
+complete list and what each one means.
+
+Clean input
+~~~~~~~~~~~
+
+If detection yields ``NoStrongEvidence`` and the layout is
+``ConventionalFile``, the run is a *verified no-op*: the gate clears and
+``OUTPUT`` is a byte-for-byte copy of ``INPUT``, reparsed from disk.
+``NoStrongEvidence`` with a non-conventional layout adds a blocker instead.
+
+.. _experimental-output:
+
+Experimental output
+-------------------
+
+``--experimental`` exists so the reintegration machinery can be exercised
+end-to-end against real samples before every proof is in place. It is
+quarantined to its own path and loudly labelled:
+
+* a warning is printed to standard error:
+  ``[experimental] WARNING: unverified devirtualized output written to <path>; N blocker(s) remain``
+* the report contains ``experimental: true`` and the full ``blockers`` list;
+* if no reintegrated image was produced, nothing is written and
+  ``[experimental] no reintegrated image was produced`` is printed.
+
+If the final image fails ``validate_for_loader`` it is still written for
+inspection, flagged as not loader-valid. The sound ``OUTPUT`` is never written
+on any reparse or validation failure.
+
+.. warning::
+
+    Experimental output can be confidently wrong. It is a test artifact, not a
+    product. A dispatcher in the output falls back to the original, still
+    protected, entry for inputs outside the recovered domain, and that safety
+    net is only unreachable when the domain is proven complete.
+
+Output
+------
+
+Text lines emitted, in order:
+
+``[clean]``
+    ``protection=<verdict> layout=<layout> vm_entries=<n> routines=<n> blockers=<n>``
+``[decode]``
+    One line per recovered VM path: ``assignments=<map> operations=<n> stop=<reason>``.
+``[clean] blocker:``
+    One line per blocker.
+``[layout]``
+    Layout diagnostics and ``loader validation passed: ...`` or ``FAILED``.
+``[verify]``
+    Reparse results for each written file.
+``[report]``
+    The report path, when ``--report`` was given.
+
+Examples
+--------
+
+Analyse and keep the report even though output is refused:
+
+.. code-block:: console
+
+    $ vmpx clean addon.dll addon.clean.dll --report addon.report.json
+    [clean] protection=VmprotectLikely layout=PackedVirtualSections vm_entries=<n> routines=<n> blockers=<n>
+    [clean] blocker: application import set is not proven independently reconstructed
+    [clean] blocker: ...
+    [report] addon.report.json
+    Error: clean proof gate refused addon.dll; output addon.clean.dll was not written
+
+Also write the loadable but not devirtualized reconstruction:
+
+.. code-block:: console
+
+    $ vmpx clean addon.dll addon.clean.dll --reconstructed addon.loadable.dll
+
+Write the experimental reintegrated image:
+
+.. code-block:: console
+
+    $ vmpx clean addon.dll addon.clean.dll --report r.json --experimental addon.exp.dll
+
+Verified no-op on an unprotected file:
+
+.. code-block:: console
+
+    $ vmpx clean hello.exe hello.copy.exe
+    [clean] protection=NoStrongEvidence layout=ConventionalFile vm_entries=<n> routines=0 blockers=0
+    [clean] no strong protection evidence; preserved <size> bytes in hello.copy.exe
+    [verify] output reparsed successfully from disk
