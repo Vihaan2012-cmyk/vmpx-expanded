@@ -1,0 +1,24 @@
+[package]
+name = "vmpx-vtil-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Feature-gated FFI binding to the native VTIL optimizer bridge"
+build = "build.rs"
+
+[features]
+default = []
+# Links native/vtil-bridge; needs VMPX_VTIL_LIB_DIRS (see build.rs).
+vtil = []
+
+[dependencies]
+thiserror.workspace = true
+
+# Not inherited from the workspace: this is the only crate that needs FFI.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -11,6 +11,7 @@ members = [
     "crates/vmpx-unpack",
     "crates/vmpx-vm",
     "crates/vmpx-vmlift",
+    "crates/vmpx-vtil-sys",
 ]
 
 [workspace.package]

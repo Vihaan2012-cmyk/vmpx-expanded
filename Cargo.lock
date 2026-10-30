@@ -2825,6 +2825,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-vtil-sys"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
