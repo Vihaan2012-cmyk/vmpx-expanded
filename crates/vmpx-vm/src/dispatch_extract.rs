@@ -812,6 +812,232 @@ fn attempt_candidate(
                 transforms: TransformChain { transforms },
                 update_key_operation: Some(update_key_operation),
             },
+            table: None,
+        },
+        confidence: 100,
+        evidence,
+    })
+}
+
+/// Recognizes a `movsxd handler, [table + index*stride]` table-entry load, the
+/// sign-extended relative dispatch of a table-indexed VM. Returns the table
+/// base register, the byte stride, and the signed entry width.
+fn table_entry_load(
+    instruction: &Instruction,
+    handler: Register,
+    index: Register,
+) -> Option<(Register, u32, BitWidth)> {
+    if !matches!(instruction.mnemonic(), Mnemonic::Movsxd | Mnemonic::Movsx)
+        || instruction.op0_kind() != OpKind::Register
+        || canonical(instruction.op0_register()) != canonical(handler)
+        || instruction.op0_register().size() != 8
+        || instruction.op1_kind() != OpKind::Memory
+        || instruction.memory_displacement64() != 0
+        || !has_flat_segment_address(instruction)
+    {
+        return None;
+    }
+    let table = instruction.memory_base();
+    if table == Register::None || table.size() != 8 || canonical(table) != table {
+        return None;
+    }
+    if canonical(instruction.memory_index()) != canonical(index)
+        || instruction.memory_index().size() != 8
+    {
+        return None;
+    }
+    let entry_width = source_load_width(instruction)?;
+    let stride = instruction.memory_index_scale();
+    // A dense table of signed entries sign-extended to the 64-bit handler delta.
+    (stride == entry_width.bytes()).then_some((table, stride, entry_width))
+}
+
+fn handler_adds_table(instruction: &Instruction, handler: Register, table: Register) -> bool {
+    instruction.mnemonic() == Mnemonic::Add
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Register
+        && instruction.op0_register().size() == 8
+        && instruction.op1_register().size() == 8
+        && canonical(instruction.op0_register()) == canonical(handler)
+        && canonical(instruction.op1_register()) == canonical(table)
+}
+
+/// Recovers a table-indexed keyless dispatch (VMProtect 3.x "Compact").
+///
+/// The opcode is read raw from `[vip]` (no rolling key) and used to index a
+/// static table of signed relative entries:
+/// `handler = table_base + sext(table[opcode])`. The table base is held in a
+/// register established by a `lea table, [abs]` static anchor when present.
+#[allow(clippy::too_many_arguments)]
+fn attempt_table_indexed_candidate(
+    decoded: &[&DecodedInstruction],
+    dispositions: &BTreeMap<Rva, NativeInstructionDisposition>,
+    source_index: usize,
+    end_index: usize,
+    direction: BytecodeDirection,
+    roles: HandlerRegisterRoles,
+    terminal_dispatch: Rva,
+    terminal_evidence: &str,
+) -> Result<DispatchExtractionCandidate, String> {
+    let source = decoded[source_index];
+    // The opcode must be zero-extended so the index register holds exactly the
+    // unsigned table index.
+    if source.instruction.mnemonic() != Mnemonic::Movzx {
+        return Err("table-indexed opcode load is not zero-extended".to_owned());
+    }
+    let opcode_width =
+        source_load_width(&source.instruction).ok_or_else(|| "unsupported opcode width".to_owned())?;
+    let index = canonical(source.instruction.op0_register());
+    if index == canonical(roles.vip)
+        || index == canonical(roles.handler)
+        || index == canonical(roles.rolling_key)
+    {
+        return Err("table-indexed opcode register aliases a dispatch role".to_owned());
+    }
+    let mut factory = InstructionInfoFactory::new();
+    let mut vip_delta = 0_i64;
+    let mut table_load: Option<(Register, u32, BitWidth, usize)> = None;
+    let mut handler_add_index = None;
+    for (position, decoded) in decoded
+        .iter()
+        .enumerate()
+        .take(end_index)
+        .skip(source_index + 1)
+    {
+        if !dispositions
+            .get(&decoded.rva)
+            .copied()
+            .is_some_and(is_active)
+        {
+            continue;
+        }
+        let instruction = &decoded.instruction;
+        if instruction.op0_kind() == OpKind::Register
+            && canonical(instruction.op0_register()) == canonical(roles.vip)
+            && matches!(instruction.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
+        {
+            if instruction.op0_register().size() != 8 {
+                return Err("VIP adjustment is not a full-width write".to_owned());
+            }
+            let delta = signed_immediate(instruction, 1)
+                .ok_or_else(|| "VIP adjustment is not an immediate".to_owned())?;
+            vip_delta = match instruction.mnemonic() {
+                Mnemonic::Add => vip_delta.checked_add(delta),
+                Mnemonic::Sub => vip_delta.checked_sub(delta),
+                _ => unreachable!(),
+            }
+            .ok_or_else(|| "VIP adjustment overflows".to_owned())?;
+            continue;
+        }
+        if writes_register(&mut factory, instruction, canonical(roles.vip)) {
+            return Err(format!("VIP has an unmodelled write at {}", decoded.rva));
+        }
+        if let Some((table, stride, entry_width)) =
+            table_entry_load(instruction, roles.handler, index)
+        {
+            if table_load.is_some() {
+                return Err("duplicate table-indexed dispatch load".to_owned());
+            }
+            table_load = Some((table, stride, entry_width, position));
+            continue;
+        }
+        if table_load.is_none() && writes_register(&mut factory, instruction, index) {
+            return Err(format!(
+                "table index register is clobbered before the dispatch load at {}",
+                decoded.rva
+            ));
+        }
+        if let Some((table, _, _, _)) = table_load {
+            if handler_adds_table(instruction, roles.handler, table) {
+                if handler_add_index.is_some() {
+                    return Err("duplicate handler base addition".to_owned());
+                }
+                handler_add_index = Some(position);
+                continue;
+            }
+        }
+        if writes_register(&mut factory, instruction, canonical(roles.handler)) {
+            return Err(format!(
+                "handler register has an unmodelled write at {}",
+                decoded.rva
+            ));
+        }
+    }
+    let (table, stride, entry_width, table_load_index) =
+        table_load.ok_or_else(|| "no table-indexed dispatch load".to_owned())?;
+    let handler_add_index =
+        handler_add_index.ok_or_else(|| "table-indexed handler base addition is absent".to_owned())?;
+    if table_load_index >= handler_add_index {
+        return Err("table load does not precede the handler base addition".to_owned());
+    }
+    let expected_vip_delta = match direction {
+        BytecodeDirection::Ascending => i64::from(opcode_width.bytes()),
+        BytecodeDirection::Descending => -i64::from(opcode_width.bytes()),
+        BytecodeDirection::StateDependent | BytecodeDirection::Unknown => {
+            return Err("bytecode direction is not concrete".to_owned());
+        }
+    };
+    if vip_delta != expected_vip_delta {
+        return Err(format!(
+            "VIP delta {vip_delta} does not match opcode width {}",
+            opcode_width.bytes()
+        ));
+    }
+    // Recover the static table anchor from a pre-source `lea table, [abs]` that
+    // is not later clobbered.
+    let mut table_anchor: Option<(Va, Rva)> = None;
+    for decoded in decoded.iter().take(source_index) {
+        if !dispositions
+            .get(&decoded.rva)
+            .copied()
+            .is_some_and(is_active)
+        {
+            continue;
+        }
+        if let Some(base) = static_handler_rebase(&decoded.instruction, table) {
+            table_anchor = Some((base, decoded.rva));
+        } else if writes_register(&mut factory, &decoded.instruction, table) {
+            table_anchor = None;
+        }
+    }
+    let handler_rebase = table_anchor.map(|(base, _)| base);
+    let handler_rebase_rva = table_anchor.map(|(_, rva)| rva);
+    let mut evidence = vec![
+        format!("table-indexed opcode {opcode_width:?} load from the recovered VIP register"),
+        format!("opcode indexes a dense {entry_width:?} signed dispatch table at stride {stride}"),
+        "handler is the table base plus the sign-extended table entry".to_owned(),
+        format!("VIP advances by {vip_delta} bytes"),
+        "no rolling-key transform participates in dispatch".to_owned(),
+        terminal_evidence.to_owned(),
+    ];
+    if let Some((base, _)) = table_anchor {
+        evidence.push(format!("table base established by static anchor {base}"));
+    }
+    Ok(DispatchExtractionCandidate {
+        encoded_load: source.rva,
+        decoded_register: format!("{:?}", source.instruction.op0_register()),
+        vip_rebased_before_source: false,
+        handler_rebase,
+        handler_rebase_rva,
+        vip_delta,
+        handler_update: decoded[handler_add_index].rva,
+        terminal_dispatch,
+        codec: RelativeDispatchCodec {
+            displacement: crate::KeyedTransformCodec {
+                width: entry_width,
+                input_key_operation: None,
+                input_key_on_left: false,
+                transforms: TransformChain {
+                    transforms: Vec::new(),
+                },
+                update_key_operation: None,
+            },
+            table: Some(crate::TableIndexedDispatch {
+                opcode_width,
+                entry_width,
+                stride,
+                table_base: handler_rebase,
+            }),
         },
         confidence: 100,
         evidence,
@@ -890,19 +1116,35 @@ fn extract_relative_dispatch_codecs_with_terminal(
             "trace does not terminate through the recovered handler register".to_owned()
         });
         match result.and_then(|terminal| {
-            attempt_candidate(
+            // Table-indexed keyless dispatch and keyed threaded dispatch are
+            // structurally disjoint; try the table form first and fall back to
+            // the threaded recovery, keeping both diagnostics on failure.
+            attempt_table_indexed_candidate(
                 &decoded,
                 &dispositions,
                 index,
-                position
-                    .checked_sub(1)
-                    .and_then(|previous| source_indices.get(previous).copied()),
                 end_index,
                 direction,
                 roles,
                 terminal,
                 terminal_evidence,
             )
+            .or_else(|table_reason| {
+                attempt_candidate(
+                    &decoded,
+                    &dispositions,
+                    index,
+                    position
+                        .checked_sub(1)
+                        .and_then(|previous| source_indices.get(previous).copied()),
+                    end_index,
+                    direction,
+                    roles,
+                    terminal,
+                    terminal_evidence,
+                )
+                .map_err(|reason| format!("{reason}; table-indexed: {table_reason}"))
+            })
         }) {
             Ok(candidate) => candidates.push(candidate),
             Err(reason) => rejected_sources.push(DispatchExtractionRejection {
@@ -1313,6 +1555,93 @@ mod tests {
         handler_write.add(r14, r10).expect("handler update");
         handler_write.jmp(r14).expect("dispatch");
         assert!(report_from_assembler(handler_write).candidates.is_empty());
+    }
+
+    #[test]
+    fn recognizes_table_indexed_keyless_dispatch() {
+        // movzx op,[vip]; vip+=1; movsxd handler,[table+op*4]; handler+=table.
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler
+            .lea(r11, qword_ptr(0x1800_u64))
+            .expect("static table anchor");
+        assembler
+            .movzx(eax, byte_ptr(r15))
+            .expect("zero-extended opcode load");
+        assembler.add(r15, 1).expect("VIP advance");
+        assembler
+            .movsxd(r14, dword_ptr(r11 + rax * 4))
+            .expect("sign-extended table entry load");
+        assembler.add(r14, r11).expect("handler base addition");
+        assembler.jmp(r14).expect("indirect dispatch");
+
+        let report = report_from_assembler(assembler);
+        let [candidate] = report.candidates.as_slice() else {
+            panic!("expected one table-indexed candidate: {report:?}");
+        };
+        let table = candidate.codec.table.expect("table-indexed dispatch");
+        assert_eq!(table.opcode_width, BitWidth::W8);
+        assert_eq!(table.entry_width, BitWidth::W32);
+        assert_eq!(table.stride, 4);
+        assert_eq!(table.table_base, Some(Va(0x1800)));
+        assert_eq!(candidate.vip_delta, 1);
+        assert_eq!(candidate.handler_rebase, Some(Va(0x1800)));
+        assert!(candidate.codec.displacement.input_key_operation.is_none());
+        assert!(candidate.codec.displacement.update_key_operation.is_none());
+        assert!(
+            candidate
+                .codec
+                .displacement
+                .transforms
+                .transforms
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_unsound_table_indexed_dispatch_shapes() {
+        // A sign-extended opcode would corrupt the unsigned table index.
+        let mut signed_opcode = CodeAssembler::new(64).expect("x64 assembler");
+        signed_opcode
+            .lea(r11, qword_ptr(0x1800_u64))
+            .expect("anchor");
+        signed_opcode
+            .movsx(eax, byte_ptr(r15))
+            .expect("sign-extended opcode");
+        signed_opcode.add(r15, 1).expect("VIP advance");
+        signed_opcode
+            .movsxd(r14, dword_ptr(r11 + rax * 4))
+            .expect("table entry load");
+        signed_opcode.add(r14, r11).expect("handler base addition");
+        signed_opcode.jmp(r14).expect("dispatch");
+        assert!(report_from_assembler(signed_opcode).candidates.is_empty());
+
+        // The table load must be indexed by the decoded opcode register.
+        let mut wrong_index = CodeAssembler::new(64).expect("x64 assembler");
+        wrong_index.lea(r11, qword_ptr(0x1800_u64)).expect("anchor");
+        wrong_index
+            .movzx(eax, byte_ptr(r15))
+            .expect("opcode load");
+        wrong_index.add(r15, 1).expect("VIP advance");
+        wrong_index
+            .movsxd(r14, dword_ptr(r11 + rcx * 4))
+            .expect("mis-indexed table load");
+        wrong_index.add(r14, r11).expect("handler base addition");
+        wrong_index.jmp(r14).expect("dispatch");
+        assert!(report_from_assembler(wrong_index).candidates.is_empty());
+
+        // A dense signed table requires the stride to equal the entry width.
+        let mut wrong_stride = CodeAssembler::new(64).expect("x64 assembler");
+        wrong_stride.lea(r11, qword_ptr(0x1800_u64)).expect("anchor");
+        wrong_stride
+            .movzx(eax, byte_ptr(r15))
+            .expect("opcode load");
+        wrong_stride.add(r15, 1).expect("VIP advance");
+        wrong_stride
+            .movsxd(r14, dword_ptr(r11 + rax * 2))
+            .expect("mismatched-stride table load");
+        wrong_stride.add(r14, r11).expect("handler base addition");
+        wrong_stride.jmp(r14).expect("dispatch");
+        assert!(report_from_assembler(wrong_stride).candidates.is_empty());
     }
 
     #[test]

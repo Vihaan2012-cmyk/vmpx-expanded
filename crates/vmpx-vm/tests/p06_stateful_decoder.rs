@@ -102,6 +102,7 @@ fn p06_context_scatter_codec() -> RelativeThreadedCodec {
             ],
         ),
         dispatch: RelativeDispatchCodec {
+            table: None,
             displacement: xor_codec(
                 BitWidth::W32,
                 &[
@@ -127,6 +128,7 @@ fn p06_constant_push_codec() -> RelativeThreadedCodec {
             ],
         ),
         dispatch: RelativeDispatchCodec {
+            table: None,
             displacement: xor_codec(
                 BitWidth::W32,
                 &[
@@ -156,6 +158,7 @@ fn p06_register_read_codec() -> RelativeThreadedCodec {
             ],
         ),
         dispatch: RelativeDispatchCodec {
+            table: None,
             displacement: xor_codec(
                 BitWidth::W32,
                 &[
@@ -171,6 +174,7 @@ fn p06_register_read_codec() -> RelativeThreadedCodec {
 
 fn p06_add_dispatch_codec() -> RelativeDispatchCodec {
     RelativeDispatchCodec {
+        table: None,
         displacement: xor_codec(
             BitWidth::W32,
             &[
@@ -185,6 +189,7 @@ fn p06_add_dispatch_codec() -> RelativeDispatchCodec {
 
 fn p06_bootstrap_dispatch_codec() -> RelativeDispatchCodec {
     RelativeDispatchCodec {
+        table: None,
         displacement: xor_codec(
             BitWidth::W32,
             &[

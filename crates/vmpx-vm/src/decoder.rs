@@ -62,9 +62,30 @@ pub struct DecodedDispatch {
     pub state_after: RelativeDispatchState,
 }
 
+/// Table-indexed keyless dispatch (VMProtect 3.x "Compact").
+///
+/// The opcode is read raw from `[vip]` (no rolling-key transform) and used to
+/// index a static table of signed relative entries:
+/// `handler = table_base + sext_entry(read_entry([table_base + opcode*stride]))`.
+/// `table_base` is the dispatch anchor; when a native `lea` established it
+/// statically it is recorded here, otherwise the decode uses the dispatch
+/// state's handler as the table base (supplied as a handler anchor).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct TableIndexedDispatch {
+    pub opcode_width: BitWidth,
+    pub entry_width: BitWidth,
+    pub stride: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_base: Option<Va>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RelativeDispatchCodec {
     pub displacement: KeyedTransformCodec,
+    /// Present for table-indexed keyless dispatch; `None` is inline threaded
+    /// dispatch whose token is read and keyed directly at `[vip]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<TableIndexedDispatch>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -281,6 +302,9 @@ impl RelativeDispatchCodec {
         state: RelativeDispatchState,
         direction: BytecodeDirection,
     ) -> Result<DecodedDispatch, BytecodeDecodeError> {
+        if let Some(table) = self.table {
+            return self.decode_table_indexed(pe, state, direction, table);
+        }
         let (displacement_address, vip) =
             consume_vip(state.vip, self.displacement.width, direction)?;
         let encoded_displacement =
@@ -305,6 +329,54 @@ impl RelativeDispatchCodec {
             state_after: RelativeDispatchState {
                 vip,
                 rolling_key: displacement.key_after,
+                handler,
+            },
+        })
+    }
+
+    fn decode_table_indexed(
+        &self,
+        pe: &PeImage<'_>,
+        state: RelativeDispatchState,
+        direction: BytecodeDirection,
+        table: TableIndexedDispatch,
+    ) -> Result<DecodedDispatch, BytecodeDecodeError> {
+        // The opcode byte is the only stream-consuming read; the table entry is
+        // static data addressed by the table base, not the VIP.
+        let (opcode_address, vip) = consume_vip(state.vip, table.opcode_width, direction)?;
+        let encoded_opcode = read_bytes(pe, opcode_address, table.opcode_width.bytes())?;
+        let opcode = little_endian_value(&encoded_opcode);
+        let table_base = table.table_base.unwrap_or(state.handler);
+        let entry_offset = opcode
+            .checked_mul(u64::from(table.stride))
+            .ok_or_else(|| BytecodeDecodeError::Address {
+                va: table_base,
+                message: "dispatch table index overflows".to_owned(),
+            })?;
+        let entry_address =
+            table_base
+                .checked_add(entry_offset)
+                .ok_or_else(|| BytecodeDecodeError::Address {
+                    va: table_base,
+                    message: "dispatch table entry address overflows".to_owned(),
+                })?;
+        let encoded_entry = read_bytes(pe, entry_address, table.entry_width.bytes())?;
+        let entry_value = little_endian_value(&encoded_entry);
+        let signed_displacement = sign_extend_to_i64(entry_value, table.entry_width);
+        let handler = table_base
+            .checked_add_signed(signed_displacement)
+            .ok_or_else(|| BytecodeDecodeError::Address {
+                va: table_base,
+                message: "table-indexed handler target overflows".to_owned(),
+            })?;
+        Ok(DecodedDispatch {
+            state_before: state,
+            encoded_displacement: encoded_opcode,
+            displacement: entry_value,
+            signed_displacement,
+            state_after: RelativeDispatchState {
+                vip,
+                rolling_key: state.rolling_key,
                 handler,
             },
         })

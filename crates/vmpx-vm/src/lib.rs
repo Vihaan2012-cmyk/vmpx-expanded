@@ -66,8 +66,8 @@ pub use codec_recovery::{
 pub use decoder::{
     BytecodeDecodeError, DecodedDispatch, DecodedOperandDispatch, DecodedVmInstruction,
     KeyOperation, KeyedDecodeResult, KeyedTransformCodec, LinearDecodeStop, LinearVmDecodeReport,
-    RelativeDispatchCodec, RelativeDispatchState, RelativeThreadedCodec, VmHandlerDecodeSpec,
-    decode_linear_vm_stream, decode_linear_vm_stream_direction,
+    RelativeDispatchCodec, RelativeDispatchState, RelativeThreadedCodec, TableIndexedDispatch,
+    VmHandlerDecodeSpec, decode_linear_vm_stream, decode_linear_vm_stream_direction,
 };
 pub use dispatch_extract::{
     DispatchExtractionCandidate, DispatchExtractionRejection, DispatchExtractionReport,

@@ -183,9 +183,17 @@ impl ConcreteBootstrapMachine {
     fn operand(&self, instruction: &Instruction, operand: u32) -> Option<u64> {
         match instruction.op_kind(operand) {
             OpKind::Register => self.read_register(instruction.op_register(operand)),
-            OpKind::Memory if instruction.memory_size().size() == 8 => self
-                .stack_address(instruction)
-                .and_then(|address| self.stack.get(&address).copied()),
+            OpKind::Memory => {
+                // Stack slots are stored as aligned qwords; a narrower read
+                // (e.g. the VIP setup `mov esi,[rsp+80h]`) takes its low bytes.
+                let size = u32::try_from(instruction.memory_size().size()).ok()?;
+                if size == 0 || size > 8 {
+                    return None;
+                }
+                let address = self.stack_address(instruction)?;
+                let value = self.stack.get(&address).copied()?;
+                Some(value & bit_mask(size.saturating_mul(8)))
+            }
             _ => Self::immediate(instruction, operand),
         }
     }
@@ -424,10 +432,12 @@ fn role_trace_start(
     direction: BytecodeDirection,
 ) -> Rva {
     let decoded = trace.instructions().collect::<Vec<_>>();
-    let source_index = decoded.iter().position(|decoded| {
-        decoded.instruction.memory_base().full_register() == vip
-            && decoded.instruction.op_count() != 0
-    });
+    // The dispatch window begins after VIP setup: the VIP-relative token load is
+    // the real dispatch source, not an earlier `lea vip,[vip + const]` that
+    // establishes the full-width VIP (its address base is also the VIP).
+    let source_index = decoded
+        .iter()
+        .position(|decoded| crate::dispatch_extract::is_source_load(&decoded.instruction, vip));
     let Some(source_index) = source_index else {
         return trace.entry;
     };
@@ -467,6 +477,8 @@ fn evaluate_initial_state(
     roles: HandlerRegisterRoles,
     encoded_load: Rva,
     limits: DirectJumpTraceLimits,
+    handler_override: Option<Va>,
+    keyless: bool,
 ) -> Result<RelativeDispatchState, BootstrapRecoveryError> {
     let seed = entry.seed.ok_or(BootstrapRecoveryError::MissingSeed)?;
     let call_target = entry
@@ -494,10 +506,22 @@ fn evaluate_initial_state(
                 message: format!("{description} register {register:?} is not concrete"),
             })
     };
+    // A keyless VM never consults the rolling key, so a non-concrete key
+    // register is immaterial; a table-indexed dispatch anchors on the recovered
+    // table base rather than a rolling handler register.
+    let rolling_key = if keyless {
+        machine.read_register(roles.rolling_key).unwrap_or(0)
+    } else {
+        value(roles.rolling_key, "rolling key")?
+    };
+    let handler = match handler_override {
+        Some(base) => base,
+        None => Va(value(roles.handler, "handler anchor")?),
+    };
     Ok(RelativeDispatchState {
         vip: Va(value(roles.vip, "VIP")?),
-        rolling_key: value(roles.rolling_key, "rolling key")?,
-        handler: Va(value(roles.handler, "handler anchor")?),
+        rolling_key,
+        handler,
     })
 }
 
@@ -574,12 +598,16 @@ pub fn recover_bootstrap_dispatch(
                     RegisterDispatchProofLimits::default(),
                 )?;
                 for candidate in extraction.candidates {
+                    let table = candidate.codec.table;
+                    let handler_override = table.and_then(|table| table.table_base);
                     let mut initial_state = match evaluate_initial_state(
                         pe,
                         entry,
                         roles,
                         candidate.encoded_load,
                         limits,
+                        handler_override,
+                        table.is_some(),
                     ) {
                         Ok(state) => state,
                         Err(error) => {
@@ -600,10 +628,17 @@ pub fn recover_bootstrap_dispatch(
                                 message: "descending pre-fetch VIP adjustment overflows".to_owned(),
                             })?;
                     }
+                    // A keyless (table-indexed) dispatch does not consult the
+                    // rolling-key register, so every rolling-key role assignment
+                    // yields the same VM; collapse them to one candidate by
+                    // ignoring the rolling-key role in the identity.
                     if !recovered
                         .iter()
                         .any(|existing: &BootstrapDispatchRecovery| {
-                            existing.roles == roles
+                            existing.roles.vip == roles.vip
+                                && existing.roles.handler == roles.handler
+                                && (table.is_some()
+                                    || existing.roles.rolling_key == roles.rolling_key)
                                 && existing.bytecode_direction == bytecode_direction
                                 && existing.encoded_load == candidate.encoded_load
                                 && existing.codec == candidate.codec

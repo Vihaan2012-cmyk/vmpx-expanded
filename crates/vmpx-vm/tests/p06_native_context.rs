@@ -37,6 +37,7 @@ fn p06_context_scatter_codec() -> RelativeThreadedCodec {
             ],
         ),
         dispatch: RelativeDispatchCodec {
+            table: None,
             displacement: keyed(
                 BitWidth::W32,
                 &[

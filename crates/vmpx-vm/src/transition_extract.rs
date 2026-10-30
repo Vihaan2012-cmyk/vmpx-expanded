@@ -626,6 +626,7 @@ fn recover_dispatch(
             transforms: TransformChain { transforms },
             update_key_operation: Some(update.operation),
         },
+        table: None,
     })
 }
 
