@@ -13,6 +13,22 @@ Completion strategy: a mix of *soundness-first* and *hybrid/decomposed*. The sou
 proof-gated path is the real deliverable and the default. An explicit, loudly labelled
 experimental mode exists only as scaffolding to exercise the machinery early.
 
+Real-sample status
+------------------
+
+The first real VMProtect 3.11 sample uses the "Compact" VM, and it is now fully
+decoded: 256 of 256 handlers classified with none unknown or failed, table-indexed
+keyless dispatch modelled, and the stream decoded through a CFG walk. Linear
+functions devirtualize fully to native x86-64. Branching functions decode with
+branches resolved by symbolic execution and proven input domains, and their
+CFG-level lift is landing. The honest limits of the static approach (unbounded
+input branches, re-entrant continuations, protector-continuation exits and
+environment-dependent branches) are in
+:doc:`/vmprotect/devirtualization/static-frontier`; dynamic assist is the
+intended way past them. See :doc:`/tool/pipeline/compact-vm` and
+:doc:`/tool/pipeline/function-lift`. These stages are not yet driven by
+``clean``.
+
 Sub-projects
 ------------
 

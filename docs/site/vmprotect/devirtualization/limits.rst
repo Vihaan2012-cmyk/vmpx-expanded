@@ -19,6 +19,9 @@ General input-dependent control flow is undecidable
     jump tables, memory-dependent targets, loops on inputs, nested input branches,
     mixed widths, ``nor``/``nand`` use and opaque intrinsics.
 
+The refused cases are catalogued, with the reason for each, in
+:doc:`static-frontier`.
+
 Memory is not fully modelled
     The model tracks the VM stack and external stores exactly, but a store to an address
     that could alias tracked memory discards precision (a *havoc*), and an unknown native
@@ -42,12 +45,15 @@ These are implementation status, not theory:
 
    * - Gap
      - State
+   * - Lifting of branching functions
+     - CFG-level lift exists in ``vmpx-vmlift`` and is landing; it refuses loops and any
+       branch whose targets are not proven. Not yet called by ``clean``
+   * - Lowering of ``TableChecksum``, wide multiply and divide, ``ReadTimestampCounter``
+     - Decoded, not compiled
    * - Executable (non-DLL) OEP from the continuation
      - Not implemented; the executable entry is recovered as a single input-closed path
    * - Nested-continuation redirects
      - Counted, not appended; a nested entry never counts as covered
-   * - ``TableChecksum`` lowering
-     - Recognised and evaluated, not compiled back
    * - Application import set
      - Reduction wired into ``clean`` but fed an intentionally empty referenced-slot set,
        so the blocker always stays; thunk and bridge resolution is not connected

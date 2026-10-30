@@ -40,6 +40,15 @@ Handler analysis
 ``prove_handler_value_flow``, ``recover_handler_codecs``,
 ``resolve_vm_profile_roles`` and ``analyze_vm_transition``.
 
+Compact VM and CFG
+------------------
+
+``TableIndexedDispatch`` (table-indexed keyless dispatch), the keyless operand
+recovery, ``recover_vm_cfg`` with ``VmCfg``, ``VmBasicBlock``, ``BlockExit``,
+``CfgEdge`` / ``CfgEdgeKind``, ``CfgStall`` and ``VmCfgLimits``. The
+``infer_branch_input_domains`` family proves finite branch-input domains. See
+:doc:`/tool/pipeline/compact-vm`.
+
 Decoding
 --------
 

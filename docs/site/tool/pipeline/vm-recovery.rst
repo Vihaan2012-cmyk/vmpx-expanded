@@ -166,6 +166,10 @@ The expression folder encodes one VMProtect idiom explicitly: the pair
 ``not(not(x) + a) + b`` "expresses a plain pointer adjustment" and is folded to
 ``x + (b - a)``. Without it, stack-relative addresses stay opaque.
 
+The Compact VM, which uses table-indexed keyless dispatch instead of the keyed
+relative dispatch described above, is covered in :doc:`compact-vm`. The CFG walk
+that follows a function's branches is described there too.
+
 Discovery limits
 ----------------
 

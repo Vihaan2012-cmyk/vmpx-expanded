@@ -1,0 +1,91 @@
+The Static Frontier
+===================
+
+A decoded virtual machine is not the same as a devirtualized program. Once the
+Compact VM was fully decoded, the remaining failures all came from one source:
+facts about the program that static analysis cannot establish. This page lists
+what vmpx refuses in that situation, why, and what lies beyond.
+
+What is decidable
+-----------------
+
+A branch target is an expression over the function's live-in registers and
+memory reads. vmpx resolves it in two ways:
+
+* **Constant.** Symbolic execution simplifies the target to one value.
+* **Proven exhaustive domain.** The target's image over a finite set of input
+  values is shown to equal its image over every possible value. This is
+  established structurally, never by sampling. An input register may only be
+  observed through a low slice of at most 8 bits (all values enumerated), or
+  through ``vm_flags_add_wN`` / ``vm_flags_sub_wN`` status words of one common
+  width (including non-affine sub conditions), which depend on the register only through the cell it falls in between
+  a fixed set of cut points and its residue modulo 256. An unconstrained memory
+  read is replaced by a free register named after the read and covered the same
+  way; the address is dropped, so the domain can only over-approximate.
+
+That is the *decidable frontier*. A function whose branches all fall inside it
+is recovered completely; any other use of an input is refused.
+
+What is refused
+---------------
+
+Unbounded or undecidable input branches
+    A branch whose target depends on an input through direct arithmetic, a wide
+    comparison, a table lookup or a loop counter has a path set as large as the
+    input's range. Jump tables, loops on inputs, nested input branches, mixed
+    widths, comparisons of two input-dependent operands and opaque intrinsics all
+    end in a stall (``target depends on unproven input``) or an incomplete domain.
+    Guessing a bound would make the output wrong for some input, so the function
+    is reported blocked.
+
+Re-entrant and nested continuations
+    A virtualized function that re-enters the VM, or whose native continuation
+    lands in another virtualized entry, cannot be modelled as a single closed
+    path family. A nested entry is counted but never counted as covered, and no
+    redirect is emitted for it. Loops within one function are refused for the same
+    reason: the lift expands paths into a tree, and a block that repeats on a path
+    has no finite expansion.
+
+Protector-continuation exits
+    A VM exit that returns into the entry frame (the protector's own native
+    continuation) rather than into the caller is not a callee-style return. The
+    lift cannot prove that a native ``ret`` reads the same word, so it refuses
+    (``the exit returns into the entry frame``). A return address written by the
+    VM, or reached through a computed address, is refused for the same reason.
+
+Environment-dependent branches
+    A branch fed by a value read from the environment (a ``gs:``-relative read of
+    the TEB, or a memory read the model does not track) depends on the machine
+    the program runs on. An untracked memory read is treated as a free value, so
+    its domain over-approximates what the program can see; that is sound only when
+    the branch observes it through the covers above. When the value decides
+    control flow any other way (direct arithmetic, a load through it, a wide
+    comparison), the domain cannot be enumerated and the branch is refused. The
+    read itself lowers to an exact native instruction, but static equivalence must
+    trust it rather than prove it, so it is marked as a boundary.
+
+Semantics without a verified lowering
+    ``TableChecksum``, wide multiply and divide and ``ReadTimestampCounter`` decode
+    but do not yet compile. Functions that use them are decoded, reported and not
+    lifted (:doc:`/tool/pipeline/function-lift`).
+
+Why refusal is the answer
+-------------------------
+
+Each of these is a case where a sound answer requires information that is not in
+the binary: the range of an input, the identity of a caller, or the state of the
+machine. Producing output anyway would give code that is right for the cases the
+tool happened to consider. In the sound path it reports a blocker instead, with
+the stall reason in the CFG report, and the rest of the file is unaffected.
+
+Beyond the frontier: dynamic assist
+-----------------------------------
+
+The path past these limits is observation, not stronger static inference. A
+recorded run supplies what the binary does not: the concrete environment values,
+the real continuation of a protector exit, and the inputs that exercise a branch.
+Such facts can seed the static model (a domain for an otherwise unbounded input,
+a resolved nested entry), but they are evidence about one execution, not a proof.
+Any output that relies on them must be labelled as such and kept out of the sound
+path, in the same way ``--experimental`` is today. This is the direction of future
+work; it is not implemented.

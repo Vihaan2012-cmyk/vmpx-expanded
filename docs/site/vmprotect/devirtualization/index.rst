@@ -87,6 +87,7 @@ identified as VMProtect's design constraints:
    attacking-anti-analysis
    attacking-imports
    limits
+   static-frontier
    tooling-map
 
 How to read a result

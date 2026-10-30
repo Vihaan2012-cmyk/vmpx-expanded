@@ -139,6 +139,42 @@ SP5: differential equivalence verifier and neutralize transform
 VTIL bridge
     The feature-gated Rust FFI binding in ``vmpx-vtil-sys`` (commit ``a4ea913``).
 
+Real-sample decode and lift (VMProtect 3.11 Compact)
+----------------------------------------------------
+
+The first real protected sample exposed a VM unlike the synthetic fixtures: keyless,
+with table-indexed dispatch. It was decoded in stages, each a commit on the
+``sp2-oep-generalized`` line.
+
+Dispatch (``a86c405``, ``194a09c``)
+    Table-indexed keyless dispatch modelled; postlude-branch dispatch and the
+    branch handlers recognised.
+Operands and ALU (``2ed6552``)
+    Keyless raw operand recovery, ``Add`` and ``Sub`` classification and value flow,
+    16-bit virtual-register slot indices.
+Stream decode (``9801512``)
+    Table base propagated through the stream; linear VM instruction stream decoded.
+Mul, Div, narrow widths (``2fd129c``)
+    ``DIV``/``MUL`` and narrow-width handlers classified.
+CFG walk (``6b19f26``)
+    Control-flow walk over VM branches for complete function decode.
+Branches and checksum (``9e50df6``)
+    Intra-branch and checksum handlers decoded; this closed the handler set at
+    256 of 256 classified.
+Native calls (``237919f``)
+    Keyless native-call bridge handlers decoded.
+Performance (``dcecea0``)
+    Structural sharing and simplification bound symbolic expression size.
+Lift (``a09a025``, ``1e5d8ad``)
+    Decoded-stream lift adapter lifts linear functions to native code; a CFG-level
+    lift handles branching functions and bridges native calls.
+Branch domains (``921ab03``)
+    Finite domains proven for non-affine ``vm_flags_sub`` branch conditions.
+
+Result: linear functions devirtualize fully; branching functions decode and resolve,
+and their lift is landing. The sound frontier and what is refused are written up in
+:doc:`/vmprotect/devirtualization/static-frontier`.
+
 Verification scope
 ------------------
 

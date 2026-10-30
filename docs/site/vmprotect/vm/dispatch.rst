@@ -5,8 +5,8 @@ Dispatch
 jump to it. In a conventional interpreter this is a table lookup. In VMProtect it is
 engineered to resist exactly that kind of analysis.
 
-Two dispatch styles
--------------------
+Dispatch styles
+---------------
 
 Table dispatch
 ~~~~~~~~~~~~~~
@@ -57,6 +57,14 @@ The terminal jump can take either of two forms, and vmpx accepts both:
     ret                         ; the same effect through the stack
 
 Which one a given VM instance uses is a *mutation*, not a semantic difference.
+
+Keyless table-indexed dispatch (the Compact VM)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+VMProtect 3.11's "Compact" VM combines the two styles. The opcode is read raw from
+``[vip]`` with no rolling key, and indexes a table of signed relative entries; the
+handler is ``table_base + sext(entry)``. vmpx models this as
+``TableIndexedDispatch`` (:doc:`/tool/pipeline/compact-vm`).
 
 Why scattered code defeats linear disassembly
 ---------------------------------------------
