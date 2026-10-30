@@ -1449,8 +1449,14 @@ fn match_stack_check(
 }
 
 /// Straight-line decodes that land exactly on `head` and end in the unique
-/// static `lea table,[abs]` anchor. Ambiguous or absent anchors are rejected.
-fn table_anchor_before(pe: &PeImage<'_>, head: Rva, table: Register) -> Result<(Va, Rva), String> {
+/// static `lea table,[abs]` anchor. `Ok(Some)` is a proven local anchor,
+/// `Ok(None)` means no local anchor exists (the table base is a global live-in
+/// bound later from the bootstrap anchor), and `Err` is an ambiguous anchor.
+fn table_anchor_before(
+    pe: &PeImage<'_>,
+    head: Rva,
+    table: Register,
+) -> Result<Option<(Va, Rva)>, String> {
     let mut factory = InstructionInfoFactory::new();
     let mut found: Option<(Va, Rva)> = None;
     for back in 1..=MAX_ANCHOR_LOOKBACK {
@@ -1491,7 +1497,7 @@ fn table_anchor_before(pe: &PeImage<'_>, head: Rva, table: Register) -> Result<(
             }
         }
     }
-    found.ok_or_else(|| "no static table anchor falls through into the dispatch head".to_owned())
+    Ok(found)
 }
 
 /// Every direct-flow path from `from` must reach `head` without calls, returns,
@@ -1618,7 +1624,12 @@ fn recognize_postlude_dispatch(
             table_entry_load(&decoded.instruction, roles.handler, index).map(|(table, _, _)| table)
         })
         .ok_or_else(|| "dispatch head table load was not retained".to_owned())?;
-    let (anchor, anchor_rva) = table_anchor_before(pe, shape.head, table)?;
+    // A local `lea table,[abs]` anchor pins the base here; its absence means the
+    // base is a global live-in that the bootstrap anchor supplies and the linear
+    // decoder binds later. Either way the register must still hold that base at
+    // the load, so the handler, the head (up to the dispatch), and the relocation
+    // fall-through must all leave the table register untouched.
+    let anchor = table_anchor_before(pe, shape.head, table)?;
 
     let mut factory = InstructionInfoFactory::new();
     if trace
@@ -1627,6 +1638,13 @@ fn recognize_postlude_dispatch(
     {
         return Err("handler writes the dispatch table register".to_owned());
     }
+    if anchor.is_none()
+        && head_trace
+            .instructions()
+            .any(|decoded| writes_register(&mut factory, &decoded.instruction, table))
+    {
+        return Err("dispatch head rewrites the global table register before dispatch".to_owned());
+    }
     region_reaches_head(
         pe,
         shape.fallthrough,
@@ -1634,10 +1652,10 @@ fn recognize_postlude_dispatch(
         &[roles.vip, check.vsp, table],
     )?;
 
-    candidate.handler_rebase = Some(anchor);
-    candidate.handler_rebase_rva = Some(anchor_rva);
+    candidate.handler_rebase = anchor.map(|(base, _)| base);
+    candidate.handler_rebase_rva = anchor.map(|(_, rva)| rva);
     candidate.codec.table = Some(crate::TableIndexedDispatch {
-        table_base: Some(anchor),
+        table_base: anchor.map(|(base, _)| base),
         ..entry_table
     });
     candidate.postlude = Some(PostludeDispatch {
@@ -1649,9 +1667,14 @@ fn recognize_postlude_dispatch(
         "handler ends in the shared stack-check postlude; ja targets the proven dispatch head"
             .to_owned(),
     );
-    candidate.evidence.push(format!(
-        "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base {anchor} falls into the head"
-    ));
+    match anchor {
+        Some((base, _)) => candidate.evidence.push(format!(
+            "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base {base} falls into the head"
+        )),
+        None => candidate.evidence.push(
+            "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base is a bootstrap-proven global live-in".to_owned(),
+        ),
+    }
     Ok(Some(candidate))
 }
 

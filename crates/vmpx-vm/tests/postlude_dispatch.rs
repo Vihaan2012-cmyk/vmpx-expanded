@@ -85,6 +85,8 @@ struct Variant {
     handler_writes_table: bool,
     /// The head has no static table anchor falling into it.
     no_anchor: bool,
+    /// The dispatch head rewrites the (global) table register before the load.
+    head_writes_table: bool,
 }
 
 struct Fixture {
@@ -182,6 +184,12 @@ fn build(body: &HandlerBody, variant: Variant) -> Fixture {
     a.set_label(&mut head).expect("head label");
     a.movzx(eax, byte_ptr(rsi)).expect("opcode");
     a.add(rsi, 1).expect("VIP advance");
+    if variant.head_writes_table {
+        // Clobber the global table register after the opcode load but before the
+        // table lookup: the bare-head check still passes, so only the explicit
+        // head preservation check catches it.
+        a.mov(r11, rsp).expect("head clobbers the global table register");
+    }
     a.movsxd(rbx, dword_ptr(r11 + rax * 4))
         .expect("table entry");
     a.add(rbx, r11).expect("handler base");
@@ -288,10 +296,6 @@ fn unsound_fallthrough_table_or_anchor_is_rejected() {
             handler_writes_table: true,
             ..Variant::default()
         },
-        Variant {
-            no_anchor: true,
-            ..Variant::default()
-        },
     ];
     for variant in variants {
         let fixture = build(&HandlerBody::ViaPostlude, variant);
@@ -311,6 +315,84 @@ fn unsound_fallthrough_table_or_anchor_is_rejected() {
             report.dispatch_analysis.rejected_sources
         );
     }
+}
+
+/// When the dispatch head's table base is a global live-in rather than a local
+/// `lea table,[abs]` anchor (as in the bit-permutation / graph-interpreter VM
+/// profile), the postlude dispatch is still recovered structurally, with its
+/// table base left unbound for the bootstrap anchor to supply. The handler, the
+/// head up to the dispatch, and the relocation fall-through are all proven to
+/// leave the table register untouched, so binding that global base is sound.
+#[test]
+fn stack_check_postlude_with_global_table_base_recovers_unbound() {
+    let fixture = build(
+        &HandlerBody::ViaPostlude,
+        Variant {
+            no_anchor: true,
+            ..Variant::default()
+        },
+    );
+    let report = recover(&fixture, fixture.handler);
+    let [candidate] = report.dispatch_analysis.candidates.as_slice() else {
+        panic!("expected one dispatch codec for the global-base postlude: {report:#?}");
+    };
+    assert!(candidate.postlude.is_some(), "postlude-reached dispatch");
+    assert_eq!(
+        candidate.handler_rebase, None,
+        "a global live-in base has no local anchor"
+    );
+    assert!(
+        candidate.table_register.is_some(),
+        "the table register is recovered for the global binding"
+    );
+    let table = candidate.codec.table.expect("table-indexed dispatch");
+    assert_eq!(
+        table.table_base, None,
+        "the table base is left unbound for the bootstrap anchor"
+    );
+    assert_eq!(table.stride, 4);
+    assert!(
+        candidate
+            .evidence
+            .iter()
+            .any(|line| line.contains("global live-in")),
+        "{:#?}",
+        candidate.evidence
+    );
+    assert!(
+        report.dispatch_analysis.rejected_sources.is_empty(),
+        "{:#?}",
+        report.dispatch_analysis.rejected_sources
+    );
+}
+
+/// A global-base postlude whose dispatch head rewrites the table register before
+/// the dispatch cannot soundly bind the bootstrap base, so it fails closed.
+#[test]
+fn stack_check_postlude_head_rewriting_global_table_is_rejected() {
+    let fixture = build(
+        &HandlerBody::ViaPostlude,
+        Variant {
+            no_anchor: true,
+            head_writes_table: true,
+            ..Variant::default()
+        },
+    );
+    let report = recover(&fixture, fixture.handler);
+    assert!(
+        report.dispatch_analysis.candidates.is_empty(),
+        "{report:#?}"
+    );
+    assert_eq!(report.status, RecoveryStatus::Failed);
+    assert!(
+        report
+            .dispatch_analysis
+            .rejected_sources
+            .iter()
+            .any(|rejection| rejection.reason.contains("head rewrites the global table register")),
+        "{:#?}",
+        report.dispatch_analysis.rejected_sources
+    );
 }
 
 #[test]
