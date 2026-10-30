@@ -1,0 +1,10 @@
+# Regenerable / large build outputs (see benchmark.md).
+# gen_manifest.json + gen_corpus.c are committed as a reference sample.
+gen_oracle.json
+*.dll
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+__pycache__/
