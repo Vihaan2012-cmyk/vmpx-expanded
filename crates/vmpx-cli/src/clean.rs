@@ -908,6 +908,10 @@ pub fn analyze_clean_with_image(
     // exit with no remaining semantic gaps.
     let export_reports = export_dependency_report(&pe);
     let vm_inventory = build_vm_inventory(&pe, &export_reports, &mut warnings);
+    // Single-body functions (input-closed set plus the executable entry) that
+    // reintegration below replaces in place.
+    let mut single_body_functions: Vec<crate::input_closed_functions::InputClosedFunction> =
+        Vec::new();
     let input_closed_functions = if protection.verdict == DetectionVerdict::NoStrongEvidence {
         completed_stage("not required for an input with no strong protection evidence")
     } else {
@@ -917,6 +921,7 @@ pub fn analyze_clean_with_image(
             exe_header_rva,
         );
         recovered.closed.extend(exe_entry_function);
+        single_body_functions.clone_from(&recovered.closed);
         let mut diagnostics = std::mem::take(&mut recovered.diagnostics);
         diagnostics.extend(recovered.closed.iter().map(|function| {
             format!(
@@ -1245,6 +1250,48 @@ pub fn analyze_clean_with_image(
                 }
             }
 
+            // Single-body functions: each gets its own inputs and carried
+            // effects, is laid out after the groups, and has its VM-entry stub
+            // redirected once the section exists. A failure skips only that
+            // function and leaves the cursor and payload untouched.
+            let is_dll = pe.coff.characteristics & IMAGE_FILE_DLL != 0;
+            let mut stub_redirects: Vec<(Rva, Rva)> = Vec::new();
+            let mut seen_stubs = BTreeSet::new();
+            let mut single_body_bytes: u64 = 0;
+            layout_cursor = u32::try_from(reintegration_payload.len()).unwrap_or(layout_cursor);
+            for function in &single_body_functions {
+                let handled_by_group = (is_dll && function.rva == pe.optional.address_of_entry_point)
+                    || tls_callback_index(&pe, function.rva).is_some();
+                if handled_by_group || !seen_stubs.insert(function.rva) {
+                    continue;
+                }
+                let Some(body_rva) = planned_rva.0.checked_add(layout_cursor).map(Rva) else {
+                    reintegration_diagnostics.push(format!(
+                        "{}: single-body layout overflow; skipped",
+                        function.rva
+                    ));
+                    continue;
+                };
+                let body_va = va + u64::from(layout_cursor);
+                match compile_single_body(&pe, function, body_va) {
+                    Ok(body) => {
+                        layout_cursor =
+                            layout_cursor.saturating_add(u32::try_from(body.len()).unwrap_or(0));
+                        let len = u64::try_from(body.len()).unwrap_or(0);
+                        total_bytes += len;
+                        single_body_bytes += len;
+                        emitted += 1;
+                        reintegration_payload.extend_from_slice(&body);
+                        stub_redirects.push((function.rva, body_rva));
+                    }
+                    Err(error) => reintegration_diagnostics.push(format!(
+                        "{}: single-body replacement not built ({} effect store(s)): {error}",
+                        function.rva,
+                        function.effects.stores.len()
+                    )),
+                }
+            }
+
             // Nested-continuation bodies still compile and count here (nothing
             // is silently dropped), but reintegration is deferred: redirecting
             // to one means rewriting another body's continuation target, which
@@ -1289,7 +1336,22 @@ pub fn analyze_clean_with_image(
                         tls_redirects: &tls_redirects,
                     },
                 ) {
-                    Ok((bytes, report)) => {
+                    Ok((mut bytes, report)) => {
+                        let mut functions_redirected: u64 = 0;
+                        for (stub, body) in &stub_redirects {
+                            match vmpx_rebuild::redirect_vm_stub(&bytes, *stub, *body) {
+                                Ok(redirected) => {
+                                    bytes = redirected;
+                                    functions_redirected += 1;
+                                    reintegration_diagnostics.push(format!(
+                                        "{stub}: VM entry stub redirected to single-body                                          replacement at {body}"
+                                    ));
+                                }
+                                Err(error) => reintegration_diagnostics.push(format!(
+                                    "{stub}: stub redirect failed, original stub kept: {error}"
+                                )),
+                            }
+                        }
                         reintegrated = Some(bytes);
                         let entries_redirected = u64::from(report.entry_redirected)
                             + u64::try_from(report.tls_redirected).unwrap_or(0);
@@ -1310,6 +1372,12 @@ pub fn analyze_clean_with_image(
                                 ),
                                 ("entries_redirected".to_owned(), entries_redirected),
                                 ("dispatchers".to_owned(), dispatcher_count),
+                                (
+                                    "single_body_candidates".to_owned(),
+                                    u64::try_from(stub_redirects.len()).unwrap_or(0),
+                                ),
+                                ("single_body_redirected".to_owned(), functions_redirected),
+                                ("single_body_bytes".to_owned(), single_body_bytes),
                                 (
                                     "tls_redirected".to_owned(),
                                     u64::try_from(report.tls_redirected).unwrap_or(0),
@@ -1621,6 +1689,20 @@ fn compile_replacement_body(
     vmpx_vmlift::build_replacement(&exit.registers, &config, vmpx_recompile::CodeAddress(va))
         .map(|replacement| replacement.compiled.bytes)
         .map_err(|error| error.to_string())
+}
+
+/// Builds one recovered single-body function's replacement with its OWN entry
+/// inputs (never the header entry's) and its carried effects.
+fn compile_single_body(
+    pe: &PeImage<'_>,
+    function: &crate::input_closed_functions::InputClosedFunction,
+    va: u64,
+) -> Result<Vec<u8>, String> {
+    let candidate = analyze_vm_entry_at(pe, function.rva, VmDiscoveryLimits::default())
+        .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
+    let mut rewrites = BTreeMap::new();
+    let inputs = replacement_inputs(pe, &candidate, &mut rewrites)?;
+    compile_replacement_body(pe, &inputs, &rewrites, &function.exit, &function.effects, va)
 }
 
 /// Resolves a TLS entry's RVA back to its position in the TLS directory's

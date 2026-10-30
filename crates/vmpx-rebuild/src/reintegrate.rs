@@ -166,6 +166,91 @@ pub fn set_tls_callback(input: &[u8], index: usize, target: Rva) -> Result<Vec<u
     Ok(output)
 }
 
+const JMP_REL32_LEN: u32 = 5;
+
+/// `E9 rel32` for a near jump placed at `stub`, or `None` when the displacement
+/// does not fit in 32 bits.
+fn jmp_rel32(stub: Rva, target: Rva) -> Option<[u8; 5]> {
+    let next = i64::from(stub.0) + i64::from(JMP_REL32_LEN);
+    let rel = i32::try_from(i64::from(target.0) - next).ok()?;
+    let mut jmp = [0xE9, 0, 0, 0, 0];
+    jmp[1..].copy_from_slice(&rel.to_le_bytes());
+    Some(jmp)
+}
+
+/// Overwrites the first five bytes at `stub_rva` with a near `jmp target_rva`
+/// and reparses the result to confirm the bytes landed.
+///
+/// Unlike the append-only header/TLS redirects, this edits existing code bytes
+/// in the rebuilt output, which is standard for devirtualization
+/// reintegration. The result belongs to the `--experimental` image only; it
+/// changes the module's code and so interacts with integrity checks, which are
+/// handled at SP5.
+///
+/// # Errors
+///
+/// Rejects an unparseable input, a stub that is not in an executable,
+/// file-backed section with at least five bytes left to the end of its raw
+/// data, a target that is not in an executable section, a displacement that
+/// does not fit `rel32`, and any write that does not survive reparse.
+pub fn redirect_vm_stub(
+    input: &[u8],
+    stub_rva: Rva,
+    target_rva: Rva,
+) -> Result<Vec<u8>, RebuildError> {
+    let pe = PeImage::parse(input).map_err(|source| RebuildError::Pe {
+        stage: "input",
+        source,
+    })?;
+    let executable = |rva: Rva| {
+        pe.sections.iter().find(|section| {
+            section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 && section.contains_mapped_rva(rva)
+        })
+    };
+    let section = executable(stub_rva).ok_or(RebuildError::VmStubNotExecutable { rva: stub_rva })?;
+    if executable(target_rva).is_none() {
+        return Err(RebuildError::VmStubTargetNotExecutable { rva: target_rva });
+    }
+    let stub_offset = pe
+        .rva_to_file_offset(stub_rva)
+        .map_err(|_| RebuildError::VmStubNotFileBacked { rva: stub_rva })?;
+    let delta = stub_rva.0 - section.virtual_address.0;
+    let available = section.size_of_raw_data.saturating_sub(delta);
+    if available < JMP_REL32_LEN {
+        return Err(RebuildError::VmStubNoRoom {
+            rva: stub_rva,
+            available,
+        });
+    }
+    let jmp = jmp_rel32(stub_rva, target_rva).ok_or(RebuildError::VmStubRel32Range {
+        stub: stub_rva,
+        target: target_rva,
+    })?;
+
+    let mut output = input.to_vec();
+    write_bytes(&mut output, stub_offset, &jmp, "vm stub jmp")?;
+
+    let reparsed = PeImage::parse(&output).map_err(|source| RebuildError::Pe {
+        stage: "output",
+        source,
+    })?;
+    let landed_offset = reparsed
+        .rva_to_file_offset(stub_rva)
+        .map_err(|source| RebuildError::Pe {
+            stage: "output stub",
+            source,
+        })?;
+    let start = usize::try_from(landed_offset.0).map_err(|_| RebuildError::Overflow {
+        what: "vm stub offset",
+    })?;
+    if output.get(start..start + jmp.len()) != Some(&jmp[..]) {
+        return Err(RebuildError::OutputInvariant(
+            "VM stub jmp did not survive reparse".to_owned(),
+        ));
+    }
+    Ok(output)
+}
+
 fn read_u64(data: &[u8], offset: FileOffset) -> Result<u64, RebuildError> {
     let start = usize::try_from(offset.0).map_err(|_| RebuildError::Overflow { what: "tls read" })?;
     let end = start.checked_add(8).ok_or(RebuildError::Overflow { what: "tls read" })?;
@@ -296,6 +381,87 @@ mod tests {
             set_tls_callback(&input, 9, Rva(0x2000)),
             Err(RebuildError::TlsCallbackIndex { index: 9, count: 1 })
         ));
+    }
+
+    fn file_offset_of(bytes: &[u8], rva: Rva) -> usize {
+        usize::try_from(
+            PeImage::parse(bytes)
+                .expect("parse")
+                .rva_to_file_offset(rva)
+                .expect("offset")
+                .0,
+        )
+        .expect("small offset")
+    }
+
+    #[test]
+    fn redirect_vm_stub_writes_a_jmp_that_decodes_to_the_target() {
+        let input = minimal_conventional_pe();
+        let (stub, target) = (Rva(0x1100), Rva(0x2000));
+        let output = redirect_vm_stub(&input, stub, target).expect("redirect");
+        let at = file_offset_of(&output, stub);
+        assert_eq!(output[at], 0xE9);
+        let rel = i32::from_le_bytes(output[at + 1..at + 5].try_into().expect("4 bytes"));
+        assert_eq!(i64::from(stub.0) + 5 + i64::from(rel), i64::from(target.0));
+        // Only the five stub bytes changed.
+        let diff = input.iter().zip(&output).filter(|(a, b)| a != b).count();
+        assert!(diff <= 5);
+    }
+
+    #[test]
+    fn redirect_vm_stub_encodes_a_backward_jump() {
+        let input = minimal_conventional_pe();
+        let output = redirect_vm_stub(&input, Rva(0x2000), Rva(0x1010)).expect("redirect");
+        let at = file_offset_of(&output, Rva(0x2000));
+        let rel = i32::from_le_bytes(output[at + 1..at + 5].try_into().expect("4 bytes"));
+        assert_eq!(rel, 0x1010 - 0x2005);
+    }
+
+    #[test]
+    fn redirect_vm_stub_rejects_a_non_executable_section() {
+        let mut input = minimal_conventional_pe();
+        put_u32(&mut input, SECTION_TABLE_OFFSET + 36, 0x4000_0040); // R, initialized data
+        assert!(matches!(
+            redirect_vm_stub(&input, Rva(0x1100), Rva(0x2000)),
+            Err(RebuildError::VmStubNotExecutable { rva: Rva(0x1100) })
+        ));
+    }
+
+    #[test]
+    fn redirect_vm_stub_rejects_a_stub_with_no_room() {
+        let input = minimal_conventional_pe();
+        // Last section byte is 0x2FFF: stub at 0x2FFC leaves only 4 bytes.
+        assert!(matches!(
+            redirect_vm_stub(&input, Rva(0x2FFC), Rva(0x1000)),
+            Err(RebuildError::VmStubNoRoom { available: 4, .. })
+        ));
+        assert!(redirect_vm_stub(&input, Rva(0x2FFB), Rva(0x1000)).is_ok());
+    }
+
+    #[test]
+    fn redirect_vm_stub_rejects_a_stub_without_file_data() {
+        let mut input = minimal_conventional_pe();
+        put_u32(&mut input, SECTION_TABLE_OFFSET + 16, 0x1000); // raw shrinks, span stays mapped
+        assert!(matches!(
+            redirect_vm_stub(&input, Rva(0x2100), Rva(0x1000)),
+            Err(RebuildError::VmStubNotFileBacked { .. } | RebuildError::VmStubNoRoom { .. })
+        ));
+    }
+
+    #[test]
+    fn redirect_vm_stub_rejects_a_target_outside_executable_code() {
+        let input = minimal_conventional_pe();
+        assert!(matches!(
+            redirect_vm_stub(&input, Rva(0x1100), Rva(0x9000)),
+            Err(RebuildError::VmStubTargetNotExecutable { rva: Rva(0x9000) })
+        ));
+    }
+
+    #[test]
+    fn jmp_rel32_rejects_an_unrepresentable_displacement() {
+        assert!(jmp_rel32(Rva(0x1000), Rva(0xF000_0000)).is_none());
+        assert!(jmp_rel32(Rva(0xF000_0000), Rva(0x1000)).is_none());
+        assert!(jmp_rel32(Rva(0x1000), Rva(0x2000)).is_some());
     }
 
     #[test]

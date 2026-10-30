@@ -12,7 +12,9 @@ pub use layout::{
     is_conventional_layout, is_discardable, is_rva_layout, normalize_characteristics,
     relayout_conventional, validate_for_loader,
 };
-pub use reintegrate::{ReintegrationReport, ReintegrationRequest, reintegrate, set_tls_callback};
+pub use reintegrate::{
+    ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate, set_tls_callback,
+};
 
 use thiserror::Error;
 use vmpx_pe::{
@@ -131,6 +133,21 @@ pub enum RebuildError {
 
     #[error("TLS callback target RVA {rva:?} is not backed by file data")]
     TlsCallbackNotFileBacked { rva: Rva },
+
+    #[error("VM stub RVA {rva:?} is not inside an executable section")]
+    VmStubNotExecutable { rva: Rva },
+
+    #[error("VM stub RVA {rva:?} is not backed by file data")]
+    VmStubNotFileBacked { rva: Rva },
+
+    #[error("VM stub RVA {rva:?} has only {available} file-backed byte(s) left; a jmp needs 5")]
+    VmStubNoRoom { rva: Rva, available: u32 },
+
+    #[error("VM stub redirect target RVA {rva:?} is not inside an executable section")]
+    VmStubTargetNotExecutable { rva: Rva },
+
+    #[error("jmp from {stub:?} to {target:?} does not fit a rel32 displacement")]
+    VmStubRel32Range { stub: Rva, target: Rva },
 }
 
 fn align_u32(value: u32, alignment: u32, what: &'static str) -> Result<u32, RebuildError> {

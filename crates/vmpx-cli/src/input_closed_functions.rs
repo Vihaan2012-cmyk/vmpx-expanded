@@ -17,7 +17,7 @@ use vmpx_vm::{
     VmProfileExplorerLimits, X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
     is_expr_input_closed, is_input_closed, recover_branching_entry_paths, recover_entry_paths,
 };
-use vmpx_vmlift::{calling_convention, collect_path_effects};
+use vmpx_vmlift::{CollectedEffects, calling_convention, collect_path_effects};
 
 use crate::{clean::replacement_inputs, vm_inventory::VmInventoryEntry};
 
@@ -29,9 +29,10 @@ pub(crate) const MIN_CONFIDENCE: u8 = 60;
 #[derive(Clone, Debug)]
 pub(crate) struct InputClosedFunction {
     pub rva: Rva,
-    /// Consumed by reintegration (SP2 Task 5).
-    #[expect(dead_code, reason = "consumed by SP2 Task 5 reintegration")]
     pub exit: NativeExitState,
+    /// Stores and calls the replacement must replay (an exit alone would
+    /// silently drop them).
+    pub effects: CollectedEffects,
     /// Every symbol the replacement binds (the closedness `allowed` set).
     pub inputs: BTreeSet<String>,
     /// Task 3's inferred live-in registers. Informational only: it
@@ -130,7 +131,7 @@ fn closed_exit(
     family: &RecoveredEntryPathFamily,
     path: &RecoveredEntryPath,
     allowed: &BTreeSet<String>,
-) -> Result<NativeExitState, String> {
+) -> Result<(NativeExitState, CollectedEffects), String> {
     let exit = path
         .native_exit
         .clone()
@@ -152,7 +153,7 @@ fn closed_exit(
     if !memory_is_exact(family, path) {
         return Err("path has memory havocs or tainted memory".to_owned());
     }
-    Ok(exit)
+    Ok((exit, effects))
 }
 
 /// Recovers `rva` as an input-closed function: an empty input domain, so the
@@ -184,12 +185,13 @@ pub(crate) fn recover_input_closed(
             "path depends on an enumerated input".to_owned(),
         ));
     }
-    let exit = closed_exit(&family, path, &allowed)?;
+    let (exit, effects) = closed_exit(&family, path, &allowed)?;
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
     Ok(InputClosedFunction {
         rva,
         exit,
+        effects,
         inputs: allowed,
         live_in: calling_convention(&family, &frame).live_in,
     })
@@ -222,7 +224,7 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         if !path.assignments.is_empty() {
             return Err("branching path was specialized by an input".to_owned());
         }
-        paths.push((*target, closed_exit(family, path, &allowed)?));
+        paths.push((*target, closed_exit(family, path, &allowed)?.0));
     }
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
@@ -331,6 +333,11 @@ mod tests {
                 rflags: Expr::constant(BitWidth::W64, 0x202),
                 return_address: Expr::constant(BitWidth::W64, 0x1_4000_1000),
                 frame_size: 136,
+            },
+            effects: CollectedEffects {
+                stores: Vec::new(),
+                calls: Vec::new(),
+                unsupported: Vec::new(),
             },
             inputs: BTreeSet::new(),
             live_in: BTreeSet::new(),
