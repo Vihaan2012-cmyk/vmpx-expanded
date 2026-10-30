@@ -82,6 +82,7 @@ fn cfg(blocks: Vec<(Va, VmBasicBlock)>, edges: Vec<CfgEdge>, entry: u64) -> VmCf
         visits: 0,
         frame_cells_known: 17,
         frame_note: None,
+        assumptions: std::collections::BTreeSet::new(),
     }
 }
 

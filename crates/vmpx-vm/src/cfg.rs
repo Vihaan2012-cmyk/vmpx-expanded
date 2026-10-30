@@ -139,6 +139,17 @@ pub enum CfgLimitHit {
     TotalInstructions,
 }
 
+/// A labeled assumption the recovery relied on, surfaced rather than folded
+/// silently (mirrors `IdiomAssumption::AssumesCleanEnvironment`).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmCfgAssumption {
+    /// A native input register used only to relocate in-image addresses was
+    /// bound to 0 for branch resolution: the image-base / relocation delta,
+    /// which is 0 at the preferred base every image read already assumes.
+    PreferredImageBase,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct VmCfg {
     pub entry: Va,
@@ -150,6 +161,8 @@ pub struct VmCfg {
     /// Initial VM-stack cells with a proven value, and why the rest are unknown.
     pub frame_cells_known: usize,
     pub frame_note: Option<String>,
+    /// Labeled assumptions relied on during recovery.
+    pub assumptions: BTreeSet<VmCfgAssumption>,
 }
 
 impl VmCfg {
@@ -628,6 +641,80 @@ fn proven_exit_layout(report: Option<&VmExitReport>) -> Option<VmExitReport> {
         .cloned()
 }
 
+/// True when every occurrence of register `name` in `expr` is an operand of
+/// `name + <in-image preferred-base VA>` — the signature of an image-base /
+/// relocation-delta addend (added to a preferred-base image address to relocate
+/// it). A single occurrence anywhere else — a bare register, a data operand, a
+/// comparison — makes this false, so the caller fails closed instead of binding
+/// a value it cannot prove is the delta.
+fn image_base_relative_only(expr: &Expr, name: &str, is_image_va: &impl Fn(u64) -> bool) -> bool {
+    let is_image_addend = |reg: &Expr, other: &Expr| {
+        matches!(&reg.kind, ExprKind::Register { name: n } if n == name)
+            && reg.width == BitWidth::W64
+            && matches!(&other.kind, ExprKind::Const { value } if is_image_va(*value))
+    };
+    match &expr.kind {
+        // A bare occurrence not consumed by an image-addend `Add` is a data use.
+        ExprKind::Register { name: n } => n != name,
+        ExprKind::Const { .. } => true,
+        ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } if is_image_addend(left, right) || is_image_addend(right, left) => true,
+        ExprKind::Unary { value, .. }
+        | ExprKind::Load { address: value }
+        | ExprKind::Extract { value, .. }
+        | ExprKind::Resize { value, .. } => image_base_relative_only(value, name, is_image_va),
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => {
+            image_base_relative_only(left, name, is_image_va)
+                && image_base_relative_only(right, name, is_image_va)
+        }
+        ExprKind::Intrinsic { arguments, .. } => arguments
+            .iter()
+            .all(|argument| image_base_relative_only(argument, name, is_image_va)),
+    }
+}
+
+/// Binds image-base-relative native registers in `target` to 0 under the
+/// preferred-base frame, returning the rewritten target and the names bound.
+/// `is_image_va` recognizes a preferred-base in-image VA.
+///
+/// Sound: a register bound here is proven (structurally, by
+/// [`image_base_relative_only`]) to appear only as an addend relocating an
+/// in-image preferred-base address. That is the relocation delta / image base,
+/// which is 0 at the preferred base every image read in the tool assumes. A
+/// register used as any other value is left untouched (the branch then stalls).
+fn bind_preferred_base_registers(
+    target: &Expr,
+    is_image_va: &impl Fn(u64) -> bool,
+) -> (Expr, BTreeSet<String>) {
+    const MAX_NODES: usize = 4_096;
+    if target.node_count_bounded(MAX_NODES) > MAX_NODES {
+        return (target.clone(), BTreeSet::new());
+    }
+    let mut replacements = BTreeMap::new();
+    let mut bound = BTreeSet::new();
+    for name in target.dependencies() {
+        if image_base_relative_only(target, &name, is_image_va) {
+            replacements.insert(name.clone(), Expr::constant(BitWidth::W64, 0));
+            bound.insert(name);
+        }
+    }
+    if replacements.is_empty() {
+        return (target.clone(), bound);
+    }
+    match target.substitute(&replacements) {
+        Ok(rewritten) => (rewritten, bound),
+        // A width mismatch cannot prove the delta: leave the target unbound.
+        Err(_) => (target.clone(), BTreeSet::new()),
+    }
+}
+
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
 fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
@@ -1102,13 +1189,24 @@ impl Walker<'_, '_> {
                 return;
             }
         };
-        let (targets, guarded) = match resolve_targets(target, self.limits) {
+        // Bind image-base-relative native registers (the relocation delta) to 0
+        // under the preferred-base frame, so a branch relocated through the
+        // image base resolves instead of stalling on that residual addend.
+        let (bound_target, bound_registers) = bind_preferred_base_registers(target, &|value| {
+            bytecode_section(self.pe, Va(value)).is_some()
+        });
+        let (targets, guarded) = match resolve_targets(&bound_target, self.limits) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 self.stall(key, vip, format!("unresolved branch target: {reason}"));
                 return;
             }
         };
+        if !bound_registers.is_empty() {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::PreferredImageBase);
+        }
         for value in targets {
             let target_va = Va(value);
             if self.section.is_none() || bytecode_section(self.pe, target_va) != self.section {
@@ -1394,6 +1492,7 @@ pub fn recover_vm_cfg(
             visits: 0,
             frame_cells_known,
             frame_note,
+            assumptions: BTreeSet::new(),
         },
         total_instructions: 0,
     };
@@ -1493,6 +1592,104 @@ mod tests {
         .simplify();
         assert!(target.dependencies().contains("native_r13_initial"));
         assert_eq!(flag_fork_targets(&target, VmCfgLimits::default()), None);
+    }
+
+    /// A predicate matching the oracle's bytecode-section preferred-base VAs.
+    fn is_oracle_image_va(value: u64) -> bool {
+        (0x1_8000_0000..0x1_9000_0000).contains(&value)
+    }
+
+    fn reg_r13() -> Expr {
+        Expr::register(BitWidth::W64, "native_r13_initial")
+    }
+
+    fn image_addend(va: u64) -> Expr {
+        Expr::binary(BinaryOp::Add, reg_r13(), Expr::constant(BitWidth::W64, va)).unwrap()
+    }
+
+    /// The oracle's branchless select, verbatim in shape:
+    /// `r13 + select(ZF(operand), lo, hi)`, with `r13 + VA` kept under a `Not`
+    /// in each branch so it survives simplification (it is never a bare addend).
+    fn r13_relative_flag_select(operand: Expr, lo: u64, hi: u64) -> Expr {
+        let not = |e| Expr::unary(crate::UnaryOp::Not, e);
+        let or = |l, r| Expr::binary(BinaryOp::Or, l, r).unwrap();
+        let inner = Expr::binary(
+            BinaryOp::Add,
+            zf_bit(operand),
+            Expr::constant(BitWidth::W64, u64::MAX),
+        )
+        .unwrap();
+        let left = not(or(not(inner.clone()), not(image_addend(lo))));
+        let right = not(or(inner, not(image_addend(hi))));
+        Expr::binary(BinaryOp::Add, left, right).unwrap()
+    }
+
+    #[test]
+    fn image_base_relative_register_binds_and_branch_resolves() {
+        // r13 is added only to in-image target VAs (the relocation delta).
+        let target = r13_relative_flag_select(opaque_operand(), 0x1_8009_ED37, 0x1_8009_EDB0);
+        assert!(target.dependencies().contains("native_r13_initial"));
+        assert!(image_base_relative_only(
+            &target,
+            "native_r13_initial",
+            &is_oracle_image_va
+        ));
+        // Binding removes the residual delta that otherwise fails the fork closed.
+        let (bound, names) = bind_preferred_base_registers(&target, &is_oracle_image_va);
+        assert_eq!(names, BTreeSet::from(["native_r13_initial".to_owned()]));
+        assert!(!bound.dependencies().contains("native_r13_initial"));
+        // The flag fork now resolves both image targets exactly.
+        assert_eq!(
+            resolve_targets(&bound, VmCfgLimits::default()),
+            Ok((vec![0x1_8009_ED37, 0x1_8009_EDB0], true))
+        );
+    }
+
+    #[test]
+    fn register_used_as_data_value_is_not_bound() {
+        // r13 added to a non-image constant is a general value, not a relocation
+        // of an image address: it must not bind, and the branch fails closed.
+        let data = Expr::binary(
+            BinaryOp::Add,
+            reg_r13(),
+            Expr::constant(BitWidth::W64, 0x40),
+        )
+        .unwrap();
+        let target = Expr::binary(
+            BinaryOp::Add,
+            select(zf_bit(opaque_operand()), 0x1_8009_ED37, 0x1_8009_EDB0),
+            data,
+        )
+        .unwrap();
+        let (bound, names) = bind_preferred_base_registers(&target, &is_oracle_image_va);
+        assert!(names.is_empty());
+        assert_eq!(bound, target);
+        assert!(resolve_targets(&target, VmCfgLimits::default()).is_err());
+
+        // Mixed use: one image-base addend and one bare data occurrence of the
+        // same register still fails closed — it cannot be proven the pure delta.
+        let mixed = Expr::binary(BinaryOp::Add, image_addend(0x1_8009_ED37), reg_r13()).unwrap();
+        assert!(!image_base_relative_only(
+            &mixed,
+            "native_r13_initial",
+            &is_oracle_image_va
+        ));
+        let (_, mixed_names) = bind_preferred_base_registers(&mixed, &is_oracle_image_va);
+        assert!(mixed_names.is_empty());
+    }
+
+    #[test]
+    fn binding_surfaces_the_preferred_base_assumption_label() {
+        // A non-empty bound set is exactly what follow_branch records as the
+        // labeled, surfaced assumption.
+        let target = r13_relative_flag_select(opaque_operand(), 0x1_8009_ED37, 0x1_8009_EDB0);
+        let (_, names) = bind_preferred_base_registers(&target, &is_oracle_image_va);
+        assert!(!names.is_empty());
+        let mut assumptions = BTreeSet::new();
+        if !names.is_empty() {
+            assumptions.insert(VmCfgAssumption::PreferredImageBase);
+        }
+        assert!(assumptions.contains(&VmCfgAssumption::PreferredImageBase));
     }
 
     #[test]
@@ -1640,6 +1837,7 @@ mod tests {
             visits: 0,
             frame_cells_known: 0,
             frame_note: None,
+            assumptions: BTreeSet::new(),
         }
     }
 

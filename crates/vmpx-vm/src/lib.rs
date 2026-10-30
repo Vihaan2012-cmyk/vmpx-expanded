@@ -59,7 +59,7 @@ pub use call_effects::{
 };
 pub use cfg::{
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, VmBasicBlock, VmCfg,
-    VmCfgLimits, recover_vm_cfg,
+    VmCfgAssumption, VmCfgLimits, recover_vm_cfg,
 };
 pub use checksum::{
     ChecksumAccumulatorSource, ChecksumCombine, ChecksumShift, ChecksumTableIndex,
