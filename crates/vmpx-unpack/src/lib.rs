@@ -1,3 +1,40 @@
+//! Static recovery of VMProtect-packed sections.
+//!
+//! # Real VMProtect 3.11 packed layout (reverse-engineered from genuine output)
+//!
+//! When "Pack the output file" is enabled, VMProtect strips the raw bytes of
+//! every initialized section of the pre-pack image (`PointerToRawData == 0`,
+//! `SizeOfRawData == 0`, `VirtualSize != 0`) and stores each section's bytes as
+//! an independent **raw LZMA1 stream** inside the protector's own raw-data
+//! section. The loader stub that places them is itself virtualized, so there is
+//! **no plaintext descriptor table** (the earlier `PACKER_INFO` model — 8-byte
+//! source/destination pairs, plaintext or rotating-key XOR — does not occur in
+//! real output and has been removed).
+//!
+//! Each stream is a header-less LZMA1 stream with the standard VMProtect
+//! properties `lc=3, lp=0, pb=2` and an end-of-stream marker. A stream's
+//! decompressed length equals the destination section's `VirtualSize` rounded
+//! up to `FileAlignment` (the original on-disk section size). Streams are not
+//! stored in section order and carry no self-identifying metadata, so they are
+//! located structurally: every zero-initialised offset in the protector's
+//! raw-data sections is probed, and an offset is accepted as a stream for a
+//! destination only when it decodes to *exactly* that destination's rounded
+//! size and is immediately followed by a clean EOS marker (validated with three
+//! independent `lzma-rs` decodes — see [`section_stream_matches`]).
+//!
+//! # Soundness
+//!
+//! A stream is bound to a destination only when its decompressed size matches
+//! exactly. When several destinations share one rounded size, the located
+//! streams for that size must number *exactly* as many as those destinations
+//! (otherwise the file is rejected as ambiguous); they are then paired in
+//! ascending file-offset / ascending-RVA order, which is the sole residual
+//! assumption and is surfaced as a report warning. The rebuilt image must
+//! reparse in memory, and (via `--conventional`) pass loader validation.
+//! Any count/size/range/decode mismatch fails closed with a precise error.
+
+#![allow(clippy::doc_markdown)]
+
 use std::{
     collections::HashMap,
     io::{self, BufRead, Read, Write},
@@ -8,9 +45,11 @@ use thiserror::Error;
 use vmpx_pe::{FileOffset, PeError, PeImage, Rva, Section};
 
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
-const DEFAULT_LZMA_PROPERTIES: [u8; 5] = [0x5D, 0x00, 0x00, 0x00, 0x04];
+/// Standard VMProtect packer LZMA properties: `lc=3, lp=0, pb=2`, 64 MiB dict.
+const VMPROTECT_LZMA_PROPERTIES: [u8; 5] = [0x5D, 0x00, 0x00, 0x00, 0x04];
 const MAX_PACKED_SECTIONS: usize = 256;
-const MAX_TABLE_CANDIDATES: usize = 16;
+/// Upper bound on located streams per distinct size before declaring ambiguity.
+const MAX_STREAMS_PER_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct UnpackLimits {
@@ -30,21 +69,21 @@ impl Default for UnpackLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackerLayoutKind {
-    LegacyPlaintext,
-    EncodedRotatingKey,
+    /// Real VMProtect 3.x layout: one header-less raw LZMA1 stream per section.
+    RawLzma1Sections,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PackerEntry {
     pub source_rva: Rva,
     pub destination_rva: Rva,
+    pub decompressed_size: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PackerTable {
     pub kind: PackerLayoutKind,
     pub file_offset: FileOffset,
-    pub destination_key: Option<u32>,
     pub lzma_properties: [u8; 5],
     pub entries: Vec<PackerEntry>,
 }
@@ -98,236 +137,17 @@ pub enum UnpackError {
     Reconstruct(String),
 }
 
-fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    let bytes = data.get(offset..offset.checked_add(4)?)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn packed_sections(pe: &PeImage<'_>, limit: usize) -> Result<Vec<Section>, UnpackError> {
-    let sections: Vec<_> = pe
-        .sections
-        .iter()
-        .filter(|section| {
-            section.pointer_to_raw_data.0 == 0
-                && section.size_of_raw_data == 0
-                && section.virtual_size != 0
-                && section.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA == 0
-        })
-        .cloned()
-        .collect();
-    if sections.is_empty() {
-        return Err(UnpackError::Locate(
-            "no initialized virtual-only destination sections were found".to_owned(),
-        ));
+fn round_up(value: u32, align: u32) -> Option<u32> {
+    if align <= 1 {
+        return Some(value);
     }
-    if sections.len() > limit {
-        return Err(UnpackError::Locate(format!(
-            "{} packed-section candidates exceed limit {limit}",
-            sections.len()
-        )));
-    }
-    Ok(sections)
+    let blocks = value.checked_add(align - 1)? / align;
+    blocks.checked_mul(align)
 }
 
 fn lzma_source_offset(pe: &PeImage<'_>, rva: Rva) -> Option<usize> {
     let raw = usize::try_from(pe.rva_to_file_offset(rva).ok()?.0).ok()?;
     (pe.data().get(raw) == Some(&0)).then_some(raw)
-}
-
-fn validate_sources(pe: &PeImage<'_>, data: &[u8], table_offset: usize, count: usize) -> bool {
-    for index in 0..count {
-        let Some(entry_offset) = index
-            .checked_mul(8)
-            .and_then(|delta| table_offset.checked_add(delta))
-        else {
-            return false;
-        };
-        let Some(source) = read_u32(data, entry_offset) else {
-            return false;
-        };
-        if lzma_source_offset(pe, Rva(source)).is_none() {
-            return false;
-        }
-    }
-    true
-}
-
-fn find_legacy_tables(pe: &PeImage<'_>, destinations: &[Section]) -> Vec<PackerTable> {
-    let data = pe.data();
-    let Some(table_size) = destinations.len().checked_mul(8) else {
-        return Vec::new();
-    };
-    if table_size > data.len() {
-        return Vec::new();
-    }
-    let mut candidates = Vec::new();
-    for table_offset in 8..=data.len() - table_size {
-        let destinations_match = destinations.iter().enumerate().all(|(index, section)| {
-            read_u32(data, table_offset + index * 8 + 4) == Some(section.virtual_address.0)
-        });
-        if !destinations_match || !validate_sources(pe, data, table_offset, destinations.len()) {
-            continue;
-        }
-        let Some(properties_rva) = read_u32(data, table_offset - 8) else {
-            continue;
-        };
-        let Ok(properties_offset) = pe.rva_to_file_offset(Rva(properties_rva)) else {
-            continue;
-        };
-        let Ok(properties_offset) = usize::try_from(properties_offset.0) else {
-            continue;
-        };
-        let Some(properties) = data.get(properties_offset..properties_offset.saturating_add(5))
-        else {
-            continue;
-        };
-        let mut lzma_properties = [0_u8; 5];
-        lzma_properties.copy_from_slice(properties);
-        let entries = destinations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, section)| {
-                Some(PackerEntry {
-                    source_rva: Rva(read_u32(data, table_offset + index * 8)?),
-                    destination_rva: section.virtual_address,
-                })
-            })
-            .collect();
-        candidates.push(PackerTable {
-            kind: PackerLayoutKind::LegacyPlaintext,
-            file_offset: FileOffset(u64::try_from(table_offset).unwrap_or(u64::MAX)),
-            destination_key: None,
-            lzma_properties,
-            entries,
-        });
-        if candidates.len() >= MAX_TABLE_CANDIDATES {
-            break;
-        }
-    }
-    candidates
-}
-
-fn decode_destinations(
-    stored: &[u32],
-    key: u32,
-    destination_indexes: &HashMap<u32, usize>,
-) -> Option<Vec<Rva>> {
-    let mut seen = vec![false; destination_indexes.len()];
-    let mut decoded = Vec::with_capacity(stored.len());
-    for (index, encoded) in stored.iter().copied().enumerate() {
-        let rotation = u32::try_from((index * 7) & 31).ok()?;
-        let destination = encoded ^ key.rotate_left(rotation);
-        let destination_index = *destination_indexes.get(&destination)?;
-        if seen[destination_index] {
-            return None;
-        }
-        seen[destination_index] = true;
-        decoded.push(Rva(destination));
-    }
-    seen.iter().all(|value| *value).then_some(decoded)
-}
-
-fn find_encoded_tables(pe: &PeImage<'_>, destinations: &[Section]) -> Vec<PackerTable> {
-    let data = pe.data();
-    let Some(table_size) = destinations.len().checked_mul(8) else {
-        return Vec::new();
-    };
-    if table_size > data.len() {
-        return Vec::new();
-    }
-    let destination_indexes: HashMap<_, _> = destinations
-        .iter()
-        .enumerate()
-        .map(|(index, section)| (section.virtual_address.0, index))
-        .collect();
-    let mut candidates = Vec::new();
-    let mut table_offset = 0_usize;
-    while table_offset <= data.len() - table_size {
-        // Two cheap source checks reject almost every byte position. The full
-        // source pass is done only for the rare survivor.
-        let first_source = read_u32(data, table_offset).map(Rva);
-        let second_source = read_u32(data, table_offset + 8).map(Rva);
-        if first_source
-            .and_then(|rva| lzma_source_offset(pe, rva))
-            .is_none()
-            || second_source
-                .and_then(|rva| lzma_source_offset(pe, rva))
-                .is_none()
-            || !validate_sources(pe, data, table_offset, destinations.len())
-        {
-            table_offset += 1;
-            continue;
-        }
-        let stored: Vec<_> = (0..destinations.len())
-            .filter_map(|index| read_u32(data, table_offset + index * 8 + 4))
-            .collect();
-        if stored.len() != destinations.len() {
-            table_offset += 1;
-            continue;
-        }
-        for seed in destinations {
-            let key = stored[0] ^ seed.virtual_address.0;
-            let Some(decoded) = decode_destinations(&stored, key, &destination_indexes) else {
-                continue;
-            };
-            let entries = decoded
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, destination_rva)| {
-                    Some(PackerEntry {
-                        source_rva: Rva(read_u32(data, table_offset + index * 8)?),
-                        destination_rva,
-                    })
-                })
-                .collect();
-            candidates.push(PackerTable {
-                kind: PackerLayoutKind::EncodedRotatingKey,
-                file_offset: FileOffset(u64::try_from(table_offset).unwrap_or(u64::MAX)),
-                destination_key: Some(key),
-                lzma_properties: DEFAULT_LZMA_PROPERTIES,
-                entries,
-            });
-            if candidates.len() >= MAX_TABLE_CANDIDATES {
-                return candidates;
-            }
-        }
-        table_offset += 1;
-    }
-    candidates
-}
-
-/// Finds a uniquely validated legacy or rotating-key `PACKER_INFO` table.
-///
-/// # Errors
-///
-/// Returns an error when destination sections are absent, resource limits are
-/// exceeded, no table validates, or multiple candidates remain ambiguous.
-pub fn locate_packer_table(
-    pe: &PeImage<'_>,
-    limits: UnpackLimits,
-) -> Result<(Vec<Section>, PackerTable), UnpackError> {
-    let destinations = packed_sections(pe, limits.max_packed_sections)?;
-    let legacy = find_legacy_tables(pe, &destinations);
-    if legacy.len() == 1 {
-        return Ok((destinations, legacy[0].clone()));
-    }
-    if legacy.len() > 1 {
-        return Err(UnpackError::Locate(format!(
-            "{} legacy PACKER_INFO candidates are ambiguous",
-            legacy.len()
-        )));
-    }
-    let encoded = find_encoded_tables(pe, &destinations);
-    match encoded.as_slice() {
-        [table] => Ok((destinations, table.clone())),
-        [] => Err(UnpackError::Locate(
-            "no validated legacy or rotating-key PACKER_INFO table was found".to_owned(),
-        )),
-        _ => Err(UnpackError::Locate(format!(
-            "{} encoded PACKER_INFO candidates are ambiguous",
-            encoded.len()
-        ))),
-    }
 }
 
 struct BoundedWriter<'a> {
@@ -355,6 +175,28 @@ impl Write for BoundedWriter<'_> {
     }
 }
 
+/// A capped sink that counts bytes and refuses to exceed `cap`.
+struct CountingWriter {
+    written: usize,
+    cap: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.written + buffer.len() > self.cap {
+            return Err(io::Error::new(io::ErrorKind::FileTooLarge, "cap exceeded"));
+        }
+        self.written += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Presents a synthesized 13-byte LZMA header (`properties` + little-endian
+/// `declared_size`) followed by `payload`, without copying the payload.
 struct HeaderPayloadReader<'a> {
     header: [u8; 13],
     payload: &'a [u8],
@@ -362,19 +204,15 @@ struct HeaderPayloadReader<'a> {
 }
 
 impl<'a> HeaderPayloadReader<'a> {
-    fn new(properties: [u8; 5], payload: &'a [u8]) -> Self {
+    fn new(properties: [u8; 5], declared_size: u64, payload: &'a [u8]) -> Self {
         let mut header = [0_u8; 13];
         header[..5].copy_from_slice(&properties);
-        header[5..].copy_from_slice(&u64::MAX.to_le_bytes());
+        header[5..].copy_from_slice(&declared_size.to_le_bytes());
         Self {
             header,
             payload,
             position: 0,
         }
-    }
-
-    fn payload_position(&self) -> usize {
-        self.position.saturating_sub(self.header.len())
     }
 }
 
@@ -403,52 +241,246 @@ impl BufRead for HeaderPayloadReader<'_> {
     }
 }
 
-fn decompress_attempt(
+fn decode_into<W: Write>(
     properties: [u8; 5],
-    compressed: &[u8],
-    destination: &mut [u8],
-) -> (Result<(), String>, usize, usize) {
-    let mut input = HeaderPayloadReader::new(properties, compressed);
-    let mut output = BoundedWriter {
-        destination,
-        written: 0,
-    };
+    declared_size: u64,
+    payload: &[u8],
+    output: &mut W,
+) -> Result<(), String> {
+    let mut input = HeaderPayloadReader::new(properties, declared_size, payload);
     let options = lzma_rs::decompress::Options {
         unpacked_size: lzma_rs::decompress::UnpackedSize::ReadFromHeader,
-        memlimit: Some(128 * 1024 * 1024),
+        memlimit: Some(256 * 1024 * 1024),
         allow_incomplete: false,
     };
-    let result = lzma_rs::lzma_decompress_with_options(&mut input, &mut output, &options)
-        .map_err(|error| error.to_string());
-    (result, input.payload_position(), output.written)
+    lzma_rs::lzma_decompress_with_options(&mut input, output, &options).map_err(|e| e.to_string())
 }
 
-fn decompress_block(
-    properties: [u8; 5],
-    compressed: &[u8],
-    destination: &mut [u8],
-) -> Result<usize, String> {
-    let (first_result, consumed, written) = decompress_attempt(properties, compressed, destination);
-    let first_error = match first_result {
-        Ok(()) => return Ok(written),
-        Err(error) => error,
+/// Decode exactly `size` bytes of a header-less raw LZMA1 stream at `payload`
+/// into a counting sink; succeeds only when exactly `size` bytes are produced.
+fn decode_counted(properties: [u8; 5], size: usize, payload: &[u8]) -> Result<(), String> {
+    let mut sink = CountingWriter {
+        written: 0,
+        cap: size,
     };
-    if consumed == 0 || consumed >= compressed.len() {
-        return Err(first_error);
+    decode_into(properties, size as u64, payload, &mut sink)?;
+    (sink.written == size)
+        .then_some(())
+        .ok_or_else(|| format!("produced {:#X} bytes, expected {size:#X}", sink.written))
+}
+
+/// Structural test: does `payload` begin a valid raw LZMA1 stream that
+/// decompresses to *exactly* `size` bytes and ends on a clean EOS marker?
+///
+/// Three independent `lzma-rs` decodes make this sound against `lzma-rs`'s
+/// lenient range decoder:
+/// 1. exact-size decode yields exactly `size` bytes (so `len >= size`);
+/// 2. a `size + 1` decode fails (the EOS marker sits exactly at `size`, so
+///    `len <= size`);
+/// 3. an unknown-size decode trips over trailing file bytes *after* a valid EOS
+///    (`"end-of-stream marker"`), rejecting mis-decodes that merely tolerate
+///    `size` garbage bytes before faulting on an LZ distance.
+fn section_stream_matches(properties: [u8; 5], payload: &[u8], size: usize) -> bool {
+    if payload.first() != Some(&0) {
+        return false;
+    }
+    if decode_counted(properties, size, payload).is_err() {
+        return false;
+    }
+    if decode_counted(properties, size + 1, payload).is_ok() {
+        return false;
+    }
+    let mut sink = CountingWriter {
+        written: 0,
+        cap: size + 64,
+    };
+    matches!(
+        decode_into(properties, u64::MAX, payload, &mut sink),
+        Err(message) if message.contains("end-of-stream marker")
+    )
+}
+
+/// Virtual-only initialized sections: the decompression destinations.
+fn packed_sections(pe: &PeImage<'_>, limit: usize) -> Result<Vec<Section>, UnpackError> {
+    let sections: Vec<_> = pe
+        .sections
+        .iter()
+        .filter(|section| {
+            section.pointer_to_raw_data.0 == 0
+                && section.size_of_raw_data == 0
+                && section.virtual_size != 0
+                && section.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA == 0
+        })
+        .cloned()
+        .collect();
+    if sections.is_empty() {
+        return Err(UnpackError::Locate(
+            "no initialized virtual-only destination sections were found".to_owned(),
+        ));
+    }
+    if sections.len() > limit {
+        return Err(UnpackError::Locate(format!(
+            "{} packed-section candidates exceed limit {limit}",
+            sections.len()
+        )));
+    }
+    Ok(sections)
+}
+
+/// File ranges of the protector's raw-data sections (where streams live).
+fn raw_data_ranges(pe: &PeImage<'_>) -> Vec<(usize, usize)> {
+    let len = pe.data().len();
+    pe.sections
+        .iter()
+        .filter(|s| s.pointer_to_raw_data.0 != 0 && s.size_of_raw_data != 0)
+        .filter_map(|s| {
+            let start = usize::try_from(s.pointer_to_raw_data.0).ok()?;
+            let end = start
+                .checked_add(usize::try_from(s.size_of_raw_data).ok()?)?
+                .min(len);
+            (start < end).then_some((start, end))
+        })
+        .collect()
+}
+
+/// Capacity (bytes) available at `section` before the next section / image end.
+fn destination_capacity(pe: &PeImage<'_>, section: &Section) -> Option<u32> {
+    let next = pe
+        .sections
+        .iter()
+        .filter_map(|c| (c.virtual_address.0 > section.virtual_address.0).then_some(c.virtual_address.0))
+        .min()
+        .unwrap_or(pe.optional.size_of_image);
+    next.checked_sub(section.virtual_address.0)
+}
+
+/// Locates the per-section raw LZMA1 streams and binds each to its destination.
+///
+/// # Errors
+///
+/// Returns an error when destinations are absent, a destination's rounded size
+/// does not fit its capacity, the number of located streams for any size does
+/// not match the number of same-sized destinations, or limits are exceeded.
+#[allow(clippy::too_many_lines)]
+pub fn locate_packer_table(
+    pe: &PeImage<'_>,
+    limits: UnpackLimits,
+) -> Result<(Vec<Section>, PackerTable, Vec<String>), UnpackError> {
+    let destinations = packed_sections(pe, limits.max_packed_sections)?;
+    let file_alignment = pe.optional.file_alignment;
+
+    // Each destination's expected decompressed size = VirtualSize rounded up to
+    // FileAlignment, which must fit the section's capacity.
+    let mut targets = Vec::with_capacity(destinations.len());
+    for section in &destinations {
+        let size = round_up(section.virtual_size, file_alignment).ok_or_else(|| {
+            UnpackError::Locate(format!("section {} rounded size overflows", section.name))
+        })?;
+        let capacity = destination_capacity(pe, section).ok_or_else(|| {
+            UnpackError::Locate(format!("section {} capacity underflows", section.name))
+        })?;
+        if size > capacity {
+            return Err(UnpackError::Locate(format!(
+                "section {} rounded size {size:#X} exceeds capacity {capacity:#X}",
+                section.name
+            )));
+        }
+        if usize::try_from(size).unwrap_or(usize::MAX) > limits.max_image_size {
+            return Err(UnpackError::Locate(format!(
+                "section {} rounded size {size:#X} exceeds image limit",
+                section.name
+            )));
+        }
+        targets.push(size);
     }
 
-    // Embedded streams are followed by unrelated PE bytes. lzma-rs correctly
-    // rejects such trailing input for a standalone stream, so retry with the
-    // exact amount consumed through the end marker. This is evidence-derived,
-    // not a guessed compressed size.
-    destination.fill(0);
-    let (retry_result, _, retry_written) =
-        decompress_attempt(properties, &compressed[..consumed], destination);
-    retry_result.map(|()| retry_written).map_err(|retry_error| {
-        format!(
-            "initial decode failed ({first_error}); exact-consumption retry failed ({retry_error})"
-        )
-    })
+    let ranges = raw_data_ranges(pe);
+    let data = pe.data();
+    let mut distinct: Vec<u32> = targets.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    // Structurally locate every stream of each distinct target size.
+    let mut candidates: HashMap<u32, Vec<usize>> = HashMap::new();
+    for &size in &distinct {
+        let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+        let mut offsets = Vec::new();
+        'ranges: for &(start, end) in &ranges {
+            for offset in start..end {
+                if data[offset] != 0 {
+                    continue;
+                }
+                if section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &data[offset..], size_usize) {
+                    offsets.push(offset);
+                    if offsets.len() > MAX_STREAMS_PER_SIZE {
+                        break 'ranges;
+                    }
+                }
+            }
+        }
+        candidates.insert(size, offsets);
+    }
+
+    // Bind streams to destinations: exact per-size count match (fail closed on
+    // ambiguity), paired in ascending file-offset / ascending-RVA order.
+    let mut warnings = Vec::new();
+    for &size in &distinct {
+        let dest_count = targets.iter().filter(|&&t| t == size).count();
+        let found = candidates.get(&size).map_or(0, Vec::len);
+        if found != dest_count {
+            return Err(UnpackError::Locate(format!(
+                "{found} raw LZMA1 stream(s) of decompressed size {size:#X} found for \
+                 {dest_count} destination section(s) of that size - layout is ambiguous"
+            )));
+        }
+        if dest_count > 1 {
+            let names: Vec<_> = destinations
+                .iter()
+                .zip(&targets)
+                .filter(|(_, t)| **t == size)
+                .map(|(s, _)| s.name.clone())
+                .collect();
+            warnings.push(format!(
+                "sections {names:?} share decompressed size {size:#X}; streams assigned by \
+                 ascending file offset to ascending section RVA"
+            ));
+        }
+    }
+    for offsets in candidates.values_mut() {
+        offsets.sort_unstable();
+    }
+
+    // Destinations are already in section (ascending-RVA) order; assign each the
+    // next unused stream of its size.
+    let mut cursor: HashMap<u32, usize> = HashMap::new();
+    let mut entries = Vec::with_capacity(destinations.len());
+    for (section, &size) in destinations.iter().zip(&targets) {
+        let index = cursor.entry(size).or_insert(0);
+        let offset = candidates[&size][*index];
+        *index += 1;
+        let source_rva = pe
+            .file_offset_to_rva(FileOffset(u64::try_from(offset).unwrap_or(u64::MAX)))
+            .map_err(UnpackError::from)?;
+        entries.push(PackerEntry {
+            source_rva,
+            destination_rva: section.virtual_address,
+            decompressed_size: size,
+        });
+    }
+
+    let file_offset = entries
+        .iter()
+        .filter_map(|e| pe.rva_to_file_offset(e.source_rva).ok())
+        .min_by_key(|o| o.0)
+        .unwrap_or(FileOffset(0));
+
+    let table = PackerTable {
+        kind: PackerLayoutKind::RawLzma1Sections,
+        file_offset,
+        lzma_properties: VMPROTECT_LZMA_PROPERTIES,
+        entries,
+    };
+    Ok((destinations, table, warnings))
 }
 
 /// Restores packed initialized sections into an explicit RVA-layout image.
@@ -481,7 +513,7 @@ pub fn unpack_to_mapped_image(
             "SizeOfHeaders {header_size:#X} exceeds input or output bounds"
         )));
     }
-    let (packed, table) = locate_packer_table(&pe, limits)?;
+    let (packed, table, mut warnings) = locate_packer_table(&pe, limits)?;
     let mut output = vec![0_u8; image_size];
     output[..header_size].copy_from_slice(&input[..header_size]);
 
@@ -558,7 +590,6 @@ pub fn unpack_to_mapped_image(
         .map(|section| (section.virtual_address.0, section))
         .collect();
     let mut blocks = Vec::with_capacity(table.entries.len());
-    let mut warnings = Vec::new();
     for (block_index, entry) in table.entries.iter().enumerate() {
         let section = destinations_by_rva
             .get(&entry.destination_rva.0)
@@ -577,27 +608,17 @@ pub fn unpack_to_mapped_image(
         let destination = usize::try_from(entry.destination_rva.0).map_err(|_| {
             UnpackError::Reconstruct(format!("block {block_index} destination is too large"))
         })?;
-        let destination_limit = pe
-            .sections
-            .iter()
-            .filter_map(|candidate| {
-                (candidate.virtual_address.0 > entry.destination_rva.0)
-                    .then_some(candidate.virtual_address.0)
-            })
-            .min()
-            .unwrap_or(pe.optional.size_of_image);
-        let capacity_u32 = destination_limit
-            .checked_sub(entry.destination_rva.0)
-            .filter(|capacity| *capacity >= section.virtual_size)
+        let capacity_u32 = destination_capacity(&pe, section)
+            .filter(|capacity| *capacity >= entry.decompressed_size)
             .ok_or_else(|| {
                 UnpackError::Reconstruct(format!(
-                    "block {block_index} destination span is smaller than section virtual size"
+                    "block {block_index} decompressed size exceeds destination capacity"
                 ))
             })?;
-        let capacity = usize::try_from(capacity_u32).map_err(|_| {
-            UnpackError::Reconstruct(format!("block {block_index} capacity is too large"))
+        let expected = usize::try_from(entry.decompressed_size).map_err(|_| {
+            UnpackError::Reconstruct(format!("block {block_index} size is too large"))
         })?;
-        let destination_end = destination.checked_add(capacity).ok_or_else(|| {
+        let destination_end = destination.checked_add(expected).ok_or_else(|| {
             UnpackError::Reconstruct(format!("block {block_index} destination overflows"))
         })?;
         let destination_bytes = output
@@ -605,17 +626,30 @@ pub fn unpack_to_mapped_image(
             .ok_or_else(|| {
                 UnpackError::Reconstruct(format!("block {block_index} destination exceeds image"))
             })?;
-        let written = decompress_block(table.lzma_properties, &input[source..], destination_bytes)
-            .map_err(|message| UnpackError::Decompress {
+        let mut writer = BoundedWriter {
+            destination: destination_bytes,
+            written: 0,
+        };
+        decode_into(
+            table.lzma_properties,
+            entry.decompressed_size.into(),
+            &input[source..],
+            &mut writer,
+        )
+        .map_err(|message| UnpackError::Decompress {
+            block: block_index,
+            section: section.name.clone(),
+            message,
+        })?;
+        if writer.written != expected {
+            return Err(UnpackError::Decompress {
                 block: block_index,
                 section: section.name.clone(),
-                message,
-            })?;
-        if written < usize::try_from(section.virtual_size).unwrap_or(usize::MAX) {
-            warnings.push(format!(
-                "block {block_index} ({}) produced {written:#X} bytes for virtual size {:#X}",
-                section.name, section.virtual_size
-            ));
+                message: format!(
+                    "decoded {:#X} bytes, expected {expected:#X}",
+                    writer.written
+                ),
+            });
         }
         blocks.push(UnpackedBlock {
             section_index: section.index,
@@ -624,17 +658,16 @@ pub fn unpack_to_mapped_image(
             destination_rva: entry.destination_rva,
             section_virtual_size: section.virtual_size,
             destination_capacity: capacity_u32,
-            decompressed_size: u32::try_from(written).map_err(|_| {
-                UnpackError::Reconstruct(format!("block {block_index} output exceeds 32 bits"))
-            })?,
+            decompressed_size: entry.decompressed_size,
         });
     }
 
     PeImage::parse(&output).map_err(|error| {
         UnpackError::Reconstruct(format!("mapped output failed in-memory reparse: {error}"))
     })?;
+    warnings.sort();
     let report = UnpackReport {
-        schema_version: 1,
+        schema_version: 2,
         input_size: u64::try_from(input.len()).unwrap_or(u64::MAX),
         output_size: u64::try_from(output.len()).unwrap_or(u64::MAX),
         packed_sections: packed.len(),
@@ -654,29 +687,65 @@ pub fn unpack_to_mapped_image(
 mod tests {
     use super::*;
 
+    /// Encode `plain` as a header-less raw LZMA1 stream (strip the 13-byte
+    /// `.lzma` header `lzma-rs` writes) — the exact shape VMProtect stores.
+    fn raw_lzma1(plain: &[u8]) -> Vec<u8> {
+        let mut framed = Vec::new();
+        lzma_rs::lzma_compress(&mut io::Cursor::new(plain), &mut framed).expect("compress");
+        framed.split_off(13)
+    }
+
     #[test]
-    fn rotating_key_destinations_require_a_permutation() {
-        let destinations = [0x1000_u32, 0x5000, 0x9000];
-        let key = 0xA1B2_C3D4_u32;
-        let stored: Vec<_> = destinations
-            .iter()
-            .enumerate()
-            .map(|(index, destination)| {
-                let rotation = u32::try_from((index * 7) & 31).unwrap_or(0);
-                destination ^ key.rotate_left(rotation)
-            })
-            .collect();
-        let indexes = destinations
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (*value, index))
-            .collect();
-        assert_eq!(
-            decode_destinations(&stored, key, &indexes),
-            Some(destinations.into_iter().map(Rva).collect())
-        );
-        let duplicates = [stored[0], stored[0], stored[2]];
-        assert_eq!(decode_destinations(&duplicates, key, &indexes), None);
+    fn matches_a_real_raw_lzma1_section_stream() {
+        // A stream decoding to exactly `size` bytes, followed by trailing bytes,
+        // is recognised; sizes off by one are not.
+        let payload = vec![0xAB_u8; 0x200];
+        let mut stream = raw_lzma1(&payload);
+        stream.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // trailing PE bytes
+        assert!(section_stream_matches(
+            VMPROTECT_LZMA_PROPERTIES,
+            &stream,
+            0x200
+        ));
+        assert!(!section_stream_matches(
+            VMPROTECT_LZMA_PROPERTIES,
+            &stream,
+            0x1FF
+        ));
+        assert!(!section_stream_matches(
+            VMPROTECT_LZMA_PROPERTIES,
+            &stream,
+            0x201
+        ));
+    }
+
+    #[test]
+    fn decode_counted_round_trips_raw_lzma1() {
+        let plain: Vec<u8> = (0..0x400_u32).map(|i| (i ^ (i >> 3)) as u8).collect();
+        let stream = raw_lzma1(&plain);
+        assert!(decode_counted(VMPROTECT_LZMA_PROPERTIES, plain.len(), &stream).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_stream_and_truncated_bytes() {
+        // Arbitrary high-entropy bytes are not a clean EOS-terminated stream.
+        let garbage: Vec<u8> = (0..0x400_u16).map(|i| (i.wrapping_mul(2654) >> 3) as u8).collect();
+        assert!(!section_stream_matches(VMPROTECT_LZMA_PROPERTIES, &garbage, 0x200));
+
+        // A valid stream with its tail removed must fail the exact-size decode.
+        let payload = vec![0xCD_u8; 0x200];
+        let mut stream = raw_lzma1(&payload);
+        stream.truncate(stream.len() / 2);
+        assert!(decode_counted(VMPROTECT_LZMA_PROPERTIES, 0x200, &stream).is_err());
+    }
+
+    #[test]
+    fn round_up_matches_file_alignment() {
+        assert_eq!(round_up(0x156, 0x200), Some(0x200));
+        assert_eq!(round_up(0xAA, 0x200), Some(0x200));
+        assert_eq!(round_up(0xE7_1BC, 0x200), Some(0xE7_200));
+        assert_eq!(round_up(0x200, 0x200), Some(0x200));
+        assert_eq!(round_up(0, 0x200), Some(0));
     }
 
     #[test]
