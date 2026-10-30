@@ -47,6 +47,8 @@ fn main() {
         println!("effects {:#?}", r.effects);
         println!("analysis {:#?}", r.handler_analysis);
         println!("flow {:#?}", r.value_flow);
+        println!("checksum {:#?}", r.table_checksum);
+        println!("native_call {:#?}", r.native_call);
         return;
     }
     let mut recovered = 0usize;

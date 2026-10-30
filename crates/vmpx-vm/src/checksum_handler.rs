@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use iced_x86::{Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use serde::Serialize;
 use vmpx_disasm::{
@@ -128,15 +130,6 @@ fn flags_defined(instruction: &Instruction) -> bool {
         != 0
 }
 
-fn same_register_binary(instruction: &Instruction, mnemonic: Mnemonic, register: Register) -> bool {
-    instruction.mnemonic() == mnemonic
-        && register_operand(instruction, 0)
-            .zip(register_operand(instruction, 1))
-            .is_some_and(|(left, right)| {
-                canonical(left) == canonical(register) && canonical(right) == canonical(register)
-            })
-}
-
 fn static_lea_address(pe: &PeImage<'_>, instruction: &Instruction) -> Option<(Register, Va)> {
     if instruction.mnemonic() == Mnemonic::Mov
         && instruction.op0_kind() == OpKind::Register
@@ -200,10 +193,359 @@ fn report_failure(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Role {
+    Acc,
+    OrigPtr,
+    OrigLen,
+    StackPtr,
+    Byte,
+    WideIdx,
+    Idx,
+    Entry,
+    Table(Va),
+    Shifted,
+    Combined,
+    Keyed,
+}
+
+fn is_low_byte(register: Register) -> bool {
+    register.size() == 1
+        && !matches!(
+            register,
+            Register::AH | Register::BH | Register::CH | Register::DH
+        )
+}
+
+fn written_registers(
+    factory: &mut InstructionInfoFactory,
+    instruction: &Instruction,
+) -> Vec<Register> {
+    factory
+        .info(instruction)
+        .used_registers()
+        .iter()
+        .filter(|used| {
+            matches!(
+                used.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+        })
+        .map(|used| canonical(used.register()))
+        .collect()
+}
+
+fn writes_memory(factory: &mut InstructionInfoFactory, instruction: &Instruction) -> bool {
+    factory.info(instruction).used_memory().iter().any(|used| {
+        matches!(
+            used.access(),
+            OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+        )
+    })
+}
+
+fn is_rsp_slot(instruction: &Instruction, displacement: i64) -> bool {
+    is_memory_operand(instruction.op0_kind())
+        && canonical(instruction.memory_base()) == Register::RSP
+        && instruction.memory_index() == Register::None
+        && memory_displacement(instruction) == displacement
+        && memory_width(instruction) == 8
+}
+
+/// Register-role tracker used to prove each native instruction on the
+/// checksum paths is either part of the recurrence or a side-effect-free
+/// write to a register nothing downstream depends on.
+struct Scan<'a> {
+    factory: InstructionInfoFactory,
+    roles: BTreeMap<Register, Role>,
+    zero: BTreeSet<Register>,
+    protected: &'a BTreeSet<Register>,
+    accumulator: Register,
+}
+
+#[derive(Default)]
+struct IterationFacts {
+    byte_loaded: bool,
+    advanced: bool,
+    counted: bool,
+    table: Option<(Register, Va)>,
+    iteration_xor: Option<u32>,
+    byte_load: Option<Rva>,
+}
+
+impl<'a> Scan<'a> {
+    fn new(protected: &'a BTreeSet<Register>, accumulator: Register) -> Self {
+        Self {
+            factory: InstructionInfoFactory::new(),
+            roles: BTreeMap::new(),
+            zero: BTreeSet::new(),
+            protected,
+            accumulator,
+        }
+    }
+
+    fn role(&self, register: Register) -> Option<Role> {
+        self.roles.get(&canonical(register)).copied()
+    }
+
+    fn set(&mut self, register: Register, role: Role) {
+        self.zero.remove(&canonical(register));
+        self.roles.insert(canonical(register), role);
+    }
+
+    fn clobber(&mut self, written: &[Register]) {
+        for register in written {
+            self.roles.remove(register);
+            self.zero.remove(register);
+        }
+    }
+
+    fn unique_role(&self, role: Role) -> Option<Register> {
+        let mut found = self
+            .roles
+            .iter()
+            .filter(|(_, candidate)| **candidate == role)
+            .map(|(register, _)| *register);
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
+    /// Validates an instruction that is not part of any recognized pattern and
+    /// returns the registers it writes.
+    fn generic(
+        &mut self,
+        instruction: &Instruction,
+        accumulator_locked: bool,
+    ) -> Result<Vec<Register>, String> {
+        use iced_x86::FlowControl;
+        if !matches!(
+            instruction.flow_control(),
+            FlowControl::Next | FlowControl::UnconditionalBranch
+        ) {
+            return Err(format!(
+                "unexpected control flow `{:?}` on a checksum path",
+                instruction.mnemonic()
+            ));
+        }
+        if matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pop) {
+            return Err("unexpected stack operation on a checksum path".to_owned());
+        }
+        if writes_memory(&mut self.factory, instruction) {
+            return Err(format!(
+                "`{:?}` writes memory outside the recognized counters",
+                instruction.mnemonic()
+            ));
+        }
+        let written = written_registers(&mut self.factory, instruction);
+        if written.contains(&Register::RSP) {
+            return Err("native stack pointer is modified directly".to_owned());
+        }
+        if accumulator_locked && written.contains(&self.accumulator) {
+            return Err("accumulator is written by an unrecognized instruction".to_owned());
+        }
+        self.clobber(&written);
+        Ok(written)
+    }
+
+    fn violates_protection(&self, written: &[Register], exempt: &BTreeSet<Register>) -> bool {
+        written
+            .iter()
+            .any(|register| self.protected.contains(register) && !exempt.contains(register))
+    }
+
+    /// One in-loop instruction. Returns the written registers.
+    #[allow(clippy::too_many_lines)]
+    fn loop_step(
+        &mut self,
+        instruction: &Instruction,
+        rva: Rva,
+        stack_mode: bool,
+        pointer: Register,
+        length: Register,
+        facts: &mut IterationFacts,
+    ) -> Result<Vec<Register>, String> {
+        let acc = self.accumulator;
+        let mnemonic = instruction.mnemonic();
+        let op0 = register_operand(instruction, 0);
+        let op1 = register_operand(instruction, 1);
+
+        if stack_mode
+            && mnemonic == Mnemonic::Mov
+            && let Some(target) = op0
+            && target.size() == 8
+            && is_memory_operand(instruction.op1_kind())
+            && canonical(instruction.memory_base()) == Register::RSP
+            && instruction.memory_index() == Register::None
+            && memory_displacement(instruction) == 0
+            && memory_width(instruction) == 8
+        {
+            let written = written_registers(&mut self.factory, instruction);
+            self.clobber(&written);
+            self.set(target, Role::StackPtr);
+            return Ok(written);
+        }
+        if mnemonic == Mnemonic::Movzx
+            && let Some(target) = op0
+            && matches!(target.size(), 4 | 8)
+            && is_memory_operand(instruction.op1_kind())
+            && instruction.memory_index() == Register::None
+            && memory_displacement(instruction) == 0
+            && memory_width(instruction) == 1
+        {
+            let base = canonical(instruction.memory_base());
+            let wanted = if stack_mode {
+                Role::StackPtr
+            } else {
+                Role::OrigPtr
+            };
+            if self.role(base) != Some(wanted) || (!stack_mode && base != pointer) {
+                return Err("input byte is not loaded through the recovered pointer".to_owned());
+            }
+            if facts.byte_loaded {
+                return Err("more than one input byte load per iteration".to_owned());
+            }
+            let written = written_registers(&mut self.factory, instruction);
+            self.clobber(&written);
+            self.set(target, Role::Byte);
+            facts.byte_loaded = true;
+            facts.byte_load = Some(rva);
+            return Ok(written);
+        }
+        if mnemonic == Mnemonic::Xor
+            && let (Some(left), Some(right)) = (op0, op1)
+            && canonical(right) == acc
+            && self.role(acc) == Some(Role::Acc)
+        {
+            if is_low_byte(left) && is_low_byte(right) && self.role(left) == Some(Role::Byte) {
+                let written = written_registers(&mut self.factory, instruction);
+                self.clobber(&written);
+                self.set(left, Role::Idx);
+                return Ok(written);
+            }
+            if left.size() == 4 && right.size() == 4 && self.role(left) == Some(Role::Byte) {
+                let written = written_registers(&mut self.factory, instruction);
+                self.clobber(&written);
+                self.set(left, Role::WideIdx);
+                return Ok(written);
+            }
+        }
+        if mnemonic == Mnemonic::And
+            && let Some(target) = op0
+            && matches!(target.size(), 4 | 8)
+            && immediate(instruction, 1) == Some(0xff)
+            && self.role(target) == Some(Role::WideIdx)
+        {
+            let written = written_registers(&mut self.factory, instruction);
+            self.clobber(&written);
+            self.set(target, Role::Idx);
+            return Ok(written);
+        }
+        if mnemonic == Mnemonic::Mov
+            && let Some(target) = op0
+            && target.size() == 4
+            && is_memory_operand(instruction.op1_kind())
+            && instruction.memory_index_scale() == 4
+            && memory_displacement(instruction) == 0
+            && memory_width(instruction) == 4
+            && let Some(Role::Table(address)) = self.role(instruction.memory_base())
+            && self.role(instruction.memory_index()) == Some(Role::Idx)
+        {
+            if facts.table.is_some() {
+                return Err("more than one table lookup per iteration".to_owned());
+            }
+            facts.table = Some((canonical(instruction.memory_base()), address));
+            let written = written_registers(&mut self.factory, instruction);
+            self.clobber(&written);
+            self.set(target, Role::Entry);
+            return Ok(written);
+        }
+        if mnemonic == Mnemonic::Shr
+            && let Some(target) = op0
+            && canonical(target) == acc
+            && target.size() == 4
+            && immediate(instruction, 1) == Some(8)
+            && self.role(acc) == Some(Role::Acc)
+        {
+            self.roles.insert(acc, Role::Shifted);
+            return Ok(vec![acc]);
+        }
+        if mnemonic == Mnemonic::Xor
+            && let (Some(left), Some(right)) = (op0, op1)
+            && canonical(left) == acc
+            && left.size() == 4
+            && right.size() == 4
+            && self.role(acc) == Some(Role::Shifted)
+            && self.role(right) == Some(Role::Entry)
+        {
+            self.roles.insert(acc, Role::Combined);
+            return Ok(vec![acc]);
+        }
+        if mnemonic == Mnemonic::Xor
+            && let Some(left) = op0
+            && canonical(left) == acc
+            && left.size() == 4
+            && instruction.op1_kind() != OpKind::Register
+            && !is_memory_operand(instruction.op1_kind())
+            && self.role(acc) == Some(Role::Combined)
+            && let Some(value) = immediate(instruction, 1).and_then(|v| u32::try_from(v).ok())
+        {
+            self.roles.insert(acc, Role::Keyed);
+            facts.iteration_xor = Some(value);
+            return Ok(vec![acc]);
+        }
+        if stack_mode && mnemonic == Mnemonic::Inc && is_rsp_slot(instruction, 0) {
+            if !facts.byte_loaded || facts.advanced {
+                return Err("pointer advance is not exactly once after the byte load".to_owned());
+            }
+            facts.advanced = true;
+            return Ok(Vec::new());
+        }
+        if stack_mode && mnemonic == Mnemonic::Dec && is_rsp_slot(instruction, 8) {
+            if facts.counted {
+                return Err("loop count decremented more than once".to_owned());
+            }
+            facts.counted = true;
+            return Ok(Vec::new());
+        }
+        if !stack_mode
+            && let Some(target) = op0
+            && canonical(target) == pointer
+            && target.size() == 8
+            && (mnemonic == Mnemonic::Inc
+                || (mnemonic == Mnemonic::Add && signed_immediate(instruction, 1) == Some(1)))
+        {
+            if !facts.byte_loaded || facts.advanced {
+                return Err("pointer advance is not exactly once after the byte load".to_owned());
+            }
+            facts.advanced = true;
+            return Ok(Vec::new());
+        }
+        if !stack_mode
+            && mnemonic == Mnemonic::Dec
+            && let Some(target) = op0
+            && canonical(target) == length
+            && target.size() == 8
+        {
+            if facts.counted {
+                return Err("loop count decremented more than once".to_owned());
+            }
+            facts.counted = true;
+            return Ok(Vec::new());
+        }
+        self.generic(instruction, true)
+    }
+}
+
 /// Recognizes a counted W32 byte-table checksum loop and proves that both the
-/// zero-length and loop-exit paths converge on the same ordinary threaded
-/// dispatch tail. Constants and register choices are recovered from data flow;
-/// no handler addresses, table contents, or mutation bytes are signatured.
+/// zero-length and loop-exit paths converge on the same ordinary dispatch
+/// tail. Constants and register choices are recovered from data flow; no
+/// handler addresses, table contents, or mutation bytes are signatured. Loop
+/// state may live in registers or in two native-stack slots; every other
+/// instruction on the prefix, loop and exit paths must be proven free of
+/// effects on the dispatch tail's live inputs.
 ///
 /// # Errors
 ///
@@ -230,60 +572,11 @@ pub fn analyze_table_checksum_handler(
         ));
     }
     let prefix_instructions = prefix.instructions().collect::<Vec<_>>();
-    let mut pointer = None;
-    let mut length = None;
-    for decoded in &prefix_instructions {
-        if let Some(register) = direct_load_from(&decoded.instruction, vsp, 0, 8) {
-            pointer = Some((decoded.rva, register));
-        }
-        if let Some(register) = direct_load_from(&decoded.instruction, vsp, 8, 8) {
-            length = Some((decoded.rva, register));
-        }
-    }
-    let Some((pointer_load, pointer_register)) = pointer else {
-        return Ok(report_failure(
-            entry,
-            None,
-            length.map(|(rva, _)| rva),
-            vec!["no unique W64 pointer load from VSP+0 was recovered".to_owned()],
-        ));
-    };
-    let Some((length_load, length_register)) = length else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            None,
-            vec!["no unique W64 length load from VSP+8 was recovered".to_owned()],
-        ));
-    };
-
-    let vsp_adjustments = prefix_instructions
-        .iter()
-        .filter_map(|decoded| {
-            let instruction = &decoded.instruction;
-            (instruction.mnemonic() == Mnemonic::Add
-                && register_operand(instruction, 0)
-                    .is_some_and(|register| canonical(register) == canonical(vsp)))
-            .then(|| signed_immediate(instruction, 1))
-            .flatten()
-        })
-        .collect::<Vec<_>>();
-    if vsp_adjustments.as_slice() != [12] {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec![format!(
-                "expected one packed pointer/length VSP adjustment of 12, recovered {vsp_adjustments:?}"
-            )],
-        ));
-    }
-
     let Some(branch_instruction) = prefix_instructions.last() else {
         return Ok(report_failure(
             entry,
-            Some(pointer_load),
-            Some(length_load),
+            None,
+            None,
             vec!["conditional prefix contains no instructions".to_owned()],
         ));
     };
@@ -293,8 +586,8 @@ pub fn analyze_table_checksum_handler(
         mnemonic => {
             return Ok(report_failure(
                 entry,
-                Some(pointer_load),
-                Some(length_load),
+                None,
+                None,
                 vec![format!(
                     "length split uses {mnemonic:?}, expected equality/inequality"
                 )],
@@ -303,41 +596,17 @@ pub fn analyze_table_checksum_handler(
     };
     let nonzero_successor = match branch_instruction.instruction.mnemonic() {
         Mnemonic::Je => prefix.stop.fallthrough,
-        Mnemonic::Jne => prefix.stop.direct_target,
-        _ => None,
+        _ => prefix.stop.direct_target,
     };
     let (Some(zero_successor), Some(nonzero_successor)) = (zero_successor, nonzero_successor)
     else {
         return Ok(report_failure(
             entry,
-            Some(pointer_load),
-            Some(length_load),
+            None,
+            None,
             vec!["length split does not have two executable successors".to_owned()],
         ));
     };
-
-    let test_index = prefix_instructions.iter().rposition(|decoded| {
-        same_register_binary(&decoded.instruction, Mnemonic::Test, length_register)
-    });
-    let Some(test_index) = test_index else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["conditional split is not driven by TEST length,length".to_owned()],
-        ));
-    };
-    if prefix_instructions[test_index + 1..prefix_instructions.len().saturating_sub(1)]
-        .iter()
-        .any(|decoded| flags_defined(&decoded.instruction))
-    {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["length flags are clobbered before the conditional split".to_owned()],
-        ));
-    }
 
     let zero_trace = trace_direct_jump_fragments(pe, zero_successor, trace_limits)?;
     let zero_instructions = zero_trace.instructions().collect::<Vec<_>>();
@@ -353,46 +622,37 @@ pub fn analyze_table_checksum_handler(
             if accumulator.size() != 4 {
                 return None;
             }
-            zero_instructions[not_index + 1..]
+            let mut factory = InstructionInfoFactory::new();
+            let mut intervening = zero_instructions[not_index + 1..].iter();
+            let store = intervening.find(|candidate| {
+                let store = &candidate.instruction;
+                store.mnemonic() == Mnemonic::Mov
+                    && is_memory_operand(store.op0_kind())
+                    && canonical(store.memory_base()) == canonical(vsp)
+                    && store.memory_index() == Register::None
+                    && memory_displacement(store) == 0
+                    && memory_width(store) == 4
+                    && register_operand(store, 1)
+                        .is_some_and(|source| canonical(source) == canonical(accumulator))
+            })?;
+            let clean = zero_instructions[not_index + 1..]
                 .iter()
-                .find(|candidate| {
-                    let store = &candidate.instruction;
-                    store.mnemonic() == Mnemonic::Mov
-                        && is_memory_operand(store.op0_kind())
-                        && canonical(store.memory_base()) == canonical(vsp)
-                        && store.memory_index() == Register::None
-                        && memory_displacement(store) == 0
-                        && memory_width(store) == 4
-                        && register_operand(store, 1)
-                            .is_some_and(|source| canonical(source) == canonical(accumulator))
-                })
-                .map(|store| (accumulator, decoded.rva, store.rva))
+                .take_while(|candidate| candidate.rva != store.rva)
+                .all(|candidate| {
+                    !writes_register(&mut factory, &candidate.instruction, accumulator)
+                        && !writes_register(&mut factory, &candidate.instruction, vsp)
+                        && !writes_memory(&mut factory, &candidate.instruction)
+                });
+            clean.then_some((canonical(accumulator), store.rva))
         });
-    let Some((accumulator, _final_not, output_store)) = output else {
+    let Some((accumulator, output_store)) = output else {
         return Ok(report_failure(
             entry,
-            Some(pointer_load),
-            Some(length_load),
+            None,
+            None,
             vec!["zero-length tail does not finalize and store a W32 accumulator".to_owned()],
         ));
     };
-    if !prefix_instructions.iter().any(|decoded| {
-        matches!(
-            decoded.instruction.mnemonic(),
-            Mnemonic::Xor | Mnemonic::Sub
-        ) && same_register_binary(
-            &decoded.instruction,
-            decoded.instruction.mnemonic(),
-            accumulator,
-        ) && register_operand(&decoded.instruction, 0).is_some_and(|register| register.size() >= 4)
-    }) {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["checksum accumulator is not initialized to zero before the split".to_owned()],
-        ));
-    }
 
     let zero_slice = backward_slice_handler_trace(
         &zero_trace,
@@ -415,8 +675,8 @@ pub fn analyze_table_checksum_handler(
                 schema_version: 1,
                 entry,
                 status: RecoveryStatus::Failed,
-                pointer_load: Some(pointer_load),
-                length_load: Some(length_load),
+                pointer_load: None,
+                length_load: None,
                 loop_branch: None,
                 output_store: Some(output_store),
                 common_tail: Some(zero_successor),
@@ -433,281 +693,391 @@ pub fn analyze_table_checksum_handler(
         });
     };
     let dispatch_candidate = dispatch_candidate.clone();
+    let dispatch_vip_delta = i32::try_from(dispatch_candidate.vip_delta).unwrap_or(i32::MAX);
+    if dispatch_vip_delta == i32::MAX {
+        return Ok(report_failure(
+            entry,
+            None,
+            None,
+            vec!["threaded dispatch VIP delta exceeds i32".to_owned()],
+        ));
+    }
+
+    // Registers the dispatch tail genuinely consumes: keyless table dispatch
+    // never reads the rolling-key or handler registers.
+    let keyless = dispatch_candidate.codec.table.is_some();
+    let tail_live_out = live_out_registers
+        .iter()
+        .copied()
+        .filter(|register| {
+            !keyless
+                || (canonical(*register) != canonical(roles.rolling_key)
+                    && canonical(*register) != canonical(roles.handler))
+        })
+        .collect::<Vec<_>>();
+    let tail_slice = backward_slice_handler_trace(
+        &zero_trace,
+        &HandlerSliceConfig {
+            live_out_registers: tail_live_out,
+            live_out_rflags: 0,
+        },
+    );
+    let mut protected = BTreeSet::new();
+    for register in GENERAL_REGISTERS {
+        if tail_slice
+            .live_in_registers
+            .iter()
+            .any(|name| *name == format!("{register:?}"))
+        {
+            protected.insert(register);
+        }
+    }
+    protected.insert(canonical(vsp));
+    protected.insert(canonical(roles.vip));
+    if let Some(table_register) = dispatch_candidate.table_register {
+        protected.insert(canonical(table_register));
+    }
+    protected.remove(&accumulator);
+    protected.remove(&Register::RSP);
+
+    // Prefix: loads, packed VSP adjustment, zero accumulator, zero-length split.
+    let fail = |pointer_load: Option<Rva>, length_load: Option<Rva>, message: String| {
+        report_failure(entry, pointer_load, length_load, vec![message])
+    };
+    let mut scan = Scan::new(&protected, accumulator);
+    let mut pointer_load = None;
+    let mut length_load = None;
+    let mut vsp_add = None;
+    let mut split_ok = false;
+    let no_exempt = BTreeSet::new();
+    for decoded in &prefix_instructions[..prefix_instructions.len() - 1] {
+        let instruction = &decoded.instruction;
+        let result: Result<Vec<Register>, String> = (|| {
+            if vsp_add.is_none() {
+                if let Some(register) = direct_load_from(instruction, vsp, 0, 8) {
+                    let written = written_registers(&mut scan.factory, instruction);
+                    scan.clobber(&written);
+                    scan.set(register, Role::OrigPtr);
+                    pointer_load = Some(decoded.rva);
+                    return Ok(written);
+                }
+                if let Some(register) = direct_load_from(instruction, vsp, 8, 8) {
+                    let written = written_registers(&mut scan.factory, instruction);
+                    scan.clobber(&written);
+                    scan.set(register, Role::OrigLen);
+                    length_load = Some(decoded.rva);
+                    return Ok(written);
+                }
+            }
+            if instruction.mnemonic() == Mnemonic::Add
+                && register_operand(instruction, 0)
+                    .is_some_and(|register| canonical(register) == canonical(vsp))
+                && signed_immediate(instruction, 1) == Some(12)
+            {
+                if vsp_add.is_some() {
+                    return Err("more than one packed VSP adjustment".to_owned());
+                }
+                vsp_add = Some(decoded.rva);
+                return Ok(Vec::new());
+            }
+            if matches!(instruction.mnemonic(), Mnemonic::Xor | Mnemonic::Sub)
+                && let Some(register) = register_operand(instruction, 0)
+                && register.size() >= 4
+                && register_operand(instruction, 1)
+                    .is_some_and(|other| canonical(other) == canonical(register))
+            {
+                let written = scan.generic(instruction, false)?;
+                scan.zero.insert(canonical(register));
+                return Ok(written);
+            }
+            scan.generic(instruction, false)
+        })();
+        let written = match result {
+            Ok(written) => written,
+            Err(message) => return Ok(fail(pointer_load, length_load, message)),
+        };
+        if scan.violates_protection(&written, &no_exempt) {
+            return Ok(fail(
+                pointer_load,
+                length_load,
+                "prefix clobbers a register the dispatch tail depends on".to_owned(),
+            ));
+        }
+        if flags_defined(instruction) {
+            split_ok = match instruction.mnemonic() {
+                Mnemonic::Test => {
+                    register_operand(instruction, 0)
+                        .zip(register_operand(instruction, 1))
+                        .is_some_and(|(left, right)| {
+                            canonical(left) == canonical(right)
+                                && left.size() == 8
+                                && right.size() == 8
+                                && scan.role(left) == Some(Role::OrigLen)
+                        })
+                }
+                Mnemonic::Cmp => register_operand(instruction, 0)
+                    .zip(register_operand(instruction, 1))
+                    .is_some_and(|(left, right)| {
+                        left.size() == 8
+                            && right.size() == 8
+                            && ((scan.role(left) == Some(Role::OrigLen)
+                                && scan.zero.contains(&canonical(right)))
+                                || (scan.role(right) == Some(Role::OrigLen)
+                                    && scan.zero.contains(&canonical(left))))
+                    }),
+                _ => false,
+            };
+        }
+    }
+    let (Some(pointer_load), Some(length_load)) = (pointer_load, length_load) else {
+        return Ok(fail(
+            pointer_load,
+            length_load,
+            "no W64 pointer/length load from VSP+0/VSP+8 was recovered".to_owned(),
+        ));
+    };
+    if vsp_add.is_none() {
+        return Ok(fail(
+            Some(pointer_load),
+            Some(length_load),
+            "expected one packed pointer/length VSP adjustment of 12".to_owned(),
+        ));
+    }
+    if !split_ok {
+        return Ok(fail(
+            Some(pointer_load),
+            Some(length_load),
+            "conditional split is not a W64 length-versus-zero comparison on the loaded length"
+                .to_owned(),
+        ));
+    }
+    if !scan.zero.contains(&accumulator) {
+        return Ok(fail(
+            Some(pointer_load),
+            Some(length_load),
+            "checksum accumulator is not zero at the length split".to_owned(),
+        ));
+    }
+    let (Some(pointer_register), Some(length_register)) = (
+        scan.unique_role(Role::OrigPtr),
+        scan.unique_role(Role::OrigLen),
+    ) else {
+        return Ok(fail(
+            Some(pointer_load),
+            Some(length_load),
+            "loaded pointer/length are not preserved to the split".to_owned(),
+        ));
+    };
+    let fail = |message: String| fail(Some(pointer_load), Some(length_load), message);
 
     let loop_trace = trace_direct_jump_fragments(pe, nonzero_successor, trace_limits)?;
     if loop_trace.stop.kind != DirectJumpTraceStopKind::ConditionalBranch {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["nonzero path does not end in a counted loop branch".to_owned()],
+        return Ok(fail(
+            "nonzero path does not end in a counted loop branch".to_owned(),
         ));
     }
     let loop_instructions = loop_trace.instructions().collect::<Vec<_>>();
-    let loop_rvas = loop_instructions
-        .iter()
-        .map(|decoded| decoded.rva)
-        .collect::<std::collections::BTreeSet<_>>();
     let successors = [loop_trace.stop.direct_target, loop_trace.stop.fallthrough];
     let mut loop_entry = None;
     let mut loop_exit = None;
     for successor in successors.into_iter().flatten() {
-        if loop_rvas.contains(&successor) {
+        if loop_instructions
+            .iter()
+            .any(|decoded| decoded.rva == successor)
+        {
             loop_entry = Some(successor);
         } else {
             loop_exit = Some(successor);
         }
     }
     let (Some(loop_entry), Some(loop_exit)) = (loop_entry, loop_exit) else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["counted loop does not have one back-edge and one exit".to_owned()],
+        return Ok(fail(
+            "counted loop does not have one back-edge and one exit".to_owned(),
         ));
     };
     let Some(loop_branch) = loop_instructions.last() else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["counted loop is empty".to_owned()],
-        ));
+        return Ok(fail("counted loop is empty".to_owned()));
     };
-    if loop_branch.instruction.mnemonic() != Mnemonic::Jne {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["counted loop back-edge is not JNE after decrement".to_owned()],
+    if loop_branch.instruction.mnemonic() != Mnemonic::Jne
+        || loop_trace.stop.direct_target != Some(loop_entry)
+    {
+        return Ok(fail(
+            "counted loop back-edge is not JNE after decrement".to_owned(),
         ));
     }
-    let dec_index = loop_instructions.iter().rposition(|decoded| {
-        decoded.instruction.mnemonic() == Mnemonic::Dec
-            && register_operand(&decoded.instruction, 0)
-                .is_some_and(|register| canonical(register) == canonical(length_register))
-    });
+    let entry_index = loop_instructions
+        .iter()
+        .position(|decoded| decoded.rva == loop_entry)
+        .unwrap_or(0);
+    let body_end = loop_instructions.len() - 1;
+    let dec_index = loop_instructions[entry_index..body_end]
+        .iter()
+        .rposition(|decoded| decoded.instruction.mnemonic() == Mnemonic::Dec)
+        .map(|index| index + entry_index);
     let Some(dec_index) = dec_index else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["counted loop does not decrement the recovered length register".to_owned()],
-        ));
+        return Ok(fail("counted loop has no decrement".to_owned()));
     };
-    if loop_instructions[dec_index + 1..loop_instructions.len().saturating_sub(1)]
+    let dec_instruction = &loop_instructions[dec_index].instruction;
+    let stack_mode = is_rsp_slot(dec_instruction, 8);
+    if !stack_mode
+        && register_operand(dec_instruction, 0)
+            .is_none_or(|register| canonical(register) != length_register)
+    {
+        return Ok(fail(
+            "counted loop does not decrement the recovered length".to_owned(),
+        ));
+    }
+    if loop_instructions[dec_index + 1..body_end]
         .iter()
         .any(|decoded| flags_defined(&decoded.instruction))
     {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["loop-count flags are clobbered before JNE".to_owned()],
-        ));
+        return Ok(fail("loop-count flags are clobbered before JNE".to_owned()));
     }
 
-    let lea_candidates = loop_instructions
-        .iter()
-        .filter_map(|decoded| {
-            static_lea_address(pe, &decoded.instruction)
-                .map(|(register, address)| (decoded.rva, register, address))
-        })
-        .collect::<Vec<_>>();
-    let mut recurrence = None;
-    for (lea_rva, table_register, table_address) in lea_candidates {
-        if !table_is_file_backed(pe, table_address) {
+    // Nonzero path before the loop label: stack saves and table setup.
+    let mut pushed: Vec<(Register, Option<Role>)> = Vec::new();
+    let mut pushed_set = BTreeSet::new();
+    let mut lea_rva = None;
+    for decoded in &loop_instructions[..entry_index] {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() == Mnemonic::Push {
+            let Some(register) = register_operand(instruction, 0).filter(|r| r.size() == 8) else {
+                return Ok(fail("loop setup pushes a non-register value".to_owned()));
+            };
+            pushed.push((canonical(register), scan.role(register)));
+            pushed_set.insert(canonical(register));
             continue;
         }
-        let byte_load = loop_instructions.iter().enumerate().find(|(_, decoded)| {
-            let instruction = &decoded.instruction;
-            instruction.mnemonic() == Mnemonic::Movzx
-                && register_operand(instruction, 0).is_some()
-                && is_memory_operand(instruction.op1_kind())
-                && canonical(instruction.memory_base()) == canonical(pointer_register)
-                && instruction.memory_index() == Register::None
-                && memory_width(instruction) == 1
-                && decoded.rva.0 >= loop_entry.0
-        });
-        let Some((byte_index, byte_load)) = byte_load else {
-            continue;
+        let exempt = if stack_mode { &no_exempt } else { &pushed_set };
+        let table_setup = static_lea_address(pe, instruction)
+            .filter(|(_, address)| table_is_file_backed(pe, *address));
+        let written = if let Some((target, address)) = table_setup {
+            let written = match scan.generic(instruction, true) {
+                Ok(written) => written,
+                Err(message) => return Ok(fail(message)),
+            };
+            scan.set(target, Role::Table(address));
+            lea_rva = Some(decoded.rva);
+            written
+        } else {
+            match scan.generic(instruction, true) {
+                Ok(written) => written,
+                Err(message) => return Ok(fail(message)),
+            }
         };
-        let Some(index_register) = register_operand(&byte_load.instruction, 0) else {
-            continue;
-        };
-        let xor_index = loop_instructions[byte_index + 1..]
-            .iter()
-            .position(|decoded| {
-                decoded.instruction.mnemonic() == Mnemonic::Xor
-                    && register_operand(&decoded.instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(index_register))
-                    && register_operand(&decoded.instruction, 1)
-                        .is_some_and(|register| canonical(register) == canonical(accumulator))
-            })
-            .map(|index| index + byte_index + 1);
-        let Some(xor_index) = xor_index else {
-            continue;
-        };
-        let mask_index = loop_instructions[xor_index + 1..]
-            .iter()
-            .position(|decoded| {
-                decoded.instruction.mnemonic() == Mnemonic::And
-                    && register_operand(&decoded.instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(index_register))
-                    && immediate(&decoded.instruction, 1) == Some(0xff)
-            })
-            .map(|index| index + xor_index + 1);
-        let Some(mask_index) = mask_index else {
-            continue;
-        };
-        let table_index = loop_instructions[mask_index + 1..]
-            .iter()
-            .position(|decoded| {
-                let instruction = &decoded.instruction;
-                instruction.mnemonic() == Mnemonic::Mov
-                    && register_operand(instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(index_register))
-                    && is_memory_operand(instruction.op1_kind())
-                    && canonical(instruction.memory_base()) == canonical(table_register)
-                    && canonical(instruction.memory_index()) == canonical(index_register)
-                    && instruction.memory_index_scale() == 4
-                    && memory_width(instruction) == 4
-            })
-            .map(|index| index + mask_index + 1);
-        let Some(table_index) = table_index else {
-            continue;
-        };
-        let shift_index = loop_instructions[table_index + 1..]
-            .iter()
-            .position(|decoded| {
-                decoded.instruction.mnemonic() == Mnemonic::Shr
-                    && register_operand(&decoded.instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(accumulator))
-                    && immediate(&decoded.instruction, 1) == Some(8)
-            })
-            .map(|index| index + table_index + 1);
-        let Some(shift_index) = shift_index else {
-            continue;
-        };
-        let combine_index = loop_instructions[shift_index + 1..]
-            .iter()
-            .position(|decoded| {
-                decoded.instruction.mnemonic() == Mnemonic::Xor
-                    && register_operand(&decoded.instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(accumulator))
-                    && register_operand(&decoded.instruction, 1)
-                        .is_some_and(|register| canonical(register) == canonical(index_register))
-            })
-            .map(|index| index + shift_index + 1);
-        let Some(combine_index) = combine_index else {
-            continue;
-        };
-        let iteration_xors = loop_instructions[combine_index + 1..dec_index]
-            .iter()
-            .filter_map(|decoded| {
-                let instruction = &decoded.instruction;
-                (instruction.mnemonic() == Mnemonic::Xor
-                    && register_operand(instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(accumulator)))
-                .then(|| immediate(instruction, 1))
-                .flatten()
-                .and_then(|value| u32::try_from(value).ok())
-            })
-            .collect::<Vec<_>>();
-        let iteration_xor = match iteration_xors.as_slice() {
-            [] => 0,
-            [value] => *value,
-            _ => continue,
-        };
-        let pointer_advances = loop_instructions[byte_index + 1..dec_index]
-            .iter()
-            .filter(|decoded| {
-                let instruction = &decoded.instruction;
-                (instruction.mnemonic() == Mnemonic::Inc
-                    && register_operand(instruction, 0)
-                        .is_some_and(|register| canonical(register) == canonical(pointer_register)))
-                    || (instruction.mnemonic() == Mnemonic::Add
-                        && register_operand(instruction, 0).is_some_and(|register| {
-                            canonical(register) == canonical(pointer_register)
-                        })
-                        && signed_immediate(instruction, 1) == Some(1))
-            })
-            .count();
-        if pointer_advances != 1 {
-            continue;
+        if scan.violates_protection(&written, exempt) {
+            return Ok(fail(
+                "loop setup clobbers a register the dispatch tail depends on".to_owned(),
+            ));
         }
-        recurrence = Some((
-            lea_rva,
-            table_address,
-            byte_load.rva,
-            iteration_xor,
-            index_register,
-        ));
-        break;
     }
-    let Some((lea_rva, table_address, byte_load, iteration_xor, index_register)) = recurrence
-    else {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["nonzero loop does not prove the supported W32 byte-table recurrence".to_owned()],
+    if stack_mode {
+        let roles_pushed = pushed.iter().map(|(_, role)| *role).collect::<Vec<_>>();
+        if roles_pushed != [Some(Role::OrigLen), Some(Role::OrigPtr)] {
+            return Ok(fail(
+                "stack-resident loop state is not the saved original length then pointer"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    // One iteration of the loop body.
+    scan.roles.insert(accumulator, Role::Acc);
+    let mut facts = IterationFacts::default();
+    for decoded in &loop_instructions[entry_index..body_end] {
+        let exempt = if stack_mode { &no_exempt } else { &pushed_set };
+        let written = match scan.loop_step(
+            &decoded.instruction,
+            decoded.rva,
+            stack_mode,
+            pointer_register,
+            length_register,
+            &mut facts,
+        ) {
+            Ok(written) => written,
+            Err(message) => {
+                return Ok(fail(format!(
+                    "nonzero loop does not prove the supported W32 byte-table recurrence: {message}"
+                )));
+            }
+        };
+        let written = written
+            .into_iter()
+            .filter(|register| *register != accumulator)
+            .collect::<Vec<_>>();
+        if scan.violates_protection(&written, exempt) {
+            return Ok(fail(
+                "loop clobbers a register the dispatch tail depends on".to_owned(),
+            ));
+        }
+    }
+    let Some((table_register, table_address)) = facts.table else {
+        return Ok(fail(
+            "nonzero loop does not prove the supported W32 byte-table recurrence: no table lookup"
+                .to_owned(),
         ));
     };
-
-    let exit_trace = trace_direct_jump_fragments(pe, loop_exit, trace_limits)?;
-    let exit_instructions = exit_trace.instructions().collect::<Vec<_>>();
-    if !exit_instructions
-        .iter()
-        .any(|decoded| decoded.rva == zero_successor)
-    {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["counted loop exit does not converge on the zero-length tail".to_owned()],
+    let carried_ok = matches!(
+        scan.role(accumulator),
+        Some(Role::Combined | Role::Keyed)
+    ) && scan.role(table_register) == Some(Role::Table(table_address))
+        && facts.byte_loaded
+        && facts.advanced
+        && facts.counted
+        && (stack_mode
+            || (scan.role(pointer_register) == Some(Role::OrigPtr)
+                && scan.role(length_register) == Some(Role::OrigLen)));
+    if !carried_ok {
+        return Ok(fail(
+            "nonzero loop does not prove the supported W32 byte-table recurrence: iteration state is not loop-carried"
+                .to_owned(),
         ));
     }
-    if canonical(index_register) == canonical(roles.vip) {
-        let saves_vip = loop_instructions.iter().any(|decoded| {
-            decoded.instruction.mnemonic() == Mnemonic::Push
-                && register_operand(&decoded.instruction, 0)
-                    .is_some_and(|register| canonical(register) == canonical(roles.vip))
-        });
-        let restores_vip = exit_instructions.iter().any(|decoded| {
-            decoded.instruction.mnemonic() == Mnemonic::Pop
-                && register_operand(&decoded.instruction, 0)
-                    .is_some_and(|register| canonical(register) == canonical(roles.vip))
-        });
-        if !saves_vip || !restores_vip {
-            return Ok(report_failure(
-                entry,
-                Some(pointer_load),
-                Some(length_load),
-                vec![
-                    "loop aliases the VIP register without a proven balanced save/restore"
-                        .to_owned(),
-                ],
-            ));
+    let iteration_xor = facts.iteration_xor.unwrap_or(0);
+    let byte_load = facts.byte_load.unwrap_or(loop_entry);
+
+    // Loop exit: restore saved state and converge on the zero-length tail.
+    let exit_trace = trace_direct_jump_fragments(pe, loop_exit, trace_limits)?;
+    let exit_instructions = exit_trace.instructions().collect::<Vec<_>>();
+    let Some(join_index) = exit_instructions
+        .iter()
+        .position(|decoded| decoded.rva == zero_successor)
+    else {
+        return Ok(fail(
+            "counted loop exit does not converge on the zero-length tail".to_owned(),
+        ));
+    };
+    let mut popped = Vec::new();
+    for decoded in &exit_instructions[..join_index] {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() == Mnemonic::Pop {
+            let Some(register) = register_operand(instruction, 0).filter(|r| r.size() == 8) else {
+                return Ok(fail("loop exit pops a non-register value".to_owned()));
+            };
+            popped.push(canonical(register));
+            continue;
         }
-    } else {
-        let mut factory = InstructionInfoFactory::new();
-        if loop_instructions
-            .iter()
-            .any(|decoded| writes_register(&mut factory, &decoded.instruction, roles.vip))
-        {
-            return Ok(report_failure(
-                entry,
-                Some(pointer_load),
-                Some(length_load),
-                vec![
-                    "loop clobbers VIP without using it as the proven saved index register"
-                        .to_owned(),
-                ],
+        let written = match scan.generic(instruction, true) {
+            Ok(written) => written,
+            Err(message) => return Ok(fail(message)),
+        };
+        if scan.violates_protection(&written, &no_exempt) {
+            return Ok(fail(
+                "loop exit clobbers a register the dispatch tail depends on".to_owned(),
             ));
         }
     }
-
+    let balanced = if stack_mode {
+        popped.len() == 2 && popped.iter().all(|register| !protected.contains(register))
+    } else {
+        let expected = pushed.iter().rev().map(|(register, _)| *register);
+        popped.iter().copied().eq(expected)
+    };
+    if !balanced {
+        return Ok(fail(
+            "loop exit does not restore the saved native stack state".to_owned(),
+        ));
+    }
     let metadata = TableChecksumMetadata {
         checksum_width: BitWidth::W32,
         accumulator_source: ChecksumAccumulatorSource::Constant { value: 0 },
@@ -730,15 +1100,7 @@ pub fn analyze_table_checksum_handler(
         vsp_delta: 12,
     };
     debug_assert!(metadata.validate().is_ok());
-    let dispatch_vip_delta = i32::try_from(dispatch_candidate.vip_delta).unwrap_or(i32::MAX);
-    if dispatch_vip_delta == i32::MAX {
-        return Ok(report_failure(
-            entry,
-            Some(pointer_load),
-            Some(length_load),
-            vec!["threaded dispatch VIP delta exceeds i32".to_owned()],
-        ));
-    }
+    let lea_rva = lea_rva.unwrap_or(loop_entry);
     let evidence = vec![
         "loads a W64 pointer and packed zero-extended length from VSP+0/VSP+8".to_owned(),
         "zero length and counted-loop exit converge on one W32 finalization/store tail".to_owned(),
@@ -747,9 +1109,11 @@ pub fn analyze_table_checksum_handler(
         ),
         "each iteration combines SHR32(accumulator, 8) with the selected table entry".to_owned(),
         format!("each iteration advances the pointer and XORs {iteration_xor:#010X}"),
-        "loop count is decremented to zero and any VIP alias is restored before dispatch"
-            .to_owned(),
-        "common tail yields exactly one ordinary keyed relative-dispatch codec".to_owned(),
+        format!(
+            "loop state is held in {}; every other native instruction on the prefix, loop and exit paths leaves the dispatch tail's live inputs untouched",
+            if stack_mode { "two saved native-stack slots" } else { "registers" }
+        ),
+        "common tail yields exactly one ordinary relative-dispatch codec".to_owned(),
     ];
     let report = TableChecksumHandlerReport {
         schema_version: 1,
@@ -776,6 +1140,25 @@ pub fn analyze_table_checksum_handler(
         }),
     })
 }
+
+const GENERAL_REGISTERS: [Register; 16] = [
+    Register::RAX,
+    Register::RBX,
+    Register::RCX,
+    Register::RDX,
+    Register::RSI,
+    Register::RDI,
+    Register::RBP,
+    Register::RSP,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+    Register::R12,
+    Register::R13,
+    Register::R14,
+    Register::R15,
+];
 
 #[cfg(test)]
 mod tests {
@@ -819,42 +1202,103 @@ mod tests {
         data
     }
 
-    fn checksum_code(valid_combine: bool, subtract_to_zero: bool) -> Vec<u8> {
+    #[derive(Clone, Copy, Default)]
+    struct Shape {
+        invalid_combine: bool,
+        subtract_to_zero: bool,
+        stack_state: bool,
+        compare_zero_register: bool,
+        compare_nonzero_register: bool,
+        clobber_vip_unsaved: bool,
+        stray_memory_write: bool,
+        advance_twice: bool,
+        shift_before_index: bool,
+        unbalanced_exit: bool,
+    }
+
+    fn checksum_code(shape: Shape) -> Vec<u8> {
         let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
         let mut loop_body = assembler.create_label();
         let mut common_tail = assembler.create_label();
         assembler.mov(r12, qword_ptr(rbp)).expect("pointer load");
         assembler.mov(r10, qword_ptr(rbp + 8)).expect("length load");
         assembler.add(rbp, 12).expect("consume packed inputs");
-        if subtract_to_zero {
+        if shape.subtract_to_zero {
             assembler.sub(r9d, r9d).expect("zero accumulator");
         } else {
             assembler.xor(r9d, r9d).expect("zero accumulator");
         }
-        assembler.test(r10, r10).expect("test length");
+        if shape.compare_zero_register {
+            assembler.cmp(r10, r9).expect("compare length with zero");
+        } else if shape.compare_nonzero_register {
+            assembler.cmp(r10, r11).expect("compare length with r11");
+        } else {
+            assembler.test(r10, r10).expect("test length");
+        }
         assembler.jz(common_tail).expect("zero-length tail");
         assembler
             .mov(rdx, 0x1_4000_2000_u64)
             .expect("table address");
-        assembler.push(rsi).expect("save aliased VIP");
-        assembler.set_label(&mut loop_body).expect("loop label");
-        assembler.movzx(esi, byte_ptr(r12)).expect("input byte");
-        assembler.xor(esi, r9d).expect("form table index");
-        assembler.and(esi, 0xff).expect("mask table index");
-        assembler
-            .mov(esi, dword_ptr(rdx + rsi * 4))
-            .expect("table lookup");
-        assembler.shr(r9d, 8).expect("shift accumulator");
-        if valid_combine {
-            assembler.xor(r9d, esi).expect("combine table entry");
+        if shape.stack_state {
+            assembler.push(r10).expect("save length");
+            assembler.push(r12).expect("save pointer");
+            assembler.set_label(&mut loop_body).expect("loop label");
+            assembler.mov(rax, qword_ptr(rsp)).expect("load pointer");
+            assembler.movzx(eax, byte_ptr(rax)).expect("input byte");
+            if shape.shift_before_index {
+                assembler.shr(r9d, 8).expect("shift accumulator");
+            }
+            assembler.xor(al, r9b).expect("form table index");
+            assembler
+                .mov(eax, dword_ptr(rdx + rax * 4))
+                .expect("table lookup");
+            if !shape.shift_before_index {
+                assembler.shr(r9d, 8).expect("shift accumulator");
+            }
+            assembler.xor(r9d, eax).expect("combine table entry");
+            assembler.xor(r9d, 0x1234_5678_i32).expect("iteration xor");
+            assembler.inc(qword_ptr(rsp)).expect("advance pointer");
+            if shape.advance_twice {
+                assembler.inc(qword_ptr(rsp)).expect("advance pointer");
+            }
+            if shape.stray_memory_write {
+                assembler
+                    .mov(qword_ptr(rbp - 0x40), rax)
+                    .expect("stray VM-stack write");
+            }
+            assembler
+                .dec(qword_ptr(rsp + 8))
+                .expect("decrement length");
+            assembler.jne(loop_body).expect("loop back-edge");
+            assembler.pop(r12).expect("drop pointer");
+            if !shape.unbalanced_exit {
+                assembler.pop(r10).expect("drop length");
+            }
         } else {
-            assembler.add(r9d, esi).expect("invalid table combine");
+            if !shape.clobber_vip_unsaved {
+                assembler.push(rsi).expect("save aliased VIP");
+            }
+            assembler.set_label(&mut loop_body).expect("loop label");
+            assembler.movzx(esi, byte_ptr(r12)).expect("input byte");
+            assembler.xor(esi, r9d).expect("form table index");
+            assembler.and(esi, 0xff).expect("mask table index");
+            assembler
+                .mov(esi, dword_ptr(rdx + rsi * 4))
+                .expect("table lookup");
+            assembler.shr(r9d, 8).expect("shift accumulator");
+            if shape.invalid_combine {
+                assembler.add(r9d, esi).expect("invalid table combine");
+            } else {
+                assembler.xor(r9d, esi).expect("combine table entry");
+            }
+            assembler.inc(r12).expect("advance pointer");
+            assembler.xor(r9d, 0x1234_5678_i32).expect("iteration xor");
+            assembler.dec(r10).expect("decrement length");
+            assembler.jne(loop_body).expect("loop back-edge");
+            if !shape.clobber_vip_unsaved {
+                assembler.pop(rsi).expect("restore VIP");
+            }
         }
-        assembler.inc(r12).expect("advance pointer");
-        assembler.xor(r9d, 0x1234_5678_i32).expect("iteration xor");
-        assembler.dec(r10).expect("decrement length");
-        assembler.jne(loop_body).expect("loop back-edge");
-        assembler.pop(rsi).expect("restore VIP");
         assembler.set_label(&mut common_tail).expect("tail label");
         assembler.not(r9d).expect("finalize checksum");
         assembler.mov(dword_ptr(rbp), r9d).expect("store checksum");
@@ -892,9 +1336,27 @@ mod tests {
         .expect("synthetic handler must decode")
     }
 
+    fn assert_rejected(shape: Shape, needle: &str) {
+        let analysis = analyze(&checksum_code(shape));
+        assert!(
+            analysis.recovered.is_none(),
+            "near-miss must stay Failed: {:#?}",
+            analysis.report
+        );
+        assert!(
+            analysis
+                .report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains(needle)),
+            "expected `{needle}` in {:#?}",
+            analysis.report.diagnostics
+        );
+    }
+
     #[test]
     fn recognizes_mutation_independent_table_checksum_contract() {
-        let analysis = analyze(&checksum_code(true, false));
+        let analysis = analyze(&checksum_code(Shape::default()));
         let recovered = analysis
             .recovered
             .unwrap_or_else(|| panic!("checksum must recover: {:#?}", analysis.report));
@@ -906,20 +1368,114 @@ mod tests {
 
     #[test]
     fn recognizes_subtract_to_zero_accumulator_initialization() {
-        let analysis = analyze(&checksum_code(true, true));
+        let analysis = analyze(&checksum_code(Shape {
+            subtract_to_zero: true,
+            ..Shape::default()
+        }));
         assert!(analysis.recovered.is_some(), "{:#?}", analysis.report);
     }
 
     #[test]
     fn rejects_non_xor_table_combination() {
-        let analysis = analyze(&checksum_code(false, false));
-        assert!(analysis.recovered.is_none());
-        assert!(
-            analysis
-                .report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.contains("recurrence"))
+        assert_rejected(
+            Shape {
+                invalid_combine: true,
+                ..Shape::default()
+            },
+            "recurrence",
+        );
+    }
+
+    #[test]
+    fn recognizes_stack_resident_loop_state_with_zero_register_compare() {
+        let analysis = analyze(&checksum_code(Shape {
+            stack_state: true,
+            compare_zero_register: true,
+            ..Shape::default()
+        }));
+        let recovered = analysis
+            .recovered
+            .unwrap_or_else(|| panic!("stack-state checksum must recover: {:#?}", analysis.report));
+        assert_eq!(recovered.metadata.iteration_xor, 0x1234_5678);
+        assert_eq!(recovered.metadata.vsp_delta, 12);
+    }
+
+    #[test]
+    fn recognizes_register_state_with_zero_register_compare() {
+        let analysis = analyze(&checksum_code(Shape {
+            compare_zero_register: true,
+            ..Shape::default()
+        }));
+        assert!(analysis.recovered.is_some(), "{:#?}", analysis.report);
+    }
+
+    #[test]
+    fn rejects_compare_against_unproven_register() {
+        assert_rejected(
+            Shape {
+                compare_nonzero_register: true,
+                ..Shape::default()
+            },
+            "length-versus-zero",
+        );
+    }
+
+    #[test]
+    fn rejects_vip_clobber_without_save_restore() {
+        assert_rejected(
+            Shape {
+                clobber_vip_unsaved: true,
+                ..Shape::default()
+            },
+            "dispatch tail depends on",
+        );
+    }
+
+    #[test]
+    fn rejects_stray_memory_write_in_loop() {
+        assert_rejected(
+            Shape {
+                stack_state: true,
+                stray_memory_write: true,
+                ..Shape::default()
+            },
+            "writes memory",
+        );
+    }
+
+    #[test]
+    fn rejects_double_pointer_advance() {
+        assert_rejected(
+            Shape {
+                stack_state: true,
+                advance_twice: true,
+                ..Shape::default()
+            },
+            "recurrence",
+        );
+    }
+
+    #[test]
+    fn rejects_shift_before_index_formation() {
+        assert_rejected(
+            Shape {
+                stack_state: true,
+                shift_before_index: true,
+                ..Shape::default()
+            },
+            "recurrence",
+        );
+    }
+
+    #[test]
+    fn rejects_unbalanced_stack_exit() {
+        assert_rejected(
+            Shape {
+                stack_state: true,
+                unbalanced_exit: true,
+                ..Shape::default()
+            },
+            "restore",
         );
     }
 }
