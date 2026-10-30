@@ -11,8 +11,8 @@ use crate::{
     NativeCallInvocationDescriptor, NativeCallMemoryDecision, NativeCallMemoryEffect,
     NativeCallResultEffect, NativeCallSelectorOutcome, NativeCallTargetDescriptor,
     NativeCallValueSource, ResizeOp, TableChecksumMetadata, UnaryOp, VmHandlerSemantic,
-    VmSemanticMetadata, apply_native_call_effect, resolve_native_call_import,
-    summarize_known_import,
+    VmSemanticMetadata, apply_native_call_effect, distinct_node_count_bounded,
+    resolve_native_call_import, summarize_known_import,
 };
 
 const WIN64_ARGUMENT_REGISTERS: [&str; 4] = ["RCX", "RDX", "R8", "R9"];
@@ -758,9 +758,7 @@ impl<'a> SymbolicMachine<'a> {
                 limits.max_memory_bytes
             ));
         }
-        let mut peak = 0_usize;
-        let mut aggregate = 0_usize;
-        for expression in std::iter::once(&self.vsp)
+        let roots = std::iter::once(&self.vsp)
             .chain(std::iter::once(&self.flags))
             .chain(self.memory.keys())
             .chain(self.memory.values())
@@ -774,19 +772,15 @@ impl<'a> SymbolicMachine<'a> {
                 self.fresh_allocations
                     .iter()
                     .flat_map(|allocation| [&allocation.allocation, &allocation.size]),
-            )
-        {
-            let nodes = expression.node_count_bounded(limits.max_expression_nodes);
-            peak = peak.max(nodes);
-            aggregate = aggregate.saturating_add(nodes);
-            if nodes > limits.max_expression_nodes || aggregate > limits.max_expression_nodes {
-                return Err(format!(
-                    "aggregate expressions exceed {} nodes",
-                    limits.max_expression_nodes
-                ));
-            }
+            );
+        let live = distinct_node_count_bounded(roots, limits.max_expression_nodes);
+        if live > limits.max_expression_nodes {
+            return Err(format!(
+                "aggregate expressions exceed {} nodes",
+                limits.max_expression_nodes
+            ));
         }
-        self.peak_expression_nodes = self.peak_expression_nodes.max(peak);
+        self.peak_expression_nodes = self.peak_expression_nodes.max(live);
         Ok(())
     }
 }

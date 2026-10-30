@@ -805,16 +805,14 @@ pub fn analyze_table_checksum_handler(
         }
         if flags_defined(instruction) {
             split_ok = match instruction.mnemonic() {
-                Mnemonic::Test => {
-                    register_operand(instruction, 0)
-                        .zip(register_operand(instruction, 1))
-                        .is_some_and(|(left, right)| {
-                            canonical(left) == canonical(right)
-                                && left.size() == 8
-                                && right.size() == 8
-                                && scan.role(left) == Some(Role::OrigLen)
-                        })
-                }
+                Mnemonic::Test => register_operand(instruction, 0)
+                    .zip(register_operand(instruction, 1))
+                    .is_some_and(|(left, right)| {
+                        canonical(left) == canonical(right)
+                            && left.size() == 8
+                            && right.size() == 8
+                            && scan.role(left) == Some(Role::OrigLen)
+                    }),
                 Mnemonic::Cmp => register_operand(instruction, 0)
                     .zip(register_operand(instruction, 1))
                     .is_some_and(|(left, right)| {
@@ -1017,10 +1015,8 @@ pub fn analyze_table_checksum_handler(
                 .to_owned(),
         ));
     };
-    let carried_ok = matches!(
-        scan.role(accumulator),
-        Some(Role::Combined | Role::Keyed)
-    ) && scan.role(table_register) == Some(Role::Table(table_address))
+    let carried_ok = matches!(scan.role(accumulator), Some(Role::Combined | Role::Keyed))
+        && scan.role(table_register) == Some(Role::Table(table_address))
         && facts.byte_loaded
         && facts.advanced
         && facts.counted
@@ -1111,7 +1107,11 @@ pub fn analyze_table_checksum_handler(
         format!("each iteration advances the pointer and XORs {iteration_xor:#010X}"),
         format!(
             "loop state is held in {}; every other native instruction on the prefix, loop and exit paths leaves the dispatch tail's live inputs untouched",
-            if stack_mode { "two saved native-stack slots" } else { "registers" }
+            if stack_mode {
+                "two saved native-stack slots"
+            } else {
+                "registers"
+            }
         ),
         "common tail yields exactly one ordinary relative-dispatch codec".to_owned(),
     ];
@@ -1266,9 +1266,7 @@ mod tests {
                     .mov(qword_ptr(rbp - 0x40), rax)
                     .expect("stray VM-stack write");
             }
-            assembler
-                .dec(qword_ptr(rsp + 8))
-                .expect("decrement length");
+            assembler.dec(qword_ptr(rsp + 8)).expect("decrement length");
             assembler.jne(loop_body).expect("loop back-edge");
             assembler.pop(r12).expect("drop pointer");
             if !shape.unbalanced_exit {

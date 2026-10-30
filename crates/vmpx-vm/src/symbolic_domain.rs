@@ -87,28 +87,11 @@ pub enum SymbolicDomainError {
 
 fn dependency_widths(expression: &Expr) -> BTreeMap<String, crate::BitWidth> {
     let mut output = BTreeMap::new();
-    let mut pending = vec![expression];
-    while let Some(current) = pending.pop() {
-        match &current.kind {
-            ExprKind::Register { name } => {
-                output.entry(name.clone()).or_insert(current.width);
-            }
-            ExprKind::Const { .. } => {}
-            ExprKind::Unary { value, .. }
-            | ExprKind::Load { address: value }
-            | ExprKind::Extract { value, .. }
-            | ExprKind::Resize { value, .. } => pending.push(value),
-            ExprKind::Binary { left, right, .. }
-            | ExprKind::Concat {
-                high: left,
-                low: right,
-            } => {
-                pending.push(right);
-                pending.push(left);
-            }
-            ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+    expression.walk_distinct(&mut |current| {
+        if let ExprKind::Register { name } = &current.kind {
+            output.entry(name.clone()).or_insert(current.width);
         }
-    }
+    });
     output
 }
 

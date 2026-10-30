@@ -103,7 +103,9 @@ pub use exception_flow::{
     VmFaultUnwindCoverage, VmMemoryExceptionCoverageReport, analyze_exception_stack_sled,
     analyze_vm_memory_exception_coverage, analyze_vm_memory_exception_coverage_with_state,
 };
-pub use expr::{BinaryOp, Expr, ExprError, ExprKind, ResizeOp, UnaryOp};
+pub use expr::{
+    BinaryOp, Expr, ExprError, ExprKind, ExprRef, ResizeOp, UnaryOp, distinct_node_count_bounded,
+};
 pub use handler_slice::{
     HandlerSliceConfig, NativeBackwardSlice, NativeInstructionDisposition, NativeSliceInstruction,
     NativeSliceReason, backward_slice_handler_trace,

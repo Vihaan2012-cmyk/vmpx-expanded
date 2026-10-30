@@ -1,6 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 use crate::BitWidth;
@@ -47,31 +51,31 @@ pub enum ExprKind {
     },
     Unary {
         op: UnaryOp,
-        value: Box<Expr>,
+        value: ExprRef,
     },
     Binary {
         op: BinaryOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: ExprRef,
+        right: ExprRef,
     },
     Load {
-        address: Box<Expr>,
+        address: ExprRef,
     },
     Intrinsic {
         name: String,
         arguments: Vec<Expr>,
     },
     Extract {
-        value: Box<Expr>,
+        value: ExprRef,
         lsb: u32,
     },
     Concat {
-        high: Box<Expr>,
-        low: Box<Expr>,
+        high: ExprRef,
+        low: ExprRef,
     },
     Resize {
         op: ResizeOp,
-        value: Box<Expr>,
+        value: ExprRef,
     },
 }
 
@@ -79,6 +83,150 @@ pub enum ExprKind {
 pub struct Expr {
     pub width: BitWidth,
     pub kind: ExprKind,
+}
+
+struct Node {
+    expr: Expr,
+    hash: u64,
+    /// Set once one `simplify` pass over this node is known to be a no-op.
+    stable: AtomicBool,
+}
+
+/// A hash-consed shared expression node. Every `ExprRef` comes from the global
+/// interner, so structurally equal nodes are the same allocation: equality is a
+/// pointer comparison, hashing is O(1), and cloning never copies a subtree.
+#[derive(Clone)]
+pub struct ExprRef(Arc<Node>);
+
+type SubMemo = HashMap<*const Node, Expr>;
+type RwMemo = HashMap<*const Node, Expr>;
+
+#[derive(Default)]
+struct Interner {
+    buckets: HashMap<u64, Vec<Weak<Node>>>,
+    inserted: usize,
+    sweep_at: usize,
+}
+
+static INTERNER: LazyLock<Mutex<Interner>> = LazyLock::new(|| Mutex::new(Interner::default()));
+
+impl ExprRef {
+    #[must_use]
+    pub fn new(expr: Expr) -> Self {
+        let mut hasher = std::hash::DefaultHasher::new();
+        expr.hash(&mut hasher);
+        let hash = hasher.finish();
+        let mut guard = INTERNER.lock().unwrap_or_else(|e| e.into_inner());
+        let interner = &mut *guard;
+        let bucket = interner.buckets.entry(hash).or_default();
+        let mut index = 0;
+        while index < bucket.len() {
+            match bucket[index].upgrade() {
+                Some(node) if node.expr == expr => return Self(node),
+                Some(_) => index += 1,
+                None => {
+                    bucket.swap_remove(index);
+                }
+            }
+        }
+        let node = Arc::new(Node {
+            expr,
+            hash,
+            stable: AtomicBool::new(false),
+        });
+        bucket.push(Arc::downgrade(&node));
+        interner.inserted += 1;
+        if interner.inserted >= interner.sweep_at.max(1 << 16) {
+            interner.buckets.retain(|_, bucket| {
+                bucket.retain(|weak| weak.strong_count() > 0);
+                !bucket.is_empty()
+            });
+            interner.inserted = 0;
+            interner.sweep_at = interner.buckets.len().saturating_mul(2);
+        }
+        Self(node)
+    }
+
+    fn address(&self) -> *const Node {
+        Arc::as_ptr(&self.0)
+    }
+
+    fn sub_memo(
+        &self,
+        replacements: &BTreeMap<String, Expr>,
+        memo: &mut SubMemo,
+    ) -> Result<Expr, ExprError> {
+        if let Some(done) = memo.get(&self.address()) {
+            return Ok(done.clone());
+        }
+        let result = self.0.expr.sub_memo(replacements, memo)?;
+        memo.insert(self.address(), result.clone());
+        Ok(result)
+    }
+
+    fn rw_memo<F>(&self, rewrite: &mut F, memo: &mut RwMemo) -> Result<Expr, ExprError>
+    where
+        F: FnMut(BitWidth, &str, &[Expr]) -> Option<Expr>,
+    {
+        if let Some(done) = memo.get(&self.address()) {
+            return Ok(done.clone());
+        }
+        let result = self.0.expr.rw_memo(rewrite, memo)?;
+        memo.insert(self.address(), result.clone());
+        Ok(result)
+    }
+
+    /// One bottom-up simplification pass, skipping subtrees already known stable.
+    fn simplified(&self) -> Self {
+        if self.0.stable.load(Ordering::Relaxed) {
+            return self.clone();
+        }
+        let result = self.0.expr.simplify_pass();
+        if result == self.0.expr {
+            self.0.stable.store(true, Ordering::Relaxed);
+            return self.clone();
+        }
+        Self::new(result)
+    }
+}
+
+impl Deref for ExprRef {
+    type Target = Expr;
+    fn deref(&self) -> &Expr {
+        &self.0.expr
+    }
+}
+
+impl AsRef<Expr> for ExprRef {
+    fn as_ref(&self) -> &Expr {
+        &self.0.expr
+    }
+}
+
+impl PartialEq for ExprRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ExprRef {}
+
+impl Hash for ExprRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.hash);
+    }
+}
+
+impl std::fmt::Debug for ExprRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.expr.fmt(formatter)
+    }
+}
+
+impl Serialize for ExprRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.expr.serialize(serializer)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -131,7 +279,7 @@ impl Expr {
         Self {
             width,
             kind: ExprKind::Load {
-                address: Box::new(address),
+                address: ExprRef::new(address),
             },
         }
     }
@@ -158,7 +306,7 @@ impl Expr {
         Ok(Self {
             width: target,
             kind: ExprKind::Extract {
-                value: Box::new(value),
+                value: ExprRef::new(value),
                 lsb,
             },
         }
@@ -186,8 +334,8 @@ impl Expr {
         Ok(Self {
             width,
             kind: ExprKind::Concat {
-                high: Box::new(high),
-                low: Box::new(low),
+                high: ExprRef::new(high),
+                low: ExprRef::new(low),
             },
         }
         .simplify())
@@ -200,7 +348,7 @@ impl Expr {
             width,
             kind: ExprKind::Unary {
                 op,
-                value: Box::new(value),
+                value: ExprRef::new(value),
             },
         }
         .simplify()
@@ -223,8 +371,8 @@ impl Expr {
             width,
             kind: ExprKind::Binary {
                 op,
-                left: Box::new(left),
-                right: Box::new(right),
+                left: ExprRef::new(left),
+                right: ExprRef::new(right),
             },
         }
         .simplify())
@@ -252,7 +400,7 @@ impl Expr {
             width: target,
             kind: ExprKind::Resize {
                 op,
-                value: Box::new(value),
+                value: ExprRef::new(value),
             },
         }
         .simplify())
@@ -261,7 +409,11 @@ impl Expr {
     #[must_use]
     pub fn dependencies(&self) -> BTreeSet<String> {
         let mut dependencies = BTreeSet::new();
-        self.collect_dependencies(&mut dependencies);
+        self.walk_distinct(&mut |expression| {
+            if let ExprKind::Register { name } = &expression.kind {
+                dependencies.insert(name.clone());
+            }
+        });
         dependencies
     }
 
@@ -272,55 +424,40 @@ impl Expr {
     #[must_use]
     pub fn intrinsic_dependencies(&self) -> BTreeSet<String> {
         let mut intrinsics = BTreeSet::new();
+        self.walk_distinct(&mut |expression| {
+            if let ExprKind::Intrinsic { name, .. } = &expression.kind {
+                intrinsics.insert(name.clone());
+            }
+        });
+        intrinsics
+    }
+
+    /// Visits this expression and every distinct shared descendant once.
+    pub(crate) fn walk_distinct<'a>(&'a self, visit: &mut impl FnMut(&'a Self)) {
+        let mut seen: HashSet<*const Node> = HashSet::new();
         let mut pending = vec![self];
         while let Some(expression) = pending.pop() {
+            visit(expression);
+            let mut push = |child: &'a ExprRef, pending: &mut Vec<&'a Self>| {
+                if seen.insert(child.address()) {
+                    pending.push(child.as_ref());
+                }
+            };
             match &expression.kind {
                 ExprKind::Const { .. } | ExprKind::Register { .. } => {}
                 ExprKind::Unary { value, .. }
                 | ExprKind::Load { address: value }
                 | ExprKind::Extract { value, .. }
-                | ExprKind::Resize { value, .. } => pending.push(value),
+                | ExprKind::Resize { value, .. } => push(value, &mut pending),
                 ExprKind::Binary { left, right, .. }
                 | ExprKind::Concat {
                     high: left,
                     low: right,
                 } => {
-                    pending.push(right);
-                    pending.push(left);
+                    push(right, &mut pending);
+                    push(left, &mut pending);
                 }
-                ExprKind::Intrinsic { name, arguments } => {
-                    intrinsics.insert(name.clone());
-                    pending.extend(arguments);
-                }
-            }
-        }
-        intrinsics
-    }
-
-    fn collect_dependencies(&self, output: &mut BTreeSet<String>) {
-        match &self.kind {
-            ExprKind::Const { .. } => {}
-            ExprKind::Register { name } => {
-                output.insert(name.clone());
-            }
-            ExprKind::Unary { value, .. }
-            | ExprKind::Resize { value, .. }
-            | ExprKind::Extract { value, .. } => {
-                value.collect_dependencies(output);
-            }
-            ExprKind::Binary { left, right, .. }
-            | ExprKind::Concat {
-                high: left,
-                low: right,
-            } => {
-                left.collect_dependencies(output);
-                right.collect_dependencies(output);
-            }
-            ExprKind::Load { address } => address.collect_dependencies(output),
-            ExprKind::Intrinsic { arguments, .. } => {
-                for argument in arguments {
-                    argument.collect_dependencies(output);
-                }
+                ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
             }
         }
     }
@@ -331,6 +468,30 @@ impl Expr {
     ///
     /// A replacement must have the same width as the register it replaces.
     pub fn substitute(&self, replacements: &BTreeMap<String, Self>) -> Result<Self, ExprError> {
+        self.sub_memo(replacements, &mut HashMap::new())
+    }
+
+    /// Rebuilds an expression bottom-up and permits a caller to replace opaque
+    /// intrinsics after their arguments have themselves been rewritten. A
+    /// replacement must retain the intrinsic result width. The callback runs once
+    /// per distinct shared subexpression.
+    ///
+    /// # Errors
+    ///
+    /// Returns a width/shape error if rebuilding a child expression fails or
+    /// the callback returns a value of the wrong width.
+    pub fn rewrite_intrinsics<F>(&self, rewrite: &mut F) -> Result<Self, ExprError>
+    where
+        F: FnMut(BitWidth, &str, &[Self]) -> Option<Self>,
+    {
+        self.rw_memo(rewrite, &mut HashMap::new())
+    }
+
+    fn sub_memo(
+        &self,
+        replacements: &BTreeMap<String, Self>,
+        memo: &mut SubMemo,
+    ) -> Result<Self, ExprError> {
         let result = match &self.kind {
             ExprKind::Const { .. } => self.clone(),
             ExprKind::Register { name } => {
@@ -346,62 +507,54 @@ impl Expr {
                     self.clone()
                 }
             }
-            ExprKind::Unary { op, value } => Self::unary(*op, value.substitute(replacements)?),
+            ExprKind::Unary { op, value } => Self::unary(*op, value.sub_memo(replacements, memo)?),
             ExprKind::Binary { op, left, right } => Self::binary(
                 *op,
-                left.substitute(replacements)?,
-                right.substitute(replacements)?,
+                left.sub_memo(replacements, memo)?,
+                right.sub_memo(replacements, memo)?,
             )?,
-            ExprKind::Load { address } => Self::load(self.width, address.substitute(replacements)?),
+            ExprKind::Load { address } => {
+                Self::load(self.width, address.sub_memo(replacements, memo)?)
+            }
             ExprKind::Intrinsic { name, arguments } => Self::intrinsic(
                 self.width,
                 name.clone(),
                 arguments
                     .iter()
-                    .map(|argument| argument.substitute(replacements))
+                    .map(|argument| argument.sub_memo(replacements, memo))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             ExprKind::Extract { value, lsb } => {
-                Self::extract(self.width, *lsb, value.substitute(replacements)?)?
+                Self::extract(self.width, *lsb, value.sub_memo(replacements, memo)?)?
             }
             ExprKind::Concat { high, low } => Self::concat(
-                high.substitute(replacements)?,
-                low.substitute(replacements)?,
+                high.sub_memo(replacements, memo)?,
+                low.sub_memo(replacements, memo)?,
             )?,
             ExprKind::Resize { op, value } => {
-                Self::resize(*op, self.width, value.substitute(replacements)?)?
+                Self::resize(*op, self.width, value.sub_memo(replacements, memo)?)?
             }
         };
         Ok(result.simplify())
     }
 
-    /// Rebuilds an expression bottom-up and permits a caller to replace opaque
-    /// intrinsics after their arguments have themselves been rewritten. A
-    /// replacement must retain the intrinsic result width.
-    ///
-    /// # Errors
-    ///
-    /// Returns a width/shape error if rebuilding a child expression fails or
-    /// the callback returns a value of the wrong width.
-    pub fn rewrite_intrinsics<F>(&self, rewrite: &mut F) -> Result<Self, ExprError>
+    fn rw_memo<F>(&self, rewrite: &mut F, memo: &mut RwMemo) -> Result<Self, ExprError>
     where
         F: FnMut(BitWidth, &str, &[Self]) -> Option<Self>,
     {
         let rebuilt = match &self.kind {
             ExprKind::Const { .. } | ExprKind::Register { .. } => self.clone(),
-            ExprKind::Unary { op, value } => Self::unary(*op, value.rewrite_intrinsics(rewrite)?),
+            ExprKind::Unary { op, value } => Self::unary(*op, value.rw_memo(rewrite, memo)?),
             ExprKind::Binary { op, left, right } => Self::binary(
                 *op,
-                left.rewrite_intrinsics(rewrite)?,
-                right.rewrite_intrinsics(rewrite)?,
+                left.rw_memo(rewrite, memo)?,
+                right.rw_memo(rewrite, memo)?,
             )?,
-            ExprKind::Load { address } => {
-                Self::load(self.width, address.rewrite_intrinsics(rewrite)?)
-            }
+            ExprKind::Load { address } => Self::load(self.width, address.rw_memo(rewrite, memo)?),
             ExprKind::Intrinsic { name, arguments } => {
                 let arguments = arguments
                     .iter()
-                    .map(|argument| argument.rewrite_intrinsics(rewrite))
+                    .map(|argument| argument.rw_memo(rewrite, memo))
                     .collect::<Result<Vec<_>, _>>()?;
                 if let Some(replacement) = rewrite(self.width, name, &arguments) {
                     if replacement.width != self.width {
@@ -416,14 +569,13 @@ impl Expr {
                 }
             }
             ExprKind::Extract { value, lsb } => {
-                Self::extract(self.width, *lsb, value.rewrite_intrinsics(rewrite)?)?
+                Self::extract(self.width, *lsb, value.rw_memo(rewrite, memo)?)?
             }
-            ExprKind::Concat { high, low } => Self::concat(
-                high.rewrite_intrinsics(rewrite)?,
-                low.rewrite_intrinsics(rewrite)?,
-            )?,
+            ExprKind::Concat { high, low } => {
+                Self::concat(high.rw_memo(rewrite, memo)?, low.rw_memo(rewrite, memo)?)?
+            }
             ExprKind::Resize { op, value } => {
-                Self::resize(*op, self.width, value.rewrite_intrinsics(rewrite)?)?
+                Self::resize(*op, self.width, value.rw_memo(rewrite, memo)?)?
             }
         };
         Ok(rebuilt.simplify())
@@ -431,57 +583,104 @@ impl Expr {
 
     #[must_use]
     pub fn simplify(&self) -> Self {
+        self.simplify_pass()
+    }
+
+    fn simplify_pass(&self) -> Self {
         match &self.kind {
             ExprKind::Const { value } => Self::constant(self.width, *value),
             ExprKind::Register { .. } => self.clone(),
-            ExprKind::Load { address } => Self::load(self.width, address.simplify()),
+            ExprKind::Load { address } => {
+                Self::load(self.width, address.simplified().deref().clone())
+            }
             ExprKind::Intrinsic { name, arguments } => simplify_intrinsic(
                 self.width,
                 name.clone(),
-                arguments.iter().map(Self::simplify).collect(),
+                arguments.iter().map(Self::simplify_pass).collect(),
             ),
             ExprKind::Extract { value, lsb } => {
-                simplify_extract(self.width, *lsb, value.simplify())
+                simplify_extract(self.width, *lsb, value.simplified().deref().clone())
             }
-            ExprKind::Concat { high, low } => simplify_concat(high.simplify(), low.simplify()),
-            ExprKind::Unary { op, value } => simplify_unary(*op, value.simplify()),
-            ExprKind::Binary { op, left, right } => {
-                simplify_binary(*op, left.simplify(), right.simplify())
+            ExprKind::Concat { high, low } => simplify_concat(
+                high.simplified().deref().clone(),
+                low.simplified().deref().clone(),
+            ),
+            ExprKind::Unary { op, value } => {
+                simplify_unary(*op, value.simplified().deref().clone())
             }
-            ExprKind::Resize { op, value } => simplify_resize(*op, self.width, value.simplify()),
+            ExprKind::Binary { op, left, right } => simplify_binary(
+                *op,
+                left.simplified().deref().clone(),
+                right.simplified().deref().clone(),
+            ),
+            ExprKind::Resize { op, value } => {
+                simplify_resize(*op, self.width, value.simplified().deref().clone())
+            }
         }
     }
 
-    /// Counts expression-tree nodes, saturating at `limit + 1`.
+    /// Counts distinct expression nodes (shared subtrees once), saturating at
+    /// `limit + 1`.
     #[must_use]
     pub fn node_count_bounded(&self, limit: usize) -> usize {
-        let overflow = limit.saturating_add(1);
-        let mut count = 0_usize;
-        let mut pending = vec![self];
+        distinct_node_count_bounded(std::iter::once(self), limit)
+    }
+}
+
+/// Counts distinct nodes reachable from all `roots` together, so a subtree shared
+/// between expressions is counted once. Saturates at `limit + 1`.
+pub fn distinct_node_count_bounded<'a>(
+    roots: impl IntoIterator<Item = &'a Expr>,
+    limit: usize,
+) -> usize {
+    let overflow = limit.saturating_add(1);
+    let mut seen: HashSet<*const Node> = HashSet::new();
+    let mut count = 0_usize;
+    let mut pending: Vec<&Expr> = Vec::new();
+    let mut seen_roots: HashSet<&Expr> = HashSet::new();
+    for root in roots {
+        if !seen_roots.insert(root) {
+            continue;
+        }
+        count += 1;
+        if count > limit {
+            return overflow;
+        }
+        pending.push(root);
         while let Some(expression) = pending.pop() {
-            if count >= limit {
-                return overflow;
-            }
-            count += 1;
+            let mut visit = |child: &'a ExprRef, pending: &mut Vec<&'a Expr>| {
+                if seen.insert(child.address()) {
+                    count += 1;
+                    pending.push(child.as_ref());
+                }
+            };
             match &expression.kind {
                 ExprKind::Const { .. } | ExprKind::Register { .. } => {}
                 ExprKind::Unary { value, .. }
                 | ExprKind::Load { address: value }
                 | ExprKind::Extract { value, .. }
-                | ExprKind::Resize { value, .. } => pending.push(value),
+                | ExprKind::Resize { value, .. } => visit(value, &mut pending),
                 ExprKind::Binary { left, right, .. }
                 | ExprKind::Concat {
                     high: left,
                     low: right,
                 } => {
-                    pending.push(right);
-                    pending.push(left);
+                    visit(right, &mut pending);
+                    visit(left, &mut pending);
                 }
-                ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+                ExprKind::Intrinsic { arguments, .. } => {
+                    for argument in arguments {
+                        count += 1;
+                        pending.push(argument);
+                    }
+                }
+            }
+            if count > limit {
+                return overflow;
             }
         }
-        count
     }
+    count
 }
 
 fn constant_value(expr: &Expr) -> Option<u64> {
@@ -511,7 +710,7 @@ fn simplify_unary(op: UnaryOp, value: Expr) -> Expr {
         width: value.width,
         kind: ExprKind::Unary {
             op,
-            value: Box::new(value),
+            value: ExprRef::new(value),
         },
     }
 }
@@ -564,7 +763,7 @@ fn fold_double_complement_offset(complement: &Expr, offset: &Expr) -> Option<Exp
         kind: ExprKind::Binary {
             op: BinaryOp::Add,
             left: base.clone(),
-            right: Box::new(Expr::constant(width, delta)),
+            right: ExprRef::new(Expr::constant(width, delta)),
         },
     })
 }
@@ -599,10 +798,54 @@ fn simplify_intrinsic(width: BitWidth, name: String, arguments: Vec<Expr>) -> Ex
     {
         return Expr::constant(width, value);
     }
+    if let Some(constants) = constants.as_deref()
+        && let Some(value) = evaluate_double_shift(&name, width, &arguments, constants)
+    {
+        return Expr::constant(width, value);
+    }
     Expr {
         width,
         kind: ExprKind::Intrinsic { name, arguments },
     }
+}
+
+/// Exact SHLD/SHRD result for constant operands; `None` when the architecture
+/// leaves the result undefined (16-bit counts above 16).
+fn evaluate_double_shift(
+    name: &str,
+    width: BitWidth,
+    arguments: &[Expr],
+    constants: &[u64],
+) -> Option<u64> {
+    let left = if name.starts_with("x86_double_shift_left_") {
+        true
+    } else if name.starts_with("x86_double_shift_right_") {
+        false
+    } else {
+        return None;
+    };
+    let ([destination, source, count], [d, s, c]) = (
+        <[u64; 3]>::try_from(constants).ok()?,
+        <[&Expr; 3]>::try_from(arguments.iter().collect::<Vec<_>>()).ok()?,
+    );
+    if d.width != width || s.width != width || c.width != BitWidth::W8 {
+        return None;
+    }
+    let bits = width.bits();
+    let count = u32::try_from(count & if bits == 64 { 0x3F } else { 0x1F }).ok()?;
+    let (destination, source) = (width.truncate(destination), width.truncate(source));
+    if count == 0 {
+        return Some(destination);
+    }
+    if count > bits {
+        return None;
+    }
+    let result = if left {
+        (destination << count) | (source >> (bits - count))
+    } else {
+        (destination >> count) | (source << (bits - count))
+    };
+    Some(width.truncate(result))
 }
 
 fn evaluate_x86_wide_integer_result(
@@ -836,8 +1079,8 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         width,
         kind: ExprKind::Binary {
             op,
-            left: Box::new(left),
-            right: Box::new(right),
+            left: ExprRef::new(left),
+            right: ExprRef::new(right),
         },
     }
 }
@@ -854,8 +1097,8 @@ fn normalize_addition(width: BitWidth, left: Expr, right: Expr) -> Expr {
                     },
                 ..
             } => {
-                collect(*left, non_constants, constant);
-                collect(*right, non_constants, constant);
+                collect((*left).clone(), non_constants, constant);
+                collect((*right).clone(), non_constants, constant);
             }
             Expr {
                 kind: ExprKind::Const { value },
@@ -880,8 +1123,8 @@ fn normalize_addition(width: BitWidth, left: Expr, right: Expr) -> Expr {
             width,
             kind: ExprKind::Binary {
                 op: BinaryOp::Add,
-                left: Box::new(result),
-                right: Box::new(term),
+                left: ExprRef::new(result),
+                right: ExprRef::new(term),
             },
         };
     }
@@ -892,8 +1135,8 @@ fn normalize_addition(width: BitWidth, left: Expr, right: Expr) -> Expr {
             width,
             kind: ExprKind::Binary {
                 op: BinaryOp::Add,
-                left: Box::new(result),
-                right: Box::new(Expr::constant(width, constant)),
+                left: ExprRef::new(result),
+                right: ExprRef::new(Expr::constant(width, constant)),
             },
         }
     }
@@ -914,7 +1157,7 @@ fn simplify_resize(op: ResizeOp, target: BitWidth, value: Expr) -> Expr {
         width: target,
         kind: ExprKind::Resize {
             op,
-            value: Box::new(value),
+            value: ExprRef::new(value),
         },
     }
 }
@@ -953,7 +1196,7 @@ fn simplify_extract(target: BitWidth, lsb: u32, value: Expr) -> Expr {
     Expr {
         width: target,
         kind: ExprKind::Extract {
-            value: Box::new(value),
+            value: ExprRef::new(value),
             lsb,
         },
     }
@@ -983,8 +1226,8 @@ fn simplify_concat(high: Expr, low: Expr) -> Expr {
     Expr {
         width,
         kind: ExprKind::Concat {
-            high: Box::new(high),
-            low: Box::new(low),
+            high: ExprRef::new(high),
+            low: ExprRef::new(low),
         },
     }
 }
@@ -1389,5 +1632,208 @@ mod tests {
                 .expect("constant extract"),
             Expr::constant(BitWidth::W16, 0xBBCC)
         );
+    }
+    fn eval(expression: &Expr, env: &BTreeMap<String, u64>) -> u64 {
+        match &expression.kind {
+            ExprKind::Const { value } => *value,
+            ExprKind::Register { name } => expression.width.truncate(env[name]),
+            ExprKind::Unary { op, value } => {
+                let v = eval(value, env);
+                expression.width.truncate(match op {
+                    UnaryOp::Not => !v,
+                    UnaryOp::Neg => v.wrapping_neg(),
+                })
+            }
+            ExprKind::Binary { op, left, right } => {
+                evaluate_binary(*op, expression.width, eval(left, env), eval(right, env))
+            }
+            ExprKind::Extract { value, lsb } => expression
+                .width
+                .truncate(eval(value, env).wrapping_shr(*lsb)),
+            ExprKind::Concat { high, low } => expression
+                .width
+                .truncate(eval(high, env).wrapping_shl(low.width.bits()) | eval(low, env)),
+            ExprKind::Resize { op, value } => {
+                let v = eval(value, env);
+                expression.width.truncate(match op {
+                    ResizeOp::Truncate | ResizeOp::ZeroExtend => v,
+                    ResizeOp::SignExtend => sign_extend(v, value.width),
+                })
+            }
+            ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => unreachable!("not generated"),
+        }
+    }
+
+    /// Doubles the reference count of `value` at every step, so the tree form
+    /// has 2^steps leaves while the shared form stays linear.
+    fn doubling_chain(steps: u32) -> Expr {
+        let mut value = Expr::register(BitWidth::W64, "x");
+        for step in 0..steps {
+            let count = Expr::constant(BitWidth::W64, u64::from(step % 31 + 1));
+            let left = Expr::binary(BinaryOp::Rol, value.clone(), count.clone()).unwrap();
+            let right = Expr::binary(BinaryOp::Ror, value, count).unwrap();
+            value = Expr::binary(BinaryOp::Xor, left, right).unwrap();
+        }
+        value
+    }
+
+    #[test]
+    fn shared_subexpressions_are_counted_once() {
+        let chain = doubling_chain(48);
+        // Naive tree counting would need ~3^48 nodes.
+        let nodes = chain.node_count_bounded(1_000_000);
+        assert!(nodes < 1_000, "shared chain has {nodes} distinct nodes");
+        assert_eq!(chain.dependencies(), BTreeSet::from(["x".to_owned()]));
+        assert_eq!(chain.simplify(), chain);
+        assert_eq!(chain.clone(), chain);
+    }
+
+    #[test]
+    fn substitution_over_shared_chain_stays_linear() {
+        let rename = BTreeMap::from([("x".to_owned(), Expr::register(BitWidth::W64, "y"))]);
+        let replaced = doubling_chain(48).substitute(&rename).unwrap();
+        assert!(replaced.node_count_bounded(1_000_000) < 1_000);
+        // Evaluation is tree-recursive, so compare on a chain it can afford.
+        let small = doubling_chain(12);
+        let renamed = small.substitute(&rename).unwrap();
+        let value = 0x0123_4567_89AB_CDEF_u64;
+        assert_eq!(
+            eval(&renamed, &BTreeMap::from([("y".to_owned(), value)])),
+            eval(&small, &BTreeMap::from([("x".to_owned(), value)]))
+        );
+    }
+
+    #[test]
+    fn distinct_count_dedups_across_roots() {
+        let shared = doubling_chain(8);
+        let other = Expr::binary(
+            BinaryOp::Add,
+            shared.clone(),
+            Expr::register(BitWidth::W64, "k"),
+        )
+        .unwrap();
+        let alone = distinct_node_count_bounded([&shared], usize::MAX - 1);
+        let together = distinct_node_count_bounded([&shared, &other, &shared], usize::MAX - 1);
+        assert!(together <= alone + 3, "{together} vs {alone}");
+    }
+
+    #[test]
+    fn equal_expressions_share_one_node() {
+        let build = || {
+            Expr::binary(
+                BinaryOp::Xor,
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+            )
+            .unwrap()
+        };
+        let (first, second) = (build(), build());
+        let (ExprKind::Binary { left: l1, .. }, ExprKind::Binary { left: l2, .. }) =
+            (&first.kind, &second.kind)
+        else {
+            panic!("expected binary expressions");
+        };
+        assert!(l1 == l2 && Arc::ptr_eq(&l1.0, &l2.0));
+    }
+
+    #[test]
+    fn simplification_preserves_evaluation() {
+        let x = || Expr::register(BitWidth::W32, "x");
+        let y = || Expr::register(BitWidth::W32, "y");
+        let c = |value| Expr::constant(BitWidth::W32, value);
+        let b = |op, l, r| Expr::binary(op, l, r).unwrap();
+        let samples = [
+            b(BinaryOp::Xor, x(), x()),
+            b(BinaryOp::And, x(), x()),
+            b(BinaryOp::Or, x(), c(0)),
+            b(BinaryOp::Add, x(), c(0)),
+            b(BinaryOp::Shl, x(), c(0)),
+            b(BinaryOp::And, x(), Expr::unary(UnaryOp::Not, x())),
+            b(BinaryOp::Or, Expr::unary(UnaryOp::Not, y()), y()),
+            b(
+                BinaryOp::Sub,
+                b(BinaryOp::Add, x(), y()),
+                b(BinaryOp::Add, y(), x()),
+            ),
+            b(
+                BinaryOp::Add,
+                b(BinaryOp::Add, x(), c(5)),
+                b(BinaryOp::Add, y(), c(0xFFFF_FFFD)),
+            ),
+            b(BinaryOp::Mul, x(), c(1)),
+            b(BinaryOp::And, x(), c(0xFFFF_FFFF)),
+            Expr::resize(
+                ResizeOp::SignExtend,
+                BitWidth::W32,
+                Expr::resize(ResizeOp::Truncate, BitWidth::W8, x()).unwrap(),
+            )
+            .unwrap(),
+            Expr::concat(
+                Expr::extract(BitWidth::W16, 16, x()).unwrap(),
+                Expr::extract(BitWidth::W16, 0, x()).unwrap(),
+            )
+            .unwrap(),
+        ];
+        for sample in &samples {
+            // A raw rebuild of the same shape without any constructor folding.
+            let reference = sample.simplify();
+            for (a, b) in [
+                (0_u64, 0_u64),
+                (1, 2),
+                (0xFFFF_FFFF, 0x8000_0000),
+                (0x1234_5678, 0x9ABC_DEF0),
+            ] {
+                let env = BTreeMap::from([("x".to_owned(), a), ("y".to_owned(), b)]);
+                assert_eq!(eval(sample, &env), eval(&reference, &env), "{sample:?}");
+                let folded = sample
+                    .substitute(&BTreeMap::from([
+                        ("x".to_owned(), c(a)),
+                        ("y".to_owned(), c(b)),
+                    ]))
+                    .unwrap();
+                assert_eq!(
+                    folded,
+                    c(eval(sample, &env)),
+                    "full substitution must fold {sample:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn double_shifts_fold_exactly() {
+        let shift = |direction: &str, width, dst: u64, src: u64, count: u64| {
+            Expr::intrinsic(
+                width,
+                format!("x86_double_shift_{direction}_{width:?}_7").to_lowercase(),
+                vec![
+                    Expr::constant(width, dst),
+                    Expr::constant(width, src),
+                    Expr::constant(BitWidth::W8, count),
+                ],
+            )
+        };
+        let w32 = BitWidth::W32;
+        assert_eq!(
+            shift("left", w32, 0x1234_5678, 0x9ABC_DEF0, 8),
+            Expr::constant(w32, 0x3456_789A)
+        );
+        assert_eq!(
+            shift("right", w32, 0x1234_5678, 0x9ABC_DEF0, 8),
+            Expr::constant(w32, 0xF012_3456)
+        );
+        assert_eq!(
+            shift("left", w32, 0x1234_5678, 0x9ABC_DEF0, 32),
+            Expr::constant(w32, 0x1234_5678)
+        );
+        assert_eq!(
+            shift("left", BitWidth::W64, 1, 1 << 63, 1),
+            Expr::constant(BitWidth::W64, 3)
+        );
+        // 16-bit counts above 16 are architecturally undefined and stay opaque.
+        assert!(matches!(
+            shift("left", BitWidth::W16, 1, 1, 17).kind,
+            ExprKind::Intrinsic { .. }
+        ));
     }
 }
