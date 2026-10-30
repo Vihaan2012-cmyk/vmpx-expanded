@@ -45,20 +45,24 @@ These are implementation status, not theory:
    * - Executable (non-DLL) OEP from the continuation
      - Not implemented; the executable entry is recovered as a single input-closed path
    * - Nested-continuation redirects
-     - Counted, not appended
+     - Counted, not appended; a nested entry never counts as covered
    * - ``TableChecksum`` lowering
      - Recognised and evaluated, not compiled back
    * - Application import set
-     - Evidence scan, reduction and serializer exist; thunk and bridge resolution is not
-       connected
+     - Reduction wired into ``clean`` but fed an intentionally empty referenced-slot set,
+       so the blocker always stays; thunk and bridge resolution is not connected
    * - Dangling ``.vmp`` references and stripping
-     - Checker exists; not wired to clear the blocker or strip
+     - Checker wired in as a backstop for the ``.vmp`` blocker; stripping is not performed
    * - Coverage gate
-     - Implemented as a pure decision; not yet consumed by ``clean``
+     - Wired into ``clean`` and drives the OEP, reintegration and ``.vmp`` blockers; the
+       full clearing path is unexercised end-to-end (no real corpus in CI)
+   * - Differential equivalence verifier
+     - Library function; not called by ``clean``
    * - VTIL optimization
      - Binding exists, feature-gated; not in the pipeline
    * - ``--neutralize``
-     - Library transform; not a ``clean`` flag
+     - Library transform; ``clean`` reports recognition only (``applied: false``) and
+       never neutralizes in the sound path
    * - Header room for a new section
      - ``append_section`` fails cleanly when the section table is full
    * - PE32 reintegration

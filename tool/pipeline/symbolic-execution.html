@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>

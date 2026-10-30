@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="../pipeline/function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="../pipeline/function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../pipeline/function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../pipeline/function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../pipeline/lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -747,6 +755,13 @@ physical register;</p></li>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">DispatchArm</span></code> pairs an input <code class="docutils literal notranslate"><span class="pre">value</span></code> with the absolute <code class="docutils literal notranslate"><span class="pre">target</span></code> it jumps
 to; <code class="docutils literal notranslate"><span class="pre">fallback</span></code> and <code class="docutils literal notranslate"><span class="pre">dispatcher_va</span></code> are absolute addresses.</p>
+<p><code class="docutils literal notranslate"><span class="pre">emit_value_dispatcher(&amp;ValueDispatch,</span> <span class="pre">dispatcher_va)</span></code> is the variant for a
+<em>computed</em> selector: it saves registers, calls a <code class="docutils literal notranslate"><span class="pre">compute</span></code> function that leaves the
+selector in a register, compares against each arm value, and restores the saved
+registers on every exit before jumping. <code class="docutils literal notranslate"><span class="pre">emit_displaced_stub</span></code> copies the leading
+position-independent instructions of a VM stub so a dispatcher’s fallback can still
+reach the original behaviour after the stub is overwritten
+(<a class="reference internal" href="../pipeline/reintegration.html"><span class="doc">Reintegration</span></a>).</p>
 <p>A naked trampoline: for each arm <code class="docutils literal notranslate"><span class="pre">cmp</span> <span class="pre">reg,</span> <span class="pre">imm;</span> <span class="pre">je</span> <span class="pre">body</span></code>, then <code class="docutils literal notranslate"><span class="pre">jmp</span> <span class="pre">fallback</span></code>.
 It is hand-encoded with iced’s <code class="docutils literal notranslate"><span class="pre">code_asm</span></code> because <code class="docutils literal notranslate"><span class="pre">compile</span></code> always emits a
 Win64 frame, and a dispatcher must not clobber any incoming register. See

@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -811,6 +819,34 @@ bytes left to the end of its raw data;</p></li>
 <li><p>any write that does not survive reparse.</p></li>
 </ul>
 <p>A failed redirect leaves the original stub in place and records a diagnostic.</p>
+<section id="branching-functions-the-value-dispatcher">
+<h3>Branching functions: the value dispatcher<a class="headerlink" href="#branching-functions-the-value-dispatcher" title="Link to this heading"></a></h3>
+<p>A recovered <em>branching</em> function (one whose first virtual branch depends on its
+inputs, with a proven-exhaustive finite domain; see <a class="reference internal" href="function-recovery.html"><span class="doc">Generalized Function Recovery</span></a>) has
+several path bodies, and the value that selects a body is <em>computed</em>, not already in
+a register. <code class="docutils literal notranslate"><span class="pre">emit_value_dispatcher</span></code> (in <a class="reference internal" href="../crates/recompile.html"><span class="doc">vmpx-recompile</span></a>) encodes:</p>
+<div class="highlight-nasm notranslate"><div class="highlight"><pre><span></span><span class="nf">push</span><span class="w">    </span><span class="nv">saved_0</span><span class="w"> </span><span class="nv">...</span><span class="w"> </span><span class="nv">saved_n</span>
+<span class="nf">call</span><span class="w">    </span><span class="nv">compute</span><span class="w">                 </span><span class="c1">; leaves the selector in `value`</span>
+<span class="nf">cmp</span><span class="w">     </span><span class="nv">value</span><span class="p">,</span><span class="w"> </span><span class="nv">target_i</span><span class="w">         </span><span class="c1">; one pair per recovered target</span>
+<span class="nf">je</span><span class="w">      </span><span class="nv">arm_i</span><span class="w">                   </span><span class="c1">; (wide constants go through a scratch register)</span>
+<span class="nf">...</span>
+<span class="nf">pop</span><span class="w">     </span><span class="nv">saved_n</span><span class="w"> </span><span class="nv">...</span><span class="w"> </span><span class="nv">saved_0</span>
+<span class="nf">jmp</span><span class="w">     </span><span class="nv">fallback</span>
+<span class="nl">arm_i:</span>
+<span class="nf">pop</span><span class="w">     </span><span class="nv">saved_n</span><span class="w"> </span><span class="nv">...</span><span class="w"> </span><span class="nv">saved_0</span>
+<span class="nf">jmp</span><span class="w">     </span><span class="nv">body_i</span>
+</pre></div>
+</div>
+<p>Every exit restores the saved registers first, so the chosen body (or the fallback)
+sees the registers the dispatcher was entered with. Duplicate arm values and an
+unsaved <code class="docutils literal notranslate"><span class="pre">value</span></code> or <code class="docutils literal notranslate"><span class="pre">scratch</span></code> register are rejected. The function’s VM entry stub
+is redirected to this dispatcher with <code class="docutils literal notranslate"><span class="pre">redirect_vm_stub</span></code>.</p>
+<p>Because a redirect overwrites the first bytes of the stub, the fallback must still
+reach the original behaviour. <code class="docutils literal notranslate"><span class="pre">emit_displaced_stub</span></code> copies the leading whole
+instructions of the stub elsewhere, followed by a <code class="docutils literal notranslate"><span class="pre">jmp</span></code> to the rest of the stub.
+It accepts only position-independent, non-branching instructions (so the copy means
+the same thing wherever it runs) and otherwise reports <code class="docutils literal notranslate"><span class="pre">StubNotRelocatable</span></code>.</p>
+</section>
 </section>
 <section id="entry-and-tls-redirects">
 <h2>Entry and TLS redirects<a class="headerlink" href="#entry-and-tls-redirects" title="Link to this heading"></a></h2>
@@ -822,7 +858,7 @@ same checks, plus a PE32+ and file-backed guard.</p>
 <h2>Nested continuations<a class="headerlink" href="#nested-continuations" title="Link to this heading"></a></h2>
 <p>Where a VM exit continues into another VM entry, the nested entry needs its own
 replacement. Nested-continuation redirects remain deferred: they are counted but
-not appended. The <code class="docutils literal notranslate"><span class="pre">reintegration</span></code> stage diagnostics say so
+not appended, so a nested entry never counts as covered. The <code class="docutils literal notranslate"><span class="pre">reintegration</span></code> stage diagnostics say so
 (“nested-continuation redirects remain deferred”).</p>
 </section>
 <section id="output-loader-validation-and-layout">

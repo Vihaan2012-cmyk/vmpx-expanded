@@ -34,24 +34,30 @@ Sub-projects
      - Original entry point not recovered; ``.vmp`` still referenced
      - OEP decision, VM-entry inventory, live-in inference, input-closed and
        decidable branching recovery, executable-entry recovery, VM-stub redirect,
-       strict coverage-gate decision are implemented. The coverage gate is not yet
-       consumed by ``clean``; nested-continuation redirects and branching
-       value-dispatch emission remain
+       value dispatchers for branching functions and the strict coverage gate are
+       implemented, and the gate now drives blocker clearing in ``clean``. With no
+       real VMProtect corpus in CI, the full clearing path is unexercised
+       end-to-end. Nested-continuation redirects remain deferred
    * - SP3
      - Application import-set reconstruction
      - Import set not proven
-     - Core implemented in ``vmpx-rebuild``: proven-set reduction and a conventional
-       import directory builder. Not yet wired into ``clean``; thunk and bridge
-       resolution remains
+     - Proven-set reduction and a conventional import directory builder in
+       ``vmpx-rebuild``, wired into ``clean``. The referenced-IAT-slot set is
+       intentionally empty (no sound static way to compute it yet), so the import
+       blocker always stays: proven-incomplete by design, not unimplemented
    * - SP4
      - Dangling ``.vmp`` reference resolution and stripping
      - ``.vmp`` sections remain referenced
-     - Reference checker implemented in ``vmpx-disasm``. Stripping not yet performed
+     - Reference checker in ``vmpx-disasm``, wired into ``clean`` as a backstop for
+       the ``.vmp`` blocker (any unresolved reference keeps it). Stripping not yet
+       performed
    * - SP5
      - Optimizing recompilation (VTIL), differential verification, anti-debug policy
      - Quality, not coverage
-     - Differential equivalence core and ``--neutralize`` transform implemented as
-       library functions; VTIL bridge binding exists behind a feature, not yet in the
+     - Differential equivalence core is a library function (not called by ``clean``).
+       The ``neutralize`` transform is surfaced in ``clean`` as a recognition-only
+       ``anti_debug`` report field (``applied: false``); nothing is neutralized in the
+       sound path. VTIL bridge binding exists behind a feature, not yet in the
        pipeline
 
 Definition-of-done ladder

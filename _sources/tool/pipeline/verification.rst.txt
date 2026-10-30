@@ -156,8 +156,13 @@ Why neutralization is safe to offer
   exactly what neutralization alters;
 * it never alters the semantics of the sound ``OUTPUT``.
 
-There is no ``--neutralize`` flag on the ``clean`` command yet; the transform is
-implemented and tested as a library function.
+There is no ``--neutralize`` flag on the ``clean`` command. The transform is a
+tested library function, and ``clean`` wires it in **recognition-only**: the
+``anti_debug`` field of the report (``CleanAntiDebugReport``) lists the guards
+``neutralize`` recognised and carries ``applied: false``. The rewritten guards are
+discarded, so neutralization is never applied in the sound path. The pipeline does not
+yet extract conditional guards from recovered paths, so today the field examines no
+guards. The differential equivalence verifier is likewise not yet called by ``clean``.
 
 Integrity interaction
 ---------------------

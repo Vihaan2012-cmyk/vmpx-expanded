@@ -180,5 +180,5 @@ How vmpx treats it
    * - Output policy (opt-in)
      - **Neutralize**: guards recognised as checksum, timing or debugger-presence
        constructs are rewritten to force the non-detecting path. Deliberately not
-       equivalent; implemented as a library transform
-       (:doc:`/tool/pipeline/verification`)
+       equivalent; a library transform, surfaced by ``clean`` only as a
+       recognition-only report field (:doc:`/tool/pipeline/verification`)

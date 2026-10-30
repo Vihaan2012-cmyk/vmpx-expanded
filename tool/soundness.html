@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="pipeline/function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="pipeline/function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pipeline/function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="pipeline/function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="pipeline/lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -787,8 +795,8 @@ over the recovered domain is checked by the differential verifier</p></td>
 <p>A <em>blocker</em> is a statement of a proof that does not yet exist. <code class="docutils literal notranslate"><span class="pre">clean</span></code> collects
 them in <code class="docutils literal notranslate"><span class="pre">CleanReport.blockers</span></code>. <code class="docutils literal notranslate"><span class="pre">ready_to_write</span></code> is true only if the list is
 empty, and the sound <code class="docutils literal notranslate"><span class="pre">OUTPUT</span></code> is written only then.</p>
-<section id="unconditional-blockers-on-a-protected-input">
-<h3>Unconditional blockers on a protected input<a class="headerlink" href="#unconditional-blockers-on-a-protected-input" title="Link to this heading"></a></h3>
+<section id="blockers-on-a-protected-input">
+<h3>Blockers on a protected input<a class="headerlink" href="#blockers-on-a-protected-input" title="Link to this heading"></a></h3>
 <table class="docutils align-default">
 <colgroup>
 <col style="width: 48.0%" />
@@ -804,13 +812,18 @@ empty, and the sound <code class="docutils literal notranslate"><span class="pre
 <td><p>A successful OEP decision (<a class="reference internal" href="pipeline/oep-recovery.html"><span class="doc">OEP Recovery</span></a>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">application</span> <span class="pre">import</span> <span class="pre">set</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">proven</span> <span class="pre">independently</span> <span class="pre">reconstructed</span></code></p></td>
-<td><p>Import-set reconstruction wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code> (SP3)</p></td>
+<td><p>Never, today. The import reduction is wired in, but the set of referenced
+IAT slots it consumes is intentionally empty (there is no sound static way to
+compute it yet), so this blocker always stays. The reconstruction is proven
+incomplete by design, not unimplemented</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">native</span> <span class="pre">code</span> <span class="pre">reintegration</span> <span class="pre">has</span> <span class="pre">not</span> <span class="pre">produced</span> <span class="pre">a</span> <span class="pre">devirtualized</span> <span class="pre">replacement</span> <span class="pre">image</span></code></p></td>
-<td><p>Complete reintegration of all recovered routines</p></td>
+<td><p>A reintegrated image was produced</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">VMProtect</span> <span class="pre">sections</span> <span class="pre">remain</span> <span class="pre">referenced</span> <span class="pre">by</span> <span class="pre">unresolved</span> <span class="pre">paths</span></code></p></td>
-<td><p>A passing coverage gate and empty dangling-reference set (SP4)</p></td>
+<td><p>The coverage gate passes (every inventory entry covered, none dropped), a
+reintegrated image exists, and the dangling-reference checker reports no
+unresolved reference (SP4)</p></td>
 </tr>
 </tbody>
 </table>
@@ -917,8 +930,9 @@ change the semantics of the sound <code class="docutils literal notranslate"><sp
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">--experimental</span></code></dt><dd><p>Gate-relaxed emission. Implemented on <code class="docutils literal notranslate"><span class="pre">clean</span></code>.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">--neutralize</span></code></dt><dd><p>Anti-debug stripping. The transform is implemented as a library function; it
-is not yet a <code class="docutils literal notranslate"><span class="pre">clean</span></code> flag.</p>
+<dt><code class="docutils literal notranslate"><span class="pre">--neutralize</span></code></dt><dd><p>Anti-debug stripping. The transform is a library function. <code class="docutils literal notranslate"><span class="pre">clean</span></code> surfaces
+only a <em>recognition-only</em> <code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> report field (<code class="docutils literal notranslate"><span class="pre">applied:</span> <span class="pre">false</span></code>);
+neutralization is never applied in the sound path.</p>
 </dd>
 </dl>
 </section>
@@ -926,7 +940,9 @@ is not yet a <code class="docutils literal notranslate"><span class="pre">clean<
 <h2>Where soundness still has gaps<a class="headerlink" href="#where-soundness-still-has-gaps" title="Link to this heading"></a></h2>
 <p>The tool is explicit about its limits:</p>
 <ul class="simple">
-<li><p>no protected corpus in CI, so synthetic fixtures may be unrepresentative;</p></li>
+<li><p>no protected corpus in CI, so synthetic fixtures may be unrepresentative, and the
+full blocker-clearing path has not been exercised end-to-end on real protected
+input;</p></li>
 <li><p>a missed VM entry (false negative) leaves a <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> reference, so the sound
 mode correctly refuses;</p></li>
 <li><p>a mis-identified VM entry (false positive) must not produce a wrong

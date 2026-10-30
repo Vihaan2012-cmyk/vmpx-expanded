@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../tool/cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="../tool/pipeline/function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tool/pipeline/function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../tool/pipeline/lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../tool/pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../tool/soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../tool/soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../tool/soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../tool/soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../tool/soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../tool/soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -740,27 +748,33 @@ dispatchers, <code class="docutils literal notranslate"><span class="pre">--expe
 <td><p>Original entry point not recovered; <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> still referenced</p></td>
 <td><p>OEP decision, VM-entry inventory, live-in inference, input-closed and
 decidable branching recovery, executable-entry recovery, VM-stub redirect,
-strict coverage-gate decision are implemented. The coverage gate is not yet
-consumed by <code class="docutils literal notranslate"><span class="pre">clean</span></code>; nested-continuation redirects and branching
-value-dispatch emission remain</p></td>
+value dispatchers for branching functions and the strict coverage gate are
+implemented, and the gate now drives blocker clearing in <code class="docutils literal notranslate"><span class="pre">clean</span></code>. With no
+real VMProtect corpus in CI, the full clearing path is unexercised
+end-to-end. Nested-continuation redirects remain deferred</p></td>
 </tr>
 <tr class="row-even"><td><p>SP3</p></td>
 <td><p>Application import-set reconstruction</p></td>
 <td><p>Import set not proven</p></td>
-<td><p>Core implemented in <code class="docutils literal notranslate"><span class="pre">vmpx-rebuild</span></code>: proven-set reduction and a conventional
-import directory builder. Not yet wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code>; thunk and bridge
-resolution remains</p></td>
+<td><p>Proven-set reduction and a conventional import directory builder in
+<code class="docutils literal notranslate"><span class="pre">vmpx-rebuild</span></code>, wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code>. The referenced-IAT-slot set is
+intentionally empty (no sound static way to compute it yet), so the import
+blocker always stays: proven-incomplete by design, not unimplemented</p></td>
 </tr>
 <tr class="row-odd"><td><p>SP4</p></td>
 <td><p>Dangling <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> reference resolution and stripping</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">.vmp</span></code> sections remain referenced</p></td>
-<td><p>Reference checker implemented in <code class="docutils literal notranslate"><span class="pre">vmpx-disasm</span></code>. Stripping not yet performed</p></td>
+<td><p>Reference checker in <code class="docutils literal notranslate"><span class="pre">vmpx-disasm</span></code>, wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code> as a backstop for
+the <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> blocker (any unresolved reference keeps it). Stripping not yet
+performed</p></td>
 </tr>
 <tr class="row-even"><td><p>SP5</p></td>
 <td><p>Optimizing recompilation (VTIL), differential verification, anti-debug policy</p></td>
 <td><p>Quality, not coverage</p></td>
-<td><p>Differential equivalence core and <code class="docutils literal notranslate"><span class="pre">--neutralize</span></code> transform implemented as
-library functions; VTIL bridge binding exists behind a feature, not yet in the
+<td><p>Differential equivalence core is a library function (not called by <code class="docutils literal notranslate"><span class="pre">clean</span></code>).
+The <code class="docutils literal notranslate"><span class="pre">neutralize</span></code> transform is surfaced in <code class="docutils literal notranslate"><span class="pre">clean</span></code> as a recognition-only
+<code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> report field (<code class="docutils literal notranslate"><span class="pre">applied:</span> <span class="pre">false</span></code>); nothing is neutralized in the
+sound path. VTIL bridge binding exists behind a feature, not yet in the
 pipeline</p></td>
 </tr>
 </tbody>

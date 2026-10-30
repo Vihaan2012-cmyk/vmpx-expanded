@@ -50,4 +50,5 @@ What is not solved
   integration step. The slot-remap structure exists for exactly this.
 
 These are why the "application import set is not proven independently reconstructed"
-blocker is still raised by ``clean``.
+blocker is always kept by ``clean``: the reduction is wired in, but the referenced-slot
+set it needs is intentionally empty until a sound way to compute it exists.

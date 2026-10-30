@@ -26,7 +26,7 @@ Modules
        ``ImportAnalysis``, ``OepAnalysis``) and the file-writing safety checks
    * - ``clean.rs``
      - The proof-gated pipeline. ``analyze_clean`` and
-       ``analyze_clean_with_image`` build the ``CleanReport`` (schema version 2),
+       ``analyze_clean_with_image`` build the ``CleanReport`` (schema version 3),
        the optional conventional image and the optional reintegrated image
    * - ``vm_inventory.rs``
      - ``VmInventoryEntry`` and the deterministic ``merge_vm_inventory``
@@ -35,6 +35,13 @@ Modules
        executable-entry decision (``decide_exe_entry``)
    * - ``coverage_gate.rs``
      - ``decide_coverage``, the strict gate for the OEP and ``.vmp`` blockers
+   * - ``clean_wiring.rs``
+     - Pure glue between ``clean`` and the soundness cores: inventory items with
+       explicit loss accounting, ``covered`` bookkeeping (``mark_covered``,
+       ``group_covered``), ``summarize_dangling``, ``coverage_blockers``,
+       ``derive_referenced_slots`` (intentionally empty), ``prove_imports`` and the
+       recognition-only ``recognize_anti_debug``. Every helper only ever keeps a
+       blocker when in doubt
 
 Key functions in ``clean.rs``
 -----------------------------

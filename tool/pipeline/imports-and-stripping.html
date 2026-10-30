@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -707,8 +715,19 @@
 <p>Two blockers remain even when every virtualized routine has a native replacement:
 the import table still describes what the <em>protector</em> needed, and the protector
 sections are still in the file. SP3 and SP4 address them. Both are implemented as
-library components with their own tests; wiring them into <code class="docutils literal notranslate"><span class="pre">clean</span></code> so that the
-blockers can clear is future work (see <a class="reference internal" href="../../project/roadmap.html"><span class="doc">Roadmap</span></a>).</p>
+library components with their own tests, and both are now wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code> (module
+<code class="docutils literal notranslate"><span class="pre">clean_wiring.rs</span></code>), in deliberately different ways:</p>
+<ul class="simple">
+<li><p>The <strong>dangling-reference checker</strong> (SP4) runs on every protected input as a backstop
+for the <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> blocker. Any unresolved reference keeps the blocker.</p></li>
+<li><p>The <strong>import reduction</strong> (SP3) runs, but the set of <em>referenced IAT slots</em> it
+consumes is intentionally empty (<code class="docutils literal notranslate"><span class="pre">derive_referenced_slots</span></code> returns the empty
+set). A partial native scan cannot prove completeness, because protector-resident
+code also uses the table, so no reduced set may be claimed as the application’s full
+import set. The import blocker therefore always stays: reconstruction is
+<em>proven-incomplete by design</em>, not unimplemented. <code class="docutils literal notranslate"><span class="pre">CleanReport.imports</span></code> reports
+<code class="docutils literal notranslate"><span class="pre">proven_modules</span></code> and <code class="docutils literal notranslate"><span class="pre">proven_symbols</span></code> for what the reduction established.</p></li>
+</ul>
 <section id="application-import-set-reconstruction-sp3">
 <h2>Application import-set reconstruction (SP3)<a class="headerlink" href="#application-import-set-reconstruction-sp3" title="Link to this heading"></a></h2>
 <p><em>Module:</em> <code class="docutils literal notranslate"><span class="pre">import_reconstruct.rs</span></code></p>
@@ -823,9 +842,9 @@ stripping.</strong></p></td>
 <section id="strict-coverage-decision">
 <h2>Strict coverage decision<a class="headerlink" href="#strict-coverage-decision" title="Link to this heading"></a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">decide_coverage</span></code> combines the pieces. It may clear the two blockers only when
-the OEP is proven, every inventory entry is both resolved and recovered, nothing
-was dropped from the inventory, and no dangling reference remains. See
-<a class="reference internal" href="function-recovery.html"><span class="doc">Generalized Function Recovery</span></a>.</p>
+the OEP is proven, every inventory entry is both resolved and covered by an actually
+redirected replacement, nothing was dropped from the inventory, and no dangling
+reference remains. See <a class="reference internal" href="function-recovery.html"><span class="doc">Generalized Function Recovery</span></a>.</p>
 </section>
 </section>
 

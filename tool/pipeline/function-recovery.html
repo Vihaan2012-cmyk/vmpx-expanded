@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../cli/reports.html#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -826,14 +834,18 @@ stays a blocker for:</p>
 <li><p>any cover larger than the limit (<code class="docutils literal notranslate"><span class="pre">TooManyValues</span></code>).</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">recover_branching</span></code> then recovers a routine only if the first branch’s inputs
-have a proven-exhaustive domain <em>and</em> every resulting path is closed.</p>
+have a proven-exhaustive domain <em>and</em> every resulting path is closed. A recovered
+branching function is reintegrated by redirecting its VM stub to a <em>value dispatcher</em>
+that computes the selector and jumps to the matching path body
+(<a class="reference internal" href="reintegration.html"><span class="doc">Reintegration</span></a>).</p>
 </section>
 </section>
 <section id="coverage-gate">
-<h2>Coverage gate<a class="headerlink" href="#coverage-gate" title="Link to this heading"></a></h2>
-<p><em>Module:</em> <code class="docutils literal notranslate"><span class="pre">coverage_gate.rs</span></code> in <a class="reference internal" href="../crates/cli.html"><span class="doc">vmpx-cli</span></a>.</p>
+<span id="id1"></span><h2>Coverage gate<a class="headerlink" href="#coverage-gate" title="Link to this heading"></a></h2>
+<p><em>Modules:</em> <code class="docutils literal notranslate"><span class="pre">coverage_gate.rs</span></code> and <code class="docutils literal notranslate"><span class="pre">clean_wiring.rs</span></code> in <a class="reference internal" href="../crates/cli.html"><span class="doc">vmpx-cli</span></a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">decide_coverage</span></code> is the strict gate that decides whether the OEP blocker and
-the “VMProtect sections remain referenced” blocker may clear. Every doubt keeps
+the “VMProtect sections remain referenced” blocker may clear, and it is wired into
+<code class="docutils literal notranslate"><span class="pre">clean</span></code> (<code class="docutils literal notranslate"><span class="pre">analyze_clean_with_image</span></code>) through <code class="docutils literal notranslate"><span class="pre">clean_wiring</span></code>. Every doubt keeps
 its blocker:</p>
 <ul class="simple">
 <li><p>the OEP was not proven;</p></li>
@@ -843,13 +855,30 @@ can never clear by an entry vanishing;</p></li>
 <li><p>entries were dropped before reaching the inventory;</p></li>
 <li><p>dangling <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> references remain (see <a class="reference internal" href="imports-and-stripping.html"><span class="doc">Imports and Stripping</span></a>).</p></li>
 </ul>
+<section id="what-counts-as-covered">
+<h3>What counts as <em>covered</em><a class="headerlink" href="#what-counts-as-covered" title="Link to this heading"></a></h3>
+<p>The <code class="docutils literal notranslate"><span class="pre">covered</span></code> set the gate receives contains only VM-entry stubs that were
+actually redirected to an emitted replacement:</p>
+<ul class="simple">
+<li><p>a single-body or branching function’s stub counts only when <code class="docutils literal notranslate"><span class="pre">redirect_vm_stub</span></code>
+succeeded (a function that was compiled but whose redirect failed is excluded);</p></li>
+<li><p>a header-entry or TLS group counts only when its redirect landed <strong>and</strong> its path
+family was proven domain-complete, because otherwise the dispatcher falls back to
+the original VM stub for unmatched inputs;</p></li>
+<li><p>nested continuations are never counted.</p></li>
+</ul>
+<p>The gate’s verdict is reported in <code class="docutils literal notranslate"><span class="pre">CleanReport.coverage</span></code> (<a class="reference internal" href="../cli/reports.html"><span class="doc">The CleanReport Schema</span></a>),
+and <code class="docutils literal notranslate"><span class="pre">coverage_blockers</span></code> turns it into blockers: the OEP blocker stays unless the OEP
+was proven; the reintegration blocker stays unless an image was produced; the
+<code class="docutils literal notranslate"><span class="pre">.vmp</span></code> blocker stays unless the gate clears <em>and</em> a reintegrated image exists <em>and</em>
+the dangling-reference checker found no unresolved reference.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>The coverage gate, the dangling-reference checker and the import
-reconstruction exist as tested library components. They are not yet wired
-to clear blockers inside <code class="docutils literal notranslate"><span class="pre">clean</span></code>: the pipeline still adds the
-corresponding blockers unconditionally. See <a class="reference internal" href="../../project/roadmap.html"><span class="doc">Roadmap</span></a>.</p>
+<p>The whole clearing path is covered by unit tests of each helper, but, with no
+real VMProtect corpus in CI, it is unexercised end-to-end: no protected sample has
+been shown to drive every blocker to empty.</p>
 </div>
+</section>
 </section>
 </section>
 

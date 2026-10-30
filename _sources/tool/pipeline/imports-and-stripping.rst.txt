@@ -6,8 +6,18 @@ Imports and Stripping
 Two blockers remain even when every virtualized routine has a native replacement:
 the import table still describes what the *protector* needed, and the protector
 sections are still in the file. SP3 and SP4 address them. Both are implemented as
-library components with their own tests; wiring them into ``clean`` so that the
-blockers can clear is future work (see :doc:`/project/roadmap`).
+library components with their own tests, and both are now wired into ``clean`` (module
+``clean_wiring.rs``), in deliberately different ways:
+
+* The **dangling-reference checker** (SP4) runs on every protected input as a backstop
+  for the ``.vmp`` blocker. Any unresolved reference keeps the blocker.
+* The **import reduction** (SP3) runs, but the set of *referenced IAT slots* it
+  consumes is intentionally empty (``derive_referenced_slots`` returns the empty
+  set). A partial native scan cannot prove completeness, because protector-resident
+  code also uses the table, so no reduced set may be claimed as the application's full
+  import set. The import blocker therefore always stays: reconstruction is
+  *proven-incomplete by design*, not unimplemented. ``CleanReport.imports`` reports
+  ``proven_modules`` and ``proven_symbols`` for what the reduction established.
 
 Application import-set reconstruction (SP3)
 -------------------------------------------
@@ -118,6 +128,6 @@ Strict coverage decision
 ------------------------
 
 ``decide_coverage`` combines the pieces. It may clear the two blockers only when
-the OEP is proven, every inventory entry is both resolved and recovered, nothing
-was dropped from the inventory, and no dangling reference remains. See
-:doc:`function-recovery`.
+the OEP is proven, every inventory entry is both resolved and covered by an actually
+redirected replacement, nothing was dropped from the inventory, and no dangling
+reference remains. See :doc:`function-recovery`.

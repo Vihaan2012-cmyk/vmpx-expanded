@@ -152,6 +152,8 @@
 <li class="toctree-l4"><a class="reference internal" href="#vm-inventory"><code class="docutils literal notranslate"><span class="pre">vm_inventory</span></code></a></li>
 <li class="toctree-l4"><a class="reference internal" href="#virtualized-routines-cleanvmpathreport"><code class="docutils literal notranslate"><span class="pre">virtualized_routines</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanVmPathReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="#tls-entries-cleantlsentryreport"><code class="docutils literal notranslate"><span class="pre">tls_entries</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanTlsEntryReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#coverage-cleancoveragereport"><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="#anti-debug-cleanantidebugreport"><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="#exports-cleanexportreport"><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="#native-continuations-cleannestedcontinuationreport"><code class="docutils literal notranslate"><span class="pre">native_continuations</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanNestedContinuationReport</span></code>)</a></li>
 <li class="toctree-l4"><a class="reference internal" href="#layout-cleanlayoutreport"><code class="docutils literal notranslate"><span class="pre">layout</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanLayoutReport</span></code>)</a></li>
@@ -232,7 +234,10 @@
 <li class="toctree-l4"><a class="reference internal" href="../pipeline/function-recovery.html#refusals">Refusals</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="../pipeline/function-recovery.html#coverage-gate">Coverage gate</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../pipeline/function-recovery.html#coverage-gate">Coverage gate</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../pipeline/function-recovery.html#what-counts-as-covered">What counts as <em>covered</em></a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../pipeline/lifting-recompilation.html">Lifting and Recompilation</a><ul>
@@ -259,7 +264,10 @@
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#layout-contract">Layout contract</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#groups-and-dispatchers">Groups and dispatchers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#redirecting-function-stubs">Redirecting function stubs</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../pipeline/reintegration.html#branching-functions-the-value-dispatcher">Branching functions: the value dispatcher</a></li>
+</ul>
+</li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#entry-and-tls-redirects">Entry and TLS redirects</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#nested-continuations">Nested continuations</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../pipeline/reintegration.html#output-loader-validation-and-layout">Output, loader validation and layout</a></li>
@@ -294,7 +302,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#principles">Principles</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../soundness.html#blockers-and-the-proof-gate">Blockers and the proof gate</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="../soundness.html#unconditional-blockers-on-a-protected-input">Unconditional blockers on a protected input</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../soundness.html#blockers-on-a-protected-input">Blockers on a protected input</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#conditional-blockers">Conditional blockers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../soundness.html#the-verified-no-op">The verified no-op</a></li>
 </ul>
@@ -704,7 +712,7 @@
   <section id="the-cleanreport-schema">
 <h1>The CleanReport Schema<a class="headerlink" href="#the-cleanreport-schema" title="Link to this heading"></a></h1>
 <p><code class="docutils literal notranslate"><span class="pre">vmpx</span> <span class="pre">clean</span> <span class="pre">--report</span></code> writes a <code class="docutils literal notranslate"><span class="pre">CleanReport</span></code> as pretty-printed JSON. The
-current <code class="docutils literal notranslate"><span class="pre">schema_version</span></code> is <strong>2</strong>. The report is the complete, machine-readable
+current <code class="docutils literal notranslate"><span class="pre">schema_version</span></code> is <strong>3</strong>. The report is the complete, machine-readable
 record of a run, and it is written even when the proof gate refuses output.
 <a class="reference internal" href="../ui.html"><span class="doc">The vmpx-ui Front End</span></a> renders it.</p>
 <section id="top-level">
@@ -721,7 +729,7 @@ record of a run, and it is written even when the proof gate refuses output.
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">schema_version</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">3</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">input</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">{path,</span> <span class="pre">sha256,</span> <span class="pre">file_size}</span></code></p></td>
@@ -740,7 +748,7 @@ record of a run, and it is written even when the proof gate refuses output.
 <td><p><code class="docutils literal notranslate"><span class="pre">{protected_header_entry,</span> <span class="pre">recovered_entry,</span> <span class="pre">complete}</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">imports</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{parsed_modules,</span> <span class="pre">parsed_symbols,</span> <span class="pre">reconstruction_complete,</span> <span class="pre">unresolved}</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{parsed_modules,</span> <span class="pre">parsed_symbols,</span> <span class="pre">reconstruction_complete,</span> <span class="pre">proven_modules,</span> <span class="pre">proven_symbols,</span> <span class="pre">unresolved}</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vm_instances</span></code></p></td>
 <td><p>VM instances (bootstrap, entry RVAs, distinct seeds)</p></td>
@@ -780,6 +788,12 @@ record of a run, and it is written even when the proof gate refuses output.
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">reintegration</span></code></p></td>
 <td><p>Stage report for section append and redirects</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">coverage</span></code></p></td>
+<td><p>Coverage-gate verdict (below), or null when no gate was evaluated</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code></p></td>
+<td><p>Recognition-only anti-debug report (below)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reconstruction</span></code></p></td>
 <td><p>Stage report for the overall reconstruction proof</p></td>
@@ -835,7 +849,8 @@ result is proven correct.</p></td>
 <td><p>A string-to-integer map. <code class="docutils literal notranslate"><span class="pre">reintegration</span></code> carries <code class="docutils literal notranslate"><span class="pre">section_rva</span></code>,
 <code class="docutils literal notranslate"><span class="pre">section_size</span></code>, <code class="docutils literal notranslate"><span class="pre">entries_redirected</span></code>, <code class="docutils literal notranslate"><span class="pre">dispatchers</span></code>,
 <code class="docutils literal notranslate"><span class="pre">single_body_candidates</span></code>, <code class="docutils literal notranslate"><span class="pre">single_body_redirected</span></code>,
-<code class="docutils literal notranslate"><span class="pre">single_body_bytes</span></code> and <code class="docutils literal notranslate"><span class="pre">tls_redirected</span></code>. <code class="docutils literal notranslate"><span class="pre">recompilation</span></code> carries
+<code class="docutils literal notranslate"><span class="pre">single_body_bytes</span></code>, <code class="docutils literal notranslate"><span class="pre">branching_built</span></code>, <code class="docutils literal notranslate"><span class="pre">branching_redirected</span></code>,
+<code class="docutils literal notranslate"><span class="pre">branching_bytes</span></code> and <code class="docutils literal notranslate"><span class="pre">tls_redirected</span></code>. <code class="docutils literal notranslate"><span class="pre">recompilation</span></code> carries
 <code class="docutils literal notranslate"><span class="pre">emitted</span></code> and <code class="docutils literal notranslate"><span class="pre">bytes</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">diagnostics</span></code></p></td>
@@ -925,6 +940,54 @@ value of the finite input domain (the <code class="docutils literal notranslate"
 <code class="docutils literal notranslate"><span class="pre">stop_reason</span></code>, <code class="docutils literal notranslate"><span class="pre">native_exit_recovered</span></code> and <code class="docutils literal notranslate"><span class="pre">issues</span></code>. A TLS callback is a
 blocker only if its VM behaviour is still unknown; analysing each turns “N
 protected TLS entries” into per-entry evidence.</p>
+</section>
+<section id="coverage-cleancoveragereport">
+<h3><code class="docutils literal notranslate"><span class="pre">coverage</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanCoverageReport</span></code>)<a class="headerlink" href="#coverage-cleancoveragereport" title="Link to this heading"></a></h3>
+<p>The verdict of the coverage gate (<code class="docutils literal notranslate"><span class="pre">decide_coverage</span></code>) for a protected input.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 30.0%" />
+<col style="width: 70.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Contents</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">can_clear_oep</span></code></p></td>
+<td><p>The OEP was proven</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">can_clear_vmp_referenced</span></code></p></td>
+<td><p>Every inventory entry is covered, nothing was dropped, and no unresolved
+dangling reference exists</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">covered_entries</span></code></p></td>
+<td><p>RVAs of VM-entry stubs actually redirected to an emitted replacement
+(group entries count only when their family is domain-complete)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dangling_refs</span></code></p></td>
+<td><p>Number of remaining references into <code class="docutils literal notranslate"><span class="pre">.vmp*</span></code> sections with a known target</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">has_unresolved_dangling</span></code></p></td>
+<td><p>True if any reference or code region could not be resolved</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dropped_entries</span></code></p></td>
+<td><p>Discoveries known to have been lost before reaching the inventory</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">reasons</span></code></p></td>
+<td><p>One line per doubt that keeps a blocker</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section id="anti-debug-cleanantidebugreport">
+<h3><code class="docutils literal notranslate"><span class="pre">anti_debug</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanAntiDebugReport</span></code>)<a class="headerlink" href="#anti-debug-cleanantidebugreport" title="Link to this heading"></a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">guards_examined</span></code>, <code class="docutils literal notranslate"><span class="pre">recognized</span></code> (a <code class="docutils literal notranslate"><span class="pre">NeutralizeAction</span></code> per recognised guard),
+<code class="docutils literal notranslate"><span class="pre">applied</span></code> and <code class="docutils literal notranslate"><span class="pre">note</span></code>. This is <strong>recognition only</strong>: <code class="docutils literal notranslate"><span class="pre">applied</span></code> is always
+<code class="docutils literal notranslate"><span class="pre">false</span></code>, and the pipeline does not rewrite any guard. The note records that the
+pipeline does not yet extract conditional guards from recovered paths, so
+<code class="docutils literal notranslate"><span class="pre">guards_examined</span></code> is currently <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p>
 </section>
 <section id="exports-cleanexportreport">
 <h3><code class="docutils literal notranslate"><span class="pre">exports</span></code> (<code class="docutils literal notranslate"><span class="pre">CleanExportReport</span></code>)<a class="headerlink" href="#exports-cleanexportreport" title="Link to this heading"></a></h3>
