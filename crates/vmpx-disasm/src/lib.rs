@@ -8,9 +8,14 @@ use serde::Serialize;
 use thiserror::Error;
 use vmpx_pe::{FileOffset, PeImage, PeKind, Rva, Va};
 
+mod dangling;
 mod dispatch_proof;
 mod trace;
 
+pub use dangling::{
+    DanglingKind, DanglingRef, TargetClass, classify_target, collect_dangling_refs,
+    collect_dangling_refs_with, first_vmp_overlap, is_vmp_section_name, vmp_section_containing,
+};
 pub use dispatch_proof::{
     RegisterDispatchProof, RegisterDispatchProofLimits, prove_register_dispatch_postlude,
 };
