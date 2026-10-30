@@ -147,8 +147,17 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
     <a class="nl sub" href="#task4">Task 4 · pipeline wiring</a>
     <a class="nl sub" href="#task5">Task 5 · --experimental</a>
     <a class="nl sub" href="#ui">UI · vmpx-ui</a>
+    <a class="nl sub" href="#sp1done">Final review &amp; merge</a>
+    <div class="cap">SP2 — OEP + generalized</div>
+    <a class="nl" href="#sp2">Execution overview</a>
+    <a class="nl sub" href="#sp2t1">Task 1 · OEP recovery</a>
+    <a class="nl sub" href="#sp2t2">Task 2 · VM-entry inventory</a>
+    <a class="nl sub" href="#sp2t3">Task 3 · live-in / conv.</a>
+    <a class="nl sub" href="#sp2t4a">Task 4a · input-closed</a>
+    <a class="nl sub" href="#sp2t4b">Task 4b · decidable subset</a>
+    <a class="nl sub" href="#sp2t5">Task 5 · emission (paused)</a>
+    <a class="nl sub" href="#sp2rest">Remaining · 5b / 6</a>
     <div class="cap">Next</div>
-    <a class="nl" href="#sp2">SP2 · OEP + generalized</a>
     <a class="nl" href="#sp345">SP3 / SP4 / SP5</a>
   </nav>
 </div>
@@ -156,12 +165,12 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 <div class="wrap"><div class="content" id="top">
   <div class="crumb"><a href="#top">vmpx-expanded</a> » build log</div>
   <h1>vmpx-expanded build log</h1>
-  <p class="updated" id="stamp">Autonomous overnight run · updated at each step. Private branch <code>sp1-native-reintegration</code>.</p>
+  <p class="updated" id="stamp">Autonomous run · SP1 complete and merged to <code>main</code> · SP2 on branch <code>sp2-oep-generalized</code> (analysis/recovery complete, emission paused).</p>
   <div class="legend">
     <span class="badge ok">complete</span>
     <span class="badge prog">in progress</span>
     <span class="badge gap">spec gap</span>
-    <span class="badge defer">deferred</span>
+    <span class="badge defer">deferred / paused / queued</span>
   </div>
   <p>A detailed, step-by-step record of building the vmpx VMProtect devirtualization roadmap. Styled as an API reference; each task is a definition entry with its implementer, review verdict, commit, and any ruling. The terse recovery ledger lives in the repo's git-ignored scratch; this is the human-readable narrative.</p>
 
@@ -191,10 +200,10 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
   </ul>
 
   <h2 id="roadmap">Roadmap</h2>
-  <div class="def"><div class="sig"><span class="name">SP1 — Native reintegration + image emission</span><span class="badge prog">in progress</span></div>
-    <div class="body"><p>Backbone: splice compiled replacement code into a new section, redirect the entry, emit behind <code>--experimental</code>. Clears the "no replacement image produced" blocker.</p></div></div>
-  <div class="def"><div class="sig"><span class="name">SP2 — OEP + generalized virtualized-function recovery</span><span class="badge defer">queued</span></div>
-    <div class="body"><p>Prove the original entry; discover every VM entry via call-site/xref; infer each routine's calling convention + finite input domain (incl. non-DLL executable entries); lift + reintegrate each. The hard research weight — per instruction, keep chewing until it verifies.</p></div></div>
+  <div class="def"><div class="sig"><span class="name">SP1 — Native reintegration + image emission</span><span class="badge ok">complete · merged</span></div>
+    <div class="body"><p>Backbone: splice compiled replacement code into a new section, redirect the entry (PE-header entry + TLS callbacks), emit behind <code>--experimental</code>, plus the <code>vmpx-ui</code> egui frontend. Merged to <code>main</code> (fast-forward). 239 tests.</p></div></div>
+  <div class="def"><div class="sig"><span class="name">SP2 — OEP + generalized virtualized-function recovery</span><span class="badge prog">in progress</span></div>
+    <div class="body"><p>Analysis/recovery (Tasks 1–4b) is complete and reviewed sound. Binary-patching emission (Task 5) is paused pending interactive approval; Tasks 5b and 6 remain. See <a href="#sp2">SP2</a>.</p></div></div>
   <div class="def"><div class="sig"><span class="name">SP3 — Import-set reconstruction</span><span class="badge defer">queued</span></div>
     <div class="body"><p>Reduce protector-era imports to the proven application set; rebuild a conventional import directory.</p></div></div>
   <div class="def"><div class="sig"><span class="name">SP4 — Dangling .vmp resolution + stripping</span><span class="badge defer">queued</span></div>
@@ -239,30 +248,121 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 
   <div class="adm note"><div class="t">Roadmap change (mid-run, user-directed)</div><div class="c">Generalized function recovery moved into the earliest SP, combined with OEP → <strong>SP2 = OEP + generalized recovery</strong>; imports→SP3, stripping→SP4, optimization→SP5; the egui UI folded into current work. Spec updated in docs-only commits <code>bef9964</code>, <code>0d8988f</code>.</div></div>
 
-  <div class="def" id="task4"><div class="sig"><span class="name">Task 4 · wire reintegration into the clean pipeline</span><span class="badge prog">fix round 1</span></div>
+  <div class="def" id="task4"><div class="sig"><span class="name">Task 4 · wire reintegration into the clean pipeline</span><span class="badge ok">complete</span></div>
     <div class="body">
-      <p>Stops discarding the compiled replacements; lays out bodies-first / dispatcher-after (<code>layout_reintegration_payload</code>), wires the header entry, fixes the core addressing invariant (bodies compiled at <code>image_base + next_section_rva(conventional)</code>), and returns a 3-tuple with both callers updated.</p>
+      <p>Stops discarding the compiled replacements; lays out bodies-first / dispatcher-after (<code>layout_reintegration_payload</code>), wires the header entry and TLS redirects, fixes the core addressing invariant (bodies compiled at <code>image_base + next_section_rva(conventional)</code>), and returns a 3-tuple with both callers updated.</p>
       <dl>
-        <dt>commit</dt><dd><code>3f6fdd6</code> (DONE_WITH_CONCERNS)</dd>
-        <dt>review</dt><dd><span class="badge gap">spec gap</span> TLS redirects weren't wired (<code>tls_redirects: &amp;[]</code> hardcoded), which the plan required; quality approved with minors. The addressing fix — the hard part — was verified correct.</dd>
+        <dt>commits</dt><dd><code>3f6fdd6</code> payload + header reintegration · <code>6bdee34</code> TLS redirects · <code>c6d6835</code> layout rollback</dd>
+        <dt>review</dt><dd>Initial review found a <span class="badge gap">spec gap</span> (TLS redirects hardcoded empty). Fix round 1 wired them; re-review found a cursor-drift bug when a group's dispatcher assembly fails; fix round 2 rolls the layout back on failure (covered by a pure unit test). Re-review clean.</dd>
       </dl>
-      <div class="adm ruling"><div class="t">Ruling · Task 4</div><div class="c">TLS-redirect wiring is in-scope and enters the fix loop — the <code>set_tls_callback</code>/<code>tls_redirects</code> plumbing from Tasks 2–3 exists. Nested-continuation grouping (a second-order rewrite of continuation targets, unspecified in the plan) is <strong>deferred to SP2</strong>. Fix round 1 is running now.</div></div>
+      <div class="adm ruling"><div class="t">Ruling · Task 4</div><div class="c">TLS-redirect wiring was in scope (the plumbing from Tasks 2–3 existed). Nested-continuation grouping (a second-order rewrite of continuation targets, unspecified in the plan) was <strong>deferred to SP2</strong> and is now tracked as Task 5b.</div></div>
     </div></div>
 
-  <div class="def" id="task5"><div class="sig"><span class="name">Task 5 · --experimental output path</span><span class="badge defer">pending</span></div>
-    <div class="body"><p>Sound <code>output</code> unchanged; <code>--experimental &lt;path&gt;</code> writes the reintegrated image regardless of blockers, with a warning + report flag. Starts after Task 4 passes.</p></div></div>
+  <div class="def" id="task5"><div class="sig"><span class="name">Task 5 · --experimental output path</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p>Sound <code>output</code> unchanged; <code>--experimental &lt;path&gt;</code> writes the reintegrated image regardless of blockers, with a stderr warning and a <code>CleanReport.experimental</code> flag.</p>
+      <dl>
+        <dt>commit</dt><dd><code>fb69a40</code></dd>
+        <dt>review</dt><dd>spec ✅, quality approved; low minors deferred (string-path alias compare, no existence check on the path, <code>experimental</code> means requested rather than written).</dd>
+      </dl>
+    </div></div>
 
-  <div class="def" id="ui"><div class="sig"><span class="name">UI · vmpx-ui (egui/eframe)</span><span class="badge defer">pending</span></div>
-    <div class="body"><p>A separate crate driving the library: open a binary, run detect/unpack/clean, show reports, blockers, recovered VM entries, and the mode toggles. Build-verified here; the author runs the window on Windows.</p></div></div>
+  <div class="def" id="ui"><div class="sig"><span class="name">UI · vmpx-ui (egui/eframe)</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p>A separate crate driving the CLI: open a binary, run detect/unpack/clean, show reports, blockers, recovered VM entries, and the <code>--experimental</code> toggle.</p>
+      <dl>
+        <dt>commit</dt><dd><code>0258159</code></dd>
+        <dt>verification</dt><dd>Build-verified only (no display in CI); the author runs the window on Windows. 0 Critical / 0 Important in review; minors deferred (worker timeout/cancel, <code>command_for</code> tests, <code>windows_subsystem</code>).</dd>
+      </dl>
+    </div></div>
+
+  <h3 id="sp1done">Final whole-branch review &amp; merge</h3>
+  <p>An Opus whole-branch review of <code>4bfc2fa..0258159</code> was clean to merge (0 Critical, 0 Important; build and tests green). One fix wave (commit <code>2883c34</code>) addressed the worthwhile minors:</p>
+  <ul>
+    <li>A single-body group whose domain is not provably complete now gets a dispatcher with fallback, instead of a direct redirect that would run the body on out-of-domain inputs.</li>
+    <li>Removed dead code, reused the planning image, added a checked add for a VA, and tightened <code>set_tls_callback</code> (file-backed and PE32+ guards).</li>
+    <li><code>vmpx-ui</code> now handles a worker panic instead of freezing, and trims the <code>rfd</code> dependency footprint.</li>
+  </ul>
+  <p>Scoped re-review was clean. SP1 was merged to <code>main</code> by fast-forward (<code>4bfc2fa</code> → <code>2883c34</code>) with <strong>239 workspace tests</strong> passing.</p>
+  <div class="adm note"><div class="t">Verification scope</div><div class="c">There is <strong>no protected corpus in CI</strong> (running the VMProtect demo is blocked in the build sandbox). Correctness is verified by unit and synthetic tests plus out-of-band runs against locally protected samples (see the corpus recipe). The goal remains <em>behavior-reversible</em> output, not bit-reversible.</div></div>
 
   <h2 id="sp2">SP2 · OEP + generalized recovery</h2>
-  <p class="muted">Not started. This is the research-heavy milestone: per-function calling-convention and input-domain inference. Per instruction, it will be ground on until it verifies rather than parked — results reported honestly as done / partial / blocked, with the differential check as the gate.</p>
+  <p>Branch <code>sp2-oep-generalized</code>, off <code>main</code> at <code>2883c34</code>. A sequential spine: OEP → discovery → live-in inference → input-closed and decidable-branching recovery → emission → clearing blockers. The <strong>analysis and recovery half (Tasks 1–4b) is complete, reviewed, and judged sound</strong>; the workspace stands at about <strong>286 passing tests</strong>. Emission is paused (Task 5).</p>
+  <div class="adm note"><div class="t">What "recovered" means here</div><div class="c">Without a protected corpus in CI, "recovered" means the result passed synthetic verification and review, never a bare assertion. Recovery is deliberately strict: where soundness is not provable, the tool refuses and keeps the blocker rather than guessing. Real-sample behavior is checked out-of-band.</div></div>
+
+  <div class="def" id="sp2t1"><div class="sig"><span class="name">Task 1 · OEP recovery</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p><code>decide_oep</code> (<code>vmpx-vm/src/oep.rs</code>) is a pure function wired into <code>analyze_oep</code> and the clean pipeline. Recovery is <strong>strict</strong>: it refuses unless the whole DLL entry family is complete, every path is accounted for, and all paths agree on one <em>executable native</em> continuation.</p>
+      <dl>
+        <dt>commits</dt><dd><code>64cd125</code>, fix <code>90d9f38</code></dd>
+        <dt>review</dt><dd>Round 1 found a latent unsound case (a partial family could declare a wrong OEP) and a native candidate sitting next to a non-native one still recovering. Fixed; re-review clean, 246 tests.</dd>
+        <dt>deferred</dt><dd>duplicate <code>recover_entry_paths</code> (perf); a VM-to-native synthetic fixture.</dd>
+      </dl>
+    </div></div>
+
+  <div class="def" id="sp2t2"><div class="sig"><span class="name">Task 2 · generalized VM-entry inventory</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p>A deduplicated scan merged with export cross-references into <code>CleanReport.vm_inventory</code> (<code>merge_vm_inventory</code>, deterministic). Blockers and the gate are unchanged.</p>
+      <dl>
+        <dt>commit</dt><dd><code>1dfe723</code> · 253 tests</dd>
+        <dt>ruling</dt><dd>An export entry that cannot be re-resolved is currently dropped silently. Task 6 must treat such an entry as <em>uncovered</em> (keep the blocker) so the coverage gate can never clear by an entry vanishing.</dd>
+      </dl>
+    </div></div>
+
+  <div class="def" id="sp2t3"><div class="sig"><span class="name">Task 3 · per-function live-in and calling-convention inference</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p><code>infer_live_in</code> (first access is a read means live-in) plus a <code>calling_convention</code> adapter over native register initial reads and the stack cursor.</p>
+      <dl>
+        <dt>commit</dt><dd><code>c1ebf00</code> · 264 tests</dd>
+        <dt>ruling</dt><dd>The adapter <em>under-reports</em>, so it is for diagnostics only. Emission must keep binding all architectural registers and never drop an input on the strength of this set.</dd>
+      </dl>
+    </div></div>
+
+  <div class="def" id="sp2t4a"><div class="sig"><span class="name">Task 4a · input-closed function recovery</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p><code>is_input_closed</code> is a conservative predicate: the exit may depend only on provided inputs, constants, and known pure intrinsics; any havoc or unknown makes it false. <code>recover_input_closed_functions</code> applies it over the inventory (confidence at least 60, empty domain, exactly one complete path, no native calls or unsupported effects).</p>
+      <dl>
+        <dt>commit</dt><dd><code>e9d31c7</code> · 270 tests</dd>
+        <dt>review</dt><dd>Sound: no path to a wrongly "closed" result. Rulings for emission: carry the collected effects (stores and calls) as well as the exit, so side effects are replayed.</dd>
+      </dl>
+    </div></div>
+
+  <div class="def" id="sp2t4b"><div class="sig"><span class="name">Task 4b · finite-domain branching recovery + EXE entry</span><span class="badge ok">complete</span></div>
+    <div class="body">
+      <p>A spike concluded that <strong>the general branching case is undecidable</strong>, so Task 4b implements a sound <em>decidable subset</em> and refuses everything else.</p>
+      <ul>
+        <li>8-bit slices and <code>vm_flags_add</code> affine compares (<code>cmp</code>/<code>jcc</code> and small switch ladders).</li>
+        <li>16-bit covers are verified against the exact 2<sup>16</sup> image; 32- and 64-bit covers are proven exhaustive by derivation (tests only sample, a low process gap, not a soundness one).</li>
+        <li>EXE-entry recovery reuses the Task 4a empty-domain path and drops the EXE blocker only on a successful recovery.</li>
+        <li>Refused (blocker kept): jump tables, memory-dependent targets, loops, nested input branches, mixed widths, <code>nor</code>/<code>nand</code>, opaque intrinsics.</li>
+      </ul>
+      <dl>
+        <dt>commit</dt><dd><code>81a7a24</code> · 286 tests</dd>
+        <dt>review</dt><dd>Sound. The reviewer independently re-derived the 32/64-bit cover. Lows deferred (a guarded <code>unreachable!</code>, recursion depth, refusal tests assert only <code>is_err</code>).</dd>
+      </dl>
+    </div></div>
+
+  <div class="def" id="sp2t5"><div class="sig"><span class="name">Task 5 · reintegrate recovered functions (emission)</span><span class="badge defer">paused · needs interactive approval</span></div>
+    <div class="body">
+      <p>Planned: a <code>redirect_vm_stub</code> primitive that writes a <code>jmp</code> over each recovered function's VM stub, with per-entry inputs and carried effects, feeding the <code>--experimental</code> payload.</p>
+      <p>This is <strong>paused, not failed</strong>. The autonomous no-prompt mode's safety classifier gates the step that patches existing code bytes of a protected binary. The run did not reword the task or route around the gate; the step needs interactive approval to proceed. No code for it has been written (the branch is still at <code>81a7a24</code>). SP1's append-section and header/TLS redirect emission is unaffected.</p>
+    </div></div>
+
+  <div class="def" id="sp2rest"><div class="sig"><span class="name">Remaining SP2 work</span><span class="badge defer">queued / gated</span></div>
+    <div class="body">
+      <ul>
+        <li><strong>Task 5</strong> · emission, as above (gated).</li>
+        <li><strong>Task 5b</strong> · branching value-dispatch (<code>GuardedEntryPathFamily</code>) and nested continuations (should assert <code>domain_complete</code>).</li>
+        <li><strong>Task 6</strong> · clear blockers on recovery, with the inventory gate treating unresolved entries as uncovered. Depends on emission.</li>
+      </ul>
+      <p class="muted">Hygiene before SP2 merges: the stray scratch report was already untracked and <code>.superpowers/</code> is git-ignored (<code>c38a07c</code>).</p>
+    </div></div>
 
   <h2 id="sp345">SP3 / SP4 / SP5</h2>
   <p class="muted">Queued. Import reconstruction, <code>.vmp</code> stripping, and VTIL-optimized recompilation + verifier, each with its own spec → plan → build cycle.</p>
 
   <hr>
-  <p class="updated">Generated by the autonomous build controller. Full design: <code>docs/superpowers/specs/2026-10-29-vmpx-sp1-native-reintegration-design.md</code> · plan: <code>docs/superpowers/plans/2026-10-29-vmpx-sp1-native-reintegration.md</code>.</p>
+  <p class="updated">Generated by the autonomous build controller. Full design: <code>docs/superpowers/specs/2026-10-29-vmpx-sp1-native-reintegration-design.md</code> · plan: <code>docs/superpowers/plans/2026-10-29-vmpx-sp1-native-reintegration.md</code> · SP2 spec/plan: <code>docs/superpowers/{specs,plans}/2026-10-29-vmpx-sp2-oep-generalized-recovery*</code>.</p>
 </div></div>
 
 <script>
