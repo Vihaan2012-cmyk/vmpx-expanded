@@ -11,6 +11,10 @@ use vmpx_pe::{FileOffset, PeImage, PeKind, Rva, Va};
 mod dangling;
 mod dispatch_proof;
 mod iat_refs;
+mod native_expr;
+mod native_lift;
+#[cfg(test)]
+mod native_lift_tests;
 mod trace;
 
 pub use dangling::{
@@ -21,6 +25,11 @@ pub use dispatch_proof::{
     RegisterDispatchProof, RegisterDispatchProofLimits, prove_register_dispatch_postlude,
 };
 pub use iat_refs::{IatReferenceScan, referenced_iat_slots, scan_iat_references};
+pub use native_expr::{NativeAlgebra, NativeExpr, NativeNode};
+pub use native_lift::{
+    Algebra, AlgebraError, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, MemoryRead,
+    MemoryWrite, Resize, UnOp, Width, lift_block, lift_bytes,
+};
 pub use trace::{
     DirectJumpFragment, DirectJumpTrace, DirectJumpTraceLimits, DirectJumpTraceStop,
     DirectJumpTraceStopKind, trace_direct_jump_fragments,
