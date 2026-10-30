@@ -1,5 +1,7 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 use vmpx_pe::{IMAGE_DIRECTORY_ENTRY_EXCEPTION, IMAGE_DIRECTORY_ENTRY_IMPORT, PeImage, Rva, Va};
+use vmpx_vm::{VmDiscoveryLimits, discover_vm_entries};
 
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -89,6 +91,30 @@ fn owner_index(pe: &PeImage<'_>, rva: Rva) -> Option<usize> {
     pe.sections
         .iter()
         .position(|section| section.contains_mapped_rva(rva))
+}
+
+const STANDARD_SECTION_NAMES: &[&str] = &[
+    ".text", ".rdata", ".data", ".pdata", ".xdata", ".reloc", ".rsrc", ".tls", ".idata", ".edata",
+    ".bss", ".didat", ".gfids", ".crt", ".code", ".init", ".fini", ".CRT", ".00cfg", ".retplne",
+    "INIT", "PAGE", "CODE", "DATA", ".sdata", ".orpc",
+];
+
+fn is_standard_section_name(name: &str) -> bool {
+    STANDARD_SECTION_NAMES
+        .iter()
+        .any(|standard| standard.eq_ignore_ascii_case(name))
+}
+
+const STUB_SWARM_STRONG: usize = 8;
+const STUB_SWARM_WEAK: usize = 3;
+
+/// Largest group of VM entry stubs sharing one call target, as `(target, count)`.
+fn largest_stub_swarm(call_targets: impl IntoIterator<Item = Option<Rva>>) -> Option<(Rva, usize)> {
+    let mut groups: BTreeMap<Rva, usize> = BTreeMap::new();
+    for target in call_targets.into_iter().flatten() {
+        *groups.entry(target).or_default() += 1;
+    }
+    groups.into_iter().max_by_key(|(_, count)| *count)
 }
 
 fn add_evidence(
@@ -294,6 +320,43 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
         }
     }
 
+    // Virtualization-only images carry no packed blob; the anomalous pairing of a
+    // non-standard executable entry section with a swarm of push/call VM stubs
+    // into one common target is the tell. Discovery runs only when the first holds.
+    if let Some(entry_index) = entry_section {
+        let section = &pe.sections[entry_index];
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+            && !is_standard_section_name(&section.name)
+        {
+            add_evidence(
+                &mut evidence,
+                &mut score,
+                "nonstandard_executable_entry_section",
+                15,
+                format!(
+                    "entry point is in executable section {} whose name is not a standard compiler/linker section",
+                    section.name
+                ),
+            );
+            if let Ok(discovery) = discover_vm_entries(pe, VmDiscoveryLimits::default())
+                && let Some((target, count)) =
+                    largest_stub_swarm(discovery.entries.iter().map(|entry| entry.call_target))
+                && count >= STUB_SWARM_WEAK
+            {
+                let weight = if count >= STUB_SWARM_STRONG { 45 } else { 20 };
+                add_evidence(
+                    &mut evidence,
+                    &mut score,
+                    "vm_entry_stub_swarm",
+                    weight,
+                    format!(
+                        "{count} push-immediate/call VM entry stubs share the common call target {target}"
+                    ),
+                );
+            }
+        }
+    }
+
     let confidence = u8::try_from(score.min(100)).unwrap_or(100);
     let verdict = if confidence >= 60 {
         DetectionVerdict::VmprotectLikely
@@ -335,6 +398,89 @@ pub fn va_owner(pe: &PeImage<'_>, va: Va) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_pe(section_name: &[u8], stub_count: usize) -> Vec<u8> {
+        let mut data = vec![0_u8; 0x400];
+        data[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        data[0x3C..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        data[0x80..0x84].copy_from_slice(&0x0000_4550_u32.to_le_bytes());
+        let coff = 0x84;
+        data[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+        data[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        data[coff + 16..coff + 18].copy_from_slice(&0xF0_u16.to_le_bytes());
+        data[coff + 18..coff + 20].copy_from_slice(&0x2022_u16.to_le_bytes());
+        let optional = coff + 20;
+        data[optional..optional + 2].copy_from_slice(&0x020B_u16.to_le_bytes());
+        data[optional + 16..optional + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 20..optional + 24].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 24..optional + 32].copy_from_slice(&0x1_4000_0000_u64.to_le_bytes());
+        data[optional + 32..optional + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[optional + 36..optional + 40].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[optional + 56..optional + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+        data[optional + 60..optional + 64].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[optional + 68..optional + 70].copy_from_slice(&3_u16.to_le_bytes());
+        data[optional + 108..optional + 112].copy_from_slice(&16_u32.to_le_bytes());
+        let section = optional + 0xF0;
+        data[section..section + section_name.len()].copy_from_slice(section_name);
+        data[section + 8..section + 12].copy_from_slice(&0x180_u32.to_le_bytes());
+        data[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        data[section + 36..section + 40].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+        // common target at 0x1000 (ret); stubs: push imm32 ; call rel32
+        data[0x200] = 0xC3;
+        for index in 0..stub_count {
+            let at = 0x210 + index * 10;
+            data[at] = 0x68;
+            data[at + 1..at + 5].copy_from_slice(&(0x1000_0000_u32 + index as u32).to_le_bytes());
+            data[at + 5] = 0xE8;
+            let rel = 0x1000_i32 - i32::try_from(0x1000 + (at - 0x200) + 10).unwrap();
+            data[at + 6..at + 10].copy_from_slice(&rel.to_le_bytes());
+        }
+        data
+    }
+
+    fn has(report: &ProtectionReport, id: &str) -> bool {
+        report.evidence.iter().any(|item| item.id == id)
+    }
+
+    #[test]
+    fn swarm_groups_by_common_call_target() {
+        let common = Rva(0x11F000);
+        let targets = std::iter::repeat_n(Some(common), 9).chain([Some(Rva(0x2000)), None]);
+        assert_eq!(largest_stub_swarm(targets), Some((common, 9)));
+        assert_eq!(largest_stub_swarm([None, None]), None);
+    }
+
+    #[test]
+    fn standard_names_are_recognized_case_insensitively() {
+        for name in [".text", ".TEXT", ".rdata", ".pdata", ".reloc", ".tls"] {
+            assert!(is_standard_section_name(name), "{name}");
+        }
+        for name in [".2ZQ", ".o}1", ".vmp0", ".themida"] {
+            assert!(!is_standard_section_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn standard_text_section_with_stubs_is_not_flagged() {
+        let data = synthetic_pe(b".text", 12);
+        let pe = PeImage::parse(&data).expect("synthetic PE parses");
+        let report = detect_vmprotect(&pe);
+        assert!(!has(&report, "nonstandard_executable_entry_section"));
+        assert!(!has(&report, "vm_entry_stub_swarm"));
+        assert_eq!(report.verdict, DetectionVerdict::NoStrongEvidence);
+    }
+
+    #[test]
+    fn nonstandard_entry_section_alone_stays_below_strong_evidence() {
+        let data = synthetic_pe(b".o}1", 0);
+        let pe = PeImage::parse(&data).expect("synthetic PE parses");
+        let report = detect_vmprotect(&pe);
+        assert!(has(&report, "nonstandard_executable_entry_section"));
+        assert!(!has(&report, "vm_entry_stub_swarm"));
+        assert_eq!(report.verdict, DetectionVerdict::NoStrongEvidence);
+    }
 
     #[test]
     fn empty_entropy_is_zero() {

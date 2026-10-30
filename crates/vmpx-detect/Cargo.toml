@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 vmpx-pe = { path = "../vmpx-pe" }
+vmpx-vm = { path = "../vmpx-vm" }
 
 [lints]
 workspace = true
