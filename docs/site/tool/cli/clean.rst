@@ -11,7 +11,7 @@ Synopsis
 
 .. code-block:: console
 
-    vmpx clean <INPUT> <OUTPUT> [--report <PATH>] [--reconstructed <PATH>] [--experimental <PATH>]
+    vmpx clean <INPUT> <OUTPUT> [--report <PATH>] [--reconstructed <PATH>] [--experimental <PATH>] [--decoded-lift]
 
 Arguments
 ---------
@@ -44,6 +44,14 @@ Arguments
    a warning on standard error. The report gains ``experimental: true``. This
    does not relax the gate: the sound ``OUTPUT`` is still written only when
    the proof gate clears. See :ref:`experimental-output`.
+
+.. option:: --decoded-lift
+
+   Requires ``--experimental``. Also lifts every remaining VM entry from its
+   decoded handler stream (linear lift, then CFG lift) and redirects its stub to
+   the native body, producing a hybrid image: devirtualized functions are native,
+   the rest still run through the original VM. Slow on large inputs (minutes), so
+   it is off by default. See :doc:`/tool/pipeline/reintegration`.
 
 What it does
 ------------
@@ -185,6 +193,12 @@ Write the experimental reintegrated image:
 .. code-block:: console
 
     $ vmpx clean addon.dll addon.clean.dll --report r.json --experimental addon.exp.dll
+
+Write a hybrid image with decoded-stream lifts spliced in:
+
+.. code-block:: console
+
+    $ vmpx clean addon.dll addon.clean.dll --experimental addon.hybrid.dll --decoded-lift
 
 Verified no-op on an unprotected file:
 

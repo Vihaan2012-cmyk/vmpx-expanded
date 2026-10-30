@@ -26,7 +26,7 @@ Result
      - Decoded, with the table base propagated through the stream
    * - Branches
      - Followed by a CFG walk; targets resolved by symbolic execution and
-       proven input domains
+       proven input domains; nested VM-to-VM continuations are followed
    * - Native calls and checksum loops
      - Decoded as dedicated handler semantics
 
@@ -105,7 +105,7 @@ a linear function that is the whole body, ending at ``VmExit``.
 entry block, symbolically executes it from a proven entry frame, and follows
 each block's terminating branch to its successors, carrying the symbolic VM
 state. Each block ends in one of four ways: ``VmExit``, ``Branch``,
-``NativeCall`` or ``Stalled``. Edges are one of three kinds:
+``NativeCall`` or ``Stalled``. Edges are one of four kinds:
 
 ``Branch``
     The target simplified to a constant.
@@ -114,6 +114,12 @@ state. Each block ends in one of four ways: ``VmExit``, ``Branch``,
     (:doc:`symbolic-execution`).
 ``NativeCallReturn``
     Control resumes after a proven native call.
+``NestedEntry``
+    A proven VM exit returns into another entry stub of the same VM. The walk
+    composes the native frame, decodes the nested entry's stream and keeps
+    going, so the continuation is part of the function's CFG. Following is
+    bounded (``max_nested_entries``); a target that is not provably a VM entry
+    ends the path as an ordinary native return.
 
 A successor is followed only when its branch target is proven. Anything else
 stops that path and is recorded as a ``CfgStall`` with the reason; no edge is
@@ -128,6 +134,13 @@ Keyless native-call bridge handlers are decoded to a ``NativeCall`` whose call
 frame (target and arguments) is recovered from the VM stack. The CFG walk
 treats the call as a block boundary, proves the frame, and resumes at the
 recorded continuation.
+
+A call target is resolved to a concrete import when that is provable: either the
+target is an IAT slot, or it is the address of a ``jmp qword ptr [rip+disp32]``
+thunk in read-only bytes whose slot is exactly one import's IAT entry. The
+resolved import selects a call-effect summary, which is how ``HeapAlloc`` and
+``HeapFree`` are recovered from VM code. Memory is folded into the model only
+from read-only sections; a writable read is never treated as constant.
 
 What it does not yet do
 -----------------------

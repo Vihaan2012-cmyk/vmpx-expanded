@@ -39,19 +39,22 @@ Unbounded or undecidable input branches
     is reported blocked.
 
 Re-entrant and nested continuations
-    A virtualized function that re-enters the VM, or whose native continuation
-    lands in another virtualized entry, cannot be modelled as a single closed
-    path family. A nested entry is counted but never counted as covered, and no
-    redirect is emitted for it. Loops within one function are refused for the same
+    A virtualized function that re-enters the VM cannot be modelled as a single
+    closed path family. A VM exit that returns into another entry of the same VM
+    is followed in the CFG and lifted as a continuation exit, but in the sound
+    path a nested entry is counted and never counted as covered, and no redirect
+    is emitted for it. Loops within one function are refused for the same
     reason: the lift expands paths into a tree, and a block that repeats on a path
     has no finite expansion.
 
 Protector-continuation exits
     A VM exit that returns into the entry frame (the protector's own native
-    continuation) rather than into the caller is not a callee-style return. The
-    lift cannot prove that a native ``ret`` reads the same word, so it refuses
-    (``the exit returns into the entry frame``). A return address written by the
-    VM, or reached through a computed address, is refused for the same reason.
+    continuation) rather than into the caller is not a callee-style return. A
+    return address written by the VM is lifted as a region exit when the exit
+    registers, flags and staged stack words are all computed values. Where the
+    lift cannot prove that a native ``ret`` reads the same word (an exit that
+    returns into the entry frame, flags that are a stack pointer, a return
+    reached through an unresolved computed address) it still refuses.
 
 Environment-dependent branches
     A branch fed by a value read from the environment (a ``gs:``-relative read of
@@ -87,5 +90,5 @@ the real continuation of a protector exit, and the inputs that exercise a branch
 Such facts can seed the static model (a domain for an otherwise unbounded input,
 a resolved nested entry), but they are evidence about one execution, not a proof.
 Any output that relies on them must be labelled as such and kept out of the sound
-path, in the same way ``--experimental`` is today. This is the direction of future
-work; it is not implemented.
+path, in the same way ``--experimental`` is today. The design is in
+:doc:`dynamic-assist`; it is not implemented.

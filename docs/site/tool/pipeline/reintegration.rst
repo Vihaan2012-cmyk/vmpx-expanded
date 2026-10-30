@@ -155,6 +155,24 @@ instructions of the stub elsewhere, followed by a ``jmp`` to the rest of the stu
 It accepts only position-independent, non-branching instructions (so the copy means
 the same thing wherever it runs) and otherwise reports ``StubNotRelocatable``.
 
+Hybrid output: decoded-stream lifts
+-----------------------------------
+
+With ``clean --experimental <path> --decoded-lift``, every remaining VM entry in
+the inventory is also lifted from its decoded handler stream
+(:doc:`function-lift`). For each entry the linear lift is tried first, then the
+CFG lift. A body that lifts is appended to the ``.vmpx0`` section after the
+earlier bodies and the entry's VM stub is redirected to it with
+``redirect_vm_stub``. An entry that does not lift is skipped with a diagnostic
+and its stub is left intact.
+
+The result is a *hybrid* PE: devirtualized functions run as native code from
+``.vmpx0``, and every function that could not be lifted still runs through the
+original, intact VM. The image reparses and passes loader validation. The report
+metrics ``decoded_lifted``, ``decoded_redirected``, ``decoded_failed`` and
+``decoded_bytes`` count the outcome. These redirects are experimental output only:
+they are not counted as coverage, so the sound proof gate is unaffected.
+
 Entry and TLS redirects
 -----------------------
 
@@ -166,8 +184,9 @@ Nested continuations
 --------------------
 
 Where a VM exit continues into another VM entry, the nested entry needs its own
-replacement. Nested-continuation redirects remain deferred: they are counted but
-not appended, so a nested entry never counts as covered. The ``reintegration`` stage diagnostics say so
+replacement. Nested-continuation redirects remain deferred in the sound path: they are counted but
+not appended, so a nested entry never counts as covered. (The decoded-stream lift
+can instead follow a nested continuation inside one function's CFG.) The ``reintegration`` stage diagnostics say so
 ("nested-continuation redirects remain deferred").
 
 Output, loader validation and layout
