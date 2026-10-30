@@ -236,7 +236,9 @@ impl Default for CfgLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CfgError {
     EntryOutOfRange(u64),
-    /// A branch target lands inside an already-decoded instruction.
+    /// Retained for API stability; no longer produced. Overlapping instructions
+    /// (a branch into the middle of a previously-decoded instruction) are now
+    /// resolved by decoding each proven-reachable offset on its own.
     OverlappingInstructions(u64),
     LimitExceeded,
     Pe(String),
@@ -315,10 +317,12 @@ pub fn recover_native_cfg_proven(
 
 /// Like [`recover_native_cfg`] with explicit size limits. Only constant `jmp`/`jcc`
 /// targets are followed; indirect branches, calls and unliftable blocks end in
-/// [`Terminator::Unsupported`] with no outgoing edges.
+/// [`Terminator::Unsupported`] with no outgoing edges. A branch into the middle of a
+/// previously-decoded instruction re-decodes at that proven-reachable offset, so
+/// overlapping-instruction anti-disassembly resolves instead of failing.
 ///
 /// # Errors
-/// Entry outside `code`, overlapping decodes, or exceeding `limits`.
+/// Entry outside `code`, or exceeding `limits`.
 pub fn recover_native_cfg_with(
     code: &[u8],
     base_ip: u64,
@@ -363,21 +367,18 @@ pub fn recover_native_cfg_opts(
                 bad.insert(ip, "runs past the end of the code window".to_owned());
                 break;
             }
-            if let Some((&p, prev)) = instrs.range(..ip).next_back()
-                && p + prev.len() as u64 > ip
-            {
-                return Err(CfgError::OverlappingInstructions(ip));
-            }
+            // `ip` is reached by proven control flow (entry, a constant direct branch
+            // target, or a linear fall-through), so the bytes there are a real
+            // instruction even when they overlap one decoded on another path:
+            // VMProtect mutation branches into the middle of a "cover" instruction, so
+            // two reachable streams legally share bytes. We decode each reachable offset
+            // on its own and let the entries overlap, rather than treating the clash as
+            // undecodable. No speculative offset is ever decoded, so this stays sound.
             let off = usize::try_from(ip - base_ip).map_err(|_| CfgError::LimitExceeded)?;
             let ins = Decoder::with_ip(64, &code[off..], ip, DecoderOptions::NONE).decode();
             if ins.is_invalid() {
                 bad.insert(ip, "invalid instruction encoding".to_owned());
                 break;
-            }
-            if let Some((&n, _)) = instrs.range(ip + 1..).next()
-                && ip + ins.len() as u64 > n
-            {
-                return Err(CfgError::OverlappingInstructions(ip));
             }
             instrs.insert(ip, ins);
             if instrs.len() > limits.max_instructions {
@@ -725,6 +726,44 @@ mod tests {
         let cfg = recover_native_cfg(ALIAS, 0x1000, 0x1000).expect("cfg");
         assert!(cfg.blocks[&0x1000].semantics.is_none());
         assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+    }
+
+    #[test]
+    fn overlap_resolution_decodes_mid_instruction_target() {
+        // 0x1000 jne 0x1005; 0x1002 mov eax,0x90C39090 (covers 0x1002..0x1007);
+        // the taken target 0x1005 lands *inside* that mov, where the bytes are `C3` (ret).
+        // A linear/one-pass decode would call this an overlap; decoding at the
+        // proven-reached offset recovers the `ret` block.
+        let code = [0x75, 0x03, 0xB8, 0x90, 0x90, 0xC3, 0x90, 0xC3];
+        let cfg = recover_native_cfg(&code, 0x1000, 0x1000).expect("overlap resolves");
+        assert!(cfg.is_complete());
+        assert_eq!(cfg.blocks.len(), 3);
+        // The mid-instruction target decoded to its own `ret` block.
+        let tgt = &cfg.blocks[&0x1005];
+        assert_eq!(tgt.terminator, Terminator::Return);
+        assert!(tgt.semantics.is_some());
+        // The covering instruction kept its own (overlapping) decode and lifted.
+        let cover = &cfg.blocks[&0x1002];
+        assert_eq!(cover.terminator, Terminator::Return);
+        assert_eq!(cover.semantics.as_ref().expect("sem").instruction_count, 1);
+        assert!(cfg.edges.contains(&(0x1000, 0x1005, EdgeKind::Taken)));
+        assert!(cfg.edges.contains(&(0x1000, 0x1002, EdgeKind::NotTaken)));
+    }
+
+    #[test]
+    fn computed_target_still_fails_closed() {
+        // Overlap tolerance must not license speculative decode: an unresolved
+        // computed branch stays refused with no edge and no invented successor block.
+        // mov eax,ecx; jmp rax
+        let code = [0x89, 0xC8, 0xFF, 0xE0];
+        let cfg = recover_native_cfg(&code, 0x1000, 0x1000).expect("cfg");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert!(cfg.edges.is_empty());
+        assert!(!cfg.is_complete());
+        assert!(matches!(
+            cfg.blocks[&0x1000].terminator,
+            Terminator::Unsupported(_)
+        ));
     }
 
     #[test]
