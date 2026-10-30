@@ -614,8 +614,33 @@ impl<'a> SymbolicMachine<'a> {
         &mut self,
         instruction_index: usize,
         address: &Expr,
+        width: BitWidth,
     ) -> Result<(), String> {
         self.advance_memory_epoch()?;
+        // Proof path: when the store address provably lies within a bounded byte
+        // range over a single proven-region root (vsp_initial or a fresh
+        // allocation), preserve exactly the tracked cells proven disjoint from
+        // that range instead of havocing them. This is a proof, not an
+        // assumption: a cell at `root + d` (one byte) aliases the store iff
+        // `d` falls in `[slo, shi)`, so cells outside it (and cells in a
+        // different proven-disjoint region) survive precisely. Branch-relevant
+        // vsp-rooted state below/above an array-store window thus stays precise
+        // and the post-store branch resolves.
+        if let Some((root, slo, shi)) = proven_store_byte_range(address, width) {
+            self.memory
+                .retain(|cell_address, _| store_range_disjoint_from_cell(&root, slo, shi, cell_address));
+            // The store base is a symbolic region pointer; it cannot be proven
+            // disjoint from concrete in-image addresses, so image-source reads
+            // stay withheld (this does not block branch resolution or resume).
+            self.image_reads_suppressed = true;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index,
+                cause: "external store proven within a bounded range over a single VM-region \
+                        base; range-disjoint tracked cells preserved"
+                    .to_owned(),
+            });
+            return Ok(());
+        }
         if address.dependencies().contains("vsp_initial") {
             // The address may alias the VM operand stack itself; keep the broad,
             // assumption-free havoc.
@@ -675,7 +700,7 @@ impl<'a> SymbolicMachine<'a> {
             // preserves the vsp-rooted cells. The VM-private vreg file is a
             // separate namespace the store path cannot reach, so it is kept.
             // The write itself is still recorded below, so the lift preserves it.
-            self.havoc_external_store(instruction_index, &address)?;
+            self.havoc_external_store(instruction_index, &address, value.width)?;
         }
         self.external_writes.push(SymbolicMemoryWrite {
             instruction_index,
@@ -1075,6 +1100,236 @@ fn is_proven_region_pointer(expression: &Expr) -> bool {
                 || is_fresh_allocation_root(&root)
         }
         _ => false,
+    }
+}
+
+fn is_proven_region_root(root: &Expr) -> bool {
+    matches!(&root.kind, ExprKind::Register { name } if name == "vsp_initial")
+        || is_fresh_allocation_root(root)
+}
+
+/// A proven bound on a pointer/index expression's 64-bit value: it equals
+/// `root_value + k` for some signed `k` in `[lo, hi]` (when `root` is `Some`),
+/// or the value itself lies in `[lo, hi]` (when `root` is `None`). Intervals are
+/// over-approximations; any form that cannot be bounded returns `None` so the
+/// caller fails closed to the conservative havoc.
+#[derive(Clone)]
+struct AddressBounds {
+    root: Option<Expr>,
+    lo: i64,
+    hi: i64,
+}
+
+/// Unsigned value range `[0, 2^bits - 1]` of a sub-expression of the given
+/// width. Returns `None` for 64-bit (unbounded for our signed-offset model).
+fn unsigned_width_range(width: BitWidth) -> Option<(i64, i64)> {
+    let bits = width.bits();
+    if bits >= 64 {
+        return None;
+    }
+    i64::try_from((1u128 << bits) - 1).ok().map(|hi| (0, hi))
+}
+
+#[allow(clippy::too_many_lines)]
+fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
+    match &expression.kind {
+        ExprKind::Register { name } if name == "vsp_initial" => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Intrinsic { .. } if is_fresh_allocation_root(expression) => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Const { value } => {
+            let signed = i64::from_ne_bytes(value.to_ne_bytes());
+            Some(AddressBounds {
+                root: None,
+                lo: signed,
+                hi: signed,
+            })
+        }
+        // A bare symbolic register below 64 bits, or any truncation, is an
+        // unconstrained value of its own width, i.e. bounded by that unsigned
+        // range.
+        ExprKind::Register { .. }
+        | ExprKind::Resize {
+            op: ResizeOp::Truncate,
+            ..
+        } => {
+            let (lo, hi) = unsigned_width_range(expression.width)?;
+            Some(AddressBounds {
+                root: None,
+                lo,
+                hi,
+            })
+        }
+        ExprKind::Resize {
+            op: ResizeOp::ZeroExtend,
+            value,
+        } => {
+            // A zero-extended value stays in the unsigned range of its SOURCE
+            // width; intersect with any tighter bound the operand proves.
+            let (wlo, whi) = unsigned_width_range(value.width)?;
+            let inner = address_bounds(value);
+            let (lo, hi) = match inner {
+                Some(AddressBounds {
+                    root: None,
+                    lo,
+                    hi,
+                }) => (lo.max(wlo), hi.min(whi)),
+                _ => (wlo, whi),
+            };
+            (lo <= hi).then_some(AddressBounds {
+                root: None,
+                lo,
+                hi,
+            })
+        }
+        // `concat(0, low)` is a zero-extension of `low`.
+        ExprKind::Concat { high, low } if matches!(high.kind, ExprKind::Const { value: 0 }) => {
+            address_bounds(low)
+        }
+        ExprKind::Binary {
+            op: op @ (BinaryOp::Add | BinaryOp::Sub),
+            left,
+            right,
+        } => {
+            let left = address_bounds(left)?;
+            let right = address_bounds(right)?;
+            if matches!(op, BinaryOp::Add) {
+                // At most one side may carry a root (two roots would be a
+                // non-unit coefficient we cannot represent as an offset).
+                let ((None, root) | (root, None)) = (left.root, right.root) else {
+                    return None;
+                };
+                Some(AddressBounds {
+                    root,
+                    lo: left.lo.checked_add(right.lo)?,
+                    hi: left.hi.checked_add(right.hi)?,
+                })
+            } else {
+                // Subtracting a rooted term is not a constant offset.
+                if right.root.is_some() {
+                    return None;
+                }
+                Some(AddressBounds {
+                    root: left.root,
+                    lo: left.lo.checked_sub(right.hi)?,
+                    hi: left.hi.checked_sub(right.lo)?,
+                })
+            }
+        }
+        // Scaling an index (`index << c` / `index * c`) keeps a rootless range.
+        ExprKind::Binary {
+            op: BinaryOp::Shl,
+            left,
+            right,
+        } => {
+            let ExprKind::Const { value: shift } = right.kind else {
+                return None;
+            };
+            let base = address_bounds(left)?;
+            if base.root.is_some() || shift >= 63 {
+                return None;
+            }
+            let scale = 1i64.checked_shl(u32::try_from(shift).ok()?)?;
+            scale_rootless(base.lo, base.hi, scale)
+        }
+        ExprKind::Binary {
+            op: BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            let (base, scalar) = match (&left.kind, &right.kind) {
+                (ExprKind::Const { value }, _) => (address_bounds(right)?, *value),
+                (_, ExprKind::Const { value }) => (address_bounds(left)?, *value),
+                _ => return None,
+            };
+            if base.root.is_some() {
+                return None;
+            }
+            scale_rootless(base.lo, base.hi, i64::try_from(scalar).ok()?)
+        }
+        // `index & mask` with a small positive mask bounds the value to [0, mask].
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mask = match (&left.kind, &right.kind) {
+                (ExprKind::Const { value }, _) | (_, ExprKind::Const { value }) => *value,
+                _ => return None,
+            };
+            let hi = i64::try_from(mask).ok()?;
+            Some(AddressBounds {
+                root: None,
+                lo: 0,
+                hi,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn scale_rootless(lo: i64, hi: i64, scale: i64) -> Option<AddressBounds> {
+    if scale < 0 {
+        return None;
+    }
+    Some(AddressBounds {
+        root: None,
+        lo: lo.checked_mul(scale)?,
+        hi: hi.checked_mul(scale)?,
+    })
+}
+
+/// Proves the half-open byte range `[slo, shi)` (offsets relative to a single
+/// proven-region `root`) that a `width`-wide store provably stays within.
+/// Returns `None` unless the address reduces to `root + [lo, hi]` over a
+/// `vsp_initial` / fresh-allocation root with representable signed bounds.
+fn proven_store_byte_range(address: &Expr, width: BitWidth) -> Option<(Expr, i64, i64)> {
+    let bounds = address_bounds(address)?;
+    let root = bounds.root?;
+    if !is_proven_region_root(&root) {
+        return None;
+    }
+    let slo = bounds.lo;
+    let shi = bounds.hi.checked_add(i64::from(width.bytes()))?;
+    (slo < shi).then_some((root, slo, shi))
+}
+
+/// Whether a one-byte tracked cell is proven disjoint from a store occupying
+/// `[slo, shi)` over `store_root`. A same-root cell is disjoint iff its offset
+/// is outside the range; a cell in a different proven-region (another named
+/// base / distinct fresh allocation) is disjoint by region; everything else
+/// (concrete cells, unprovable roots) is treated as possibly aliasing and
+/// discarded.
+fn store_range_disjoint_from_cell(
+    store_root: &Expr,
+    slo: i64,
+    shi: i64,
+    cell_address: &Expr,
+) -> bool {
+    let Some(PointerAffine {
+        root: Some(cell_root),
+        coefficient: 1,
+        constant,
+    }) = pointer_affine(cell_address)
+    else {
+        return false;
+    };
+    if !is_proven_region_root(&cell_root) {
+        return false;
+    }
+    if &cell_root == store_root {
+        let offset = i64::from_ne_bytes(constant.to_ne_bytes());
+        offset < slo || offset >= shi
+    } else {
+        // Two distinct proven regions (vsp stack vs a fresh allocation, or two
+        // distinct fresh allocations) never alias.
+        true
     }
 }
 
@@ -2455,6 +2710,80 @@ mod tests {
             report.final_vsp,
             Expr::register(BitWidth::W64, "vsp_initial")
         );
+    }
+
+    // (c) Two provably-disjoint stack-relative stores: an array store bounded to
+    // `vsp_initial + [64, 1088)` (index is a zero-extended byte scaled by 4) is
+    // proven disjoint from a tracked cell below it. The disjoint cell is
+    // preserved precisely, no assumption is taken, memory is not tainted, and the
+    // post-store branch state survives.
+    #[test]
+    fn bounded_array_store_preserves_range_disjoint_stack_cell() {
+        let mut machine = default_machine();
+        // Branch-relevant cell well below the array window.
+        machine
+            .store_memory(&stack_address(-8), &Expr::constant(BitWidth::W64, 0x1234))
+            .expect("seed disjoint low cell");
+        // A cell inside the array window must be discarded.
+        machine
+            .store_memory(&stack_address(80), &Expr::constant(BitWidth::W64, 0x99))
+            .expect("seed in-window cell");
+        // Address: (zext_W8(index) << 2) + (vsp_initial + 64).
+        let index = Expr::resize(
+            ResizeOp::ZeroExtend,
+            BitWidth::W64,
+            Expr::register(BitWidth::W8, "array_index"),
+        )
+        .expect("zero-extend index");
+        let scaled = Expr::binary(BinaryOp::Shl, index, Expr::constant(BitWidth::W64, 2))
+            .expect("scale index");
+        let address = Expr::binary(BinaryOp::Add, scaled, stack_address(64)).expect("array address");
+        let range = proven_store_byte_range(&address, BitWidth::W32).expect("bounded range");
+        assert_eq!((range.1, range.2), (64, 64 + 1020 + 4));
+        machine
+            .store_external(5, address, Expr::constant(BitWidth::W32, 0x55))
+            .expect("bounded store narrows");
+        assert!(!machine.memory_tainted);
+        assert!(!machine.assumed_external_disjoint_from_vm_stack);
+        assert_eq!(machine.memory_havocs.len(), 1);
+        // The disjoint low cell survives precisely.
+        let preserved = machine
+            .load_memory(stack_address(-8), BitWidth::W64)
+            .expect("load preserved cell");
+        assert!(matches!(preserved.kind, ExprKind::Const { value: 0x1234 }));
+        // The in-window cell was discarded (reads back as a fresh unknown).
+        let discarded = machine
+            .load_memory(stack_address(80), BitWidth::W64)
+            .expect("load discarded cell");
+        assert!(is_free_read(&discarded));
+    }
+
+    // (d) Fail-closed: a vsp-rooted store with an UNPROVABLE (full-width symbolic)
+    // offset cannot be bounded to a range, so no cell is proven disjoint and the
+    // conservative full havoc (taint) is kept — a possibly-aliasing store never
+    // preserves a cell.
+    #[test]
+    fn unprovable_offset_store_still_full_havocs() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(&stack_address(-8), &Expr::constant(BitWidth::W64, 0x1234))
+            .expect("seed cell");
+        // vsp_initial + opaque 64-bit index: no provable bound on the index.
+        let address = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "vsp_initial"),
+            Expr::register(BitWidth::W64, "opaque_index"),
+        )
+        .expect("symbolic offset address");
+        assert!(proven_store_byte_range(&address, BitWidth::W32).is_none());
+        machine
+            .store_external(5, address, Expr::constant(BitWidth::W32, 0x55))
+            .expect("unprovable store over-approximated");
+        assert!(machine.memory_tainted);
+        let reloaded = machine
+            .load_memory(stack_address(-8), BitWidth::W64)
+            .expect("load");
+        assert!(is_free_read(&reloaded));
     }
 
     #[test]
