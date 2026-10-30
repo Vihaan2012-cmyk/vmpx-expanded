@@ -2,42 +2,148 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use serde_json::Value;
 
 use crate::runner::{Action, JobResult};
+use crate::theme::{ACCENT, BAD, OK};
 
-const OK: Color32 = Color32::from_rgb(90, 200, 120);
-const BAD: Color32 = Color32::from_rgb(230, 100, 100);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultTab {
+    Summary,
+    RawJson,
+    Stdout,
+    Stderr,
+}
 
-pub fn show(ui: &mut Ui, result: &JobResult) {
-    ui.horizontal_wrapped(|ui| {
-        ui.strong(result.action.label());
+pub fn default_tab(result: &JobResult) -> ResultTab {
+    if result.json.is_some() {
+        ResultTab::Summary
+    } else if result.stdout.trim().is_empty() && !result.stderr.trim().is_empty() {
+        ResultTab::Stderr
+    } else {
+        ResultTab::Stdout
+    }
+}
+
+/// The text the Copy and Save buttons act on for a tab.
+fn tab_text(result: &JobResult, tab: ResultTab) -> String {
+    match (tab, &result.json) {
+        (ResultTab::Summary | ResultTab::RawJson, Some(json)) => pretty(json),
+        (ResultTab::Stderr, _) => result.stderr.clone(),
+        _ => result.stdout.clone(),
+    }
+}
+
+fn banner(ui: &mut Ui, result: &JobResult) {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(58, 28, 30))
+        .stroke(egui::Stroke::new(1.0_f32, BAD))
+        .rounding(5.0)
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let title = match (&result.error, result.exit_code) {
+                (Some(error), _) => error.clone(),
+                (None, Some(code)) => format!("Process exited with code {code}"),
+                (None, None) => "Process ended without an exit code".to_owned(),
+            };
+            ui.label(RichText::new(title).strong().color(BAD));
+            let stderr = result.stderr.trim();
+            if !stderr.is_empty() {
+                let head: Vec<&str> = stderr.lines().take(8).collect();
+                ui.label(
+                    RichText::new(head.join(
+                        "
+",
+                    ))
+                    .monospace(),
+                );
+                if stderr.lines().count() > head.len() {
+                    ui.weak("... see the Stderr tab for the rest");
+                }
+            }
+        });
+    ui.add_space(4.0);
+}
+
+/// Returns a status note after a copy or save.
+pub fn show(ui: &mut Ui, result: &JobResult, tab: &mut ResultTab) -> Option<String> {
+    let mut note = None;
+    ui.horizontal(|ui| {
         match result.exit_code {
             Some(0) => ui.colored_label(OK, "exit 0"),
             Some(code) => ui.colored_label(BAD, format!("exit {code}")),
             None => ui.colored_label(BAD, "no exit code"),
         };
-        ui.weak(format!("{:.2}s", result.elapsed.as_secs_f64()));
+        ui.label(format!("{:.2}s", result.elapsed.as_secs_f64()));
+        ui.separator();
+        ui.selectable_value(tab, ResultTab::Summary, "Summary");
+        if result.json.is_some() {
+            ui.selectable_value(tab, ResultTab::RawJson, "Raw JSON");
+        }
+        ui.selectable_value(tab, ResultTab::Stdout, "Stdout");
+        let stderr = if result.stderr.trim().is_empty() {
+            RichText::new("Stderr")
+        } else {
+            RichText::new("Stderr").color(BAD)
+        };
+        ui.selectable_value(tab, ResultTab::Stderr, stderr);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Save").clicked() {
+                note = save(result, *tab);
+            }
+            if ui.button("Copy").clicked() {
+                let text = tab_text(result, *tab);
+                note = Some(format!("copied {} bytes", text.len()));
+                ui.ctx().copy_text(text);
+            }
+        });
     });
-    ui.weak(&result.command_line);
-    if let Some(error) = &result.error {
-        ui.colored_label(BAD, error);
+    if *tab == ResultTab::RawJson && result.json.is_none() {
+        *tab = ResultTab::Stdout;
     }
     ui.separator();
+    if result.failed() {
+        banner(ui, result);
+    }
 
     egui::ScrollArea::both()
         .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            if let Some(json) = &result.json {
-                egui::CollapsingHeader::new("Summary")
-                    .default_open(true)
-                    .show(ui, |ui| summary(ui, result.action, json));
-                ui.collapsing("Raw JSON", |ui| raw(ui, &pretty(json)));
-            } else if !result.stdout.trim().is_empty() {
-                egui::CollapsingHeader::new("Output")
-                    .default_open(true)
-                    .show(ui, |ui| raw(ui, &result.stdout));
-            } else {
-                ui.label("No stdout.");
-            }
+        .show(ui, |ui| match *tab {
+            ResultTab::Summary => match &result.json {
+                Some(json) => summary(ui, result.action, json),
+                None => text_or_empty(ui, &result.stdout, "No structured output."),
+            },
+            ResultTab::RawJson => match &result.json {
+                Some(json) => raw(ui, &pretty(json)),
+                None => text_or_empty(ui, &result.stdout, "No JSON output."),
+            },
+            ResultTab::Stdout => text_or_empty(ui, &result.stdout, "No stdout."),
+            ResultTab::Stderr => text_or_empty(ui, &result.stderr, "No stderr."),
         });
+    note
+}
+
+fn save(result: &JobResult, tab: ResultTab) -> Option<String> {
+    let json_tab = matches!(tab, ResultTab::Summary | ResultTab::RawJson) && result.json.is_some();
+    let (name, filter) = if json_tab {
+        (format!("vmpx-{}.json", result.action.subcommand()), "json")
+    } else {
+        (format!("vmpx-{}.txt", result.action.subcommand()), "txt")
+    };
+    let path = rfd::FileDialog::new()
+        .set_file_name(name)
+        .add_filter(filter, &[filter])
+        .save_file()?;
+    Some(match std::fs::write(&path, tab_text(result, tab)) {
+        Ok(()) => format!("saved {}", path.display()),
+        Err(error) => format!("save failed: {error}"),
+    })
+}
+
+fn text_or_empty(ui: &mut Ui, text: &str, empty: &str) {
+    if text.trim().is_empty() {
+        ui.weak(empty);
+    } else {
+        raw(ui, text);
+    }
 }
 
 fn pretty(value: &Value) -> String {
@@ -87,6 +193,7 @@ fn summary(ui: &mut Ui, action: Action, json: &Value) {
     match action {
         Action::Detect => protection(ui, json),
         Action::Clean => clean(ui, json),
+        Action::Compare => compare(ui, json),
         Action::VmList => vm_list(ui, json),
         _ => generic(ui, json),
     }
@@ -357,6 +464,52 @@ fn vm_list(ui: &mut Ui, json: &Value) {
             });
     }
     list(ui, "Diagnostics", json.get("diagnostics"));
+}
+
+fn compare(ui: &mut Ui, json: &Value) {
+    let differences = items(json.get("differences"));
+    let color = if differences.is_empty() { OK } else { ACCENT };
+    egui::CollapsingHeader::new(
+        RichText::new(format!("Differences ({})", differences.len())).color(color),
+    )
+    .default_open(true)
+    .show(ui, |ui| {
+        if differences.is_empty() {
+            ui.weak("no modeled structural differences");
+        }
+        for difference in differences {
+            ui.monospace(scalar(difference));
+        }
+    });
+    let (left, right) = (json.get("left"), json.get("right"));
+    let keys: Vec<&String> = left
+        .and_then(Value::as_object)
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    egui::CollapsingHeader::new("Side by side")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("compare_grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("field");
+                    ui.strong("left");
+                    ui.strong("right");
+                    ui.end_row();
+                    for key in keys {
+                        let (l, r) = (
+                            left.and_then(|v| v.get(key)),
+                            right.and_then(|v| v.get(key)),
+                        );
+                        ui.label(key);
+                        ui.monospace(l.map_or_else(|| "-".into(), scalar));
+                        let same = l == r;
+                        let text = RichText::new(r.map_or_else(|| "-".into(), scalar)).monospace();
+                        ui.label(if same { text } else { text.color(ACCENT) });
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 /// Top-level scalars inline; arrays and objects as collapsible sections.
