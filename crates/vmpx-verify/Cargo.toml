@@ -8,6 +8,13 @@ rust-version.workspace = true
 [dependencies]
 vmpx-mutation = { path = "../vmpx-mutation" }
 vmpx-vm = { path = "../vmpx-vm" }
+z3 = { version = "0.22", optional = true }
+
+[features]
+# Real SMT backend (Z3). Off by default: needs a system libz3 (headers + lib);
+# `smt-z3-bundled` instead builds Z3 from source (needs cmake + a C++ compiler).
+smt-z3 = ["dep:z3"]
+smt-z3-bundled = ["smt-z3", "z3/bundled"]
 
 [lints]
 workspace = true
