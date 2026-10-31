@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use vmpx_detect::{DetectionVerdict, ImageLayout, ProtectionReport, detect_vmprotect};
 use vmpx_disasm::{CfgLimits, DirectJumpTraceLimits, collect_dangling_refs, recover_cfg};
@@ -753,6 +753,95 @@ fn locate_original(input_path: &str) -> Option<std::path::PathBuf> {
         Some(dir.join(&stripped)),
     ];
     candidates.into_iter().flatten().find(|p| p.is_file())
+}
+
+/// Observed-tier outcome of rebuilding a standalone PE from a detonation memory
+/// dump (`clean --dynamic --experimental --dump-pe`). Every field reflects ONE
+/// contained run's memory state; nothing here is sound, and it never touches the
+/// proof-gated `output`.
+#[derive(Clone, Debug)]
+pub struct DumpPeOutcome {
+    pub bytes: Vec<u8>,
+    pub steps: usize,
+    pub stop: String,
+    pub observed_oep: Option<u64>,
+    pub total_regions: usize,
+    pub module_regions: usize,
+    pub sections: usize,
+    pub size_of_image: u32,
+    pub file_size: u64,
+    pub loader_summary: String,
+}
+
+/// EXPERIMENTAL dynamic-assist: detonate the sample in the contained software
+/// emulator, snapshot its mapped memory, and rebuild a conventional, loader-valid
+/// standalone PE from the MODULE portion of that snapshot (the fake sysdll/TEB/
+/// stub/heap/stack pools are filtered out by `rebuild_module_pe`).
+///
+/// This is an OBSERVED artifact reflecting one run's memory state — it is NOT a
+/// sound devirtualization and does not affect the proof-gated `output`. If the
+/// dump lacks the module headers or the reconstruction is not loader-valid, this
+/// fails with a clear error rather than writing anything.
+///
+/// # Errors
+///
+/// Propagates a PE parse failure, a detonation that could not start, an absent
+/// memory dump, or a `rebuild_module_pe`/loader-validation failure.
+pub fn rebuild_dumped_pe(input_path: &str, input: &[u8]) -> Result<DumpPeOutcome> {
+    let pe = PeImage::parse(input).context("[dump-pe] input is not a supported PE")?;
+    let size_of_image = pe.optional.size_of_image;
+    let mut warnings = Vec::new();
+    let export_reference = dynamic_export_reference(input_path, &mut warnings);
+    for warning in &warnings {
+        eprintln!("{warning}");
+    }
+    let base = vmpx_emulate::DetonateOptions::default();
+    let max_steps = std::env::var("VMPX_DYNAMIC_MAXSTEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(base.max_steps);
+    let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, dump: true, ..base };
+    let result = vmpx_emulate::detonate(&pe, &opts)
+        .map_err(|error| anyhow!("[dump-pe] detonation could not start: {error:?}"))?;
+    let dump = result
+        .dump
+        .ok_or_else(|| anyhow!("[dump-pe] detonation produced no memory dump"))?;
+    let total_regions = dump.regions.len();
+    let module_end = dump.image_base.saturating_add(u64::from(size_of_image));
+    let module_regions = dump
+        .regions
+        .iter()
+        .filter(|region| region.va >= dump.image_base && region.va < module_end)
+        .count();
+    let bytes = vmpx_emulate::rebuild_module_pe(&dump, u64::from(size_of_image))
+        .map_err(|error| anyhow!("[dump-pe] rebuild_module_pe failed: {error}"))?;
+    let rebuilt = PeImage::parse(&bytes).context("[dump-pe] rebuilt PE failed reparse")?;
+    let validation = validate_for_loader(&bytes)
+        .map_err(|error| anyhow!("[dump-pe] rebuilt PE failed loader validation: {error}"))?;
+    let loader_summary = format!(
+        "{} import symbol(s) in {} module(s), {} export(s), {} TLS callback(s), {} relocation(s), entry_executable={}",
+        validation.import_symbols,
+        validation.import_modules,
+        validation.exports,
+        validation.tls_callbacks,
+        validation.relocation_entries,
+        validation.entry_executable,
+    );
+    let sections = rebuilt.sections.len();
+    let size_of_image = rebuilt.optional.size_of_image;
+    let file_size = bytes.len() as u64;
+    Ok(DumpPeOutcome {
+        bytes,
+        steps: result.steps,
+        stop: format!("{:?}", result.stop),
+        observed_oep: result.observed.oep,
+        total_regions,
+        module_regions,
+        sections,
+        size_of_image,
+        file_size,
+        loader_summary,
+    })
 }
 
 #[allow(clippy::too_many_lines)]

@@ -65,6 +65,12 @@ enum Command {
         /// path and its blockers are never affected.
         #[arg(long, requires = "experimental")]
         dynamic: bool,
+        /// With `--dynamic`, also rebuild a conventional, loadable standalone PE
+        /// from the detonation memory dump (the "dumped DLL") and write it here.
+        /// OBSERVED artifact: it reflects one run's memory state, is never
+        /// loader-verified as sound, and does not affect the proof-gated `output`.
+        #[arg(long, requires = "dynamic")]
+        dump_pe: Option<PathBuf>,
         /// With `--experimental`, attempt to strip protector (non-standard-named)
         /// sections from the reintegrated image. Only removes them when the sound
         /// dangling-ref checker approves and the result validates; otherwise it
@@ -766,6 +772,7 @@ fn main() -> Result<()> {
             experimental,
             decoded_lift,
             dynamic,
+            dump_pe,
             strip,
         } => {
             if input == output {
@@ -799,6 +806,19 @@ fn main() -> Result<()> {
                         && fs::canonicalize(&input).ok() == fs::canonicalize(path).ok()))
             {
                 bail!("experimental path aliases an input, output, report, or reconstructed file");
+            }
+            if let Some(path) = &dump_pe
+                && (path == &input
+                    || path == &output
+                    || report.as_ref() == Some(path)
+                    || reconstructed.as_ref() == Some(path)
+                    || experimental.as_ref() == Some(path)
+                    || (path.exists()
+                        && fs::canonicalize(&input).ok() == fs::canonicalize(path).ok()))
+            {
+                bail!(
+                    "dump-pe path aliases an input, output, report, reconstructed, or experimental file"
+                );
             }
             let input_data = read_file(&input)?;
             let (mut clean, conventional, reintegrated) =
@@ -922,6 +942,40 @@ fn main() -> Result<()> {
                         path.display()
                     ),
                 }
+            }
+            // EXPERIMENTAL dynamic-assist: rebuild a standalone PE from the
+            // detonation memory dump. Observed-tier only; it never touches the
+            // proof-gated `output` path below.
+            if let Some(path) = &dump_pe {
+                let outcome = clean::rebuild_dumped_pe(&input.display().to_string(), &input_data)?;
+                fs::write(path, &outcome.bytes)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                let disk = read_file(path)?;
+                PeImage::parse(&disk).with_context(|| {
+                    format!("dump-pe output {} failed disk reparse", path.display())
+                })?;
+                eprintln!(
+                    "[dump-pe] WARNING: OBSERVED artifact (one run's memory state), not a sound result"
+                );
+                println!(
+                    "[dump-pe] detonation ran {} instr(s), stop={}, observed oep={}",
+                    outcome.steps,
+                    outcome.stop,
+                    outcome
+                        .observed_oep
+                        .map_or_else(|| "none".to_owned(), |oep| format!("{oep:#X}"))
+                );
+                println!(
+                    "[dump-pe] filtered module: {} of {} dumped region(s) are the module",
+                    outcome.module_regions, outcome.total_regions
+                );
+                println!(
+                    "[dump-pe] rebuilt standalone PE: {} bytes, {} section(s), size_of_image={:#X}",
+                    outcome.file_size, outcome.sections, outcome.size_of_image
+                );
+                println!("[dump-pe] loader validation passed: {}", outcome.loader_summary);
+                println!("[dump-pe] {}", path.display());
+                println!("[verify] dumped PE reparsed successfully from disk");
             }
             if !clean.ready_to_write {
                 if let Some(report_path) = report {

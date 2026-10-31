@@ -67,7 +67,10 @@ pub use detonate::{
     DetonateError, DetonateOptions, DetonationResult, detonate, export_reference_from_exports,
     export_reference_from_imports,
 };
-pub use dump::{DumpImage, DumpRegion, OepHook, capture_globals, dump_image};
+pub use dump::{
+    DumpImage, DumpRegion, OepHook, RebuildModuleError, capture_globals, dump_image,
+    rebuild_module_pe,
+};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
 pub use differential::{
     DiffRecord, DiffReport, Divergence, Incomplete, Limits, Outcome, OutputRegion, RunError,
