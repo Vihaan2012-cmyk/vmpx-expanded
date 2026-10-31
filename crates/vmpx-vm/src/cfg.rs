@@ -94,9 +94,9 @@ impl Default for VmCfgLimits {
             max_total_instructions: 200_000,
             max_targets: 16,
             max_nested_entries: 8,
-            max_profile_transitions: 3,
-            max_transition_visits: 16,
-            max_transition_instructions: 1_500,
+            max_profile_transitions: 8,
+            max_transition_visits: 64,
+            max_transition_instructions: 6_000,
             max_loop_unrolls: 4,
         }
     }
@@ -2238,17 +2238,31 @@ impl Walker<'_, '_> {
                 return;
             }
         };
-        if setup.profile != self.ctx_profile()
-            || bootstrap_global_table(&setup.bootstrap) != self.ctx_global_table()
-            || bytecode_section(self.pe, setup.bootstrap.initial_state.vip) != self.ctx_section()
-        {
-            self.stall(
-                key,
-                vip,
-                format!("nested VM entry {at} is not proven to share this VM's profile"),
-            );
-            return;
-        }
+        // The nested entry's OWN profile, proven by `prepare_entry_stream` (its
+        // bootstrap dispatch, register roles, and bytecode direction all recover
+        // or this is an `Err` stall above). When it matches the current region we
+        // continue under the active profile (byte-for-byte as before); when it
+        // differs we continue under the nested entry's own proven profile instead
+        // of stalling. Sound: nothing is guessed — the switch rides the same
+        // positive proof that recovers any root entry, and a wrong profile only
+        // misdirects decoding, which then fails closed (the oracle never inflates).
+        // Bounded: still one nested entry, capped by `max_nested_entries`.
+        let nested_global_table = bootstrap_global_table(&setup.bootstrap);
+        let nested_section = bytecode_section(self.pe, setup.bootstrap.initial_state.vip);
+        let shares_profile = setup.profile == self.ctx_profile()
+            && nested_global_table == self.ctx_global_table()
+            && nested_section == self.ctx_section();
+        let nested_profile = if shares_profile {
+            self.active.clone()
+        } else {
+            Some(Rc::new(ProfileContext {
+                config: entry_stream_config(&setup.profile, self.limits.entry),
+                profile: setup.profile,
+                direction: setup.profile.bytecode_direction,
+                global_table: nested_global_table,
+                section: nested_section,
+            }))
+        };
         let (cells, top_offset) = match recover_entry_frame(
             self.pe,
             &candidate,
@@ -2299,7 +2313,7 @@ impl Walker<'_, '_> {
             address: Some(setup.bootstrap.initial_state.vip),
             symbolic: initial,
             path: self.current.clone(),
-            profile: self.active.clone(),
+            profile: nested_profile,
         });
     }
 

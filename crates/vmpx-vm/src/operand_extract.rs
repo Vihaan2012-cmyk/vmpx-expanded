@@ -11,7 +11,7 @@ use crate::{
     dispatch_extract::{
         canonical, immediate_transform, instruction_writes_value, is_active, is_source_load,
         key_operation, recover_key_updates, same_register_value, signed_immediate,
-        source_load_width, writes_register,
+        source_load_width, vip_self_offset_delta, writes_register,
     },
 };
 
@@ -436,21 +436,6 @@ pub fn extract_operand_codecs_mode(
             });
             continue;
         }
-        if direction == BytecodeDirection::Ascending
-            && decoded[..source_index].iter().any(|decoded| {
-                dispositions
-                    .get(&decoded.rva)
-                    .copied()
-                    .is_some_and(is_active)
-                    && writes_register(&mut factory, &decoded.instruction, canonical(roles.vip))
-            })
-        {
-            rejected_sources.push(KeyedOperandCodecRejection {
-                encoded_load: source.rva,
-                reason: "VIP is modified before the encoded operand load".to_owned(),
-            });
-            continue;
-        }
         let next_source = source_indices
             .get(position + 1)
             .copied()
@@ -477,44 +462,39 @@ pub fn extract_operand_codecs_mode(
             .checked_sub(1)
             .and_then(|previous| source_indices.get(previous).copied());
         let prefix_start = previous_source.map_or(0, |index| index + 1);
+        // Fold every pre-source VIP write into the starting delta when each is a
+        // provable constant self-offset (the descending predecrement, or an
+        // ascending pre-increment). The net is validated against the operand
+        // width downstream, so a wrong fold stalls there; any non-self-offset
+        // write fails closed here. Scoped to the VIP role only.
         let mut prefix_vip_delta = 0_i64;
         let mut prefix_error = None;
-        if direction == BytecodeDirection::Descending {
-            for decoded in &decoded[prefix_start..source_index] {
-                if !dispositions
-                    .get(&decoded.rva)
-                    .copied()
-                    .is_some_and(is_active)
-                    || !writes_register(
-                        &mut InstructionInfoFactory::new(),
-                        &decoded.instruction,
-                        canonical(roles.vip),
-                    )
-                {
-                    continue;
-                }
-                let instruction = &decoded.instruction;
-                if instruction.op0_kind() != OpKind::Register
-                    || instruction.op0_register().size() != 8
-                    || !matches!(instruction.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
-                {
-                    prefix_error = Some(format!(
-                        "descending VIP has an unmodelled pre-source write at {}",
-                        decoded.rva
-                    ));
-                    break;
-                }
-                let Some(delta) = signed_immediate(instruction, 1) else {
-                    prefix_error = Some("descending VIP adjustment is not immediate".to_owned());
-                    break;
-                };
-                prefix_vip_delta = match instruction.mnemonic() {
-                    Mnemonic::Add => prefix_vip_delta.checked_add(delta),
-                    Mnemonic::Sub => prefix_vip_delta.checked_sub(delta),
-                    _ => unreachable!(),
-                }
-                .unwrap_or(i64::MAX);
+        for decoded in &decoded[prefix_start..source_index] {
+            if !dispositions
+                .get(&decoded.rva)
+                .copied()
+                .is_some_and(is_active)
+                || !writes_register(
+                    &mut InstructionInfoFactory::new(),
+                    &decoded.instruction,
+                    canonical(roles.vip),
+                )
+            {
+                continue;
             }
+            let Some(delta) = vip_self_offset_delta(&decoded.instruction, roles.vip) else {
+                prefix_error = Some(format!(
+                    "{} VIP has an unmodelled pre-source write at {}",
+                    if direction == BytecodeDirection::Descending {
+                        "descending"
+                    } else {
+                        "ascending"
+                    },
+                    decoded.rva
+                ));
+                break;
+            };
+            prefix_vip_delta = prefix_vip_delta.checked_add(delta).unwrap_or(i64::MAX);
         }
         if let Some(reason) = prefix_error {
             rejected_sources.push(KeyedOperandCodecRejection {
@@ -852,6 +832,88 @@ mod tests {
             });
         }
         decoded
+    }
+
+    fn descending_prefix_rejections(assembler: CodeAssembler) -> Vec<String> {
+        use vmpx_disasm::{DirectJumpFragment, DirectJumpTraceStop, DirectJumpTraceStopKind};
+        use crate::{HandlerSliceConfig, backward_slice_handler_trace};
+        let instructions = decode_for_test(assembler);
+        let terminal = instructions.last().expect("at least one instruction");
+        let (terminal_rva, end) = (terminal.rva, terminal.next_rva().expect("end rva"));
+        let trace = DirectJumpTrace {
+            entry: Rva(0x1000),
+            decoded_instructions: instructions.len(),
+            fragments: vec![DirectJumpFragment {
+                start: Rva(0x1000),
+                end,
+                instructions,
+                next_fragment: None,
+            }],
+            stop: DirectJumpTraceStop {
+                kind: DirectJumpTraceStopKind::IndirectBranch,
+                at: terminal_rva,
+                direct_target: None,
+                fallthrough: None,
+                detail: None,
+            },
+        };
+        let roles = HandlerRegisterRoles {
+            vip: Register::R15,
+            rolling_key: Register::RBP,
+            handler: Register::R14,
+        };
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![Register::R11, Register::R14, Register::R15, Register::RBP],
+                live_out_rflags: 0,
+            },
+        );
+        extract_operand_codecs_mode(
+            &trace,
+            &slice,
+            roles,
+            &BTreeSet::new(),
+            BytecodeDirection::Descending,
+            false,
+        )
+        .rejected_sources
+        .into_iter()
+        .map(|rejection| rejection.reason)
+        .collect()
+    }
+
+    /// A descending `lea vip,[vip-w]` predecrement is a provable constant
+    /// self-offset, so the pre-source gate folds it instead of rejecting the
+    /// operand; FAIL-CLOSED: a value-carrying `mov vip,reg` predecrement stays an
+    /// unmodelled pre-source write and the source is rejected.
+    #[test]
+    fn descending_prefix_folds_self_offset_and_rejects_unmodelled_write() {
+        let mut folded = CodeAssembler::new(64).expect("x64 assembler");
+        folded.lea(r15, qword_ptr(r15 - 1)).expect("lea predecrement");
+        folded.movzx(ecx, byte_ptr(r15)).expect("operand load");
+        folded.xor(cl, bpl).expect("key mix");
+        folded.add(r14, rcx).expect("handler update");
+        folded.jmp(r14).expect("dispatch");
+        assert!(
+            !descending_prefix_rejections(folded)
+                .iter()
+                .any(|reason| reason.contains("unmodelled pre-source write")),
+            "a lea predecrement is a constant self-offset and must be folded"
+        );
+
+        let mut unmodelled = CodeAssembler::new(64).expect("x64 assembler");
+        unmodelled.mov(r15, rax).expect("value-carrying VIP write");
+        unmodelled.movzx(ecx, byte_ptr(r15)).expect("operand load");
+        unmodelled.xor(cl, bpl).expect("key mix");
+        unmodelled.add(r14, rcx).expect("handler update");
+        unmodelled.jmp(r14).expect("dispatch");
+        assert!(
+            descending_prefix_rejections(unmodelled)
+                .iter()
+                .any(|reason| reason.contains("unmodelled pre-source write")),
+            "a mov vip,reg predecrement must fail closed"
+        );
     }
 
     fn keyless_candidate(assembler: CodeAssembler) -> Result<KeyedOperandCodecCandidate, String> {

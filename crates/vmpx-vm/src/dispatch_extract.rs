@@ -239,6 +239,36 @@ pub(crate) fn signed_immediate(instruction: &Instruction, operand: u32) -> Optio
     }
 }
 
+/// Signed byte delta of a VIP write that is a provable constant self-offset
+/// (`vip += imm`/`vip -= imm`, `inc`/`dec vip`, `lea vip,[vip+imm]`): the result
+/// is the prior VIP plus a constant, so the cursor advances by a known amount and
+/// the VIP-relative decode is unaffected. Returns `None` for any other write (a
+/// `mov vip,x`, an indexed `lea`, a sub-64-bit write), which keeps the caller's
+/// fail-closed stall. Scoped to the VIP role only.
+pub(crate) fn vip_self_offset_delta(instruction: &Instruction, vip: Register) -> Option<i64> {
+    if instruction.op0_kind() != OpKind::Register
+        || canonical(instruction.op0_register()) != canonical(vip)
+        || instruction.op0_register().size() != 8
+    {
+        return None;
+    }
+    match instruction.mnemonic() {
+        Mnemonic::Add => signed_immediate(instruction, 1),
+        Mnemonic::Sub => signed_immediate(instruction, 1).and_then(i64::checked_neg),
+        Mnemonic::Inc => Some(1),
+        Mnemonic::Dec => Some(-1),
+        Mnemonic::Lea
+            if instruction.op1_kind() == OpKind::Memory
+                && canonical(instruction.memory_base()) == canonical(vip)
+                && instruction.memory_index() == Register::None =>
+        {
+            // Reinterpret the two's-complement displacement as signed.
+            Some(instruction.memory_displacement64() as i64)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn key_operation(mnemonic: Mnemonic) -> Option<KeyOperation> {
     match mnemonic {
         Mnemonic::Add => Some(KeyOperation::Add),
@@ -601,23 +631,15 @@ fn attempt_candidate(
                 continue;
             }
             if direction == BytecodeDirection::Descending && index >= local_prefix_start {
-                if instruction.op0_kind() != OpKind::Register
-                    || instruction.op0_register().size() != 8
-                    || !matches!(instruction.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
-                {
+                let Some(delta) = vip_self_offset_delta(instruction, roles.vip) else {
                     return Err(format!(
                         "descending VIP has an unmodelled pre-source write at {}",
                         decoded.rva
                     ));
-                }
-                let delta = signed_immediate(instruction, 1)
-                    .ok_or_else(|| "descending VIP adjustment is not immediate".to_owned())?;
-                vip_delta = match instruction.mnemonic() {
-                    Mnemonic::Add => vip_delta.checked_add(delta),
-                    Mnemonic::Sub => vip_delta.checked_sub(delta),
-                    _ => unreachable!(),
-                }
-                .ok_or_else(|| "descending VIP adjustment overflows".to_owned())?;
+                };
+                vip_delta = vip_delta
+                    .checked_add(delta)
+                    .ok_or_else(|| "descending VIP adjustment overflows".to_owned())?;
                 continue;
             }
             if !has_prior_source {
@@ -2205,5 +2227,93 @@ mod tests {
         high_byte.add(r14, rax).expect("handler update");
         high_byte.jmp(r14).expect("dispatch");
         assert!(report_from_assembler(high_byte).candidates.is_empty());
+    }
+
+    fn decode_one(mut assembler: CodeAssembler) -> iced_x86::Instruction {
+        let bytes = assembler.assemble(0x1_4000_1000).expect("assemble one");
+        let mut decoder = Decoder::with_ip(64, &bytes, 0x1_4000_1000, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert_ne!(instruction.code(), Code::INVALID);
+        instruction
+    }
+
+    /// Each provable constant self-offset of the VIP register yields its exact
+    /// signed byte delta, so the cursor advance is accounted precisely.
+    #[test]
+    fn vip_self_offset_delta_accounts_each_constant_self_offset() {
+        let add = |mut a: CodeAssembler| {
+            a.add(r15, 4).expect("add");
+            a
+        };
+        let sub = |mut a: CodeAssembler| {
+            a.sub(r15, 8).expect("sub");
+            a
+        };
+        let inc = |mut a: CodeAssembler| {
+            a.inc(r15).expect("inc");
+            a
+        };
+        let dec = |mut a: CodeAssembler| {
+            a.dec(r15).expect("dec");
+            a
+        };
+        let lea_pos = |mut a: CodeAssembler| {
+            a.lea(r15, qword_ptr(r15 + 4)).expect("lea+");
+            a
+        };
+        let lea_neg = |mut a: CodeAssembler| {
+            a.lea(r15, qword_ptr(r15 - 8)).expect("lea-");
+            a
+        };
+        let one = |build: &dyn Fn(CodeAssembler) -> CodeAssembler| {
+            build(CodeAssembler::new(64).expect("asm"))
+        };
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&add)), Register::R15), Some(4));
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&sub)), Register::R15), Some(-8));
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&inc)), Register::R15), Some(1));
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&dec)), Register::R15), Some(-1));
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&lea_pos)), Register::R15), Some(4));
+        assert_eq!(vip_self_offset_delta(&decode_one(one(&lea_neg)), Register::R15), Some(-8));
+    }
+
+    /// FAIL-CLOSED: a VIP write that is NOT a provable constant self-offset — a
+    /// value-carrying `mov`, an index-register `lea`, or a sub-64-bit write — is
+    /// unmodelled, so the gate returns `None` and the caller keeps its stall. A
+    /// wrong classification here is the only way a pre-source write could
+    /// false-recover, so this is the soundness boundary.
+    #[test]
+    fn vip_self_offset_delta_rejects_unmodelled_writes() {
+        let mov_reg = {
+            let mut a = CodeAssembler::new(64).expect("asm");
+            a.mov(r15, rax).expect("mov vip,reg");
+            a
+        };
+        let mov_imm = {
+            let mut a = CodeAssembler::new(64).expect("asm");
+            a.mov(r15, 0x1234i64).expect("mov vip,imm");
+            a
+        };
+        let lea_indexed = {
+            let mut a = CodeAssembler::new(64).expect("asm");
+            a.lea(r15, qword_ptr(r15 + rax)).expect("indexed lea");
+            a
+        };
+        let lea_other_base = {
+            let mut a = CodeAssembler::new(64).expect("asm");
+            a.lea(r15, qword_ptr(rax + 4)).expect("other-base lea");
+            a
+        };
+        let sub_word = {
+            let mut a = CodeAssembler::new(64).expect("asm");
+            a.sub(r15w, 4i32).expect("16-bit sub");
+            a
+        };
+        for assembler in [mov_reg, mov_imm, lea_indexed, lea_other_base, sub_word] {
+            assert_eq!(
+                vip_self_offset_delta(&decode_one(assembler), Register::R15),
+                None,
+                "an unmodelled VIP write must fail closed"
+            );
+        }
     }
 }
