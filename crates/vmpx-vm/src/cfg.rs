@@ -28,7 +28,8 @@ use crate::{
     dispatch_extract::canonical,
     entry_profile::{bootstrap_global_table, entry_stream_config, prepare_entry_stream},
     resolve_vm_profile_roles,
-    enumerate_symbolic_value, execute_symbolic_linear_block_with_initial_state,
+    distinct_node_count_bounded, enumerate_symbolic_value,
+    execute_symbolic_linear_block_with_initial_state,
     execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
     native_context::{
         Provenance, caller_push_source, defines_flags, initial_provenance, is_cursor_capture,
@@ -38,6 +39,19 @@ use crate::{
     recover_and_decode_linear_vm_stream_cached, recover_image_table_targets,
     recover_modulo_image_targets, recover_native_exit_state, value_range, ImageTableBranchLimits,
 };
+
+/// 1.5 GiB per entry: far above any entry that completes, yet small enough that
+/// several concurrent entries stay well inside a 10 GB machine.
+const DEFAULT_MAX_MEMORY_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Over-estimate of the bytes one distinct hash-consed `Expr` node costs: the
+/// node, its `Arc` header, the interner's weak slot and bucket, and allocator
+/// overhead (a measured node is well under half this).
+const EXPR_NODE_BYTES: usize = 256;
+/// Per-root container overhead (`BTreeMap`/`Vec` slot plus the inline `Expr`).
+const STATE_ROOT_BYTES: usize = 128;
+/// Over-estimate of one decoded instruction including its heap-owned bytes.
+const DECODED_INSTRUCTION_BYTES: usize = std::mem::size_of::<DecodedVmInstruction>() + 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmCfgLimits {
@@ -80,6 +94,12 @@ pub struct VmCfgLimits {
     /// state into post-loop join blocks, so an over-large budget stalls those
     /// joins before the widened state can subsume the iterations.
     pub max_loop_unrolls: usize,
+    /// Hard per-entry ceiling on a conservative estimate of the bytes the walker
+    /// retains (symbolic state held in `explored`/`widened`/pending/path nodes,
+    /// plus decoded-instruction buffers). Exceeding it fails the entry closed
+    /// with [`CfgLimitHit::Memory`] before real memory can be exhausted. The
+    /// estimate only over-counts, so an entry under the cap is unaffected.
+    pub max_memory_bytes: usize,
 }
 
 impl Default for VmCfgLimits {
@@ -98,6 +118,7 @@ impl Default for VmCfgLimits {
             max_transition_visits: 64,
             max_transition_instructions: 6_000,
             max_loop_unrolls: 4,
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
         }
     }
 }
@@ -174,6 +195,9 @@ pub enum CfgLimitHit {
     /// (bounds memory: see `VmCfgLimits::max_transition_visits`). The entry fails
     /// closed; it never affects a walk that followed no transition.
     TransitionBudget,
+    /// The byte-accounted per-entry memory cap was exceeded (see
+    /// `VmCfgLimits::max_memory_bytes`). The entry fails closed.
+    Memory,
 }
 
 /// A labeled assumption the recovery relied on, surfaced rather than folded
@@ -614,6 +638,8 @@ fn followable_observed_targets(
 const NESTED_ENTRY_CONFIDENCE: u8 = 60;
 
 struct Item {
+    /// Bytes charged to the walker's live estimate while this item is queued.
+    bytes: usize,
     start: RelativeDispatchState,
     address: Option<Va>,
     symbolic: SymbolicVmInitialState,
@@ -1122,6 +1148,8 @@ struct Walker<'a, 'p> {
     widened: BTreeMap<Va, SymbolicVmInitialState>,
     cfg: VmCfg,
     total_instructions: usize,
+    /// Running over-estimate of live walker bytes; see `VmCfgLimits::max_memory_bytes`.
+    live_bytes: usize,
     /// Observed runtime memory seed for the experimental tier (empty on the
     /// sound path). Consulted only to resolve provably-null image reads.
     observed: &'a crate::ObservedMemory,
@@ -1693,6 +1721,60 @@ impl Walker<'_, '_> {
         })
     }
 
+    /// Conservative bytes held by `state`: distinct shared nodes (each counted
+    /// once per state, so sharing across states only over-counts) plus per-root
+    /// overhead. The node walk stops once it alone would bust the cap.
+    fn state_bytes(&self, state: &SymbolicVmInitialState) -> usize {
+        let roots = std::iter::once(&state.vsp)
+            .chain(std::iter::once(&state.flags))
+            .chain(state.context_values.values())
+            .chain(state.memory_values.iter().flat_map(|(a, v)| [a, v]))
+            .chain(
+                state
+                    .fresh_allocations
+                    .iter()
+                    .flat_map(|f| [&f.allocation, &f.size]),
+            );
+        let node_budget = self
+            .limits
+            .max_memory_bytes
+            .saturating_sub(self.live_bytes)
+            / EXPR_NODE_BYTES;
+        let nodes = distinct_node_count_bounded(roots, node_budget);
+        let root_count = 2
+            + state.context_values.len()
+            + 2 * state.memory_values.len()
+            + 2 * state.fresh_allocations.len();
+        nodes
+            .saturating_mul(EXPR_NODE_BYTES)
+            .saturating_add(root_count.saturating_mul(STATE_ROOT_BYTES))
+    }
+
+    /// Adds `bytes` to the live estimate; on exceeding the cap records
+    /// `CfgLimitHit::Memory` and a stall, and returns false (fail closed).
+    fn charge(&mut self, bytes: usize, key: Va, vip: Va) -> bool {
+        self.live_bytes = self.live_bytes.saturating_add(bytes);
+        if self.live_bytes <= self.limits.max_memory_bytes {
+            return true;
+        }
+        self.cfg.limit_hit.get_or_insert(CfgLimitHit::Memory);
+        self.stall(key, vip, "per-entry memory cap exceeded");
+        false
+    }
+
+    /// Charges the symbolic state each newly queued successor carries.
+    fn account_pending(&mut self, items: &mut [Item]) -> bool {
+        for item in items {
+            let bytes = self.state_bytes(&item.symbolic);
+            item.bytes = bytes;
+            let vip = item.start.vip;
+            if !self.charge(bytes, vip, vip) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn decode_block(&mut self, item: &Item) -> bool {
         let key = item.start.vip;
         if self.decoded.contains_key(&key) {
@@ -1751,6 +1833,16 @@ impl Walker<'_, '_> {
             }
         };
         self.total_instructions += block.instructions.len();
+        // Decoded buffers live in `decoded`, in `cfg.blocks`, and as a transient
+        // clone in `visit`.
+        let decoded_bytes = block
+            .instructions
+            .len()
+            .saturating_mul(DECODED_INSTRUCTION_BYTES)
+            .saturating_mul(3);
+        if !self.charge(decoded_bytes, key, item.start.vip) {
+            return false;
+        }
         let boundary_handler = block.boundary.map(|_| block.final_state.handler);
         let exit = match block.boundary {
             Some(VmHandlerSemantic::VmExit) => BlockExit::VmExit,
@@ -1857,6 +1949,8 @@ impl Walker<'_, '_> {
             return match widen_state(key, canonical, incoming) {
                 Ok(None) => GeneralizeAcross::Closed,
                 Ok(Some(widened)) => {
+                    let bytes = self.state_bytes(&widened);
+                    self.charge(bytes, key, key);
                     self.widened.insert(key, widened.clone());
                     GeneralizeAcross::Continue(widened)
                 }
@@ -1866,6 +1960,8 @@ impl Walker<'_, '_> {
         let states = self.explored.get(&key).cloned().unwrap_or_default();
         match fold_states(key, &states, incoming) {
             Ok(widened) => {
+                let bytes = self.state_bytes(&widened);
+                self.charge(bytes, key, key);
                 self.widened.insert(key, widened.clone());
                 GeneralizeAcross::Continue(widened)
             }
@@ -1921,6 +2017,11 @@ impl Walker<'_, '_> {
             if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
                 return;
             }
+        }
+        // Held in `explored` and the path node (which clones the containers).
+        let held = self.state_bytes(&symbolic_in).saturating_mul(2);
+        if !self.charge(held, key, key) {
+            return;
         }
         self.explored.entry(key).or_default().push(symbolic_in.clone());
         self.cfg.visits += 1;
@@ -2258,6 +2359,7 @@ impl Walker<'_, '_> {
             },
         });
         pending.push(Item {
+            bytes: 0,
             start: first.state_after,
             address: Some(target_va),
             symbolic: symbolic.continuation_state(),
@@ -2449,6 +2551,7 @@ impl Walker<'_, '_> {
             kind: CfgEdgeKind::NestedEntry,
         });
         pending.push(Item {
+            bytes: 0,
             start: setup.first_state,
             address: Some(setup.bootstrap.initial_state.vip),
             symbolic: initial,
@@ -2513,6 +2616,7 @@ impl Walker<'_, '_> {
             kind: CfgEdgeKind::NativeCallReturn,
         });
         pending.push(Item {
+            bytes: 0,
             start: decoded.state_after,
             address: None,
             symbolic: call.continuation_state(),
@@ -2687,6 +2791,7 @@ impl Walker<'_, '_> {
             kind: CfgEdgeKind::ProfileTransition,
         });
         pending.push(Item {
+            bytes: 0,
             start: first.state_after,
             address: Some(Va(target)),
             symbolic: pop.continuation_state(),
@@ -2813,12 +2918,14 @@ pub fn recover_vm_cfg_with_observed(
             assumptions: BTreeSet::new(),
         },
         total_instructions: 0,
+        live_bytes: 0,
         observed: &observed.memory,
         seeded: &seeded,
         observed_depths: &observed.loop_depths,
         observed_branch_targets: &observed.branch_targets,
     };
     let mut pending = vec![Item {
+        bytes: 0,
         start: setup.first_state,
         address: Some(entry_address),
         symbolic: initial,
@@ -2826,7 +2933,10 @@ pub fn recover_vm_cfg_with_observed(
         profile: None,
     }];
     while let Some(item) = pending.pop() {
+        walker.live_bytes = walker.live_bytes.saturating_sub(item.bytes);
+        let queued = pending.len();
         walker.visit(&item, &mut pending);
+        walker.account_pending(&mut pending[queued..]);
         if walker
             .cfg
             .limit_hit
@@ -3001,6 +3111,7 @@ mod tests {
                 assumptions: BTreeSet::new(),
             },
             total_instructions: 0,
+            live_bytes: 0,
             observed: &observed.memory,
             seeded,
             observed_depths: &observed.loop_depths,
@@ -3089,6 +3200,61 @@ mod tests {
         assert!(pending.is_empty(), "no successor may be queued");
         assert!(walker.cfg.edges.is_empty(), "no edge may be added");
         assert!(walker.active.is_none(), "the base profile is untouched");
+    }
+
+    /// A symbolic state whose retained size exceeds the per-entry byte cap must
+    /// fail the entry closed with `CfgLimitHit::Memory`; an in-cap state must
+    /// charge and release exactly, leaving the entry unaffected.
+    #[test]
+    fn oversized_symbolic_state_trips_the_memory_cap() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+
+        let mut big = SymbolicVmInitialState::default();
+        for slot in 0..64_i64 {
+            big.context_values.insert(
+                slot,
+                Expr::register(BitWidth::W64, format!("native_slot_{slot}_initial")),
+            );
+        }
+        let item = |symbolic: SymbolicVmInitialState| Item {
+            bytes: 0,
+            start: RelativeDispatchState {
+                vip: Va(RDATA_VA),
+                rolling_key: RDATA_VA,
+                handler: Va(RDATA_VA),
+            },
+            address: None,
+            symbolic,
+            path: None,
+            profile: None,
+        };
+
+        // Default cap: the state is accounted, nothing trips.
+        let mut queued = [item(big.clone())];
+        assert!(walker.account_pending(&mut queued));
+        assert!(queued[0].bytes >= 64 * EXPR_NODE_BYTES, "all nodes counted");
+        assert_eq!(walker.live_bytes, queued[0].bytes);
+        assert!(walker.cfg.limit_hit.is_none());
+        assert!(walker.cfg.stalls.is_empty());
+
+        // A cap below that state's size: fail closed with `Memory`.
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        walker.limits.max_memory_bytes = 64 * EXPR_NODE_BYTES / 2;
+        let mut queued = [item(big)];
+        assert!(!walker.account_pending(&mut queued));
+        assert_eq!(walker.cfg.limit_hit, Some(CfgLimitHit::Memory));
+        assert!(!walker.cfg.is_complete(), "a memory stall is never complete");
+        assert_eq!(walker.cfg.stalls.len(), 1);
     }
 
     /// MEMORY BUDGET: once the per-entry cross-profile-transition budget is
