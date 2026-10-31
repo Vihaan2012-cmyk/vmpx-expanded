@@ -430,6 +430,116 @@ fn emit_cpuid(
     assembler.pop(rax)
 }
 
+/// Emits a one-operand `MUL`/`IMUL` of two width-sized frame slots and captures
+/// the raw `RFLAGS` it produces into `out_flags`, without disturbing any general
+/// register. `RAX` and `RDX` carry the double-width product, so both are saved
+/// first and the slot displacements are rebased by the sixteen saved bytes. Only
+/// the flags are kept; the product is discarded. The flags reproduce the VM
+/// multiply-flag word by identity: `CF`/`OF` come from the product magnitude and
+/// the `SF`/`ZF`/`AF`/`PF` the ISA leaves undefined are whatever the real
+/// instruction set, exactly as the virtualized handler captured them.
+fn emit_multiply_flags(
+    assembler: &mut CodeAssembler,
+    signed: bool,
+    width: Width,
+    left: i32,
+    right: i32,
+    out_flags: i32,
+) -> Result<(), iced_x86::IcedError> {
+    const SAVED: i32 = 16;
+    assembler.push(rax)?;
+    assembler.push(rdx)?;
+    match width {
+        Width::W8 => {
+            assembler.mov(al, byte_ptr(rsp + (left + SAVED)))?;
+            if signed {
+                assembler.imul(byte_ptr(rsp + (right + SAVED)))?;
+            } else {
+                assembler.mul(byte_ptr(rsp + (right + SAVED)))?;
+            }
+        }
+        Width::W16 => {
+            assembler.mov(ax, word_ptr(rsp + (left + SAVED)))?;
+            if signed {
+                assembler.imul(word_ptr(rsp + (right + SAVED)))?;
+            } else {
+                assembler.mul(word_ptr(rsp + (right + SAVED)))?;
+            }
+        }
+        Width::W32 => {
+            assembler.mov(eax, dword_ptr(rsp + (left + SAVED)))?;
+            if signed {
+                assembler.imul(dword_ptr(rsp + (right + SAVED)))?;
+            } else {
+                assembler.mul(dword_ptr(rsp + (right + SAVED)))?;
+            }
+        }
+        Width::W64 => {
+            assembler.mov(rax, qword_ptr(rsp + (left + SAVED)))?;
+            if signed {
+                assembler.imul(qword_ptr(rsp + (right + SAVED)))?;
+            } else {
+                assembler.mul(qword_ptr(rsp + (right + SAVED)))?;
+            }
+        }
+    }
+    // A MOV does not touch the flags, so the slot store after this read is safe.
+    assembler.pushfq()?;
+    assembler.pop(rax)?;
+    assembler.mov(qword_ptr(rsp + (out_flags + SAVED)), rax)?;
+    assembler.pop(rdx)?;
+    assembler.pop(rax)
+}
+
+/// Emits an unsigned one-operand `DIV` of the double-width dividend `high:low`
+/// by `divisor` (all width-sized frame slots), writing the quotient, remainder
+/// and raw `RFLAGS` to frame slots, without disturbing any general register.
+/// `RDX:RAX` holds the dividend and receives the result, so both are saved first
+/// and displacements are rebased by the sixteen saved bytes. A zero divisor or a
+/// quotient overflow raises `#DE`, exactly as the virtualized `DIV` would. The
+/// byte form is rejected before emission (its remainder lands in `AH`).
+fn emit_unsigned_divide(
+    assembler: &mut CodeAssembler,
+    width: Width,
+    inputs: [i32; 3],
+    outputs: [i32; 3],
+) -> Result<(), iced_x86::IcedError> {
+    const SAVED: i32 = 16;
+    let [high, low, divisor] = inputs;
+    let [quotient, remainder, flags] = outputs;
+    assembler.push(rax)?;
+    assembler.push(rdx)?;
+    match width {
+        Width::W16 => {
+            assembler.mov(ax, word_ptr(rsp + (low + SAVED)))?;
+            assembler.mov(dx, word_ptr(rsp + (high + SAVED)))?;
+            assembler.div(word_ptr(rsp + (divisor + SAVED)))?;
+            assembler.mov(word_ptr(rsp + (quotient + SAVED)), ax)?;
+            assembler.mov(word_ptr(rsp + (remainder + SAVED)), dx)?;
+        }
+        Width::W32 => {
+            assembler.mov(eax, dword_ptr(rsp + (low + SAVED)))?;
+            assembler.mov(edx, dword_ptr(rsp + (high + SAVED)))?;
+            assembler.div(dword_ptr(rsp + (divisor + SAVED)))?;
+            assembler.mov(dword_ptr(rsp + (quotient + SAVED)), eax)?;
+            assembler.mov(dword_ptr(rsp + (remainder + SAVED)), edx)?;
+        }
+        Width::W64 => {
+            assembler.mov(rax, qword_ptr(rsp + (low + SAVED)))?;
+            assembler.mov(rdx, qword_ptr(rsp + (high + SAVED)))?;
+            assembler.div(qword_ptr(rsp + (divisor + SAVED)))?;
+            assembler.mov(qword_ptr(rsp + (quotient + SAVED)), rax)?;
+            assembler.mov(qword_ptr(rsp + (remainder + SAVED)), rdx)?;
+        }
+        Width::W8 => unreachable!("byte divide is rejected before emission"),
+    }
+    assembler.pushfq()?;
+    assembler.pop(rax)?;
+    assembler.mov(qword_ptr(rsp + (flags + SAVED)), rax)?;
+    assembler.pop(rdx)?;
+    assembler.pop(rax)
+}
+
 fn emit_move_immediate(
     assembler: &mut CodeAssembler,
     destination: MachineRegister,
@@ -1101,6 +1211,50 @@ pub fn compile(
                 ];
                 append_assembled(&mut output, address, operation_index, |assembler| {
                     emit_cpuid(assembler, leaf, subleaf, outputs)
+                })?;
+            }
+            Operation::MultiplyFlags {
+                signed,
+                width,
+                left,
+                right,
+                out_flags,
+            } => {
+                let left = spill_displacement(&function.frame, *left)?;
+                let right = spill_displacement(&function.frame, *right)?;
+                let out_flags = spill_displacement(&function.frame, *out_flags)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_multiply_flags(assembler, *signed, *width, left, right, out_flags)
+                })?;
+            }
+            Operation::UnsignedDivide {
+                width,
+                high,
+                low,
+                divisor,
+                out_quotient,
+                out_remainder,
+                out_flags,
+            } => {
+                if *width == Width::W8 {
+                    // The byte DIV leaves its remainder in AH, which this
+                    // register-transparent encoding does not model; callers fail
+                    // closed before building the op, and this guard is a backstop.
+                    return Err(CompileError::UnsupportedWidth { width: *width });
+                }
+                let high = spill_displacement(&function.frame, *high)?;
+                let low = spill_displacement(&function.frame, *low)?;
+                let divisor = spill_displacement(&function.frame, *divisor)?;
+                let out_quotient = spill_displacement(&function.frame, *out_quotient)?;
+                let out_remainder = spill_displacement(&function.frame, *out_remainder)?;
+                let out_flags = spill_displacement(&function.frame, *out_flags)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_unsigned_divide(
+                        assembler,
+                        *width,
+                        [high, low, divisor],
+                        [out_quotient, out_remainder, out_flags],
+                    )
                 })?;
             }
             Operation::ReturnPopping { bytes } => {

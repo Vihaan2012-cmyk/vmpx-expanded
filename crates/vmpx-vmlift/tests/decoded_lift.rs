@@ -153,8 +153,9 @@ fn a_gs_load_lifts_as_a_passthrough_environment_boundary() {
 #[test]
 fn an_unliftable_semantic_stops_the_lift_at_its_index() {
     let frame = [NativeFrameSource::Rflags];
+    // UnsignedDivide is no longer here: it now lowers by re-emitting a real
+    // `div` (see `expr_codegen`).
     for semantic in [
-        VmHandlerSemantic::UnsignedDivide,
         VmHandlerSemantic::TableChecksum,
         VmHandlerSemantic::ReadTimestampCounter,
         VmHandlerSemantic::ConditionalBranch,

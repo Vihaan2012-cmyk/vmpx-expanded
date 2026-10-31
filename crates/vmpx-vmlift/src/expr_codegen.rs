@@ -515,6 +515,223 @@ impl LoweringContext<'_> {
         self.lower(&product)
     }
 
+    /// Lowers a VM multiply-flag word by re-emitting the exact `mul`/`imul` the
+    /// handler ran and reading its raw flags. `CF`/`OF` are defined by the
+    /// product; the `SF`/`ZF`/`AF`/`PF` the ISA leaves undefined are reproduced by
+    /// identity, the same trust basis as the double-shift flag read. Unlike the
+    /// add/sub/logical flags, these are not masked: the VM has no concrete model
+    /// for them (`evaluate_vm_flags` folds only add/sub/logical), so the faithful
+    /// value is the raw captured flag word.
+    fn lower_multiply_flags(
+        &mut self,
+        name: &str,
+        signed: bool,
+        width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "multiply flags take two operands"));
+        };
+        if left.width != width || right.width != width || expression.width != BitWidth::W64 {
+            return Err(malformed(name, "multiply-flag operand widths disagree"));
+        }
+        self.lower(left)?;
+        let left_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: left_slot,
+            source: accumulator(width),
+        });
+        self.lower(right)?;
+        let right_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: right_slot,
+            source: accumulator(width),
+        });
+        let flags_slot = self.allocate_slot()?;
+        self.operations.push(Operation::MultiplyFlags {
+            signed,
+            width: native_width(width),
+            left: left_slot,
+            right: right_slot,
+            out_flags: flags_slot,
+        });
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(BitWidth::W64),
+            slot: flags_slot,
+        });
+        for _ in 0..3 {
+            self.release_slot();
+        }
+        Ok(())
+    }
+
+    /// Evaluates `high`, `low`, `divisor` into width-sized slots and emits the
+    /// unsigned divide, returning its quotient, remainder and flags slots. All six
+    /// slots it leaves allocated (three operands, three results) are released by
+    /// the caller once it has read the result it needs. Fails closed on the byte
+    /// form, whose remainder lands in `AH`.
+    fn emit_unsigned_divide(
+        &mut self,
+        name: &str,
+        width: BitWidth,
+        arguments: &[Expr],
+    ) -> Result<(SpillSlot, SpillSlot, SpillSlot), ExpressionCodegenError> {
+        let [high, low, divisor] = arguments else {
+            return Err(malformed(name, "a wide divide takes high, low and divisor"));
+        };
+        if high.width != width || low.width != width || divisor.width != width {
+            return Err(malformed(name, "wide-divide operand widths disagree"));
+        }
+        if width == BitWidth::W8 {
+            return Err(malformed(name, "byte divide has no lowering"));
+        }
+        self.lower(high)?;
+        let high_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: high_slot,
+            source: accumulator(width),
+        });
+        self.lower(low)?;
+        let low_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: low_slot,
+            source: accumulator(width),
+        });
+        self.lower(divisor)?;
+        let divisor_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: divisor_slot,
+            source: accumulator(width),
+        });
+        let quotient_slot = self.allocate_slot()?;
+        let remainder_slot = self.allocate_slot()?;
+        let flags_slot = self.allocate_slot()?;
+        self.operations.push(Operation::UnsignedDivide {
+            width: native_width(width),
+            high: high_slot,
+            low: low_slot,
+            divisor: divisor_slot,
+            out_quotient: quotient_slot,
+            out_remainder: remainder_slot,
+            out_flags: flags_slot,
+        });
+        Ok((quotient_slot, remainder_slot, flags_slot))
+    }
+
+    /// Lowers the packed or split value of a VM unsigned divide. The value is
+    /// computed by the real `div`, which also raises `#DE` exactly where the
+    /// virtualized instruction would.
+    fn lower_unsigned_divide_value(
+        &mut self,
+        name: &str,
+        width: BitWidth,
+        part: DividePart,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        if expression.width != BitWidth::W64 {
+            return Err(malformed(name, "a wide-divide value is a qword"));
+        }
+        match part {
+            DividePart::Packed if width == BitWidth::W64 => {
+                return Err(malformed(name, "a 64-bit divide cannot pack into one qword"));
+            }
+            DividePart::Quotient | DividePart::Remainder if width != BitWidth::W64 => {
+                return Err(malformed(name, "split divide halves are the 64-bit form"));
+            }
+            _ => {}
+        }
+        let (quotient_slot, remainder_slot, _flags_slot) =
+            self.emit_unsigned_divide(name, width, arguments)?;
+        match part {
+            DividePart::Quotient => self.operations.push(Operation::SpillLoad {
+                destination: accumulator(BitWidth::W64),
+                slot: quotient_slot,
+            }),
+            DividePart::Remainder => self.operations.push(Operation::SpillLoad {
+                destination: accumulator(BitWidth::W64),
+                slot: remainder_slot,
+            }),
+            DividePart::Packed => {
+                // `(zero_extend(remainder) << width) | zero_extend(quotient)`,
+                // matching how the executor packs the double-width result.
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(width),
+                    slot: quotient_slot,
+                });
+                self.operations.push(Operation::Resize {
+                    operation: NativeResizeOp::ZeroExtend,
+                    destination: accumulator(BitWidth::W64),
+                    source: accumulator(width),
+                });
+                self.operations.push(Operation::SpillStore {
+                    slot: quotient_slot,
+                    source: accumulator(BitWidth::W64),
+                });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(width),
+                    slot: remainder_slot,
+                });
+                self.operations.push(Operation::Resize {
+                    operation: NativeResizeOp::ZeroExtend,
+                    destination: accumulator(BitWidth::W64),
+                    source: accumulator(width),
+                });
+                self.operations.push(Operation::Shift {
+                    operation: ShiftOp::Left,
+                    destination: accumulator(BitWidth::W64),
+                    count: ShiftCount::Immediate(
+                        u8::try_from(width.bits())
+                            .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?,
+                    ),
+                });
+                self.operations.push(Operation::Move {
+                    destination: temporary(BitWidth::W64),
+                    source: accumulator(BitWidth::W64),
+                });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(BitWidth::W64),
+                    slot: quotient_slot,
+                });
+                self.operations.push(Operation::Binary {
+                    operation: NativeBinaryOp::Or,
+                    destination: accumulator(BitWidth::W64),
+                    source: BinarySource::Register(temporary(BitWidth::W64)),
+                });
+            }
+        }
+        for _ in 0..6 {
+            self.release_slot();
+        }
+        Ok(())
+    }
+
+    /// Lowers a VM divide-flag word by re-emitting the real `div` and reading its
+    /// raw flags. `div` leaves every status flag ISA-undefined, so there is no
+    /// concrete model to match; the captured flag word is faithful by identity.
+    fn lower_unsigned_divide_flags(
+        &mut self,
+        name: &str,
+        width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        if expression.width != BitWidth::W64 {
+            return Err(malformed(name, "a divide flag word is a qword"));
+        }
+        let (_quotient_slot, _remainder_slot, flags_slot) =
+            self.emit_unsigned_divide(name, width, arguments)?;
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(BitWidth::W64),
+            slot: flags_slot,
+        });
+        for _ in 0..6 {
+            self.release_slot();
+        }
+        Ok(())
+    }
+
     /// Lowers an intrinsic that stands for an imported call's return value.
     ///
     /// The intrinsic's leading arguments become the call arguments, the call is
@@ -646,6 +863,73 @@ fn wide_multiply_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
     Some((signed, width))
 }
 
+fn width_from_digits(text: &str) -> Option<BitWidth> {
+    match text {
+        "8" => Some(BitWidth::W8),
+        "16" => Some(BitWidth::W16),
+        "32" => Some(BitWidth::W32),
+        "64" => Some(BitWidth::W64),
+        _ => None,
+    }
+}
+
+fn is_index(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// `vm_flags_signed_multiply_wN_K` / `vm_flags_unsigned_multiply_wN_K`:
+/// signedness and operand width of the flag word a VM multiply leaves. Those
+/// flags have no concrete VM model (`evaluate_vm_flags` folds only add/sub/
+/// logical), so the only faithful lowering re-emits the real `mul`/`imul` and
+/// reads the raw flags, exactly as the double-shift flag passthrough does.
+fn multiply_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
+    let (signed, rest) = if let Some(rest) = name.strip_prefix("vm_flags_signed_multiply_w") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix("vm_flags_unsigned_multiply_w")?)
+    };
+    let mut parts = rest.split('_');
+    let width = width_from_digits(parts.next()?)?;
+    (is_index(parts.next()?) && parts.next().is_none()).then_some((signed, width))
+}
+
+/// Which half of a wide unsigned-divide value a `x86_unsigned_divide_*`
+/// intrinsic names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DividePart {
+    /// Widths up to 32 pack `(remainder << width) | quotient` into one qword.
+    Packed,
+    /// The 64-bit form splits into independent `_quotient`/`_remainder` qwords.
+    Quotient,
+    Remainder,
+}
+
+/// `x86_unsigned_divide_wN_K` (packed, N<=32) or `x86_unsigned_divide_w64_K_{quotient,remainder}`.
+fn unsigned_divide_value_intrinsic(name: &str) -> Option<(BitWidth, DividePart)> {
+    let rest = name.strip_prefix("x86_unsigned_divide_w")?;
+    let mut parts = rest.split('_');
+    let width = width_from_digits(parts.next()?)?;
+    if !is_index(parts.next()?) {
+        return None;
+    }
+    match parts.next() {
+        None => Some((width, DividePart::Packed)),
+        Some("quotient") if parts.next().is_none() => Some((width, DividePart::Quotient)),
+        Some("remainder") if parts.next().is_none() => Some((width, DividePart::Remainder)),
+        _ => None,
+    }
+}
+
+/// `vm_flags_unsigned_divide_wN_K`: operand width of the flag word a VM divide
+/// leaves. Undefined by the ISA and unmodelled by the VM, so reproduced by
+/// re-emitting the real `div` and reading the raw flags.
+fn unsigned_divide_flags_intrinsic(name: &str) -> Option<BitWidth> {
+    let rest = name.strip_prefix("vm_flags_unsigned_divide_w")?;
+    let mut parts = rest.split('_');
+    let width = width_from_digits(parts.next()?)?;
+    (is_index(parts.next()?) && parts.next().is_none()).then_some(width)
+}
+
 fn native_width(width: BitWidth) -> Width {
     match width {
         BitWidth::W8 => Width::W8,
@@ -755,6 +1039,12 @@ impl LoweringContext<'_> {
                     self.lower_logical_flags(name, or, width, expression, arguments)?;
                 } else if let Some((signed, width)) = wide_multiply_intrinsic(name) {
                     self.lower_wide_multiply(name, signed, width, expression, arguments)?;
+                } else if let Some((signed, width)) = multiply_flags_intrinsic(name) {
+                    self.lower_multiply_flags(name, signed, width, expression, arguments)?;
+                } else if let Some((width, part)) = unsigned_divide_value_intrinsic(name) {
+                    self.lower_unsigned_divide_value(name, width, part, expression, arguments)?;
+                } else if let Some(width) = unsigned_divide_flags_intrinsic(name) {
+                    self.lower_unsigned_divide_flags(name, width, expression, arguments)?;
                 } else {
                     return Err(ExpressionCodegenError::UnsupportedIntrinsic {
                         name: name.clone(),
@@ -1349,6 +1639,166 @@ mod tests {
             .iter()
             .filter(|instruction| instruction.mnemonic() == mnemonic)
             .count()
+    }
+
+    #[test]
+    fn multiply_flags_lower_to_the_real_multiply_and_a_raw_flag_read() {
+        // A VM multiply-flag word has no concrete model, so it is reproduced by
+        // re-emitting the exact `mul`/`imul` and reading its raw flags: `mul` for
+        // the unsigned form, `imul` for the signed, each with a `pushfq`. The raw
+        // word is not masked (unlike add/sub/logical flags).
+        let operands = || {
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+            ]
+        };
+        for (name, mnemonic) in [
+            ("vm_flags_unsigned_multiply_w32_7", iced_x86::Mnemonic::Mul),
+            ("vm_flags_signed_multiply_w32_7", iced_x86::Mnemonic::Imul),
+        ] {
+            let expression = Expr::intrinsic(BitWidth::W64, name, operands());
+            let lowered = lowers_to(&expression, mnemonic);
+            // A multiply-flag lowering is exact-by-identity, not a trusted
+            // passthrough or an environment boundary.
+            assert!(lowered.passthroughs.is_empty());
+            assert!(lowered.environment_boundaries.is_empty());
+            let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile mul flags");
+            assert_eq!(
+                mnemonic_count(&compiled.bytes, iced_x86::Mnemonic::Pushfq),
+                1,
+                "the raw flag word is read back once"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_divide_value_lowers_to_div_and_packs_quotient_and_remainder() {
+        // The packed w32 value is `(remainder << 32) | quotient`: one `div`, then
+        // a `shl` by the width and an `or` to pack the two halves.
+        let expression = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_unsigned_divide_w32_5",
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+                Expr::constant(BitWidth::W32, 7),
+            ],
+        );
+        let lowered = lowers_to(&expression, iced_x86::Mnemonic::Div);
+        assert_eq!(lowered.result, VirtualRegister::qword(ACCUMULATOR_ID));
+        assert!(lowered.passthroughs.is_empty());
+        let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile divide value");
+        assert_eq!(
+            mnemonic_count(&compiled.bytes, iced_x86::Mnemonic::Shl),
+            1,
+            "the remainder is shifted into the high half"
+        );
+    }
+
+    #[test]
+    fn unsigned_divide_sixty_four_bit_halves_each_lower_to_a_div() {
+        for part in ["quotient", "remainder"] {
+            let expression = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_unsigned_divide_w64_5_{part}"),
+                vec![
+                    Expr::register(BitWidth::W64, "p"),
+                    Expr::constant(BitWidth::W64, 1),
+                    Expr::constant(BitWidth::W64, 3),
+                ],
+            );
+            lowers_to(&expression, iced_x86::Mnemonic::Div);
+        }
+    }
+
+    #[test]
+    fn unsigned_divide_flags_lower_to_div_and_a_raw_flag_read() {
+        let expression = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_unsigned_divide_w32_5",
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W32, "b"),
+                Expr::constant(BitWidth::W32, 7),
+            ],
+        );
+        let lowered = lowers_to(&expression, iced_x86::Mnemonic::Div);
+        assert!(lowered.passthroughs.is_empty());
+        let compiled = compile(&lowered.function, CodeAddress(0)).expect("compile divide flags");
+        assert_eq!(
+            mnemonic_count(&compiled.bytes, iced_x86::Mnemonic::Pushfq),
+            1,
+            "the raw flag word is read back once"
+        );
+    }
+
+    #[test]
+    fn multiply_flags_and_divide_fail_closed_on_bad_shapes() {
+        let config = passthrough_config();
+        // Wrong arity.
+        let wrong_arity = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_signed_multiply_w32_1",
+            vec![Expr::register(BitWidth::W32, "a")],
+        );
+        assert!(matches!(
+            lower_expression(&wrong_arity, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+        // Operand-width disagreement.
+        let wrong_width = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_unsigned_multiply_w32_1",
+            vec![
+                Expr::register(BitWidth::W32, "a"),
+                Expr::register(BitWidth::W64, "p"),
+            ],
+        );
+        assert!(matches!(
+            lower_expression(&wrong_width, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+        // The byte DIV leaves its remainder in AH and has no sound lowering here.
+        let byte_divide = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_unsigned_divide_w8_1",
+            vec![
+                Expr::register(BitWidth::W8, "n"),
+                Expr::register(BitWidth::W8, "n"),
+                Expr::register(BitWidth::W8, "n"),
+            ],
+        );
+        assert!(matches!(
+            lower_expression(&byte_divide, &config),
+            Err(ExpressionCodegenError::MalformedPassthrough { .. })
+        ));
+    }
+
+    #[test]
+    fn multiply_and_divide_intrinsic_names_are_classified() {
+        assert_eq!(
+            multiply_flags_intrinsic("vm_flags_signed_multiply_w16_3"),
+            Some((true, BitWidth::W16))
+        );
+        assert_eq!(
+            multiply_flags_intrinsic("vm_flags_unsigned_multiply_w64_9"),
+            Some((false, BitWidth::W64))
+        );
+        assert_eq!(multiply_flags_intrinsic("vm_flags_add_w32"), None);
+        assert!(matches!(
+            unsigned_divide_value_intrinsic("x86_unsigned_divide_w32_5"),
+            Some((BitWidth::W32, DividePart::Packed))
+        ));
+        assert!(matches!(
+            unsigned_divide_value_intrinsic("x86_unsigned_divide_w64_5_remainder"),
+            Some((BitWidth::W64, DividePart::Remainder))
+        ));
+        assert_eq!(
+            unsigned_divide_flags_intrinsic("vm_flags_unsigned_divide_w32_5"),
+            Some(BitWidth::W32)
+        );
+        assert_eq!(unsigned_divide_value_intrinsic("x86_unsigned_divide_wx_5"), None);
     }
 
     /// Counts register-to-register `and`/`or` instructions, i.e. the

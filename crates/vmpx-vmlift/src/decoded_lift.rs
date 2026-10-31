@@ -75,10 +75,10 @@ pub fn semantic_lowering(semantic: VmHandlerSemantic) -> SemanticLowering {
         }
         S::VmExit => L::BlockExit,
         S::ReadTimestampCounter => L::Refused("rdtsc has no lowering yet"),
-        // Wide multiply is symbolically executed to a packed double-width
-        // product (see `expr_codegen`); wide divide still has no lowering.
-        S::Mul | S::SignedMultiply => L::Computed,
-        S::UnsignedDivide => L::Refused("wide divide has no lowering yet"),
+        // Wide multiply and unsigned divide are symbolically executed to packed
+        // double-width results and their flag words; `expr_codegen` lowers each by
+        // re-emitting the real `mul`/`imul`/`div` (see those lowerings).
+        S::Mul | S::SignedMultiply | S::UnsignedDivide => L::Computed,
         S::TableChecksum => L::Refused("table checksum has no lowering"),
         S::ConditionalBranch | S::UnconditionalBranch | S::NativeCall => {
             L::Refused("control transfer needs the CFG lift")

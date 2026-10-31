@@ -302,6 +302,34 @@ pub enum Operation {
         out_ecx: SpillSlot,
         out_edx: SpillSlot,
     },
+    /// One-operand `MUL`/`IMUL` of two width-sized frame slots, writing the raw
+    /// `RFLAGS` the multiply left into `out_flags` (a qword slot). It is
+    /// register-transparent: `RAX` and `RDX` hold the double-width product during
+    /// the instruction and are saved and restored around it. Only the captured
+    /// flags are kept; the product itself is discarded.
+    MultiplyFlags {
+        signed: bool,
+        width: Width,
+        left: SpillSlot,
+        right: SpillSlot,
+        out_flags: SpillSlot,
+    },
+    /// Unsigned one-operand `DIV` of the double-width dividend `high:low` by
+    /// `divisor` (all width-sized frame slots), writing the quotient, the
+    /// remainder and the raw `RFLAGS` to frame slots. It is register-transparent:
+    /// `RAX` and `RDX` are saved and restored around the instruction. A zero
+    /// divisor or a quotient that overflows the width raises `#DE`, exactly as the
+    /// virtualized `DIV` on the same inputs would. Width must be 16/32/64; the
+    /// byte form (remainder in `AH`) has no lowering.
+    UnsignedDivide {
+        width: Width,
+        high: SpillSlot,
+        low: SpillSlot,
+        divisor: SpillSlot,
+        out_quotient: SpillSlot,
+        out_remainder: SpillSlot,
+        out_flags: SpillSlot,
+    },
 }
 
 /// One lowered function and the allocation/frame facts required to emit it.

@@ -992,6 +992,28 @@ pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
             .iter()
             .map(|slot| slot.0)
             .collect(),
+        Operation::MultiplyFlags {
+            left,
+            right,
+            out_flags,
+            ..
+        } => vec![left.0, right.0, out_flags.0],
+        Operation::UnsignedDivide {
+            high,
+            low,
+            divisor,
+            out_quotient,
+            out_remainder,
+            out_flags,
+            ..
+        } => vec![
+            high.0,
+            low.0,
+            divisor.0,
+            out_quotient.0,
+            out_remainder.0,
+            out_flags.0,
+        ],
         _ => Vec::new(),
     }
 }
@@ -1007,6 +1029,21 @@ fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
             out_ecx,
             out_edx,
         } => vec![leaf, subleaf, out_eax, out_ebx, out_ecx, out_edx],
+        Operation::MultiplyFlags {
+            left,
+            right,
+            out_flags,
+            ..
+        } => vec![left, right, out_flags],
+        Operation::UnsignedDivide {
+            high,
+            low,
+            divisor,
+            out_quotient,
+            out_remainder,
+            out_flags,
+            ..
+        } => vec![high, low, divisor, out_quotient, out_remainder, out_flags],
         _ => Vec::new(),
     }
 }
@@ -1138,7 +1175,9 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
             destination: register(destination),
             address: Address::new(register(address.base), address.displacement),
         },
-        Operation::Cpuid { .. } => operation.clone(),
+        Operation::Cpuid { .. }
+        | Operation::MultiplyFlags { .. }
+        | Operation::UnsignedDivide { .. } => operation.clone(),
         Operation::EntryStackPointer { destination } => Operation::EntryStackPointer {
             destination: register(destination),
         },
