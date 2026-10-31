@@ -125,6 +125,14 @@ pub struct Emulator {
     pub trace: Vec<TraceEntry>,
     pub hook: Option<Box<dyn Hook>>,
     pub observe: ObserveConfig,
+    /// DETONATION-only concretization. When `false` (the default), a read of an
+    /// architecturally-undefined flag stops the run with [`Stop::UndefinedFlags`]
+    /// — the sound, fail-closed behaviour the static/differential paths rely on,
+    /// byte-for-byte unchanged. When `true`, each flag producer resolves its
+    /// undefined bits to the deterministic value real silicon leaves (see
+    /// [`Emulator::apply`]), so a later `jcc`/`cmov`/`setcc` reads a concrete bit
+    /// and proceeds. Observed/quarantined tier only — never sound static output.
+    pub resolve_undefined_flags: bool,
     cur: (u64, Mnemonic),
     det: (Option<u64>, Option<u64>),
 }
@@ -138,6 +146,7 @@ impl Emulator {
             trace: Vec::new(),
             hook: None,
             observe: ObserveConfig::default(),
+            resolve_undefined_flags: false,
             cur: (0, Mnemonic::INVALID),
             det: (None, None),
         }
@@ -241,8 +250,20 @@ impl Emulator {
     }
 
     fn apply(&mut self, f: Flags) {
-        self.cpu.rflags = (self.cpu.rflags & !(f.def | f.undef)) | (f.val & f.def);
-        self.cpu.undef_flags = (self.cpu.undef_flags & !f.def) | f.undef;
+        if self.resolve_undefined_flags {
+            // Detonation concretization: an architecturally-undefined bit takes
+            // the deterministic hardware value its producer carries in `f.val`
+            // and becomes defined, so a later flag consumer reads a concrete
+            // bit. `f.val` already holds the modeled value for every undef bit
+            // (shift/rotate/shld OF via the 1-bit formula; mul/imul SF/ZF/PF
+            // from the low result, AF=0; bt*/bsf/bsr/div status bits cleared).
+            let all = f.def | f.undef;
+            self.cpu.rflags = (self.cpu.rflags & !all) | (f.val & all);
+            self.cpu.undef_flags &= !all;
+        } else {
+            self.cpu.rflags = (self.cpu.rflags & !(f.def | f.undef)) | (f.val & f.def);
+            self.cpu.undef_flags = (self.cpu.undef_flags & !f.def) | f.undef;
+        }
     }
 
     fn ea(&self, ins: &Instruction) -> Result<u64, Stop> {

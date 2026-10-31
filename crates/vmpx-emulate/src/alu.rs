@@ -139,14 +139,21 @@ pub fn shift(kind: Shift, a: u64, count: u64, bytes: u32) -> Option<(u64, Flags)
             (((sa >> c.min(63)) as u64) & m, Some(bit(sa as u64, (c - 1).min(63))))
         }
     };
-    let of = (c == 1).then(|| match kind {
+    // OF is architecturally defined only for a 1-bit shift. For a multi-bit
+    // shift it is left undefined, but real silicon produces a deterministic
+    // value: the same 1-bit formula evaluated on the final state (observed-tier,
+    // matches the common QEMU/Unicorn result). We always compute that value and
+    // carry it in `val`; it only becomes a *defined* flag for the 1-bit case
+    // (otherwise it stays in `undef`, so the default fail-closed path is
+    // byte-for-byte unchanged and only the detonation mode reads it).
+    let of_det = match kind {
         Shift::Shl => bit(res, bits - 1) ^ cf.unwrap_or(0),
         Shift::Shr => bit(a, bits - 1),
         Shift::Sar => 0,
-    });
+    };
     let mut def = SF | ZF | PF;
-    let mut undef = AF;
-    let mut val = szp(res, bits);
+    let mut undef = AF; // AF deterministic value is 0 (absent from `val`).
+    let mut val = szp(res, bits) | pick(of_det != 0, OF);
     match cf {
         Some(v) => {
             def |= CF;
@@ -154,12 +161,10 @@ pub fn shift(kind: Shift, a: u64, count: u64, bytes: u32) -> Option<(u64, Flags)
         }
         None => undef |= CF,
     }
-    match of {
-        Some(v) => {
-            def |= OF;
-            val |= pick(v != 0, OF);
-        }
-        None => undef |= OF,
+    if c == 1 {
+        def |= OF;
+    } else {
+        undef |= OF;
     }
     Some((res, Flags { def, val, undef }))
 }
@@ -193,6 +198,10 @@ pub fn sbb(a: u64, b: u64, borrow: bool, bytes: u32) -> (u64, Flags) {
 }
 
 // mul/imul leave SF, ZF, AF, PF architecturally undefined; only CF/OF are set.
+// For the detonation mode the deterministic silicon value of the undefined bits
+// (observed-tier, matching QEMU) is SF/ZF/PF derived from the LOW result half
+// and AF = 0; each producer carries that in `Flags.val` (masked out of the
+// default path by `def`), via `szp` on that result half.
 const MULDEF: u64 = CF | OF;
 const MULUNDEF: u64 = SF | ZF | AF | PF;
 
@@ -205,7 +214,8 @@ pub fn mul(a: u64, b: u64, bytes: u32) -> (u64, u64, Flags) {
     let p = u128::from(a & m) * u128::from(b & m);
     let lo = (p as u64) & m;
     let hi = ((p >> bits) as u64) & m;
-    (lo, hi, Flags { def: MULDEF, val: pick(hi != 0, MULDEF), undef: MULUNDEF })
+    let val = pick(hi != 0, MULDEF) | szp(lo, bits);
+    (lo, hi, Flags { def: MULDEF, val, undef: MULUNDEF })
 }
 
 /// Signed 1-operand `imul`: returns `(low, high)` halves and flags. CF=OF when
@@ -218,7 +228,8 @@ pub fn imul1(a: u64, b: u64, bytes: u32) -> (u64, u64, Flags) {
     let lo = (p as u64) & m;
     let hi = ((p >> bits) as u64) & m;
     let fits = p >= -(1i128 << (bits - 1)) && p < (1i128 << (bits - 1));
-    (lo, hi, Flags { def: MULDEF, val: pick(!fits, MULDEF), undef: MULUNDEF })
+    let val = pick(!fits, MULDEF) | szp(lo, bits);
+    (lo, hi, Flags { def: MULDEF, val, undef: MULUNDEF })
 }
 
 /// Signed 2/3-operand `imul`: truncated result with CF=OF on signed overflow.
@@ -229,7 +240,8 @@ pub fn imul_n(a: u64, b: u64, bytes: u32) -> (u64, Flags) {
     let p = i128::from(sext(a, bytes) as i64) * i128::from(sext(b, bytes) as i64);
     let r = (p as u64) & m;
     let fits = p >= -(1i128 << (bits - 1)) && p < (1i128 << (bits - 1));
-    (r, Flags { def: MULDEF, val: pick(!fits, MULDEF), undef: MULUNDEF })
+    let val = pick(!fits, MULDEF) | szp(r, bits);
+    (r, Flags { def: MULDEF, val, undef: MULUNDEF })
 }
 
 /// `div`/`idiv` of the double-wide dividend `hi:lo` by `divisor`. For byte
@@ -280,13 +292,14 @@ pub fn dshift(left: bool, dest: u64, src: u64, cnt: u32, bytes: u32) -> (u64, Fl
     } else {
         (((dest >> cnt) | (src << (bits - cnt))) & m, bit(dest, cnt - 1))
     };
+    // OF defined only for a 1-bit shift; its deterministic multi-bit value (the
+    // same formula) is always carried in `val` for the detonation mode.
     let of = bit(dest, bits - 1) ^ bit(res, bits - 1);
     let mut def = CF | SF | ZF | PF;
-    let mut val = szp(res, bits) | pick(cf != 0, CF);
-    let mut undef = AF;
+    let val = szp(res, bits) | pick(cf != 0, CF) | pick(of != 0, OF);
+    let mut undef = AF; // AF deterministic value is 0.
     if cnt == 1 {
         def |= OF;
-        val |= pick(of != 0, OF);
     } else {
         undef |= OF;
     }
@@ -339,16 +352,18 @@ pub fn rotate(kind: Rotate, a: u64, count: u64, cf_in: bool, bytes: u32) -> Opti
             (v, carry)
         }
     };
+    // OF defined only for a 1-bit rotate. Its deterministic multi-bit value (the
+    // same formula) is always carried in `val` for the detonation mode; it stays
+    // in `undef` for multi-bit so the default fail-closed path is unchanged.
     let of = match kind {
         Rotate::Rol | Rotate::Rcl => bit(res, bits - 1) ^ cf,
         Rotate::Ror | Rotate::Rcr => bit(res, bits - 1) ^ bit(res, bits - 2),
     };
     let mut def = CF;
     let mut undef = 0;
-    let mut val = pick(cf != 0, CF);
+    let val = pick(cf != 0, CF) | pick(of != 0, OF);
     if masked == 1 {
         def |= OF;
-        val |= pick(of != 0, OF);
     } else {
         undef |= OF;
     }
@@ -474,6 +489,34 @@ mod tests {
         // zero masked count is a no-op; multi-bit leaves OF undefined.
         assert!(rotate(Rotate::Rol, 0x12, 0, false, 1).is_none());
         let (_, f) = rotate(Rotate::Rol, 0x12, 3, false, 1).unwrap();
+        assert_eq!(f.undef, OF);
+    }
+
+    // The detonation mode reads a producer's deterministic value for an
+    // undefined bit out of `Flags.val`; the default path masks it out via `def`.
+    // These assert the value is present in `val` AND the bit stays in `undef`
+    // (so the default fail-closed behaviour is preserved — the apply() in emu.rs
+    // is what gates on the mode).
+    #[test]
+    fn deterministic_undef_carried_in_val() {
+        // Multi-bit SHL: OF still undefined, but val carries the 1-bit-formula
+        // value. 0x4000_0000 << 2 -> msb(res)=0, cf(bit 30 of a)=1 => OF=1.
+        let (_, f) = shift(Shift::Shl, 0x4000_0000, 2, 4).unwrap();
+        assert_eq!(f.undef & OF, OF, "OF still undefined by default");
+        assert_eq!(f.val & OF, OF, "deterministic OF carried in val");
+        // Multi-bit SHR: OF deterministic = msb of original operand.
+        let (_, f) = shift(Shift::Shr, 0x8000_0000, 3, 4).unwrap();
+        assert_eq!(f.undef & OF, OF);
+        assert_eq!(f.val & OF, OF, "SHR OF = original msb");
+        // mul: SF/ZF/PF/AF undefined, but val carries szp of the low half.
+        // 0x10*0x10 = 0x100 -> lo byte 0 => ZF set, PF set (parity of 0).
+        let (lo, _, f) = mul(0x10, 0x10, 1);
+        assert_eq!(lo, 0);
+        assert_eq!(f.undef, SF | ZF | AF | PF);
+        assert_eq!(f.val & (ZF | PF), ZF | PF, "mul szp(lo) carried in val");
+        assert_eq!(f.val & AF, 0, "mul AF deterministic = 0");
+        // Multi-bit rotate already carries its OF formula via `val` too.
+        let (_, f) = rotate(Rotate::Rol, 0x80, 3, false, 1).unwrap();
         assert_eq!(f.undef, OF);
     }
 }

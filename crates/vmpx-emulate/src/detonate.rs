@@ -58,6 +58,13 @@ pub struct DetonateOptions {
     pub export_reference: BTreeMap<String, Vec<SymbolOrOrdinal>>,
     /// Snapshot the mapped image after the run.
     pub dump: bool,
+    /// Resolve architecturally-undefined flags to their deterministic hardware
+    /// value instead of fail-closing (see [`crate::Emulator::resolve_undefined_flags`]).
+    /// Default `true`: a concrete CPU run has a definite flag value, so a
+    /// `cmov`/`jcc` consuming e.g. a multi-bit-rotate's undefined OF proceeds
+    /// rather than stopping. Observed/quarantined tier — never sound static
+    /// output. Set `false` to reproduce the sound fail-closed stop.
+    pub resolve_undefined_flags: bool,
 }
 
 impl Default for DetonateOptions {
@@ -71,6 +78,7 @@ impl Default for DetonateOptions {
             vm_loop_head: None,
             export_reference: BTreeMap::new(),
             dump: true,
+            resolve_undefined_flags: true,
         }
     }
 }
@@ -242,6 +250,13 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     let sentinel = img.return_sentinel();
     let mut emu = img.prepare(entry, &args)?;
     emu.hook = Some(hook);
+    // Detonation is a concrete CPU run: by default resolve architecturally-
+    // undefined flags to their deterministic hardware value instead of
+    // fail-closing, so a `cmov`/`jcc` that consumes e.g. the OF left undefined
+    // by a multi-bit rotate/shift/bt proceeds as it would on real silicon. This
+    // is an observed/quarantined-tier concretization confined to this contained,
+    // in-model run; it never affects sound static output.
+    emu.resolve_undefined_flags = opts.resolve_undefined_flags;
     let stop = emu.run_until(sentinel, opts.max_steps);
     let steps = emu.trace.len();
 
@@ -452,10 +467,19 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_STEPS);
-        let opts = DetonateOptions { export_reference, max_steps, ..DetonateOptions::default() };
+        // VMPX_RESOLVE_UNDEF=0 reproduces the sound fail-closed stop; default on.
+        let resolve_undefined_flags =
+            std::env::var("VMPX_RESOLVE_UNDEF").map_or(true, |v| v != "0");
+        let opts = DetonateOptions {
+            export_reference,
+            max_steps,
+            resolve_undefined_flags,
+            ..DetonateOptions::default()
+        };
         let res = detonate(&pe, &opts).expect("detonation starts");
         eprintln!(
-            "sample={path}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?}\n  oep={:?}\n  imports captured={}",
+            "sample={path} resolve_undef={}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?}\n  oep={:?}\n  imports captured={}",
+            opts.resolve_undefined_flags,
             opts.export_reference.len(),
             res.steps,
             res.stop,
