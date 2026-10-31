@@ -161,6 +161,17 @@ impl LinearHandlerRecoveryError {
     }
 }
 
+/// Whether a section can hold the origin of a protector bytecode stream. VMProtect
+/// bytecode is data the VM interpreter reads, so it lives in an initialized
+/// section (`.vmp0`, or a relaid-out standard data section) — not necessarily the
+/// executable section that holds the native handlers. The only hard requirement
+/// is that the section is file-backed (not pure zero-fill), so the bytes provably
+/// exist; a VIP seeded into an uninitialized (`.bss`-style) range is refused.
+fn section_can_hold_bytecode(characteristics: u32) -> bool {
+    const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+    characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA == 0
+}
+
 fn is_linear_decodable_semantic(semantic: VmHandlerSemantic) -> bool {
     semantic != VmHandlerSemantic::Unknown && !semantic.ends_linear_block()
 }
@@ -1082,11 +1093,14 @@ pub fn recover_and_decode_linear_vm_stream_cached(
     let mut state = initial_state;
     let mut cumulative_vsp_delta = Some(0_i64);
     let mut handler_recoveries = BTreeMap::new();
-    // Protector bytecode is fetched from an executable section. Containment is
-    // only meaningful when the stream starts in one: a stream whose initial VIP
-    // lands in a non-executable section (an unwind table, resource blob, or
-    // zero-fill range) has a wrong seed or decode offset, so decoding it would
-    // report data as a recovered program.
+    // Protector bytecode is data the interpreter reads, not code it executes, so
+    // VMProtect keeps it in an initialized data section (`.vmp0`, or standard
+    // sections such as `.pdata`/`.idata` after relayout) distinct from the
+    // executable section holding the native handlers. Containment to that origin
+    // section is what catches drift; the only requirement on the origin is that
+    // it is a real, file-backed (initialized) section so the bytes provably
+    // exist. A VIP that lands in no section, or in a pure zero-fill (.bss) range,
+    // has a wrong seed or decode offset and is refused.
     let bytecode_origin_section = pe
         .optional
         .image_base
@@ -1095,7 +1109,8 @@ pub fn recover_and_decode_linear_vm_stream_cached(
             pe.sections
                 .iter()
                 .find(|section| {
-                    section.contains_mapped_rva(rva) && section.characteristics & 0x2000_0000 != 0
+                    section.contains_mapped_rva(rva)
+                        && section_can_hold_bytecode(section.characteristics)
                 })
                 .map(|section| section.index)
         });
@@ -1111,10 +1126,10 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                 handler_recoveries,
             ));
         }
-        // Protector bytecode stays inside the executable section that holds the
-        // entry stream. A VIP that starts outside one, or leaves it, means the
-        // decoder state has drifted, so the stream is refused instead of being
-        // reported as a decoded program.
+        // Protector bytecode stays inside the single initialized section that
+        // holds the entry stream. A VIP that starts in no such section, or leaves
+        // its origin section, means the decoder state has drifted, so the stream
+        // is refused instead of being reported as a decoded program.
         if bytecode_origin_section.is_none() {
             return Ok(linear_report(
                 Vec::new(),
@@ -1333,6 +1348,20 @@ pub fn recover_and_decode_linear_vm_stream_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytecode_origin_accepts_initialized_sections_and_rejects_bss() {
+        const EXEC_READ_CODE: u32 = 0x6000_0020; // .text / .vmp2 / .vmp3
+        const INIT_READ_DATA: u32 = 0x4000_0040; // .vmp0 / .pdata / .idata
+        const UNINIT_DATA: u32 = 0x0000_0080; // .bss (pure zero-fill)
+        const UNINIT_PLUS_READ: u32 = 0xC000_0080; // uninitialized but readable
+        // Protector bytecode lives in initialized sections, executable or not.
+        assert!(section_can_hold_bytecode(EXEC_READ_CODE));
+        assert!(section_can_hold_bytecode(INIT_READ_DATA));
+        // A zero-fill (uninitialized) section cannot back bytecode: fail closed.
+        assert!(!section_can_hold_bytecode(UNINIT_DATA));
+        assert!(!section_can_hold_bytecode(UNINIT_PLUS_READ));
+    }
 
     #[test]
     fn ambiguous_or_rejected_operands_are_not_executable_statuses() {

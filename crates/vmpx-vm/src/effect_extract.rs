@@ -344,6 +344,32 @@ fn assigns_zero(instruction: &Instruction) -> bool {
                 && instruction.op0_register() == instruction.op1_register()))
 }
 
+/// A register's own constant self-offset (`reg += imm` / `reg -= imm`,
+/// `inc`/`dec reg`, `lea reg,[reg+imm]`): the result stays a constant offset of
+/// the register's prior value, so a value provenance (e.g. "derived from the
+/// popped VM-stack qword") survives the write. VMProtect's descending bytecode
+/// predecrements the VIP (`sub vip,width`) between loading a branch target and
+/// the dispatch read; without this, that predecrement would drop the VIP's
+/// popped-value provenance before the handler's effects are classified.
+fn is_constant_self_offset(instruction: &Instruction, register: Register) -> bool {
+    if instruction.op0_kind() != OpKind::Register
+        || canonical(instruction.op0_register()) != canonical(register)
+        || instruction.op0_register().size() != 8
+    {
+        return false;
+    }
+    match instruction.mnemonic() {
+        Mnemonic::Add | Mnemonic::Sub => signed_immediate(instruction, 1).is_some(),
+        Mnemonic::Inc | Mnemonic::Dec => true,
+        Mnemonic::Lea => {
+            instruction.op1_kind() == OpKind::Memory
+                && canonical(instruction.memory_base()) == canonical(register)
+                && instruction.memory_index() == Register::None
+        }
+        _ => false,
+    }
+}
+
 fn preserves_destination_by_zero_arithmetic(
     instruction: &Instruction,
     zero_registers: &BTreeSet<Register>,
@@ -496,10 +522,22 @@ pub fn extract_handler_effects_keyed(
         let copied_zero =
             copied_registers.is_some_and(|(_, source)| zero_registers.contains(&source));
         let destination = explicit_destination(instruction);
-        let preserves_vsp_value = destination.is_some_and(|destination| {
+        // A VIP/key role register that is a popped-value alias keeps that
+        // provenance across its own constant self-offset (the descending
+        // bytecode predecrement and equivalent bookkeeping). Scoped to these two
+        // roles so ordinary scratch/VSP arithmetic is unaffected.
+        let preserves_role_offset = destination.is_some_and(|destination| {
             vsp_top_value_aliases.contains(&destination)
-                && preserves_destination_by_zero_arithmetic(instruction, &zero_registers)
+                && [dispatch_roles.vip, dispatch_roles.rolling_key]
+                    .iter()
+                    .any(|role| canonical(*role) == destination)
+                && is_constant_self_offset(instruction, destination)
         });
+        let preserves_vsp_value = preserves_role_offset
+            || destination.is_some_and(|destination| {
+                vsp_top_value_aliases.contains(&destination)
+                    && preserves_destination_by_zero_arithmetic(instruction, &zero_registers)
+            });
         let preserves_zero = destination.is_some_and(|destination| {
             zero_registers.contains(&destination)
                 && preserves_destination_by_zero_arithmetic(instruction, &zero_registers)
@@ -2718,6 +2756,60 @@ mod tests {
         assembler.mov(r15, r10).expect("set VIP");
         assembler.mov(rbp, r15).expect("reset key");
         assembler.xor(r15, r15).expect("overwrite VIP");
+        assembler
+            .lea(r14, qword_ptr(0x1234_u64))
+            .expect("reset handler base");
+        assembler.mov(edx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let trace = trace_from_assembler(assembler);
+        let boundary = trace.instructions().nth(6).expect("dispatch load").rva;
+        let summary = effects(&trace, boundary);
+        let analysis = classify_handler_effects(trace.entry, &summary, None, Some(4));
+
+        assert!(!summary.loads_vip_from_vsp);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::Unknown);
+    }
+
+    #[test]
+    fn recognizes_descending_branch_with_vip_predecrement() {
+        // VMProtect's descending bytecode predecrements the VIP (`sub vip,4`)
+        // between popping the branch target and the dispatch read. The popped
+        // value's provenance must survive that constant self-offset so the
+        // handler still classifies as an unconditional branch.
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(r10, qword_ptr(r11)).expect("pop target VIP");
+        assembler.add(r11, 8).expect("advance VSP");
+        assembler.mov(r15, r10).expect("set VIP");
+        assembler.mov(rbp, r15).expect("reset key");
+        assembler.sub(r15, 4).expect("descending VIP predecrement");
+        assembler
+            .lea(r14, qword_ptr(0x1234_u64))
+            .expect("reset handler base");
+        assembler.mov(edx, dword_ptr(r15)).expect("dispatch load");
+        assembler.jmp(r14).expect("dispatch");
+        let trace = trace_from_assembler(assembler);
+        let boundary = trace.instructions().nth(6).expect("dispatch load").rva;
+        let summary = effects(&trace, boundary);
+        let analysis = classify_handler_effects(trace.entry, &summary, None, Some(4));
+
+        assert!(summary.loads_vip_from_vsp);
+        assert!(summary.resets_key_from_vip);
+        assert!(summary.reinitializes_handler_base);
+        assert_eq!(analysis.semantic, VmHandlerSemantic::UnconditionalBranch);
+        assert_eq!(analysis.stack_delta, Some(8));
+    }
+
+    #[test]
+    fn descending_offset_preservation_does_not_survive_variable_write() {
+        // The provenance is kept only across a *constant* self-offset. A write
+        // that mixes in another register's value (not a zero register) drops it,
+        // so the handler fails closed to Unknown rather than a guessed branch.
+        let mut assembler = CodeAssembler::new(64).expect("x64 assembler");
+        assembler.mov(r10, qword_ptr(r11)).expect("pop target VIP");
+        assembler.add(r11, 8).expect("advance VSP");
+        assembler.mov(r15, r10).expect("set VIP");
+        assembler.mov(rbp, r15).expect("reset key");
+        assembler.add(r15, rax).expect("variable write to VIP");
         assembler
             .lea(r14, qword_ptr(0x1234_u64))
             .expect("reset handler base");
