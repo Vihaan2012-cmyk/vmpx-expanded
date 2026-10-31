@@ -50,6 +50,49 @@ impl ObservedMemory {
     }
 }
 
+/// Concrete VM branch targets observed on ONE detonation: a plain, crate-owned
+/// map from a branch SITE identity (the VM branch's VIP / bytecode address) to
+/// the concrete target VIP(s) the branch reached on that run. This is NOT a
+/// proof — it reflects a single run/input. The CLI builds it from a detonation's
+/// recorded branch targets; vmpx-vm never produces it and never trusts it on the
+/// sound path. A seeded target is followed only when it independently validates
+/// as real in-image bytecode (see cfg.rs), so observation can seed a resolution
+/// but can never turn a data address into code.
+///
+/// Kept deliberately free of any `vmpx-emulate` type (the crate owns this plain
+/// structure, mirroring [`ObservedMemory`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedBranchTargets {
+    sites: BTreeMap<u64, Vec<u64>>,
+}
+
+impl ObservedBranchTargets {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds the seed from `(branch_site_vip, target_vips)` pairs, e.g. a
+    /// detonation's recorded VM branch targets correlated to their branch site.
+    pub fn from_sites(sites: impl IntoIterator<Item = (u64, Vec<u64>)>) -> Self {
+        Self {
+            sites: sites.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty()
+    }
+
+    /// Observed concrete target VIP(s) for the branch at `site`, or an empty
+    /// slice when none were recorded.
+    #[must_use]
+    pub fn targets_for(&self, site: u64) -> &[u64] {
+        self.sites.get(&site).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Read-only image bytes overlaid with observed runtime memory.
 ///
 /// `read_byte` returns only sound static-image bytes (identical to
@@ -241,6 +284,18 @@ pub(crate) mod tests {
         assert_eq!(observed.read_byte(0x1003), None); // past the slot
         assert_eq!(observed.read_byte(0x0FFF), None); // before the slot
         assert!(ObservedMemory::new().read_byte(0x1000).is_none());
+    }
+
+    #[test]
+    fn observed_branch_targets_returns_recorded_sites_only() {
+        let observed =
+            ObservedBranchTargets::from_sites([(0x1000_u64, vec![0x2000, 0x3000]), (0x1800, vec![])]);
+        assert!(!observed.is_empty());
+        assert_eq!(observed.targets_for(0x1000), &[0x2000, 0x3000]);
+        assert_eq!(observed.targets_for(0x1800), &[] as &[u64]);
+        assert_eq!(observed.targets_for(0x9999), &[] as &[u64]); // unrecorded site
+        assert!(ObservedBranchTargets::new().is_empty());
+        assert_eq!(ObservedBranchTargets::new().targets_for(0x1000), &[] as &[u64]);
     }
 
     #[test]

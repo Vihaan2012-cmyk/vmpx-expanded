@@ -180,6 +180,15 @@ pub enum VmCfgAssumption {
     /// depth is present for the loop head. EXPERIMENTAL and observed-tier: valid
     /// for that run/input only, never sound output.
     ObservedRecursionDepth,
+    /// A computed branch that otherwise fails closed — its constant target points
+    /// into a non-executable data section (CASE-C), or its target depends on an
+    /// untracked runtime memory read — was resolved to a concrete target VIP
+    /// OBSERVED for that branch site on ONE detonation. The seeded target is
+    /// followed ONLY when it independently validates as real in-image bytecode in
+    /// the entry's proven bytecode section: observation seeds a resolution, it
+    /// never turns a data address into code. EXPERIMENTAL and observed-tier:
+    /// valid for that run/input only, never sound output.
+    ObservedBranchTarget,
 }
 
 /// Observed back-edge trip counts per loop head, captured on ONE detonation: a
@@ -229,14 +238,24 @@ impl ObservedLoopDepths {
 pub struct ObservedRun {
     pub memory: crate::ObservedMemory,
     pub loop_depths: ObservedLoopDepths,
+    /// Observed concrete VM branch targets per branch site (empty on the sound
+    /// path). Feeds the experimental observed-branch-target bridge, which
+    /// resolves a branch that otherwise fails closed (CASE-C data target or an
+    /// untracked-memory-epoch target) only when the observed target still
+    /// validates as real in-image bytecode.
+    pub branch_targets: crate::ObservedBranchTargets,
 }
 
 impl ObservedRun {
+    /// Construction stays source-compatible with the memory/loop-depths bridges;
+    /// `branch_targets` defaults empty. Set the field to seed observed branch
+    /// targets.
     #[must_use]
     pub fn new(memory: crate::ObservedMemory, loop_depths: ObservedLoopDepths) -> Self {
         Self {
             memory,
             loop_depths,
+            branch_targets: crate::ObservedBranchTargets::new(),
         }
     }
 }
@@ -535,6 +554,28 @@ fn out_of_bytecode_section_reason(target_characteristics: Option<u32>) -> &'stat
         Some(flags) if flags & IMAGE_SCN_MEM_EXECUTE == 0 => "it is in a non-executable data section",
         Some(_) => "it is in a different executable section not proven to hold this VM's bytecode",
     }
+}
+
+/// The observed branch targets for `site` that may be FOLLOWED as real
+/// bytecode: each must land in the entry's proven bytecode `section` (the same
+/// membership the sound branch path requires of every target). Observation
+/// seeds a resolution; it can never turn a data address into code, so a target
+/// in a data/different section or outside every section is dropped here. Empty
+/// when there is no observation for the site or none validate — the caller then
+/// keeps its exact fail-closed stall. Default/sound path: `observed` is empty,
+/// so this is always empty.
+fn followable_observed_targets(
+    pe: &PeImage<'_>,
+    section: Option<usize>,
+    observed: &crate::ObservedBranchTargets,
+    site: Va,
+) -> Vec<Va> {
+    observed
+        .targets_for(site.get())
+        .iter()
+        .map(|&value| Va(value))
+        .filter(|&target| section.is_some() && bytecode_section(pe, target) == section)
+        .collect()
 }
 
 const NESTED_ENTRY_CONFIDENCE: u8 = 60;
@@ -1030,6 +1071,10 @@ struct Walker<'a, 'p> {
     /// Consulted only to bound a VSP-changing recursion whose per-iteration VSP
     /// delta is a proven constant.
     observed_depths: &'a ObservedLoopDepths,
+    /// Observed concrete branch targets per branch site (empty on the sound
+    /// path). Consulted only at a branch that otherwise fails closed, and only
+    /// for targets that still validate as real in-image bytecode.
+    observed_branch_targets: &'a crate::ObservedBranchTargets,
 }
 
 /// Builds the memory source for a symbolic call: the sound read-only image
@@ -1833,6 +1878,14 @@ impl Walker<'_, '_> {
                             .assumptions
                             .insert(VmCfgAssumption::PreferredImageBase);
                         (targets, true, direct_registers.clone(), false)
+                    } else if self
+                        .resolve_observed_branch_targets(key, vip, &dispatch, anchor, symbolic, pending)
+                    {
+                        // EXPERIMENTAL: the target depends on an untracked runtime
+                        // memory read, so static resolution fails closed. A target
+                        // observed for this branch site (and re-validated as real
+                        // bytecode) resolved it; nothing else to enumerate here.
+                        return;
                     } else {
                         self.stall(key, vip, format!("unresolved branch target: {reason}"));
                         return;
@@ -1849,9 +1902,24 @@ impl Walker<'_, '_> {
                 .assumptions
                 .insert(VmCfgAssumption::OverApproximatedEnvironmentGate);
         }
+        // Consulted at most once, only when a target falls out of the bytecode
+        // section (CASE-C). An observed real target for this branch site, once
+        // re-validated as bytecode, supersedes the data-pointing static target.
+        let mut observed_consulted = false;
+        let mut observed_followed = false;
         for value in targets {
             let target_va = Va(value);
             if self.section.is_none() || bytecode_section(self.pe, target_va) != self.section {
+                if !observed_consulted {
+                    observed_followed = self
+                        .resolve_observed_branch_targets(key, vip, &dispatch, anchor, symbolic, pending);
+                    observed_consulted = true;
+                }
+                if observed_followed {
+                    // EXPERIMENTAL: the computed target points into data; the
+                    // observed real target replaced it. Suppress the CASE-C stall.
+                    continue;
+                }
                 let target_characteristics = self
                     .pe
                     .optional
@@ -1874,41 +1942,109 @@ impl Walker<'_, '_> {
                 );
                 continue;
             }
-            let first = match dispatch.codec.decode_direction(
-                self.pe,
-                RelativeDispatchState {
-                    vip: target_va,
-                    rolling_key: value,
-                    handler: anchor,
-                },
-                self.direction,
-            ) {
-                Ok(first) => first,
-                Err(error) => {
-                    self.stall(
-                        key,
-                        vip,
-                        format!("target {target_va} dispatch failed: {error}"),
-                    );
-                    continue;
-                }
-            };
-            self.add_edge(CfgEdge {
-                from: key,
-                to: first.state_after.vip,
-                kind: if guarded {
-                    CfgEdgeKind::GuardedBranch
-                } else {
-                    CfgEdgeKind::Branch
-                },
-            });
-            pending.push(Item {
-                start: first.state_after,
-                address: Some(target_va),
-                symbolic: symbolic.continuation_state(),
-                path: self.current.clone(),
-            });
+            self.follow_bytecode_target(key, vip, target_va, value, &dispatch, anchor, guarded, symbolic, pending);
         }
+    }
+
+    /// Decodes into a VALIDATED in-section bytecode `target_va`, adds the branch
+    /// edge, and queues the target block. Returns false (emitting a stall) when
+    /// the dispatch decode fails. Shared by the sound branch loop and the
+    /// observed-branch-target bridge; the two differ only in how `target_va` was
+    /// obtained — the caller must already have proven it is in-section bytecode.
+    #[allow(clippy::too_many_arguments)]
+    fn follow_bytecode_target(
+        &mut self,
+        key: Va,
+        vip: Va,
+        target_va: Va,
+        rolling_key: u64,
+        dispatch: &DispatchExtractionCandidate,
+        anchor: Va,
+        guarded: bool,
+        symbolic: &SymbolicVmExecutionReport,
+        pending: &mut Vec<Item>,
+    ) -> bool {
+        let first = match dispatch.codec.decode_direction(
+            self.pe,
+            RelativeDispatchState {
+                vip: target_va,
+                rolling_key,
+                handler: anchor,
+            },
+            self.direction,
+        ) {
+            Ok(first) => first,
+            Err(error) => {
+                self.stall(key, vip, format!("target {target_va} dispatch failed: {error}"));
+                return false;
+            }
+        };
+        self.add_edge(CfgEdge {
+            from: key,
+            to: first.state_after.vip,
+            kind: if guarded {
+                CfgEdgeKind::GuardedBranch
+            } else {
+                CfgEdgeKind::Branch
+            },
+        });
+        pending.push(Item {
+            start: first.state_after,
+            address: Some(target_va),
+            symbolic: symbolic.continuation_state(),
+            path: self.current.clone(),
+        });
+        true
+    }
+
+    /// EXPERIMENTAL observed-branch-target bridge. At a branch that otherwise
+    /// fails closed (a computed target into data — CASE-C — or a target gated on
+    /// an untracked runtime memory read), consult the observed-run seed for the
+    /// concrete target VIP(s) recorded for this branch site (keyed by the VM
+    /// branch VIP). Each observed target is followed ONLY if it still validates
+    /// as real in-image bytecode in the entry's proven bytecode section (see
+    /// [`followable_observed_targets`]): observation seeds a resolution, it can
+    /// never turn a data address into code. Each followed edge is labeled
+    /// [`VmCfgAssumption::ObservedBranchTarget`]. Returns true if at least one
+    /// observed target was followed (the caller then skips its fail-closed
+    /// stall); false — including the whole default/sound path, where the seed is
+    /// empty — leaves the fail-closed behavior byte-for-byte unchanged.
+    fn resolve_observed_branch_targets(
+        &mut self,
+        key: Va,
+        vip: Va,
+        dispatch: &DispatchExtractionCandidate,
+        anchor: Va,
+        symbolic: &SymbolicVmExecutionReport,
+        pending: &mut Vec<Item>,
+    ) -> bool {
+        let targets =
+            followable_observed_targets(self.pe, self.section, self.observed_branch_targets, vip);
+        if targets.is_empty() {
+            return false;
+        }
+        let mut followed = false;
+        for target_va in targets {
+            if self.follow_bytecode_target(
+                key,
+                vip,
+                target_va,
+                target_va.get(),
+                dispatch,
+                anchor,
+                true,
+                symbolic,
+                pending,
+            ) {
+                followed = true;
+            }
+        }
+        if followed {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::ObservedBranchTarget);
+        }
+        followed
     }
 
     /// Follows a proven VM exit whose return target is another entry stub of
@@ -2153,8 +2289,13 @@ pub fn recover_vm_cfg_with_observed_memory(
 ///   is a PROVEN CONSTANT, is lifted as a BOUNDED UNROLL of exactly the depth in
 ///   [`ObservedRun::loop_depths`], past the "loop changes the VM stack pointer"
 ///   stall ([`VmCfgAssumption::ObservedRecursionDepth`]).
+/// - A computed branch that otherwise fails closed — a constant target into a
+///   data section (CASE-C) or a target gated on an untracked runtime memory read
+///   — is resolved to a concrete target VIP in [`ObservedRun::branch_targets`],
+///   but ONLY when that target re-validates as real in-image bytecode
+///   ([`VmCfgAssumption::ObservedBranchTarget`]).
 ///
-/// Pass [`ObservedRun::default`] (both empty) for the sound path, which recovers
+/// Pass [`ObservedRun::default`] (all empty) for the sound path, which recovers
 /// exactly as [`recover_vm_cfg`].
 ///
 /// # Errors
@@ -2211,6 +2352,7 @@ pub fn recover_vm_cfg_with_observed(
         observed: &observed.memory,
         seeded: &seeded,
         observed_depths: &observed.loop_depths,
+        observed_branch_targets: &observed.branch_targets,
     };
     let mut pending = vec![Item {
         start: setup.first_state,
@@ -2296,6 +2438,42 @@ mod tests {
         assert_eq!(
             out_of_bytecode_section_reason(None),
             "it is not mapped to any section"
+        );
+    }
+
+    #[test]
+    fn observed_branch_target_follows_only_validated_in_section_bytecode() {
+        use crate::immutable_image::tests::{DATA_VA, IMAGE_BASE, RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        // The entry's bytecode section is index 0 (where RDATA_VA lives), standing
+        // in for the executable protector section that holds this VM's bytecode.
+        let section = bytecode_section(&pe, Va(RDATA_VA));
+        assert!(section.is_some());
+        let site = Va(IMAGE_BASE + 0x5000);
+
+        // A VALID observed target inside the entry's bytecode section is followed.
+        let valid = crate::ObservedBranchTargets::from_sites([(site.get(), vec![RDATA_VA])]);
+        assert_eq!(
+            followable_observed_targets(&pe, section, &valid, site),
+            vec![Va(RDATA_VA)]
+        );
+        // An INVALID observed target into the writable .data section is REFUSED:
+        // observation can never turn a data address into code (CASE-C soundness).
+        let into_data = crate::ObservedBranchTargets::from_sites([(site.get(), vec![DATA_VA])]);
+        assert!(followable_observed_targets(&pe, section, &into_data, site).is_empty());
+        // An observed target outside every section is refused.
+        let unmapped =
+            crate::ObservedBranchTargets::from_sites([(site.get(), vec![IMAGE_BASE + 0x9000])]);
+        assert!(followable_observed_targets(&pe, section, &unmapped, site).is_empty());
+        // No observation for this site: empty, so the caller keeps its stall.
+        assert!(followable_observed_targets(&pe, section, &valid, Va(IMAGE_BASE + 0x7777)).is_empty());
+        // No entry bytecode section: nothing is followable.
+        assert!(followable_observed_targets(&pe, None, &valid, site).is_empty());
+        // Default/sound path: an empty seed yields nothing (fail-closed unchanged).
+        assert!(
+            followable_observed_targets(&pe, section, &crate::ObservedBranchTargets::new(), site)
+                .is_empty()
         );
     }
 

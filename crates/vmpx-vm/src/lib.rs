@@ -124,7 +124,7 @@ pub use image_concretize::{
     ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
     concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
 };
-pub use immutable_image::{ObservedImage, ObservedMemory, ReadOnlyImage};
+pub use immutable_image::{ObservedBranchTargets, ObservedImage, ObservedMemory, ReadOnlyImage};
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,

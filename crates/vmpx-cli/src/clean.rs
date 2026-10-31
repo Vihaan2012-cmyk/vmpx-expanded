@@ -961,14 +961,33 @@ pub fn analyze_clean_with_image(
     } else {
         Vec::new()
     };
+    // Observed concrete VM branch targets per branch site, converted into the
+    // plain vmpx-vm `ObservedBranchTargets` seed (never the `vmpx-emulate` type).
+    // Feeds the experimental observed-branch-target bridge, which resolves a
+    // branch that otherwise fails closed (CASE-C data target, or an
+    // untracked-memory-epoch target) only when the observed target re-validates
+    // as real in-image bytecode. OBSERVE-SIDE CONTRACT (follow-on, in
+    // vmpx-emulate's `VmObserveHook` / `ObservedFacts`): for each VM branch taken
+    // during the detonation, record `(branch_site_vip, target_vip)` where
+    // `branch_site_vip` is the VM branch instruction's bytecode VIP (the same
+    // identity cfg.rs stalls on) and `target_vip` is the concrete next VIP the
+    // branch jumped to. Emit it as e.g. `ObservedFacts.branch_targets:
+    // Vec<ObservedBranchTarget { provenance, site_vip, target_vip }>`, then map
+    // it here exactly like `dynamic_globals`/`dynamic_loop_depths`. Until that
+    // field exists the seed is empty, so this bridge is a no-op on every path
+    // (the static seam is proven by the synthetic unit tests, like the globals
+    // bridge was). Grouped site -> targets for `ObservedBranchTargets`.
+    let dynamic_branch_targets: Vec<(u64, Vec<u64>)> = Vec::new();
     // Observed-tier seed for the experimental decoded-lift path only (concrete
-    // globals + recursion depths). `None` keeps the sound path's recovery
-    // seedless and unchanged.
+    // globals + recursion depths + branch targets). `None` keeps the sound
+    // path's recovery seedless and unchanged.
     let observed_run: Option<vmpx_vm::ObservedRun> = if dynamic {
-        Some(vmpx_vm::ObservedRun::new(
+        let mut run = vmpx_vm::ObservedRun::new(
             vmpx_vm::ObservedMemory::from_slots(dynamic_globals),
             vmpx_vm::ObservedLoopDepths::from_depths(dynamic_loop_depths),
-        ))
+        );
+        run.branch_targets = vmpx_vm::ObservedBranchTargets::from_sites(dynamic_branch_targets);
+        Some(run)
     } else {
         None
     };

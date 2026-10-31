@@ -187,8 +187,10 @@ pub(crate) fn lift_entry(
     // observed memory seed (empty on the sound path, so the overlay is then
     // identical to a bare read-only image). `seeded` is flipped if an observed
     // value is ever consumed, but the labeling the recovery surfaces lives on the
-    // CFG's `VmCfgAssumption::ObservedGlobal`. The observed loop depths ride
-    // along in the same run and feed the bounded-recursion unroll.
+    // CFG's `VmCfgAssumption::ObservedGlobal`. The observed loop depths and
+    // observed branch targets ride along in the same run (threaded into
+    // `recover_vm_cfg_with_observed` below) and feed the bounded-recursion unroll
+    // and the observed-branch-target bridge respectively.
     let observed = observed.cloned().unwrap_or_default();
     let seeded = Cell::new(false);
     let overlay = ObservedImage::new(ReadOnlyImage(pe), &observed.memory, &seeded);
