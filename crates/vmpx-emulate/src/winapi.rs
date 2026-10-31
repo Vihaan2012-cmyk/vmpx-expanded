@@ -513,6 +513,41 @@ impl WinApiHook {
             }
             // Frees are a no-op in the bump model; report success.
             (_, "VirtualFree" | "HeapFree") => Dispatch::Ret(1),
+            // LocalAlloc/GlobalAlloc(uFlags, dwBytes): fixed-memory blocks from
+            // the same zeroed bump pool; Free returns NULL on success.
+            (_, "LocalAlloc" | "GlobalAlloc") => {
+                let size = Self::arg(cpu, 1);
+                let va = self.alloc(mem, size);
+                if va != 0 {
+                    self.heap_sizes.insert(va, size);
+                }
+                Dispatch::Ret(va)
+            }
+            (_, "LocalFree" | "GlobalFree") => Dispatch::Ret(0),
+            (_, "FreeLibrary") => Dispatch::Ret(1),
+            // GetUserObjectInformationW(h, nIndex, pvInfo, nLength, lpnLengthNeeded):
+            // the interactive window station "WinSta0" (UOI_NAME=2) / visible
+            // flags (UOI_FLAGS=1); other indices fail.
+            (_, "GetUserObjectInformationW") => {
+                let Some(needed) = Self::stack_arg(cpu, mem, sab, 4) else {
+                    return Dispatch::Stop;
+                };
+                let (index, buf, len) = (Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3));
+                let payload: Vec<u8> = match index {
+                    2 => "WinSta0\0".encode_utf16().flat_map(u16::to_le_bytes).collect(),
+                    1 => [0u32, 0, 1].iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    _ => return Dispatch::Ret(0),
+                };
+                if needed != 0 && mem.write_uint(needed, 4, payload.len() as u64).is_err() {
+                    return Dispatch::Stop;
+                }
+                if len < payload.len() as u64 || mem.write(buf, &payload).is_err() {
+                    return Dispatch::Ret(0);
+                }
+                Dispatch::Ret(1)
+            }
+            // Fixed non-null window-station handle (interactive WinSta0).
+            (_, "GetProcessWindowStation") => Dispatch::Ret(0x0000_0070_FFD0_0010),
             (_, "GetProcessHeap") => Dispatch::Ret(PROCESS_HEAP),
             // HeapCreate(flOptions, dwInitialSize, dwMaximumSize) -> HANDLE: mint
             // a distinct non-null heap sentinel (HeapAlloc ignores the heap arg
@@ -1805,6 +1840,21 @@ mod tests {
             Dispatch::Void => panic!("expected Ret, got Void"),
             Dispatch::Stop => panic!("expected Ret, got Stop"),
         }
+    }
+
+    #[test]
+    fn user_object_information_reports_interactive_winsta() {
+        let (mut h, mut cpu, mut mem, sab) = harness();
+        set_args(&mut cpu, [0x1, 2, T_DATA, 0x40]);
+        mem.write_uint(sab, 8, T_DATA + 0x100).unwrap();
+        assert_eq!(ret_of(h.dispatch("user32.dll", "GetUserObjectInformationW", &cpu, &mut mem, sab)), 1);
+        assert_eq!(mem.read_uint(T_DATA + 0x100, 4).unwrap(), 16);
+        assert_eq!(mem.read_uint(T_DATA, 2).unwrap(), u64::from(b'W'));
+        // Unknown index fails; a too-small buffer fails.
+        set_args(&mut cpu, [0x1, 99, T_DATA, 0x40]);
+        assert_eq!(ret_of(h.dispatch("user32.dll", "GetUserObjectInformationW", &cpu, &mut mem, sab)), 0);
+        set_args(&mut cpu, [0x1, 2, T_DATA, 4]);
+        assert_eq!(ret_of(h.dispatch("user32.dll", "GetUserObjectInformationW", &cpu, &mut mem, sab)), 0);
     }
 
     #[test]

@@ -556,3 +556,18 @@ fn cmc_propagates_undefined_carry() {
     let mut e = emu_bytes(&code);
     assert!(matches!(e.run(50), Stop::UndefinedFlags { mask, .. } if mask == CF));
 }
+
+#[test]
+fn pop_to_memory_operand() {
+    // push imm; pop qword [DATA]: the stored value is the pushed one and RSP
+    // is restored.
+    let e = run(&asm(|a| {
+        a.mov(rax, 0x1122_3344_5566_7788u64).unwrap();
+        a.push(rax).unwrap();
+        a.mov(rbx, DATA).unwrap();
+        a.pop(qword_ptr(rbx)).unwrap();
+        a.nop().unwrap();
+    }));
+    assert_eq!(e.mem.read_uint(DATA, 8).unwrap(), 0x1122_3344_5566_7788);
+    assert_eq!(e.cpu.regs[4], STACK_TOP);
+}

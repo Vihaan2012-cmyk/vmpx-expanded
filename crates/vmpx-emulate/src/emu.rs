@@ -540,7 +540,8 @@ impl Emulator {
                 self.push64(v)?;
             }
             Mnemonic::Pop => {
-                if ins.op0_kind() != OpKind::Register || !ins.op0_register().is_gpr64() {
+                let reg64 = ins.op0_kind() == OpKind::Register && ins.op0_register().is_gpr64();
+                if !reg64 && ins.code() != Code::Pop_rm64 {
                     return Err(self.unsup());
                 }
                 let sp = self.cpu.regs[RSP];
