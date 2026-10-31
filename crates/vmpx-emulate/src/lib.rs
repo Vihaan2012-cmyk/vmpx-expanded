@@ -55,6 +55,7 @@ mod emu;
 mod loader;
 mod memory;
 mod observe;
+mod winapi;
 
 pub use alu::{Alu, Flags, Shift};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
@@ -70,3 +71,4 @@ pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
 pub use observe::{
     Observed, ObservedFacts, ObservedGlobal, ObservedImport, ObservedLoopDepth, SymbolOrOrdinal,
 };
+pub use winapi::WinApiHook;
