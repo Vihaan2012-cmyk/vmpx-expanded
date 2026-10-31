@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
     Register,
@@ -135,7 +137,15 @@ pub struct Emulator {
     pub resolve_undefined_flags: bool,
     cur: (u64, Mnemonic),
     det: (Option<u64>, Option<u64>),
+    /// Decode cache keyed by RIP: (decoded bytes, byte len, instruction). A hit
+    /// is only honoured when the current guest bytes still match the stored
+    /// ones, so self-modifying/unpacking code re-decodes instead of reusing a
+    /// stale entry. Cleared wholesale when it reaches [`DCACHE_CAP`].
+    dcache: HashMap<u64, ([u8; 15], usize, Instruction)>,
 }
+
+/// Entry cap for `dcache`; cleared on overflow to stay bounded over long runs.
+const DCACHE_CAP: usize = 1 << 16;
 
 impl Emulator {
     #[must_use]
@@ -149,6 +159,7 @@ impl Emulator {
             resolve_undefined_flags: false,
             cur: (0, Mnemonic::INVALID),
             det: (None, None),
+            dcache: HashMap::new(),
         }
     }
 
@@ -162,7 +173,7 @@ impl Emulator {
         self.det = (None, None);
         let mut buf = [0u8; 15];
         let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
-        let ins = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE).decode();
+        let ins = self.decode(rip, &buf, n);
         if ins.is_invalid() {
             return Err(Stop::DecodeError { rip });
         }
@@ -201,6 +212,30 @@ impl Emulator {
             }
         }
         Stop::StepLimit
+    }
+
+    /// Decode the instruction at `rip`, reusing a cached decode when the guest
+    /// bytes are unchanged. On a byte mismatch (self-modifying/unpacking code)
+    /// or a miss, decode afresh and store the result. Invalid decodes are not
+    /// cached; the caller surfaces them as [`Stop::DecodeError`].
+    fn decode(&mut self, rip: u64, buf: &[u8; 15], n: usize) -> Instruction {
+        if let Some((bytes, len, ins)) = self.dcache.get(&rip) {
+            let len = *len;
+            if len <= n && buf[..len] == bytes[..len] {
+                return *ins;
+            }
+        }
+        let ins = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE).decode();
+        let len = ins.len();
+        if !ins.is_invalid() && len <= n {
+            if self.dcache.len() >= DCACHE_CAP {
+                self.dcache.clear();
+            }
+            let mut stored = [0u8; 15];
+            stored[..len].copy_from_slice(&buf[..len]);
+            self.dcache.insert(rip, (stored, len, ins));
+        }
+        ins
     }
 
     fn unsup(&self) -> Stop {
@@ -1064,5 +1099,33 @@ fn dx_reg(bytes: u32) -> Register {
         2 => Register::DX,
         4 => Register::EDX,
         _ => Register::RDX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{PAGE_SIZE, Perm};
+
+    const ADDR: u64 = 0x1000;
+
+    /// The decode cache must not reuse a stale entry when the guest bytes at an
+    /// address change underneath it (self-modifying / write-then-execute code).
+    #[test]
+    fn decode_cache_invalidates_on_self_modifying_code() {
+        let mut mem = Memory::new();
+        mem.map(ADDR, PAGE_SIZE, Perm::RWX).unwrap();
+        // mov eax, 1 — primes the cache at ADDR.
+        mem.poke(ADDR, &[0xB8, 0x01, 0x00, 0x00, 0x00]).unwrap();
+
+        let mut emu = Emulator::new(Cpu::new(ADDR), mem);
+        emu.step().unwrap();
+        assert_eq!(emu.cpu.reg(Register::RAX), Some(1));
+
+        // Overwrite the same bytes with mov eax, 2 and re-execute at ADDR.
+        emu.mem.poke(ADDR, &[0xB8, 0x02, 0x00, 0x00, 0x00]).unwrap();
+        emu.cpu.rip = ADDR;
+        emu.step().unwrap();
+        assert_eq!(emu.cpu.reg(Register::RAX), Some(2), "cache served stale decode");
     }
 }
