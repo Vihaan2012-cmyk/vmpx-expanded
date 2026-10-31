@@ -53,7 +53,7 @@ pub(crate) struct ValidatedFunction {
     pub registers: BTreeMap<u32, PhysicalRegister>,
 }
 
-fn operation_register_accesses(
+pub(crate) fn operation_register_accesses(
     operation: &Operation,
     read: &mut BTreeSet<VirtualRegister>,
     written: &mut BTreeSet<VirtualRegister>,

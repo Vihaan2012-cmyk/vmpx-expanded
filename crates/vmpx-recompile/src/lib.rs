@@ -10,6 +10,7 @@ mod dispatch;
 mod encode;
 mod error;
 mod ir;
+pub mod opt;
 
 pub use abi::{RegisterAssignment, StackFrame, validate_function};
 pub use compose::{ComposeError, Composition, Fragment, compose};
