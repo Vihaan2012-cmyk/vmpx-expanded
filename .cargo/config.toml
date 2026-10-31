@@ -1,0 +1,9 @@
+# Containment / air-gap. These are untrusted real-world VMProtect samples (an
+# .xpl can carry malware), so the whole project stays OFFLINE: every cargo
+# operation (build, test, the contained software emulator) runs with no network
+# access. A build that would need to fetch from crates.io FAILS instead of
+# reaching the network — new external dependencies are forbidden; everything is
+# served from the local cache + Cargo.lock. The emulator has no network/syscall
+# path by construction, and no crate in this workspace contains network code.
+[net]
+offline = true
