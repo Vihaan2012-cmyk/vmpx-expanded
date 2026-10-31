@@ -753,19 +753,28 @@ impl LoweringContext<'_> {
         if count > ARGUMENT_REGISTERS.len() {
             return Err(ExpressionCodegenError::TooManyCallArguments { count });
         }
-        let mut argument_registers = Vec::with_capacity(count);
-        for (index, argument) in arguments.iter().take(count).enumerate() {
-            // Evaluate the argument into the accumulator, then move it into its
-            // ABI register.
+        // Spill every argument to its own frame slot first: lowering a later
+        // argument may shift (RCX), divide (RDX) or call, clobbering any ABI
+        // register an earlier argument already occupies. Only slot loads sit
+        // between the first ABI register write and the call.
+        let mut argument_slots = Vec::with_capacity(count);
+        for argument in arguments.iter().take(count) {
             self.lower(argument)?;
-            let target = VirtualRegister::qword(ACCUMULATOR_ID);
+            let argument_slot = self.allocate_slot()?;
+            self.operations.push(Operation::SpillStore {
+                slot: argument_slot,
+                source: VirtualRegister::qword(ACCUMULATOR_ID),
+            });
+            argument_slots.push(argument_slot);
+        }
+        let mut argument_registers = Vec::with_capacity(count);
+        for (index, argument_slot) in argument_slots.iter().enumerate() {
             let destination = VirtualRegister::qword(
                 9_000
                     + u32::try_from(index)
                         .map_err(|_| ExpressionCodegenError::StorageIdOverflow)?,
             );
-            // Reuse the shift-count register's storage when the ABI argument is
-            // RCX: the lowering already assigns that physical register, and the
+            // Reuse the storage already assigned to this physical register: the
             // backend allows one virtual register per physical register.
             let destination = self
                 .assignments
@@ -782,17 +791,26 @@ impl LoweringContext<'_> {
                     ARGUMENT_REGISTERS[index],
                 ));
             }
-            self.operations.push(Operation::Move {
+            self.operations.push(Operation::SpillLoad {
                 destination,
-                source: target,
+                slot: *argument_slot,
             });
             argument_registers.push(destination);
+        }
+        for _ in 0..count {
+            self.release_slot();
         }
         let result = VirtualRegister::qword(
             9_500 + u32::try_from(count).map_err(|_| ExpressionCodegenError::StorageIdOverflow)?,
         );
-        self.assignments
-            .push(RegisterAssignment::new(result, PhysicalRegister::Rax));
+        if !self
+            .assignments
+            .iter()
+            .any(|assignment| assignment.virtual_register.id == result.id)
+        {
+            self.assignments
+                .push(RegisterAssignment::new(result, PhysicalRegister::Rax));
+        }
         self.operations.push(Operation::Call {
             target: CallTarget::ImportAddressTable(NativeAddress(call.iat_address)),
             arguments: argument_registers,
@@ -1987,6 +2005,82 @@ mod tests {
         assert!(matches!(
             lower_expression(&Expr::constant(BitWidth::W64, 1), &constrained),
             Err(ExpressionCodegenError::NodeLimit { .. })
+        ));
+    }
+
+    fn import_config(argument_count: u8) -> ExpressionCodegenConfig {
+        ExpressionCodegenConfig {
+            inputs: vec![
+                input("a", BitWidth::W64, PhysicalRegister::Rsi),
+                input("b", BitWidth::W64, PhysicalRegister::Rdi),
+                input("n", BitWidth::W64, PhysicalRegister::R11),
+            ],
+            // The call result lives in RAX, so the accumulator cannot.
+            result_register: PhysicalRegister::Rbx,
+            import_calls: BTreeMap::from([(
+                "imp".to_owned(),
+                ImportCall {
+                    iat_address: 0x2000,
+                    argument_count,
+                },
+            )]),
+            ..ExpressionCodegenConfig::default()
+        }
+    }
+
+    #[test]
+    fn import_call_arguments_load_from_private_slots_after_all_lowering() {
+        let a = Expr::register(BitWidth::W64, "a");
+        let b = Expr::register(BitWidth::W64, "b");
+        let n = Expr::register(BitWidth::W64, "n");
+        // The second argument shifts by a variable count, which writes RCX.
+        let shifted = Expr::binary(BinaryOp::Shl, b, n).expect("variable shift");
+        let expression = Expr::intrinsic(BitWidth::W64, "imp", vec![a, shifted]);
+        let lowered = lower_expression(&expression, &import_config(2)).expect("lower import");
+        let operations = &lowered.function.operations;
+        let call = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Call { .. }))
+            .expect("call emitted");
+        let Operation::Call { arguments, .. } = &operations[call] else {
+            unreachable!()
+        };
+        assert_eq!(arguments.len(), 2);
+        let loads = &operations[call - 2..call];
+        let mut slots = Vec::new();
+        for (load, argument) in loads.iter().zip(arguments) {
+            let Operation::SpillLoad { destination, slot } = load else {
+                panic!("only slot loads sit between the ABI loads and the call: {load:?}");
+            };
+            assert_eq!(destination.id, argument.id);
+            slots.push(*slot);
+        }
+        assert_ne!(slots[0], slots[1], "each argument has its own slot");
+        let last_shift = operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::Shift { .. }))
+            .expect("variable shift emitted");
+        assert!(last_shift < call - 2, "no lowering follows the first ABI load");
+        for slot in &slots {
+            let stored = operations[..last_shift].iter().any(|operation| {
+                matches!(operation, Operation::SpillStore { slot: stored, .. } if stored == slot)
+            }) || operations[last_shift..call - 2].iter().any(|operation| {
+                matches!(operation, Operation::SpillStore { slot: stored, .. } if stored == slot)
+            });
+            assert!(stored, "{slot:?} is stored before it is loaded");
+        }
+        let input_slots = [SpillSlot(0), SpillSlot(1), SpillSlot(2)];
+        assert!(slots.iter().all(|slot| !input_slots.contains(slot)));
+        compile(&lowered.function, CodeAddress(0)).expect("compile import call");
+    }
+
+    #[test]
+    fn import_call_with_more_than_four_arguments_fails_closed() {
+        let a = Expr::register(BitWidth::W64, "a");
+        let expression = Expr::intrinsic(BitWidth::W64, "imp", vec![a; 5]);
+        assert!(matches!(
+            lower_expression(&expression, &import_config(5)),
+            Err(ExpressionCodegenError::TooManyCallArguments { count: 5 })
         ));
     }
 }
