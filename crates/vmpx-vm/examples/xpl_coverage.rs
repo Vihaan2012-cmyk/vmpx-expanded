@@ -4,9 +4,17 @@
 // the `cfgdiag` example), catches per-entry panics, and tallies completeness
 // plus the stall-cause distribution. READ-ONLY: no engine changes, static only.
 //
-// Usage: xpl_coverage [IMAGE] [MAX_ENTRIES]
-//   IMAGE        defaults to E:/downloads/systems.original.xpl
-//   MAX_ENTRIES  optional cap for a representative sample (0/omitted = all)
+// Usage: xpl_coverage [IMAGE] [SAMPLE] [THREADS]
+//   IMAGE    defaults to E:/downloads/systems.original.xpl
+//   SAMPLE   entries to sweep: a number for a sample, or "all" for the full
+//            image. OMITTED defaults to a SMALL memory-safe sample (50) so a
+//            naive run can never OOM; the full image is explicit opt-in ("all").
+//   THREADS  worker threads (default 4). Use 1 for a low-memory single-threaded
+//            run.
+//
+// Each entry is bounded by the recovery budget in `recover_one` (blocks,
+// visits, decoded instructions, and cross-profile transitions), so no single
+// entry can allocate without limit regardless of SAMPLE/THREADS.
 
 use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -63,11 +71,17 @@ fn normalize(reason: &str) -> String {
 }
 
 fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate) -> Outcome {
-    // Mirror cfgdiag's recovery budget: default CFG limits, bumped entry
-    // instruction budget. Bounded so hundreds of entries finish in wall-time.
+    // Mirror cfgdiag's recovery budget: default CFG limits (which bound blocks,
+    // visits, decoded instructions, and cross-profile transitions per entry),
+    // with a bumped per-block instruction budget. Every entry is hard-bounded,
+    // so none can allocate without limit.
     let limits = VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
-            instruction_limit: 100_000,
+            // A per-block decode budget large enough for any real handler stream
+            // block but small enough that one block's decoded-instruction vector
+            // and symbolic state can't balloon memory (post-transition, a long
+            // linear stream can decode before a clean boundary).
+            instruction_limit: 512,
             ..EntryProfileRecoveryLimits::default()
         },
         ..VmCfgLimits::default()
@@ -105,7 +119,22 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate) -> Outcome {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let image_path = args.get(1).map_or(DEFAULT_IMAGE, String::as_str);
-    let max_entries: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
+    // Memory-safe default: a small sample unless the caller explicitly asks for
+    // "all" (full image) or names a sample size. 0 means "no cap" (full image).
+    const DEFAULT_SAMPLE: usize = 50;
+    let max_entries: usize = match args.get(2).map(String::as_str) {
+        None => DEFAULT_SAMPLE,
+        Some("all") => 0,
+        Some(n) => n.parse().unwrap_or(DEFAULT_SAMPLE),
+    };
+    // A low default thread count keeps a naive multi-threaded run's peak memory
+    // modest (each concurrent entry holds its own bounded recovery state over the
+    // shared image). Raise it deliberately for a faster bounded sweep.
+    let max_threads: usize = args
+        .get(3)
+        .and_then(|a| a.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2);
 
     let t0 = Instant::now();
     let bytes = std::fs::read(image_path).unwrap_or_else(|e| panic!("read {image_path}: {e}"));
@@ -173,7 +202,7 @@ fn main() {
     // Bounded parallelism: split entries across a few scoped threads sharing &pe.
     let ts = Instant::now();
     let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get().min(8))
+        .map_or(1, |n| n.get().min(max_threads))
         .max(1);
     let chunk = entries.len().div_ceil(threads).max(1);
     let pe_ref = &pe;

@@ -55,6 +55,25 @@ pub struct VmCfgLimits {
     pub max_targets: usize,
     /// VM-to-VM re-entries followed across the whole walk.
     pub max_nested_entries: usize,
+    /// Proven cross-profile VM transitions followed per entry. Each transition
+    /// opens a new profile region whose initial symbolic state is the PRIOR
+    /// region's accumulated continuation state, so retained symbolic state grows
+    /// with transition depth. This hard cap bounds that growth (and the extra
+    /// blocks it reaches) so a pathological entry fails closed at the budget
+    /// instead of allocating without limit; the sound path (no transition) never
+    /// reaches it.
+    pub max_profile_transitions: usize,
+    /// Visited blocks allowed AFTER the first cross-profile transition, before
+    /// the walk fails closed. Each retained post-transition block carries a
+    /// deeper (larger) symbolic state than the last, so this — not the loose
+    /// entry-global `max_visits` — is what actually bounds transition-walk
+    /// memory. Counts only once a transition has fired, so an entry that follows
+    /// none is bounded exactly as before (byte-for-byte unchanged).
+    pub max_transition_visits: usize,
+    /// Decoded instructions allowed AFTER the first cross-profile transition,
+    /// before the walk fails closed. Bounds retained decoded-block memory on the
+    /// transition walk; inert on a walk that followed no transition.
+    pub max_transition_instructions: usize,
     /// Iterations of one loop unrolled with exact state before its changing
     /// cells are generalized to a stable over-approximation. Kept well under
     /// `max_visits_per_block`: each unrolled iteration propagates a distinct
@@ -75,6 +94,9 @@ impl Default for VmCfgLimits {
             max_total_instructions: 200_000,
             max_targets: 16,
             max_nested_entries: 8,
+            max_profile_transitions: 3,
+            max_transition_visits: 16,
+            max_transition_instructions: 1_500,
             max_loop_unrolls: 4,
         }
     }
@@ -148,6 +170,10 @@ pub enum CfgLimitHit {
     Visits,
     BlockVisits,
     TotalInstructions,
+    /// The tight post-cross-profile-transition exploration budget was exhausted
+    /// (bounds memory: see `VmCfgLimits::max_transition_visits`). The entry fails
+    /// closed; it never affects a walk that followed no transition.
+    TransitionBudget,
 }
 
 /// A labeled assumption the recovery relied on, surfaced rather than folded
@@ -595,7 +621,7 @@ struct Item {
     /// Profile to walk this block under; `None` is the base profile. A block
     /// reached through a proven cross-profile transition carries the new
     /// profile, which then propagates to its successors.
-    profile: Option<ProfileContext>,
+    profile: Option<Rc<ProfileContext>>,
 }
 
 /// A block on the current walk path with the symbolic state it was entered in.
@@ -1054,7 +1080,7 @@ fn bounded_unroll_or_refuse(
 /// profile for the entry's VM; a proven cross-profile transition attaches a new
 /// one to the successor block it queues (see [`Walker::follow_cross_profile_transition`]).
 /// Block/handler VAs are profile-disjoint, so the VA-keyed caches stay sound.
-#[derive(Clone)]
+/// Shared by [`Rc`] so queuing a successor never deep-clones the config/roles.
 struct ProfileContext {
     config: crate::HandlerCodecRecoveryConfig,
     profile: crate::VmProfile,
@@ -1077,7 +1103,14 @@ struct Walker<'a, 'p> {
     /// profile (every sound-path block), `Some` a profile reached through a
     /// proven cross-profile transition. Set at the top of each visit from the
     /// item being walked.
-    active: Option<ProfileContext>,
+    active: Option<Rc<ProfileContext>>,
+    /// Proven cross-profile transitions followed so far this entry; capped by
+    /// `limits.max_profile_transitions` to bound exploration/memory.
+    profile_transitions: usize,
+    /// `(total_instructions, visits)` captured when the FIRST cross-profile
+    /// transition fired. `None` until then (and forever on the sound path).
+    /// The post-transition budget is measured as growth beyond this baseline.
+    transition_budget_base: Option<(usize, usize)>,
     cache: LinearDecodeCache,
     decoded: BTreeMap<Va, DecodedBlock>,
     explored: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
@@ -1506,6 +1539,20 @@ impl Walker<'_, '_> {
         self.active.as_ref().map_or(self.profile, |c| c.profile)
     }
 
+    /// True once the post-transition exploration budget is spent. Measured as
+    /// growth in visits/decoded-instructions beyond the baseline captured at the
+    /// first cross-profile transition, so it is inert until one fires (and thus
+    /// forever on the sound path). This is the hard memory bound on the
+    /// transition walk: retained post-transition state grows with depth, so a
+    /// tight node/instruction budget — not the loose entry-global caps — keeps a
+    /// pathological entry from allocating without limit.
+    fn transition_budget_exhausted(&self) -> bool {
+        self.transition_budget_base.is_some_and(|(i0, v0)| {
+            self.total_instructions.saturating_sub(i0) >= self.limits.max_transition_instructions
+                || self.cfg.visits.saturating_sub(v0) >= self.limits.max_transition_visits
+        })
+    }
+
     fn decode_block(&mut self, item: &Item) -> bool {
         let key = item.start.vip;
         if self.decoded.contains_key(&key) {
@@ -1691,6 +1738,14 @@ impl Walker<'_, '_> {
         // `None` is the base profile, so the sound path is unchanged.
         self.active.clone_from(&item.profile);
         let key = item.start.vip;
+        // Hard memory bound on the transition walk: once the post-transition
+        // budget is spent, fail closed for this entry instead of exploring (and
+        // retaining) ever-deeper symbolic state. Inert until a transition fires.
+        if self.transition_budget_exhausted() {
+            self.cfg.limit_hit.get_or_insert(CfgLimitHit::TransitionBudget);
+            self.stall(key, key, "cross-profile exploration budget exhausted");
+            return;
+        }
         if self.cfg.visits >= self.limits.max_visits {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
@@ -2338,6 +2393,21 @@ impl Walker<'_, '_> {
         symbolic_in: &SymbolicVmInitialState,
         pending: &mut Vec<Item>,
     ) -> bool {
+        // Hard per-entry budget: each transition opens a new profile region whose
+        // retained symbolic state is deeper than the last, so an unbounded chain
+        // allocates without limit. Beyond the budget, fail closed (the caller
+        // stalls) instead of switching. Sound: a bounded walk that hits the cap
+        // stalls — it never false-completes.
+        if self.profile_transitions >= self.limits.max_profile_transitions {
+            return false;
+        }
+        // A genuine transition handler ends a short handler-stream block; a very
+        // long prefix is not a clean transition and symbolic-executing it would
+        // allocate a large state for nothing. Fail closed past a modest cap.
+        const MAX_TRANSITION_PREFIX: usize = 512;
+        if instructions.len() > MAX_TRANSITION_PREFIX {
+            return false;
+        }
         let profile = self.ctx_profile();
         let old_vsp = profile.effect_roles.vsp;
         let context_base = profile.effect_roles.context_base;
@@ -2435,13 +2505,13 @@ impl Walker<'_, '_> {
             effect_roles: resolved.effect_roles,
             bytecode_direction: resolved.bytecode_direction,
         };
-        let context = ProfileContext {
+        let context = Rc::new(ProfileContext {
             config: entry_stream_config(&new_profile, self.limits.entry),
             profile: new_profile,
             direction: resolved.bytecode_direction,
             global_table: None,
             section: bytecode_section(self.pe, Va(target)),
-        };
+        });
         if symbolic.assumed_external_disjoint_from_vm_stack
             || pop.assumed_external_disjoint_from_vm_stack
         {
@@ -2452,6 +2522,11 @@ impl Walker<'_, '_> {
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
+        // Start the post-transition memory budget at the first switch.
+        if self.transition_budget_base.is_none() {
+            self.transition_budget_base = Some((self.total_instructions, self.cfg.visits));
+        }
+        self.profile_transitions += 1;
         self.add_edge(CfgEdge {
             from: key,
             to: first.state_after.vip,
@@ -2566,6 +2641,8 @@ pub fn recover_vm_cfg_with_observed(
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
         active: None,
+        profile_transitions: 0,
+        transition_budget_base: None,
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
         explored: BTreeMap::new(),
@@ -2752,6 +2829,8 @@ mod tests {
             direction: base.bytecode_direction,
             section: Some(0),
             active: None,
+            profile_transitions: 0,
+            transition_budget_base: None,
             cache: LinearDecodeCache::default(),
             decoded: BTreeMap::new(),
             explored: BTreeMap::new(),
@@ -2806,13 +2885,13 @@ mod tests {
             Register::R11,
             crate::BytecodeDirection::Ascending,
         );
-        walker.active = Some(ProfileContext {
+        walker.active = Some(Rc::new(ProfileContext {
             config: entry_stream_config(&switched, walker.limits.entry),
             profile: switched,
             direction: switched.bytecode_direction,
             global_table: None,
             section: Some(1),
-        });
+        }));
         assert_eq!(walker.ctx_profile(), switched);
         assert_ne!(walker.ctx_profile(), base);
         assert_eq!(walker.ctx_direction(), crate::BytecodeDirection::Ascending);
@@ -2856,6 +2935,44 @@ mod tests {
         assert!(pending.is_empty(), "no successor may be queued");
         assert!(walker.cfg.edges.is_empty(), "no edge may be added");
         assert!(walker.active.is_none(), "the base profile is untouched");
+    }
+
+    /// MEMORY BUDGET: once the per-entry cross-profile-transition budget is
+    /// exhausted, the walk must fail closed immediately — no further transition
+    /// analysis, no successor queued, no edge — so a pathological entry stalls
+    /// at the cap instead of allocating without bound.
+    #[test]
+    fn exhausted_transition_budget_fails_closed() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        // Saturate the budget: the next transition must be refused outright.
+        walker.profile_transitions = walker.limits.max_profile_transitions;
+        let final_state = RelativeDispatchState {
+            vip: Va(RDATA_VA),
+            rolling_key: RDATA_VA,
+            handler: Va(RDATA_VA),
+        };
+        let symbolic_in = SymbolicVmInitialState::default();
+        let mut pending = Vec::new();
+        let switched = walker.follow_cross_profile_transition(
+            Va(RDATA_VA),
+            final_state,
+            &[],
+            &symbolic_in,
+            &mut pending,
+        );
+        assert!(!switched, "an exhausted budget must fail closed");
+        assert!(pending.is_empty(), "no successor may be queued at the cap");
+        assert!(walker.cfg.edges.is_empty(), "no edge may be added at the cap");
     }
 
     #[test]
