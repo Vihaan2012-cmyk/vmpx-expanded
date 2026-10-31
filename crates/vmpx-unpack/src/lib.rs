@@ -443,18 +443,78 @@ fn enumerate_streams(
     Ok(streams)
 }
 
-/// Binds enumerated streams to destinations. Destinations are served in
-/// ascending rounded-size order (ties by ascending RVA) and each claims the
-/// largest unclaimed stream that fits (ties by lowest file offset) — the greedy
-/// that recovers the unique matching when sizes are distinct, and that keeps a
-/// section's own stream with it when a larger section stores fewer initialized
-/// bytes. Residual ambiguity (equal-sized sections, or a zero-initialised tail
-/// making a stream smaller than its section) is surfaced as a warning; an
-/// unfitting or unequal count fails closed.
+/// Greedy claim of the largest unclaimed stream whose length is `<= bound` (ties
+/// broken by lowest file offset). Returns the chosen stream index, or `None`.
+fn claim_largest_fitting(streams: &[(usize, u32)], claimed: &[bool], bound: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (si, &(_, length)) in streams.iter().enumerate() {
+        if claimed[si] || length > bound {
+            continue;
+        }
+        best = Some(match best {
+            Some(b) if (streams[b].1, streams[si].0) >= (length, streams[b].0) => b,
+            _ => si,
+        });
+    }
+    best
+}
+
+/// Assigns one stream to each destination, returning the stream index bound to
+/// each destination (parallel to `targets`/`caps`/`vas`) or `Err(di)` for a
+/// destination with no fitting stream. Pure matching core of [`bind_streams`].
+///
+/// **Pass 1 (tight):** destinations are served in ascending rounded-size order
+/// (`targets`, ties by ascending RVA `vas`) and each claims the largest unclaimed
+/// stream no larger than its rounded `VirtualSize` — the greedy that recovers the
+/// unique matching when sizes are distinct, and that keeps a section's own stream
+/// with it when a larger section stores fewer initialized bytes (a
+/// zero-initialised tail, so its stream is *smaller* than its rounded size).
+///
+/// **Pass 2 (capacity fallback):** a section whose original `SizeOfRawData`
+/// carried raw padding *beyond* `VirtualSize` stores a stream *larger* than its
+/// rounded `VirtualSize` (real output: `.rdata`, whose stream fills its mapped
+/// slot to the next section). Pass 1 leaves such a section unmatched; it then
+/// claims the largest unclaimed stream that still physically fits its mapped slot
+/// (`<= caps[di]`), smallest-capacity-first. A stream fitting no remaining
+/// capacity fails closed.
+fn assign_streams(
+    targets: &[u32],
+    caps: &[u32],
+    vas: &[u32],
+    streams: &[(usize, u32)],
+) -> Result<Vec<usize>, usize> {
+    let count = targets.len();
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&i| (targets[i], vas[i]));
+    let mut claimed = vec![false; streams.len()];
+    let mut assigned: Vec<Option<usize>> = vec![None; count];
+    for &di in &order {
+        if let Some(si) = claim_largest_fitting(streams, &claimed, targets[di]) {
+            claimed[si] = true;
+            assigned[di] = Some(si);
+        }
+    }
+    let mut leftover: Vec<usize> = order.iter().copied().filter(|&di| assigned[di].is_none()).collect();
+    leftover.sort_by_key(|&di| (caps[di], vas[di]));
+    for &di in &leftover {
+        let si = claim_largest_fitting(streams, &claimed, caps[di]).ok_or(di)?;
+        claimed[si] = true;
+        assigned[di] = Some(si);
+    }
+    Ok(assigned.into_iter().map(|a| a.expect("every destination assigned")).collect())
+}
+
+/// Binds enumerated streams to destinations via [`assign_streams`], then surfaces
+/// the residual, non-provable choices as warnings: a capacity-fallback bind (a
+/// stream larger than its section's rounded `VirtualSize`), equal-sized section
+/// groups (ordering heuristic), and a zero-initialised tail (a stream smaller
+/// than its section). An unequal count, or a destination with no fitting stream,
+/// fails closed.
 fn bind_streams(
     pe: &PeImage<'_>,
     destinations: &[Section],
     targets: &[u32],
+    caps: &[u32],
     streams: &[(usize, u32)],
 ) -> Result<(Vec<PackerEntry>, Vec<String>), UnpackError> {
     if streams.len() != destinations.len() {
@@ -464,47 +524,32 @@ fn bind_streams(
             destinations.len()
         )));
     }
-    let mut order: Vec<usize> = (0..destinations.len()).collect();
-    order.sort_by_key(|&i| (targets[i], destinations[i].virtual_address.0));
+    let vas: Vec<u32> = destinations.iter().map(|s| s.virtual_address.0).collect();
+    let assigned = assign_streams(targets, caps, &vas, streams).map_err(|di| {
+        UnpackError::Locate(format!(
+            "destination {} (rounded size {:#X}, capacity {:#X}) has no fitting LZMA1 stream",
+            destinations[di].name, targets[di], caps[di]
+        ))
+    })?;
 
-    let mut claimed = vec![false; streams.len()];
-    let mut assigned: Vec<Option<usize>> = vec![None; destinations.len()];
-    for &di in &order {
-        let target = targets[di];
-        let mut best: Option<usize> = None;
-        for (si, &(_, length)) in streams.iter().enumerate() {
-            if claimed[si] || length > target {
-                continue;
-            }
-            // Prefer the largest length; break ties by the lowest file offset.
-            best = Some(match best {
-                Some(b) if (streams[b].1, streams[si].0) >= (length, streams[b].0) => b,
-                _ => si,
-            });
-        }
-        let si = best.ok_or_else(|| {
-            UnpackError::Locate(format!(
-                "destination {} (rounded size {target:#X}) has no fitting LZMA1 stream",
-                destinations[di].name
-            ))
-        })?;
-        claimed[si] = true;
-        assigned[di] = Some(si);
-    }
-
-    // Warnings: equal-sized section groups (ordering heuristic) and any section
-    // whose stream is shorter than its rounded size (zero-initialised tail).
     let mut warnings = Vec::new();
+    // Capacity-fallback binds: stream longer than the section's rounded VirtualSize.
+    for (di, section) in destinations.iter().enumerate() {
+        let length = streams[assigned[di]].1;
+        if length > targets[di] {
+            warnings.push(format!(
+                "section {:?} stores {length:#X} bytes, more than its rounded VirtualSize {:#X} \
+                 (raw padding past VirtualSize); bound to the largest stream fitting its capacity \
+                 {:#X}",
+                section.name, targets[di], caps[di]
+            ));
+        }
+    }
+    // Equal-sized section groups (ordering heuristic).
     let mut shared: Vec<(u32, Vec<String>)> = Vec::new();
     for (di, section) in destinations.iter().enumerate() {
         let target = targets[di];
-        if destinations
-            .iter()
-            .zip(targets)
-            .filter(|(_, t)| **t == target)
-            .count()
-            > 1
-        {
+        if destinations.iter().zip(targets).filter(|(_, t)| **t == target).count() > 1 {
             match shared.iter_mut().find(|(t, _)| *t == target) {
                 Some((_, names)) => names.push(section.name.clone()),
                 None => shared.push((target, vec![section.name.clone()])),
@@ -517,13 +562,12 @@ fn bind_streams(
              file offset to ascending section RVA"
         ));
     }
+    // Zero-initialised tail: stream shorter than the section's rounded VirtualSize.
     let bss: Vec<String> = destinations
         .iter()
         .enumerate()
-        .filter_map(|(di, section)| {
-            let si = assigned[di]?;
-            (streams[si].1 < targets[di]).then(|| section.name.clone())
-        })
+        .filter(|&(di, _)| streams[assigned[di]].1 < targets[di])
+        .map(|(_, section)| section.name.clone())
         .collect();
     if !bss.is_empty() {
         warnings.push(format!(
@@ -534,7 +578,7 @@ fn bind_streams(
 
     let mut entries = Vec::with_capacity(destinations.len());
     for (di, section) in destinations.iter().enumerate() {
-        let (offset, length) = streams[assigned[di].expect("every destination assigned")];
+        let (offset, length) = streams[assigned[di]];
         let source_rva = pe
             .file_offset_to_rva(FileOffset(u64::try_from(offset).unwrap_or(u64::MAX)))
             .map_err(UnpackError::from)?;
@@ -562,10 +606,13 @@ pub fn locate_packer_table(
     let destinations = packed_sections(pe, limits.max_packed_sections)?;
     let file_alignment = pe.optional.file_alignment;
 
-    // Each destination holds up to VirtualSize rounded to FileAlignment, which
-    // must fit before the next section; its stored stream is no larger.
+    // Each destination holds `VirtualSize` rounded to FileAlignment, and up to
+    // its capacity (bytes before the next section). The rounded size is the tight
+    // stream estimate; the capacity is the hard physical bound, since a section
+    // whose original raw data was padded past VirtualSize stores a larger stream.
     let mut targets = Vec::with_capacity(destinations.len());
-    let mut max_target = 0usize;
+    let mut caps = Vec::with_capacity(destinations.len());
+    let mut max_stream = 0usize;
     for section in &destinations {
         let rounded = round_up(section.virtual_size, file_alignment).ok_or_else(|| {
             UnpackError::Locate(format!("section {} rounded size overflows", section.name))
@@ -579,23 +626,27 @@ pub fn locate_packer_table(
                 section.name
             )));
         }
-        let rounded_usize = usize::try_from(rounded).unwrap_or(usize::MAX);
-        if rounded_usize > limits.max_image_size {
+        let capacity_usize = usize::try_from(capacity).unwrap_or(usize::MAX);
+        if capacity_usize > limits.max_image_size {
             return Err(UnpackError::Locate(format!(
-                "section {} rounded size {rounded:#X} exceeds image limit",
+                "section {} capacity {capacity:#X} exceeds image limit",
                 section.name
             )));
         }
         targets.push(rounded);
-        max_target = max_target.max(rounded_usize);
+        caps.push(capacity);
+        max_stream = max_stream.max(capacity_usize);
     }
 
     let file_alignment = usize::try_from(file_alignment)
         .ok()
         .filter(|&a| a != 0)
         .ok_or_else(|| UnpackError::Locate("invalid file alignment".to_owned()))?;
-    let streams = enumerate_streams(pe, file_alignment, max_target)?;
-    let (entries, warnings) = bind_streams(pe, &destinations, &targets, &streams)?;
+    // A stream can be as large as a destination's capacity (raw padding past
+    // VirtualSize), so the enumeration ceiling is the max capacity, not max
+    // rounded size.
+    let streams = enumerate_streams(pe, file_alignment, max_stream)?;
+    let (entries, warnings) = bind_streams(pe, &destinations, &targets, &caps, &streams)?;
 
     let file_offset = entries
         .iter()
@@ -895,6 +946,70 @@ mod tests {
         assert_eq!(round_up(0xE7_1BC, 0x200), Some(0xE7_200));
         assert_eq!(round_up(0x200, 0x200), Some(0x200));
         assert_eq!(round_up(0, 0x200), Some(0));
+    }
+
+    #[test]
+    fn assign_streams_recovers_tight_distinct_matching() {
+        // Distinct rounded sizes, every stream == its section's rounded size.
+        let targets = [0x200_u32, 0x2000, 0x10000];
+        let caps = [0x1000_u32, 0x4000, 0x11000];
+        let vas = [0x1000_u32, 0x4000, 0x20000];
+        // Streams out of order; (offset, length).
+        let streams = [(300_usize, 0x10000_u32), (100, 0x200), (200, 0x2000)];
+        let assigned = assign_streams(&targets, &caps, &vas, &streams).expect("match");
+        assert_eq!(streams[assigned[0]].1, 0x200);
+        assert_eq!(streams[assigned[1]].1, 0x2000);
+        assert_eq!(streams[assigned[2]].1, 0x10000);
+    }
+
+    #[test]
+    fn assign_streams_binds_raw_padding_section_by_capacity() {
+        // The real `.rdata` collision: a section whose stored stream (0x70C000)
+        // exceeds its rounded VirtualSize (0x70B400) but fits its capacity
+        // (0x70C000), beside a neighbour of nearly equal size (`.debug_r`) and a
+        // tiny section (`.edata`) with a large page-aligned slot. Pass 1 binds the
+        // tight matches and defers `.rdata`; the capacity fallback recovers it
+        // rather than letting `.edata` grab the 0x400 stream.
+        let targets = [0x200_u32, 0x70B400, 0x70B000];
+        let caps = [0x1000_u32, 0x70C000, 0x70B000];
+        let vas = [0x1000_u32, 0x1A3F000, 0xB52B000];
+        let streams = [(10_usize, 0x200_u32), (20, 0x70B000), (30, 0x70C000)];
+        let assigned = assign_streams(&targets, &caps, &vas, &streams).expect("match");
+        assert_eq!(streams[assigned[0]].1, 0x200, "edata keeps its tight stream");
+        assert_eq!(streams[assigned[1]].1, 0x70C000, "rdata binds its over-size stream by capacity");
+        assert_eq!(streams[assigned[2]].1, 0x70B000, "debug_r keeps its exact stream");
+    }
+
+    #[test]
+    fn assign_streams_fails_closed_when_no_capacity_fits() {
+        // A stream larger than every remaining capacity must fail closed, not be
+        // force-matched.
+        let targets = [0x200_u32, 0x400];
+        let caps = [0x1000_u32, 0x1000];
+        let vas = [0x1000_u32, 0x2000];
+        let streams = [(10_usize, 0x200_u32), (20, 0x2000)];
+        assert!(assign_streams(&targets, &caps, &vas, &streams).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the real 43 MB VMProtect plugin at E:/downloads/systems.original.xpl"]
+    fn unpacks_real_multi_section_plugin() {
+        let data = std::fs::read("E:/downloads/systems.original.xpl").expect("sample present");
+        let result = unpack_to_mapped_image(&data, UnpackLimits::default()).expect("unpack");
+        assert_eq!(result.report.blocks.len(), 23, "all 23 destinations bound");
+        assert!(result.report.in_memory_reparsed);
+        // `.rdata` stores raw padding past VirtualSize: 0x70C000 > round_up(0x70B2D0, 0x200).
+        let rdata = result
+            .report
+            .blocks
+            .iter()
+            .find(|b| b.section_name == ".rdata")
+            .expect(".rdata bound");
+        assert_eq!(rdata.decompressed_size, 0x70C000);
+        assert!(rdata.decompressed_size > rdata.section_virtual_size);
+        assert!(rdata.decompressed_size <= rdata.destination_capacity);
+        // The over-size bind is surfaced, not silent.
+        assert!(result.report.warnings.iter().any(|w| w.contains(".rdata")));
     }
 
     #[test]
