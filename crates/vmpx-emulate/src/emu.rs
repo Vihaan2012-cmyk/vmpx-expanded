@@ -8,6 +8,9 @@ use crate::cpu::{AF, CF, Cpu, OF, PF, RSP, SF, ZF, mask};
 use crate::memory::{Access, Memory};
 use crate::predecode::{self, K, Opnd, Pre, T_MEM, T_REG};
 
+#[path = "sse.rs"]
+mod sse;
+
 // GPR indices into `Cpu::regs` (RSP lives in cpu.rs).
 const RAX: usize = 0;
 const RCX: usize = 1;
@@ -34,6 +37,8 @@ impl From<Trap> for Stop {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stop {
     Unsupported { rip: u64, mnemonic: Mnemonic },
+    /// An SSE/XMM instruction outside the modeled subset (see `sse.rs`).
+    UnmodeledSse { rip: u64, mnemonic: Mnemonic },
     DecodeError { rip: u64 },
     Fault { rip: u64, addr: u64, access: Access },
     UndefinedFlags { rip: u64, mask: u64 },
@@ -43,6 +48,17 @@ pub enum Stop {
     Hook,
     Reached,
     StepLimit,
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stop::UnmodeledSse { rip, mnemonic } => {
+                write!(f, "unmodeled SSE: {} at {rip:#x}", format!("{mnemonic:?}").to_lowercase())
+            }
+            _ => write!(f, "{self:?}"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -999,23 +1015,25 @@ impl Emulator {
             return Ok(ins.memory_displacement64());
         }
         let mut a = ins.memory_displacement64();
-        let idx = ins.memory_index();
-        // 0x67-prefixed addressing: 32-bit regs, address wraps at 32 bits.
-        let addr32 = base.is_gpr32() || idx.is_gpr32();
+        // 0x67 address-size override: the effective address wraps to 32 bits.
+        let mut a32 = false;
         if base != Register::None {
             if !(base.is_gpr64() || base.is_gpr32()) {
                 return Err(self.unsup());
             }
+            a32 |= base.is_gpr32();
             a = a.wrapping_add(self.cpu.reg(base).ok_or_else(|| self.unsup())?);
         }
+        let idx = ins.memory_index();
         if idx != Register::None {
             if !(idx.is_gpr64() || idx.is_gpr32()) {
                 return Err(self.unsup());
             }
+            a32 |= idx.is_gpr32();
             let v = self.cpu.reg(idx).ok_or_else(|| self.unsup())?;
             a = a.wrapping_add(v.wrapping_mul(u64::from(ins.memory_index_scale())));
         }
-        if addr32 {
+        if a32 {
             a &= 0xffff_ffff;
         }
         if seg == Register::GS {
@@ -2046,6 +2064,7 @@ impl Emulator {
                     HookOutcome::Continue => t,
                 });
             }
+            _ if sse::is_vector(ins) => self.exec_sse(ins, mn)?,
             _ => return Err(self.unsup()),
         }
         Ok(next)
