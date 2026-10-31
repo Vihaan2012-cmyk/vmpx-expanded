@@ -67,7 +67,7 @@ mod xplm;
 
 pub use alu::{Alu, Flags, Shift};
 pub use detonate::{
-    DetonateError, DetonateOptions, DetonationResult, detonate, export_reference_from_exports,
+    DetonateError, DetonateOptions, DetonationResult, XplmSummary, detonate, export_reference_from_exports,
     export_reference_from_imports,
 };
 pub use dump::{
@@ -91,3 +91,4 @@ pub use observe::{
 pub use sysdll::{DEFAULT_SYSTEM_MODULES, SysDllDb, system_root};
 pub use vm_observe::{ObservedVmEdge, VmInstance, VmInstanceSpec, VmObservations, VmObserveHook};
 pub use winapi::WinApiHook;
+pub use xplm::{CallbackKind, RecordedCallback, Xplm};
