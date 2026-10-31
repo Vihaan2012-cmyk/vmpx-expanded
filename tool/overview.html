@@ -45,6 +45,8 @@
               <p class="caption" role="heading"><span class="caption-text">The Tool</span></p>
 <ul class="current">
 <li class="toctree-l1 current"><a class="current reference internal" href="#">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#current-capabilities">Current capabilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sound-and-experimental-tiers">Sound and experimental tiers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#goals">Goals</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#anatomy-of-a-run">Anatomy of a run</a></li>
@@ -114,7 +116,24 @@
 <li class="toctree-l3"><a class="reference internal" href="cli/detect.html#text-output">Text output</a></li>
 <li class="toctree-l3"><a class="reference internal" href="cli/detect.html#the-evidence-model">The evidence model</a></li>
 <li class="toctree-l3"><a class="reference internal" href="cli/detect.html#image-layout">Image layout</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/detect.html#protection-mode">Protection mode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/detect.html#packer-classification">Packer classification</a></li>
 <li class="toctree-l3"><a class="reference internal" href="cli/detect.html#json-schema">JSON schema</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="cli/generic-unpack.html">generic-unpack</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#what-it-does">What it does</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#outcomes">Outcomes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/generic-unpack.html#what-the-result-is-and-is-not">What the result is, and is not</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="cli/strip.html">strip</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="cli/strip.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/strip.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="cli/strip.html#behaviour">Behaviour</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="cli/vm-list.html">vm-list</a><ul>
@@ -435,6 +454,7 @@
 <li class="toctree-l3"><a class="reference internal" href="crates/vtil-sys.html#status">Status</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="crates/index.html#crates-added-since-this-page-was-first-written">Crates added since this page was first written</a></li>
 <li class="toctree-l2"><a class="reference internal" href="crates/index.html#dependency-summary">Dependency summary</a></li>
 <li class="toctree-l2"><a class="reference internal" href="crates/index.html#workspace-wide-settings">Workspace-wide settings</a></li>
 </ul>
@@ -680,15 +700,18 @@
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#what-is-decidable">What is decidable</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#what-is-refused">What is refused</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#why-refusal-is-the-answer">Why refusal is the answer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#where-the-frontier-sits-on-a-real-module">Where the frontier sits on a real module</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Observe, Then Feed Back</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-flow-observe-then-feed-back">The flow: observe, then feed back</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-engine">The engine</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#facts-and-the-bridges-that-use-them">Facts, and the bridges that use them</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#packers-other-than-vmprotect">Packers other than VMProtect</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html#containment">Containment</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
@@ -711,6 +734,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../project/roadmap.html">Roadmap</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#real-sample-status">Real-sample status</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#sub-projects">Sub-projects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#what-remains-open">What remains open</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#definition-of-done-ladder">Definition-of-done ladder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#cross-cutting-rules">Cross-cutting rules</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/roadmap.html#risks">Risks</a></li>
@@ -722,7 +746,11 @@
 <li class="toctree-l2"><a class="reference internal" href="../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/log.html#generalizing-past-the-first-sample">Generalizing past the first sample</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/log.html#mutation-mode-deobfuscation-sp6">Mutation-mode deobfuscation (SP6)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/log.html#protection-removal-and-packers">Protection removal and packers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/log.html#sp7-contained-dynamic-assist">SP7: contained dynamic assist</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../project/log.html#cross-profile-vm-transitions-and-the-measured-ceiling">Cross-profile VM transitions and the measured ceiling</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -761,19 +789,89 @@ MIT licensed, and forbids <code class="docutils literal notranslate"><span class
 the feature-gated FFI binding in <a class="reference internal" href="crates/vtil-sys.html"><span class="doc">vmpx-vtil-sys</span></a>). The command-line
 binary is named <code class="docutils literal notranslate"><span class="pre">vmpx</span></code> (package <code class="docutils literal notranslate"><span class="pre">vmpx-cli</span></code>); the analysis logic lives in
 library crates that can be used independently.</p>
-<p>Everything is static. An input file is parsed, unpacked by re-implementing the
-protector’s own decompression, and symbolically executed. No target
-instruction is ever run. Two consequences follow, and they shape the rest of
-the design:</p>
+<p>The sound path is entirely static. An input file is parsed, unpacked by
+re-implementing the protector’s own decompression, and symbolically executed.
+No target instruction is ever run natively. Two consequences follow, and they
+shape the rest of the design:</p>
 <ul class="simple">
 <li><p>Runtime defenses never fire. There is no live process, no PEB, no timing
 source and no breakpoint for an anti-debug check to observe. The checks are
 still present in the protected code, and the tool recovers the handlers that
 implement them as static semantics (see <a class="reference internal" href="../vmprotect/anti-analysis.html"><span class="doc">Anti-Debug, Anti-VM and Anti-Dump</span></a>).</p></li>
-<li><p>Nothing is ever observed; everything is proven. A path through a virtualized
-routine is either decoded and symbolically executed to a native exit state,
-or it is reported as a blocker with the reason it could not be.</p></li>
+<li><p>In the sound path nothing is observed; everything is proven. A path through a
+virtualized routine is either decoded and symbolically executed to a native
+exit state, or it is reported as a blocker with the reason it could not be.</p></li>
 </ul>
+<p>A separate, opt-in dynamic-assist engine can <em>observe</em> a sample inside a
+contained software emulator, for the facts static analysis cannot prove. It is
+described under <a class="reference internal" href="#overview-tiers"><span class="std std-ref">Sound and experimental tiers</span></a> below and never feeds the sound output.</p>
+<section id="current-capabilities">
+<h2>Current capabilities<a class="headerlink" href="#current-capabilities" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Devirtualization.</strong> Real, freshly-protected VMProtect 3.11 “Compact”
+functions are recovered end to end: opaque bytecode, a complete control-flow
+graph, and lifted native IR. Completeness is certified by an inflation-proof
+oracle (<code class="docutils literal notranslate"><span class="pre">all_paths_reach_vm_exit</span></code>), so a partial walk cannot be reported as
+complete. On a large real-world protected module with 814 virtualized
+functions, <strong>313 of 814 (38.5%) are soundly recovered</strong>. That is the current
+measured sound ceiling, not a target: the remainder depends on runtime
+facts (see <a class="reference internal" href="../vmprotect/devirtualization/static-frontier.html"><span class="doc">The Static Frontier</span></a>).</p></li>
+<li><p><strong>Cross-profile VM-transition walker.</strong> The recovery walker switches the
+active register-role and direction profile at a proven popped-target
+transition, re-resolving register roles per block, under a fail-closed
+per-entry budget. It was the main lever past the earlier ceiling.</p></li>
+<li><p><strong>Mutation-mode deobfuscation.</strong> A tournament of simplifiers (MBA and
+arithmetic-identity solvers, opaque-predicate and substitution solvers) is
+ranked by differential input-testing; an SMT equivalence gate decides whether a
+result is proven. Coverage on real mutated binaries is partial.</p></li>
+<li><p><strong>Protection removal.</strong> Real VMProtect 3.11 LZMA unpacking, section stripping
+that refuses on any dangling reference, and import reconstruction from proven
+bindings.</p></li>
+<li><p><strong>Packer front-end.</strong> <code class="docutils literal notranslate"><span class="pre">detect</span></code> classifies UPX, ASPack, PECompact, MPRESS and
+FSG; <code class="docutils literal notranslate"><span class="pre">generic-unpack</span></code> runs a bounded, contained unpack to the original entry
+point (<a class="reference internal" href="cli/generic-unpack.html"><span class="doc">generic-unpack</span></a>). Real UPX is validated end to end in the
+emulator; the other packers are routed but not validated on real samples.</p></li>
+<li><p><strong>Contained dynamic assist.</strong> <code class="docutils literal notranslate"><span class="pre">vmpx-emulate</span></code> runs a module in an in-process
+interpreter to observe an unpacked image, resolved imports, runtime globals,
+recursion depth and branch targets, and feeds them back on the experimental
+tier only (<a class="reference internal" href="../vmprotect/devirtualization/dynamic-assist.html"><span class="doc">Dynamic Assist: Observe, Then Feed Back</span></a>).</p></li>
+</ul>
+</section>
+<section id="sound-and-experimental-tiers">
+<span id="overview-tiers"></span><h2>Sound and experimental tiers<a class="headerlink" href="#sound-and-experimental-tiers" title="Link to this heading"></a></h2>
+<p>Output and facts come in two tiers that never mix.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 16.0%" />
+<col style="width: 42.0%" />
+<col style="width: 42.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"></th>
+<th class="head"><p>Sound (proven)</p></th>
+<th class="head"><p>Experimental (observed or unverified)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Source</p></td>
+<td><p>Static analysis that passed a verification gate: the completeness oracle,
+structurally proven input domains, the SMT gate for mutation results</p></td>
+<td><p>Gate-relaxed emission (<code class="docutils literal notranslate"><span class="pre">--experimental</span></code>), and facts observed in one
+emulated run (<code class="docutils literal notranslate"><span class="pre">--dynamic</span></code>, <code class="docutils literal notranslate"><span class="pre">generic-unpack</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p>Written to</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">clean</span></code>’s <code class="docutils literal notranslate"><span class="pre">OUTPUT</span></code>, only when no blocker remains</p></td>
+<td><p>Separate, labelled paths; the report names every observed fact used</p></td>
+</tr>
+<tr class="row-even"><td><p>Can be wrong</p></td>
+<td><p>Only through a bug in the gate; every doubt keeps a blocker</p></td>
+<td><p>Yes. An observed fact is evidence about one execution, not a proof</p></td>
+</tr>
+</tbody>
+</table>
+<p>Where a run contradicts a static result, the static result is reported as
+blocked rather than silently patched. See <a class="reference internal" href="soundness.html"><span class="doc">The Soundness Model</span></a>.</p>
+</section>
 <section id="goals">
 <h2>Goals<a class="headerlink" href="#goals" title="Link to this heading"></a></h2>
 <p>The long-term goal is clean, behavior-preserving (“reversible”) devirtualized
@@ -795,28 +893,28 @@ testable milestones rather than a single finish line:</p>
 <tbody>
 <tr class="row-even"><td><p>L1</p></td>
 <td><p>Native replacements spliced into a new section, entry and TLS callbacks redirected</p></td>
-<td><p>Implemented; behind <code class="docutils literal notranslate"><span class="pre">--experimental</span></code></p></td>
+<td><p>Implemented and exercised on real protected binaries; behind <code class="docutils literal notranslate"><span class="pre">--experimental</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p>L2</p></td>
 <td><p>Proven original entry point and every reachable virtualized routine recovered</p></td>
-<td><p>Analysis and the coverage gate implemented and wired; the full clearing path is unexercised end-to-end</p></td>
+<td><p>Per-function recovery works on real binaries (313 of 814 soundly on one large module); whole-module sound clearing is not reached</p></td>
 </tr>
 <tr class="row-even"><td><p>L3</p></td>
 <td><p>Imports reduced to the proven application set</p></td>
-<td><p>Wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code> as an always-incomplete proof: the referenced-slot set is intentionally empty, so the import blocker stays</p></td>
+<td><p>Wired into <code class="docutils literal notranslate"><span class="pre">clean</span></code> as an always-incomplete proof: import protection is resolved at run time, so the import blocker stays in the sound path</p></td>
 </tr>
 <tr class="row-odd"><td><p>L4</p></td>
 <td><p>Dangling <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> references resolved and sections stripped</p></td>
-<td><p>Reference checker wired in as a backstop for the <code class="docutils literal notranslate"><span class="pre">.vmp</span></code> blocker; stripping not performed</p></td>
+<td><p>Reference checker wired in; a <code class="docutils literal notranslate"><span class="pre">strip</span></code> subcommand and an opt-in experimental <code class="docutils literal notranslate"><span class="pre">--strip</span></code> stage exist; stripping is not part of the sound <code class="docutils literal notranslate"><span class="pre">OUTPUT</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p>L5</p></td>
 <td><p>Optimized recompilation and differential verification</p></td>
-<td><p>Equivalence verifier is library-only; anti-debug recognition is reported (nothing is applied in the sound path)</p></td>
+<td><p>Equivalence verifier and emulator differential harness are library-level; anti-debug recognition is reported (nothing is applied in the sound path)</p></td>
 </tr>
 </tbody>
 </table>
 <p>See <a class="reference internal" href="../project/roadmap.html"><span class="doc">Roadmap</span></a> for the detailed status of each sub-project.</p>
-<p>Separately from the rungs, the VMProtect 3.11 Compact VM is now fully decoded
+<p>Separately from the rungs, the VMProtect 3.11 Compact VM is fully decoded
 (256 of 256 handlers classified); linear and branching functions lift to native
 x86-64 and <code class="docutils literal notranslate"><span class="pre">clean</span> <span class="pre">--experimental</span> <span class="pre">--decoded-lift</span></code> splices them into a hybrid PE;
 see <a class="reference internal" href="pipeline/compact-vm.html"><span class="doc">The VMProtect 3.11 Compact VM</span></a> and <a class="reference internal" href="pipeline/function-lift.html"><span class="doc">Lifting Decoded Functions</span></a>.</p>
@@ -824,8 +922,9 @@ see <a class="reference internal" href="pipeline/compact-vm.html"><span class="d
 <section id="what-recovered-means">
 <h2>What “recovered” means<a class="headerlink" href="#what-recovered-means" title="Link to this heading"></a></h2>
 <p>Without a protected corpus in continuous integration, “recovered” does not mean
-that a behaviour was observed. It means the result passed synthetic
-verification and review. Recovery is deliberately strict: where soundness is
+that a behaviour was observed. It means the result passed verification: the
+completeness oracle and proven domains on real samples measured out of band, and
+synthetic verification and review in CI. Recovery is deliberately strict: where soundness is
 not provable the tool refuses and keeps a <em>blocker</em> rather than guessing.
 Ambiguity is preserved in a report and produces no result. Many doc comments in
 the code say this explicitly, for example “no unknown value is invented” and
@@ -860,10 +959,16 @@ synthetic fixtures the repository constructs and confirmed out-of-band on
 local samples. Coverage is bounded by the VMProtect constructs that have been
 lifted and proved; outside that, the sound path refuses.</p></li>
 <li><p>Behavior-reversible, not bit-reversible. See the note on the front page.</p></li>
-<li><p>vmpx is a research and malware-analysis tool. It does not execute the input
-and the CLI and library crates have no network, process-spawning or
-dynamic-loading surface (only the optional <a class="reference internal" href="ui.html"><span class="doc">The vmpx-ui Front End</span></a> launches a process:
-the <code class="docutils literal notranslate"><span class="pre">vmpx</span></code> CLI itself).</p></li>
+<li><p>vmpx is a research and malware-analysis tool. It never executes the input
+natively. The one dynamic component, <code class="docutils literal notranslate"><span class="pre">vmpx-emulate</span></code>, is a software
+interpreter with no host syscall, filesystem, FFI or network path; a network-API
+denylist stops a run that reaches one, and the workspace builds offline. The
+CLI and library crates have no network, process-spawning or dynamic-loading
+surface (only the optional <a class="reference internal" href="ui.html"><span class="doc">The vmpx-ui Front End</span></a> launches a process: the <code class="docutils literal notranslate"><span class="pre">vmpx</span></code> CLI
+itself).</p></li>
+<li><p>A figure such as 313 of 814 is a measurement on one module and one build.
+Re-protecting the same input moves results considerably, so read it as a
+ceiling observed, not a guaranteed rate.</p></li>
 </ul>
 </section>
 </section>

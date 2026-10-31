@@ -53,14 +53,17 @@ describes each stage: what it takes in, what it proves, and what it refuses.
 Where it stands on a real sample
 --------------------------------
 
-On a VMProtect 3.11 "Compact" sample the pipeline reaches detect, bootstrap,
-dispatch, handlers, stream decode, CFG walk and lift. All 256 handlers are
-classified (:doc:`compact-vm`). Linear functions devirtualize fully to native
-x86-64. Branching functions decode through the CFG with branches resolved by
-symbolic execution and proven input domains, and the CFG-level lift is landing
-(:doc:`function-lift`). What the static pipeline refuses is described in
-:doc:`/vmprotect/devirtualization/static-frontier`. These stages are exercised
-from the libraries and examples; ``clean`` does not yet drive them.
+On real, freshly-protected VMProtect 3.11 "Compact" binaries the pipeline reaches
+detect, bootstrap, dispatch, handlers, stream decode, CFG walk and lift. All 256
+handlers are classified (:doc:`compact-vm`). Functions devirtualize end to end to
+lifted native IR, with completeness certified by the ``all_paths_reach_vm_exit``
+oracle, and branching functions are lifted through the CFG-level lift
+(:doc:`function-lift`). The walker follows a proven popped-target transition into a
+different register-role profile (the cross-profile walker). On a large real-world
+module with 814 virtualized functions, 313 (38.5%) are soundly recovered; the rest
+are beyond sound static reach, as described in
+:doc:`/vmprotect/devirtualization/static-frontier`. ``clean`` drives these stages
+under the opt-in ``--experimental --decoded-lift``.
 
 Sub-projects
 ------------
@@ -98,8 +101,10 @@ Design rules shared by every stage
 
 Fail closed
     Ambiguity is kept in a report and yields no result, rather than a guess.
-Static only
-    No stage runs the target. Anti-debug never fires.
+Static by default
+    No stage of the sound path runs the target, so anti-debug never fires. The one
+    dynamic component is a contained software emulator whose observations stay on a
+    labelled experimental tier (:doc:`/vmprotect/devirtualization/dynamic-assist`).
 Fixture first
     Every component has synthetic fixtures as its CI oracle; local samples are
     an out-of-band behavioural check.

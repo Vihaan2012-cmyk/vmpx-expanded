@@ -45,6 +45,8 @@
               <p class="caption" role="heading"><span class="caption-text">The Tool</span></p>
 <ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#current-capabilities">Current capabilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../overview.html#sound-and-experimental-tiers">Sound and experimental tiers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../overview.html#goals">Goals</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../overview.html#what-recovered-means">What “recovered” means</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../overview.html#anatomy-of-a-run">Anatomy of a run</a></li>
@@ -114,7 +116,24 @@
 <li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#text-output">Text output</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#the-evidence-model">The evidence model</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#image-layout">Image layout</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#protection-mode">Protection mode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#packer-classification">Packer classification</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../cli/detect.html#json-schema">JSON schema</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/generic-unpack.html">generic-unpack</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#what-it-does">What it does</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#outcomes">Outcomes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#text-output">Text output</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/generic-unpack.html#what-the-result-is-and-is-not">What the result is, and is not</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="../cli/strip.html">strip</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="../cli/strip.html#synopsis">Synopsis</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/strip.html#options">Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../cli/strip.html#behaviour">Behaviour</a></li>
 </ul>
 </li>
 <li class="toctree-l2"><a class="reference internal" href="../cli/vm-list.html">vm-list</a><ul>
@@ -435,6 +454,7 @@
 <li class="toctree-l3"><a class="reference internal" href="vtil-sys.html#status">Status</a></li>
 </ul>
 </li>
+<li class="toctree-l2"><a class="reference internal" href="#crates-added-since-this-page-was-first-written">Crates added since this page was first written</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#dependency-summary">Dependency summary</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#workspace-wide-settings">Workspace-wide settings</a></li>
 </ul>
@@ -680,15 +700,18 @@
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#what-is-decidable">What is decidable</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#what-is-refused">What is refused</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#why-refusal-is-the-answer">Why refusal is the answer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#where-the-frontier-sits-on-a-real-module">Where the frontier sits on a real module</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/static-frontier.html#beyond-the-frontier-dynamic-assist">Beyond the frontier: dynamic assist</a></li>
 </ul>
 </li>
-<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Emulation First</a><ul>
-<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-flow-unpack-and-observe">The flow: unpack and observe</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#why-emulation-first">Why emulation first</a></li>
-<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#containment-layers">Containment layers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html">Dynamic Assist: Observe, Then Feed Back</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-flow-observe-then-feed-back">The flow: observe, then feed back</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-engine">The engine</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#facts-and-the-bridges-that-use-them">Facts, and the bridges that use them</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#packers-other-than-vmprotect">Packers other than VMProtect</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-trust-tier-observed-not-proven">The trust tier: observed, not proven</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#the-honest-limit">The honest limit</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html#containment">Containment</a></li>
 </ul>
 </li>
 <li class="toctree-l3"><a class="reference internal" href="../../vmprotect/devirtualization/tooling-map.html">Mapping Mechanisms to Tooling</a></li>
@@ -711,6 +734,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../project/roadmap.html">Roadmap</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#real-sample-status">Real-sample status</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#sub-projects">Sub-projects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#what-remains-open">What remains open</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#definition-of-done-ladder">Definition-of-done ladder</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#cross-cutting-rules">Cross-cutting rules</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/roadmap.html#risks">Risks</a></li>
@@ -722,7 +746,11 @@
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp2-oep-and-generalized-recovery">SP2: OEP and generalized recovery</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp3-sp4-sp5-cores">SP3, SP4, SP5 cores</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#real-sample-decode-and-lift-vmprotect-3-11-compact">Real-sample decode and lift (VMProtect 3.11 Compact)</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp7-dynamic-assist-design">SP7: dynamic assist (design)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#generalizing-past-the-first-sample">Generalizing past the first sample</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#mutation-mode-deobfuscation-sp6">Mutation-mode deobfuscation (SP6)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#protection-removal-and-packers">Protection removal and packers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#sp7-contained-dynamic-assist">SP7: contained dynamic assist</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../project/log.html#cross-profile-vm-transitions-and-the-measured-ceiling">Cross-profile VM transitions and the measured ceiling</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#verification-scope">Verification scope</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../project/log.html#design-documents">Design documents</a></li>
 </ul>
@@ -755,7 +783,8 @@
              
   <section id="crate-reference">
 <h1>Crate Reference<a class="headerlink" href="#crate-reference" title="Link to this heading"></a></h1>
-<p>The workspace has eleven crates. Each library exposes its surface from
+<p>The workspace has seventeen crates; the first eleven are described below, and the
+later additions are listed at the end of this page. Each library exposes its surface from
 <code class="docutils literal notranslate"><span class="pre">src/lib.rs</span></code> through <code class="docutils literal notranslate"><span class="pre">pub</span> <span class="pre">use</span></code> re-exports, <code class="docutils literal notranslate"><span class="pre">pub</span> <span class="pre">fn</span></code> items and public types;
 the pages below list that surface with its responsibilities.</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>vmpx-pe ---+--&gt; vmpx-detect
@@ -784,6 +813,49 @@ vmpx-ui drives that binary as a child process.
 </ul>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">vmpx-ui</span></code> has its own page, <a class="reference internal" href="../ui.html"><span class="doc">The vmpx-ui Front End</span></a>.</p>
+<section id="crates-added-since-this-page-was-first-written">
+<h2>Crates added since this page was first written<a class="headerlink" href="#crates-added-since-this-page-was-first-written" title="Link to this heading"></a></h2>
+<p>The workspace now has seventeen crates. The diagram and the pages above cover the
+original eleven. The additions have no page of their own yet; their roles, taken from
+each crate’s documentation:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 24.0%" />
+<col style="width: 76.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Crate</p></th>
+<th class="head"><p>Role</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-emulate</span></code></p></td>
+<td><p>The contained dynamic-assist engine: an in-process x86-64 interpreter, PE loader,
+Win32 API stubs, OEP and dump detection, observation hooks and the
+<code class="docutils literal notranslate"><span class="pre">ObservedFacts</span></code> hand-off (<a class="reference internal" href="../../vmprotect/devirtualization/dynamic-assist.html"><span class="doc">Dynamic Assist: Observe, Then Feed Back</span></a>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-mutation</span></code></p></td>
+<td><p>Shared types for mutation-mode deobfuscation (problem, candidate, cost, score),
+native CFG recovery and dead-term elimination</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-solvers</span></code></p></td>
+<td><p>The solver portfolio: linear and general MBA, opaque-predicate, substitution,
+dictionary and synthesis solvers</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-tournament</span></code></p></td>
+<td><p>The per-problem-class, cost-aware ELO ladder that ranks and routes solvers</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-verify</span></code></p></td>
+<td><p>The input-testing scorer and the SMT equivalence gate that promotes a candidate
+to the sound tier</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vmpx-demutate</span></code></p></td>
+<td><p>The tournament wired end to end, including a binary demutation pass and a
+synthetic benchmark</p></td>
+</tr>
+</tbody>
+</table>
+</section>
 <section id="dependency-summary">
 <h2>Dependency summary<a class="headerlink" href="#dependency-summary" title="Link to this heading"></a></h2>
 <table class="docutils align-default">

@@ -1,7 +1,7 @@
 Command-Line Reference
 ======================
 
-The ``vmpx`` binary has nine subcommands. They are the kebab-case names of the
+The ``vmpx`` binary has eleven subcommands. They are the kebab-case names of the
 variants of the clap ``Command`` enum in ``crates/vmpx-cli/src/main.rs``.
 
 .. code-block:: console
@@ -18,6 +18,8 @@ variants of the clap ``Command`` enum in ``crates/vmpx-cli/src/main.rs``.
    compare
    unpack
    detect
+   generic-unpack
+   strip
    vm-list
    imports
    oep
@@ -51,6 +53,12 @@ Summary
    * - ``detect``
      - read-only
      - Profile VMProtect evidence and layout
+   * - ``generic-unpack``
+     - writes
+     - Bounded, contained unpack of a detected non-VMProtect packer (observed artifact)
+   * - ``strip``
+     - writes
+     - Remove named sections only when no reference would dangle
    * - ``vm-list``
      - read-only
      - Discover evidence-scored VM entry stubs
@@ -118,6 +126,13 @@ printed. The tags identify the stage that produced each line:
      - Structural differences between two files
    * - ``[unpack]``
      - Packer table, blocks and loader validation
+   * - ``[mode]``
+     - Protection mode (virtualization, mutation, ultra) and its probe counts (``detect``)
+   * - ``[packer]``
+     - Non-VMProtect packer classification (``detect``), and the unpack outcome
+       (``generic-unpack``)
+   * - ``[strip]``
+     - Sections removed, or the reason a strip was refused
    * - ``[clean]``
      - Pipeline summary and blockers
    * - ``[decode]``

@@ -46,24 +46,34 @@ These are implementation status, not theory:
    * - Gap
      - State
    * - Lifting of branching functions
-     - CFG-level lift exists in ``vmpx-vmlift`` and is landing; it refuses loops and any
-       branch whose targets are not proven. Not yet called by ``clean``
-   * - Lowering of ``TableChecksum``, wide multiply and divide, ``ReadTimestampCounter``
-     - Decoded, not compiled
+     - CFG-level lift exists in ``vmpx-vmlift`` and runs behind
+       ``clean --experimental --decoded-lift``; it now emits natural reducible loops
+       and refuses any branch whose targets are not proven. The measured sound
+       ceiling on a large module is 313 of 814 functions (:doc:`static-frontier`)
+   * - Lowering of some semantics
+     - Added incrementally (flag intrinsics, wide multiply and others); a semantic
+       without a verified lowering is decoded, not compiled
    * - Executable (non-DLL) OEP from the continuation
      - Not implemented; the executable entry is recovered as a single input-closed path
    * - Nested-continuation redirects
      - Counted, not appended; a nested entry never counts as covered
    * - Application import set
-     - Reduction wired into ``clean`` but fed an intentionally empty referenced-slot set,
-       so the blocker always stays; thunk and bridge resolution is not connected
+     - Import protection is resolved at run time, so the sound path keeps the blocker.
+       Observed bindings from the contained emulator build an experimental,
+       labelled import directory only
    * - Dangling ``.vmp`` references and stripping
-     - Checker wired in as a backstop for the ``.vmp`` blocker; stripping is not performed
+     - Checker and a stripping primitive exist (``strip`` subcommand, experimental
+       ``clean --strip``); stripping is not part of the sound ``OUTPUT``
    * - Coverage gate
-     - Wired into ``clean`` and drives the OEP, reintegration and ``.vmp`` blockers; the
-       full clearing path is unexercised end-to-end (no real corpus in CI)
+     - Wired into ``clean`` and drives the OEP, reintegration and ``.vmp`` blockers;
+       whole-module sound clearing is not reached on a real protected module
    * - Differential equivalence verifier
-     - Library function; not called by ``clean``
+     - Library function and emulator harness; not called by ``clean``
+   * - Runtime-dependent functions
+     - Beyond sound static reach (runtime-pointer branch targets, nonlinear
+       double-shift targets, handlers outside the file-backed image). The dynamic
+       engine can observe some facts, on the experimental tier only
+       (:doc:`dynamic-assist`)
    * - VTIL optimization
      - Binding exists, feature-gated; not in the pipeline
    * - ``--neutralize``
@@ -82,6 +92,8 @@ Validation limits
 * No protected corpus in continuous integration.
 * Synthetic fixtures can be unrepresentative of real protector output.
 * Real-sample checks are out-of-band and local.
+* Results vary widely between protections of the same input, so a figure from one
+  build is not a rate for another.
 
 What would change the picture
 -----------------------------

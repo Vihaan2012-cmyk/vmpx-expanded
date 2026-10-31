@@ -3,9 +3,10 @@ detect
 
 .. program:: vmpx detect
 
-Profiles VMProtect evidence and the packed or mapped layout of an image. It
-looks only at structure (section geometry, entropy, directory placement), never
-at a single mandatory byte signature, and it ignores the file extension.
+Profiles VMProtect evidence, the packed or mapped layout of an image, the
+per-function protection mode, and any common non-VMProtect packer. It looks
+mainly at structure (section geometry, entropy, directory placement), never at a
+single mandatory byte signature, and it ignores the file extension.
 
 Synopsis
 --------
@@ -33,12 +34,17 @@ Text output
     [vmp] verdict=<verdict> confidence=<0-100> layout=<layout>
       +20 vmp_section_names: <statement>
       +25 packed_virtual_sections: <statement>
+    [mode] <mode> (probed=N clean_vm=N mutated_vm=N no_vm=N)
+    [mode] signal: <statement>
+    [packer] <kind> (confidence <0-100>)
+      <evidence statement>
     [region] .text    rva=0x1000 size=0x... entropy=... entry=false
     [vmp] warning: <warning>
 
-One weighted evidence line per finding (``+weight id: statement``), one
-``[region]`` line per executable section (RVA, size, Shannon entropy and whether
-it owns the entry point), and then any warnings.
+One weighted evidence line per finding (``+weight id: statement``), the protection
+mode and its probe counts, the packer classification, one ``[region]`` line per
+executable section (RVA, size, Shannon entropy and whether it owns the entry
+point), and then any warnings.
 
 The evidence model
 ------------------
@@ -110,6 +116,64 @@ unpacking is required:
 ``Ambiguous``
     Anything else (one or two virtual-only sections).
 
+Protection mode
+---------------
+
+``[mode]`` classifies how the entry stubs behave, by probing them:
+
+``virtualization``
+    A VM bootstrap dispatch is recoverable and its handlers decode into a coherent
+    instruction stream.
+``mutation``
+    Entry stubs lead to native code with no recoverable VM dispatch.
+``ultra``
+    A VM bootstrap is recoverable but its handlers do not decode, the signature of
+    virtualization combined with mutation.
+``unknown``
+    No entry stubs to probe, or the signals contradict.
+
+The counts say how many stubs were probed and how many fell into each class. It is a
+triage signal over a sample of stubs, not a per-function guarantee.
+
+Packer classification
+---------------------
+
+The same pass recognizes a common non-VMProtect packer. VMProtect evidence is not
+consulted here, so the two can appear side by side. The classification uses section
+names and, where useful, a marker in the head or tail of the file.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 14 66
+
+   * - Kind
+     - Confidence
+     - Evidence
+   * - ``UPX``
+     - 90, or 97
+     - ``UPX0``, ``UPX1`` or ``UPX2`` section name; 97 when the ``UPX!`` magic is also present
+   * - ``ASPack``
+     - 90
+     - ``.aspack`` or ``.adata`` section
+   * - ``PECompact``
+     - 90, or 70
+     - ``pec1`` or ``pec2`` section; 70 for a bare ``PEC2`` marker
+   * - ``MPRESS``
+     - 90
+     - ``.MPRESS1`` or ``.MPRESS2`` section
+   * - ``FSG``
+     - 35
+     - Heuristic only: at most two sections with the entry in a writable and
+       executable, non-standard-named first section
+   * - ``none``
+     - 0
+     - Nothing above matched
+
+Section names can be changed, so this is evidence, not identification, and the FSG
+heuristic in particular can misfire. A detection is the input to
+:doc:`generic-unpack`, which routes only UPX, ASPack, PECompact and MPRESS to a
+dynamic unpack and never FSG.
+
 JSON schema
 -----------
 
@@ -141,6 +205,10 @@ JSON schema
      - ``{section_index, section_name, start, size, entropy, owns_entry_point}`` per executable section
    * - ``evidence``
      - ``{id, weight, statement}`` per finding
+   * - ``protection_mode``
+     - ``{mode, probed_entries, clean_vm_entries, mutated_vm_entries, no_vm_entries, signal}``
+   * - ``packer``
+     - ``{kind, confidence, evidence}``: the packer classification above
    * - ``warnings``
      - Strings
 

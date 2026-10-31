@@ -18,6 +18,13 @@ library components with their own tests, and both are now wired into ``clean`` (
   import set. The import blocker therefore always stays: reconstruction is
   *proven-incomplete by design*, not unimplemented. ``CleanReport.imports`` reports
   ``proven_modules`` and ``proven_symbols`` for what the reduction established.
+  VMProtect 3.11 import protection is resolved at run time, which is why no sound
+  static set exists; bindings observed in the contained emulator
+  (``clean --experimental --dynamic``) build an experimental, labelled directory only.
+* **Section stripping** has a sound primitive that refuses when any surviving
+  reference would dangle. It is exposed as the :doc:`/tool/cli/strip` subcommand and
+  as the opt-in ``clean --experimental --strip`` stage. It is not part of the sound
+  ``OUTPUT`` path.
 
 Application import-set reconstruction (SP3)
 -------------------------------------------

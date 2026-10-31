@@ -21,13 +21,23 @@ Modules
    * - Module
      - Responsibility
    * - ``main.rs``
-     - The clap ``Command`` enum, the eight analysis subcommands, JSON
+     - The clap ``Command`` enum (eleven subcommands), JSON
        output structs (``InfoOutput``, ``Comparison``, ``FileSummary``,
        ``ImportAnalysis``, ``OepAnalysis``) and the file-writing safety checks
    * - ``clean.rs``
      - The proof-gated pipeline. ``analyze_clean`` and
        ``analyze_clean_with_image`` build the ``CleanReport`` (schema version 3),
        the optional conventional image and the optional reintegrated image
+   * - ``generic_unpack.rs``
+     - ``route_generic_unpack``: routes a detected UPX, ASPack, PECompact or MPRESS
+       image to a bounded detonation in ``vmpx-emulate``, then dump and rebuild. The
+       result is an observed artifact (:doc:`/tool/cli/generic-unpack`)
+   * - ``strip_wiring.rs``
+     - The ``strip`` subcommand and the experimental ``clean --strip`` stage, over the
+       sound section-stripping primitive
+   * - ``decoded_splice.rs``
+     - Splices decoded-stream lifts into the experimental image
+       (``clean --decoded-lift``)
    * - ``vm_inventory.rs``
      - ``VmInventoryEntry`` and the deterministic ``merge_vm_inventory``
    * - ``input_closed_functions.rs``
