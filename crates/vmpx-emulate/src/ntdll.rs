@@ -31,6 +31,8 @@ const STATUS_INVALID_INFO_CLASS: u64 = 0xC000_0003;
 const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
 const STATUS_INVALID_HANDLE: u64 = 0xC000_0008;
 const STATUS_PORT_NOT_SET: u64 = 0xC000_0353;
+const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
+const STATUS_NOT_FOUND: u64 = 0xC000_0225;
 
 // --- Win32 page protection constants --------------------------------------
 const PAGE_NOACCESS: u64 = 0x01;
@@ -180,6 +182,15 @@ impl NtState {
             "QueryInformationProcess" => Self::query_process(cpu, mem, stack_arg_base),
             "QueryInformationThread" => Self::query_thread(cpu, mem, stack_arg_base),
             "QuerySystemInformation" => Self::query_system(cpu, mem, stack_arg_base),
+            // Debug registers read as zero; a set is accepted as a no-op (no DRx
+            // breakpoint is ever armed). Anything beyond DEBUG_REGISTERS is unmodeled.
+            "GetContextThread" | "SetContextThread" => {
+                if debug_context(mem, cpu.regs[ARG[1]], base == "GetContextThread") {
+                    NtDispatch::Status(STATUS_SUCCESS)
+                } else {
+                    NtDispatch::Stop
+                }
+            }
             "OpenFile" => Self::open_file(cpu, mem, stack_arg_base),
             // No in-model registry: opening any key fails closed (NOT_FOUND),
             // never fabricating a handle or key contents.
@@ -362,12 +373,26 @@ impl NtState {
     }
 
     /// `NtClose(Handle)`. Drops any object we minted; a pseudo-handle (current
-    /// process/thread) or an already-closed handle still succeeds (NT closes
-    /// pseudo-handles as a no-op) — a benign, deterministic choice.
+    /// process/thread) closes as a no-op success. An unknown handle returns
+    /// `STATUS_INVALID_HANDLE` with NO exception: the no-debugger behaviour (a
+    /// debugger would turn it into `EXCEPTION_INVALID_HANDLE`).
     fn close(&mut self, cpu: &Cpu) -> NtDispatch {
         let h = cpu.regs[ARG[0]];
-        let _ = self.sections.remove(&h).is_some() || self.handles.remove(&h);
-        NtDispatch::Status(STATUS_SUCCESS)
+        if self.sections.remove(&h).is_some() || self.handles.remove(&h) || is_pseudo_handle(h) {
+            NtDispatch::Status(STATUS_SUCCESS)
+        } else {
+            NtDispatch::Status(STATUS_INVALID_HANDLE)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handles_for_test(&mut self, h: u64) {
+        self.handles.insert(h);
+    }
+
+    /// Whether `h` is a live handle we minted (for the Win32 `CloseHandle`).
+    pub(crate) fn owns_handle(&self, h: u64) -> bool {
+        self.sections.contains_key(&h) || self.handles.contains(&h)
     }
 
     /// `NtQueryInformationProcess(h, Class, Buffer, Length, *ReturnLength)`.
@@ -395,13 +420,15 @@ impl NtState {
             30 => (vec![0u8; 8], STATUS_PORT_NOT_SET),
             // ProcessDebugFlags (31): 1 == not being debugged (no inherit).
             31 => (1u32.to_le_bytes().to_vec(), STATUS_SUCCESS),
+            // ProcessBreakOnTermination (29): not a critical process.
+            29 => (0u32.to_le_bytes().to_vec(), STATUS_SUCCESS),
             _ => return NtDispatch::Status(STATUS_INVALID_INFO_CLASS),
         };
         if buf != 0 && (length as usize) >= bytes.len() && mem.write(buf, &bytes).is_err() {
             return NtDispatch::Stop;
         }
         if p_ret != 0 {
-            let _ = mem.write_uint(p_ret, 8, bytes.len() as u64);
+            let _ = mem.write_uint(p_ret, 4, bytes.len() as u64);
         }
         NtDispatch::Status(status)
     }
@@ -436,7 +463,7 @@ impl NtState {
             return NtDispatch::Stop;
         }
         if p_ret != 0 {
-            let _ = mem.write_uint(p_ret, 8, bytes.len() as u64);
+            let _ = mem.write_uint(p_ret, 4, bytes.len() as u64);
         }
         NtDispatch::Status(STATUS_SUCCESS)
     }
@@ -448,18 +475,59 @@ impl NtState {
         let buf = a.reg(1);
         let length = a.reg(2);
         let p_ret = a.reg(3);
-        // SystemKernelDebuggerInformation (35): two BOOLEANs
-        // { KernelDebuggerEnabled, KernelDebuggerNotPresent }.
-        // Report "no kernel debugger, not present".
+        // Anti-debug / anti-VM classes answer as a clean bare-metal host with no
+        // kernel debugger; any other class is an explicit INVALID_INFO_CLASS.
         let bytes: Vec<u8> = match class {
+            // SystemKernelDebuggerInformation (35): { KernelDebuggerEnabled,
+            // KernelDebuggerNotPresent } = { FALSE, TRUE }.
             35 => vec![0x00, 0x01],
+            // SystemKernelDebuggerInformationEx (149): { DebuggerAllowed,
+            // DebuggerEnabled, DebuggerPresent } all FALSE.
+            149 => vec![0, 0, 0],
+            // SystemFirmwareTableInformation (76).
+            76 => return Self::query_firmware(mem, buf, length, p_ret),
             _ => return NtDispatch::Status(STATUS_INVALID_INFO_CLASS),
         };
-        if buf != 0 && (length as usize) >= bytes.len() && mem.write(buf, &bytes).is_err() {
+        if p_ret != 0 {
+            let _ = mem.write_uint(p_ret, 4, bytes.len() as u64);
+        }
+        if (length as usize) < bytes.len() {
+            return NtDispatch::Status(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        if buf != 0 && mem.write(buf, &bytes).is_err() {
+            return NtDispatch::Stop;
+        }
+        NtDispatch::Status(STATUS_SUCCESS)
+    }
+
+    /// `SystemFirmwareTableInformation`: a `SYSTEM_FIRMWARE_TABLE_INFORMATION`
+    /// header {Provider, Action, TableID, TableBufferLength} then the table bytes.
+    fn query_firmware(mem: &mut Memory, buf: u64, length: u64, p_ret: u64) -> NtDispatch {
+        if length < FW_HEADER {
+            return NtDispatch::Status(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let (Ok(provider), Ok(action), Ok(id)) =
+            (mem.read_uint(buf, 4), mem.read_uint(buf + 4, 4), mem.read_uint(buf + 8, 4))
+        else {
+            return NtDispatch::Stop;
+        };
+        let payload = match firmware_table(provider as u32, action, id as u32) {
+            FwResult::Data(d) => d,
+            FwResult::NotFound => return NtDispatch::Status(STATUS_NOT_FOUND),
+            FwResult::Unmodeled => return NtDispatch::Stop,
+        };
+        let need = FW_HEADER + payload.len() as u64;
+        if mem.write_uint(buf + 12, 4, payload.len() as u64).is_err() {
             return NtDispatch::Stop;
         }
         if p_ret != 0 {
-            let _ = mem.write_uint(p_ret, 8, bytes.len() as u64);
+            let _ = mem.write_uint(p_ret, 4, need);
+        }
+        if length < need {
+            return NtDispatch::Status(STATUS_BUFFER_TOO_SMALL);
+        }
+        if mem.write(buf + FW_HEADER, &payload).is_err() {
+            return NtDispatch::Stop;
         }
         NtDispatch::Status(STATUS_SUCCESS)
     }
@@ -506,6 +574,83 @@ impl NtState {
         }
         NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)
     }
+}
+
+/// `SYSTEM_FIRMWARE_TABLE_INFORMATION` header size; the table bytes follow it.
+const FW_HEADER: u64 = 16;
+// Firmware provider signatures (MSVC multi-char literals, first char = MSB).
+const FW_FIRM: u32 = 0x4649_524D; // 'FIRM'
+const FW_RSMB: u32 = 0x5253_4D42; // 'RSMB'
+const FW_ACPI: u32 = 0x4143_5049; // 'ACPI'
+
+/// Outcome of a firmware-table request.
+pub(crate) enum FwResult {
+    Data(Vec<u8>),
+    /// The provider is known but has no such table.
+    NotFound,
+    /// A provider we do not model: fail closed rather than invent content.
+    Unmodeled,
+}
+
+/// A minimal bare-metal SMBIOS (`RawSMBIOSData`): one Type-1 System Information
+/// structure naming a generic desktop board, then the Type-127 terminator. No
+/// hypervisor / virtual-machine vendor string appears anywhere.
+fn smbios_bare_metal() -> Vec<u8> {
+    let mut t = vec![1u8, 27, 0x01, 0x00, 1, 2, 3, 4];
+    t.extend_from_slice(&[
+        0x5A, 0xC3, 0x11, 0x7E, 0x90, 0x2B, 0x4D, 0x18, 0xA6, 0x3F, 0x0C, 0xD2, 0x71, 0xE8, 0x44,
+        0x09,
+    ]);
+    t.extend_from_slice(&[6, 0, 0]); // wake-up type (power switch), SKU, family
+    for s in ["ASUSTeK COMPUTER INC.", "System Product Name", "System Version", "System Serial Number"]
+    {
+        t.extend_from_slice(s.as_bytes());
+        t.push(0);
+    }
+    t.push(0);
+    t.extend_from_slice(&[127, 4, 0x02, 0x00, 0, 0]);
+    let mut raw = vec![0u8, 3, 3, 0];
+    raw.extend_from_slice(&(t.len() as u32).to_le_bytes());
+    raw.extend_from_slice(&t);
+    raw
+}
+
+/// Firmware table `id` of `provider` (`action`: 0 = enumerate, 1 = get). RSMB
+/// exposes the single bare-metal SMBIOS table (id 0); FIRM and ACPI expose no
+/// tables (empty, never a VM signature).
+pub(crate) fn firmware_table(provider: u32, action: u64, id: u32) -> FwResult {
+    match (provider, action) {
+        (FW_RSMB, 0) => FwResult::Data(0u32.to_le_bytes().to_vec()),
+        (FW_RSMB, 1) if id == 0 => FwResult::Data(smbios_bare_metal()),
+        (FW_FIRM | FW_ACPI, 0) => FwResult::Data(Vec::new()),
+        (FW_RSMB | FW_FIRM | FW_ACPI, 1) => FwResult::NotFound,
+        _ => FwResult::Unmodeled,
+    }
+}
+
+// x64 `CONTEXT`: ContextFlags, and Dr0-Dr3, Dr6, Dr7 contiguous from 0x48.
+const CTX_FLAGS: u64 = 0x30;
+const CTX_DR0: u64 = 0x48;
+const CTX_DR_LEN: usize = 0x30;
+const CONTEXT_AMD64: u64 = 0x10_0000;
+const CONTEXT_DEBUG_REGISTERS: u64 = CONTEXT_AMD64 | 0x10;
+
+/// Service a Get/SetThreadContext that requests only `CONTEXT_DEBUG_REGISTERS`:
+/// a get returns Dr0-Dr7 as zero, a set is a no-op. `false` for any request
+/// that needs more of the context (unmodeled; the caller fails closed).
+pub(crate) fn debug_context(mem: &mut Memory, ctx: u64, get: bool) -> bool {
+    let Ok(flags) = mem.read_uint(ctx + CTX_FLAGS, 4) else {
+        return false;
+    };
+    if flags & CONTEXT_AMD64 == 0 || flags & !CONTEXT_DEBUG_REGISTERS != 0 {
+        return false;
+    }
+    !get || flags & 0x10 == 0 || mem.write(ctx + CTX_DR0, &[0u8; CTX_DR_LEN]).is_ok()
+}
+
+/// The current-process (-1) / current-thread (-2) pseudo-handles.
+fn is_pseudo_handle(h: u64) -> bool {
+    h == u64::MAX || h == u64::MAX - 1
 }
 
 /// Read a `u64` through `ptr` when non-null, else `None`.
@@ -751,5 +896,110 @@ mod tests {
         assert_eq!(mem.read_uint(buf + 24, 8).unwrap(), 0x3000, "RegionSize");
         assert_eq!(mem.read_uint(buf + 32, 4).unwrap(), MEM_COMMIT, "State = COMMIT");
         assert_eq!(mem.read_uint(buf + 36, 4).unwrap(), PAGE_EXECUTE_READ, "Protect = RX");
+    }
+    fn sysinfo(class: u64, len: u64, buf: u64, p_ret: u64, mem: &mut Memory) -> u64 {
+        let (cpu, sab) = cpu_with([class, buf, len, p_ret], &[], mem);
+        match NtState::new().dispatch("NtQuerySystemInformation", &cpu, mem, sab) {
+            NtDispatch::Status(s) => s,
+            NtDispatch::Stop => u64::MAX,
+        }
+    }
+
+    #[test]
+    fn kernel_debugger_not_present() {
+        let mut mem = fresh_mem();
+        let (buf, p_ret) = (STACK + 0x100, STACK + 0x140);
+        mem.write(buf, &[0xFF; 8]).unwrap();
+        assert_eq!(sysinfo(35, 2, buf, p_ret, &mut mem), STATUS_SUCCESS);
+        assert_eq!(mem.read_uint(buf, 1).unwrap(), 0, "KernelDebuggerEnabled");
+        assert_eq!(mem.read_uint(buf + 1, 1).unwrap(), 1, "KernelDebuggerNotPresent");
+        assert_eq!(mem.read_uint(p_ret, 4).unwrap(), 2);
+        // The Ex form: allowed / enabled / present are all FALSE.
+        mem.write(buf, &[0xFF; 8]).unwrap();
+        assert_eq!(sysinfo(149, 3, buf, p_ret, &mut mem), STATUS_SUCCESS);
+        assert_eq!(mem.read_uint(buf, 2).unwrap(), 0);
+        assert_eq!(mem.read_uint(buf + 2, 1).unwrap(), 0);
+        // A short buffer is a length mismatch, never a truncated lie.
+        assert_eq!(sysinfo(35, 1, buf, p_ret, &mut mem), STATUS_INFO_LENGTH_MISMATCH);
+    }
+
+    #[test]
+    fn firmware_query_is_bare_metal() {
+        let mut mem = fresh_mem();
+        let (buf, p_ret) = (STACK + 0x200, STACK + 0x140);
+        // Header: Provider 'RSMB', Action = get (1), TableID 0.
+        for (off, v) in [(0u64, FW_RSMB), (4, 1), (8, 0)] {
+            mem.write_uint(buf + off, 4, u64::from(v)).unwrap();
+        }
+        assert_eq!(sysinfo(76, 0x1000, buf, p_ret, &mut mem), STATUS_SUCCESS);
+        let n = mem.read_uint(buf + 12, 4).unwrap() as usize;
+        assert!(n > 8);
+        assert_eq!(mem.read_uint(p_ret, 4).unwrap() as usize, 16 + n);
+        let mut raw = vec![0u8; n];
+        mem.read(buf + 16, &mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw).to_lowercase();
+        for vm in ["vmware", "virtualbox", "vbox", "qemu", "xen", "innotek", "kvm", "hyper-v", "virtual"] {
+            assert!(!text.contains(vm), "no {vm} signature");
+        }
+        // Too small: BUFFER_TOO_SMALL with the required size reported.
+        assert_eq!(sysinfo(76, 20, buf, p_ret, &mut mem), STATUS_BUFFER_TOO_SMALL);
+        assert_eq!(mem.read_uint(p_ret, 4).unwrap() as usize, 16 + n);
+        // ACPI enumerate is empty; an unknown provider fails closed (Stop).
+        mem.write_uint(buf, 4, u64::from(FW_ACPI)).unwrap();
+        mem.write_uint(buf + 4, 4, 0).unwrap();
+        assert_eq!(sysinfo(76, 0x100, buf, p_ret, &mut mem), STATUS_SUCCESS);
+        assert_eq!(mem.read_uint(buf + 12, 4).unwrap(), 0);
+        mem.write_uint(buf, 4, 0x5858_5858).unwrap();
+        assert_eq!(sysinfo(76, 0x100, buf, p_ret, &mut mem), u64::MAX);
+    }
+
+    #[test]
+    fn nt_context_debug_registers_zero() {
+        let mut mem = fresh_mem();
+        let ctx = STACK + 0x400;
+        mem.write(ctx, &[0x55u8; 0x100]).unwrap();
+        mem.write_uint(ctx + 0x30, 4, 0x0010_0010).unwrap();
+        let (cpu, sab) = cpu_with([0xFFFF_FFFF_FFFF_FFFE, ctx, 0, 0], &[], &mut mem);
+        let mut nt = NtState::new();
+        assert!(matches!(
+            nt.dispatch("NtGetContextThread", &cpu, &mut mem, sab),
+            NtDispatch::Status(STATUS_SUCCESS)
+        ));
+        for off in (0x48..0x78).step_by(8) {
+            assert_eq!(mem.read_uint(ctx + off, 8).unwrap(), 0);
+        }
+        assert!(matches!(
+            nt.dispatch("ZwSetContextThread", &cpu, &mut mem, sab),
+            NtDispatch::Status(STATUS_SUCCESS)
+        ));
+        mem.write_uint(ctx + 0x30, 4, 0x0010_0001).unwrap(); // CONTROL: unmodeled
+        assert!(matches!(nt.dispatch("NtGetContextThread", &cpu, &mut mem, sab), NtDispatch::Stop));
+    }
+
+    #[test]
+    fn debugger_info_classes_and_invalid_close() {
+        let mut mem = fresh_mem();
+        let buf = STACK + 0x100;
+        let mut nt = NtState::new();
+        let q = |class: u64, mem: &mut Memory, nt: &mut NtState| {
+            mem.write(buf, &[0xFF; 8]).unwrap();
+            let (cpu, sab) = cpu_with([0xFFFF_FFFF_FFFF_FFFF, class, buf, 8], &[0], mem);
+            match nt.dispatch("NtQueryInformationProcess", &cpu, mem, sab) {
+                NtDispatch::Status(s) => s,
+                NtDispatch::Stop => u64::MAX,
+            }
+        };
+        assert_eq!(q(7, &mut mem, &mut nt), STATUS_SUCCESS); // ProcessDebugPort
+        assert_eq!(mem.read_uint(buf, 8).unwrap(), 0);
+        assert_eq!(q(30, &mut mem, &mut nt), STATUS_PORT_NOT_SET); // DebugObjectHandle
+        assert_eq!(mem.read_uint(buf, 8).unwrap(), 0);
+        assert_eq!(q(31, &mut mem, &mut nt), STATUS_SUCCESS); // DebugFlags
+        assert_eq!(mem.read_uint(buf, 4).unwrap(), 1, "1 == not debugged");
+        // NtClose of a bogus handle: INVALID_HANDLE status, no exception/stop.
+        let (cpu, sab) = cpu_with([0xDEAD_BEEF, 0, 0, 0], &[], &mut mem);
+        assert!(matches!(
+            nt.dispatch("NtClose", &cpu, &mut mem, sab),
+            NtDispatch::Status(STATUS_INVALID_HANDLE)
+        ));
     }
 }

@@ -82,8 +82,8 @@ pub use differential::{
     RunResult, Target, differential, edge_values, input_set, run_function,
 };
 pub use emu::{
-    Emulator, FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent, ObserveConfig, Span, Stop,
-    TraceEntry,
+    Emulator, FlowEvent, FlowKind, Hook, HookAction, InsnAudit, Interest, MemEvent, ObserveConfig,
+    Span, Stop, TraceEntry,
 };
 pub use iat_fill::{
     AddressBook, IatFill, IatSlotImport, IatSlotUnresolved, ImportSource, KnownImport,

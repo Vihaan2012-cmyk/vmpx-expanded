@@ -23,6 +23,21 @@ const DF: u64 = 1 << 10;
 /// The six status flags mul/div/string ops read or leave undefined.
 const STATUS: u64 = CF | PF | AF | ZF | SF | OF;
 
+/// Anti-analysis-relevant instructions executed: the `cpuid` (leaf, subleaf)
+/// queries and `rdtsc`/`rdtscp` reads. Pure bookkeeping; it never alters
+/// execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InsnAudit {
+    pub cpuid: std::collections::BTreeMap<(u64, u64), u64>,
+    pub rdtsc: u64,
+    pub rdtscp: u64,
+    /// `(rip, retired-step)` of the first 64 `rdtsc`/`rdtscp` executions.
+    pub tsc_sites: Vec<(u64, u64)>,
+}
+
+/// x86 Trap Flag (rflags bit 8).
+const TF: u64 = 1 << 8;
+
 /// A [`Stop`] on the hot paths: boxed so `Result<u64, Trap>` is two registers.
 type Trap = Box<Stop>;
 
@@ -352,6 +367,8 @@ enum HookOutcome {
 }
 
 pub struct Emulator {
+    /// CPU-fingerprint / timing instructions the guest has executed (audit only).
+    pub audit: InsnAudit,
     pub cpu: Cpu,
     pub mem: Memory,
     pub trace: Vec<TraceEntry>,
@@ -523,6 +540,7 @@ impl Emulator {
     #[must_use]
     pub fn new(cpu: Cpu, mem: Memory) -> Self {
         Self {
+            audit: InsnAudit::default(),
             cpu,
             mem,
             trace: Vec::new(),
@@ -1937,11 +1955,19 @@ impl Emulator {
             // Deterministic offline environment layer: no host clock or real
             // CPU is consulted, so detonation is repeatable. See `tsc`/`cpuid`.
             Mnemonic::Rdtsc => {
+                self.audit.rdtsc += 1;
+                if self.audit.tsc_sites.len() < 64 {
+                    self.audit.tsc_sites.push((self.cur.0, self.steps));
+                }
                 let t = self.tsc();
                 self.cpu.set_reg(Register::EAX, t & 0xffff_ffff);
                 self.cpu.set_reg(Register::EDX, t >> 32);
             }
             Mnemonic::Rdtscp => {
+                self.audit.rdtscp += 1;
+                if self.audit.tsc_sites.len() < 64 {
+                    self.audit.tsc_sites.push((self.cur.0, self.steps));
+                }
                 let t = self.tsc();
                 self.cpu.set_reg(Register::EAX, t & 0xffff_ffff);
                 self.cpu.set_reg(Register::EDX, t >> 32);
@@ -1950,6 +1976,7 @@ impl Emulator {
             Mnemonic::Cpuid => {
                 let leaf = self.cpu.regs[RAX] & 0xffff_ffff;
                 let sub = self.cpu.regs[RCX] & 0xffff_ffff;
+                *self.audit.cpuid.entry((leaf, sub)).or_insert(0) += 1;
                 let (a, b, c, d) = cpuid(leaf, sub);
                 self.cpu.set_reg(Register::EAX, a);
                 self.cpu.set_reg(Register::EBX, b);
@@ -1981,6 +2008,13 @@ impl Emulator {
             Mnemonic::Popfq => {
                 let sp = self.cpu.regs[RSP];
                 let v = self.load(sp, 8)?;
+                // Setting TF arms a single-step #DB after the next instruction,
+                // which a no-debugger process would catch in its own handler.
+                // No exception delivery is modeled: fail closed rather than let
+                // TF linger (rflags never holds TF, so pushfq always reads TF=0).
+                if v & TF != 0 {
+                    return Err(self.unsup());
+                }
                 self.cpu.regs[RSP] = sp.wrapping_add(8);
                 self.cpu.rflags = v | 2; // bit 1 reads as 1
                 self.cpu.undef_flags = 0; // all flags now have concrete values

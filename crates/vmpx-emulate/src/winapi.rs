@@ -45,7 +45,7 @@ const RSP: usize = 4;
 const ALLOC_BASE: u64 = 0x0000_0050_0000_0000; // VirtualAlloc/HeapAlloc pages
 const PROC_BASE: u64 = 0x0000_0060_0000_0000; // GetProcAddress result sentinels
 const HMODULE_BASE: u64 = 0x0000_0070_0000_0000; // LoadLibrary/GetModuleHandle
-const PROCESS_HEAP: u64 = 0x0000_0070_FFFF_0000; // GetProcessHeap sentinel
+use crate::loader::PROCESS_HEAP; // GetProcessHeap == PEB.ProcessHeap
 const HEAP_BASE: u64 = 0x0000_0070_FFF0_0000; // HeapCreate handle pool
 const STDHANDLE_BASE: u64 = 0x0000_0070_FFE0_0000; // GetStdHandle sentinels
 
@@ -78,6 +78,25 @@ const POINTER_COOKIE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 const CMDLINE: &str = "program.exe";
 
 const PAGE: u64 = 0x1000;
+
+const ERROR_INVALID_HANDLE: u64 = 6;
+const ERROR_MOD_NOT_FOUND: u64 = 126;
+const ERROR_INSUFFICIENT_BUFFER: u64 = 122;
+const ERROR_NOT_FOUND: u64 = 1168;
+
+/// Whether `name` is a sandbox, analysis-hook or VM-guest module that a clean
+/// bare-metal, no-debugger process never has loaded (case-insensitive, path and
+/// `.dll` extension ignored).
+fn is_analysis_artifact_module(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "sbiedll", "sbiedllx", "dbghelp", "api_log", "dir_watch", "pstorec", "vmcheck", "wpespy",
+        "cmdvrt32", "cmdvrt64", "snxhk", "avghookx", "avghooka", "sxin", "sf2", "vmguestlib",
+    ];
+    const PREFIX: &[&str] = &["vbox", "vmware", "vmhgfs", "vm3d", "vmdum", "vmtools", "vmmouse"];
+    let base = name.rsplit(['\\', '/']).next().unwrap_or(name).to_lowercase();
+    let stem = base.strip_suffix(".dll").unwrap_or(&base);
+    EXACT.contains(&stem) || PREFIX.iter().any(|p| stem.starts_with(p))
+}
 
 // Fixed user-mode address of KUSER_SHARED_DATA (constant on every Windows x64).
 const KUSD_BASE: u64 = 0x7FFE_0000;
@@ -162,6 +181,8 @@ pub struct WinApiHook {
     xplm: Option<Rc<RefCell<Xplm>>>,
     /// Every import address this hook has handed out (see [`AddressBook`]).
     addr_book: AddressBook,
+    /// Anti-analysis probes seen (see [`WinApiHook::audit`]).
+    audit: Rc<RefCell<BTreeMap<String, u64>>>,
 }
 
 /// A read-watch over one module's `AddressOfFunctions` array. When the protector
@@ -244,6 +265,7 @@ impl WinApiHook {
             nt: NtState::new(),
             xplm: None,
             addr_book,
+            audit: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
 
@@ -454,6 +476,44 @@ impl WinApiHook {
         h
     }
 
+    /// `GetModuleHandle`/`LoadLibrary` front-end: sandbox / analysis / VM-guest
+    /// modules are absent (NULL, `ERROR_MOD_NOT_FOUND`), as on a clean bare-metal
+    /// host; everything else resolves via [`Self::module_handle`].
+    fn lookup_module(&mut self, mem: &mut Memory, name: &str, api: &str) -> u64 {
+        if is_analysis_artifact_module(name) {
+            self.last_error = ERROR_MOD_NOT_FOUND;
+            self.note(&format!("{api}({}) -> NULL", name.to_lowercase()));
+            return 0;
+        }
+        self.module_handle(mem, name)
+    }
+
+    /// Audit an ntdll syscall that probes for a debugger / VM / sandbox.
+    fn note_nt(&self, func: &str, cpu: &Cpu, status: u64) {
+        let class = match func.get(2..).unwrap_or(func) {
+            "QuerySystemInformation" => Self::arg(cpu, 0),
+            "QueryInformationProcess" | "QueryInformationThread" | "SetInformationThread"
+            | "SetInformationProcess" => Self::arg(cpu, 1),
+            "GetContextThread" | "SetContextThread" => 0,
+            "Close" if status != 0 => 0,
+            _ => return,
+        };
+        self.note(&format!("{func} class={class} -> {status:#x}"));
+    }
+
+    /// Record an anti-analysis probe and the clean answer it received.
+    fn note(&self, what: &str) {
+        *self.audit.borrow_mut().entry(what.to_string()).or_insert(0) += 1;
+    }
+
+    /// Shared handle to the anti-analysis audit log: each distinct probe the
+    /// guest made (API or NT info class) and the clean answer it got, with a
+    /// call count. Clone it before installing the hook.
+    #[must_use]
+    pub fn audit(&self) -> Rc<RefCell<BTreeMap<String, u64>>> {
+        Rc::clone(&self.audit)
+    }
+
     /// A read landing in a watched `AddressOfFunctions` slot is the protector
     /// resolving that export through the direct walk: record the function it
     /// just obtained the address of (deduped across the binary search's reads).
@@ -641,7 +701,7 @@ impl WinApiHook {
                         None => return Dispatch::Stop,
                     }
                 };
-                Dispatch::Ret(self.module_handle(mem, &name))
+                Dispatch::Ret(self.lookup_module(mem, &name, func))
             }
             (_, "GetModuleHandleW" | "LoadLibraryW") => {
                 let p = Self::arg(cpu, 0);
@@ -651,7 +711,7 @@ impl WinApiHook {
                         None => return Dispatch::Stop,
                     }
                 };
-                Dispatch::Ret(self.module_handle(mem, &name))
+                Dispatch::Ret(self.lookup_module(mem, &name, func))
             }
             // GetProcAddress(hModule, lpProcName) — the import bridge.
             (_, "GetProcAddress") => {
@@ -1039,14 +1099,78 @@ impl WinApiHook {
             (_, "InitializeCriticalSection" | "EnterCriticalSection" | "LeaveCriticalSection"
                 | "DeleteCriticalSection") => Dispatch::Void,
 
-            (_, "IsDebuggerPresent") => Dispatch::Ret(0),
+            (_, "IsDebuggerPresent") => {
+                self.note("IsDebuggerPresent -> FALSE");
+                Dispatch::Ret(0)
+            }
             // CheckRemoteDebuggerPresent(hProcess, pbDebuggerPresent) -> BOOL ok
             (_, "CheckRemoteDebuggerPresent") => {
                 let p = Self::arg(cpu, 1);
                 if p != 0 && mem.write_uint(p, 4, 0).is_err() {
                     return Dispatch::Stop;
                 }
+                self.note("CheckRemoteDebuggerPresent -> FALSE");
                 Dispatch::Ret(1)
+            }
+            // OutputDebugStringA/W: with no debugger attached the text goes nowhere.
+            (_, "OutputDebugStringA" | "OutputDebugStringW") => {
+                self.note(func);
+                Dispatch::Void
+            }
+            // CloseHandle(h) -> BOOL. A handle we do not own (incl. NULL and
+            // INVALID_HANDLE_VALUE) is FALSE / ERROR_INVALID_HANDLE with NO
+            // exception (a debugger would raise EXCEPTION_INVALID_HANDLE).
+            (_, "CloseHandle") => {
+                let h = Self::arg(cpu, 0);
+                let std = (STDHANDLE_BASE..STDHANDLE_BASE + 0x10).contains(&h);
+                if std || self.nt.owns_handle(h) {
+                    let _ = self.nt.dispatch("NtClose", cpu, mem, sab);
+                    return Dispatch::Ret(1);
+                }
+                self.last_error = ERROR_INVALID_HANDLE;
+                self.note("CloseHandle(invalid) -> FALSE, no exception");
+                Dispatch::Ret(0)
+            }
+            // Get/SetThreadContext(hThread, lpContext) -> BOOL: only the debug
+            // registers are modeled (read as zero; a set is a no-op).
+            (_, "GetThreadContext" | "SetThreadContext") => {
+                let get = func == "GetThreadContext";
+                if !crate::ntdll::debug_context(mem, Self::arg(cpu, 1), get) {
+                    return Dispatch::Stop;
+                }
+                self.note(if get {
+                    "GetThreadContext(DRx) -> Dr0-7 = 0"
+                } else {
+                    "SetThreadContext(DRx) -> accepted no-op"
+                });
+                Dispatch::Ret(1)
+            }
+            // EnumSystemFirmwareTables(sig, pBuf, size) /
+            // GetSystemFirmwareTable(sig, id, pBuf, size) -> bytes (or required size).
+            (_, "EnumSystemFirmwareTables" | "GetSystemFirmwareTable") => {
+                let enumerate = func == "EnumSystemFirmwareTables";
+                let sig = Self::arg(cpu, 0) as u32;
+                let (id, buf, size) = if enumerate {
+                    (0, Self::arg(cpu, 1), Self::arg(cpu, 2) as u32)
+                } else {
+                    (Self::arg(cpu, 1) as u32, Self::arg(cpu, 2), Self::arg(cpu, 3) as u32)
+                };
+                let data = match crate::ntdll::firmware_table(sig, u64::from(!enumerate), id) {
+                    crate::ntdll::FwResult::Data(d) => d,
+                    crate::ntdll::FwResult::NotFound => {
+                        self.last_error = ERROR_NOT_FOUND;
+                        return Dispatch::Ret(0);
+                    }
+                    crate::ntdll::FwResult::Unmodeled => return Dispatch::Stop,
+                };
+                let provider: String = sig.to_be_bytes().iter().map(|&b| char::from(b)).collect();
+                self.note(&format!("{func}({provider}) -> bare-metal/empty"));
+                if (data.len() as u32) > size || buf == 0 {
+                    self.last_error = ERROR_INSUFFICIENT_BUFFER;
+                } else if mem.write(buf, &data).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(data.len() as u64)
             }
 
             // Unmodeled: stop rather than guess (see module docs).
@@ -1120,10 +1244,14 @@ impl Hook for WinApiHook {
                 let sab = Self::stack_arg_base(ev, cpu);
                 return match self.nt.dispatch(&func, cpu, mem, sab) {
                     NtDispatch::Status(s) => {
+                        self.note_nt(&func, cpu, s);
                         cpu.regs[RAX] = s;
                         Self::resume(ev, cpu, mem)
                     }
-                    NtDispatch::Stop => HookAction::Stop,
+                    NtDispatch::Stop => {
+                        self.note(&format!("UNMODELED {func} (run stopped)"));
+                        HookAction::Stop
+                    }
                 };
             }
             return self.dispatch_win32(&dll, &func, ev, cpu, mem);
@@ -1253,7 +1381,10 @@ impl WinApiHook {
             }
         }
         match self.dispatch(dll, func, cpu, mem, sab) {
-            Dispatch::Stop => HookAction::Stop,
+            Dispatch::Stop => {
+                self.note(&format!("UNMODELED {dll}!{func} (run stopped)"));
+                HookAction::Stop
+            }
             Dispatch::Ret(v) => {
                 cpu.regs[RAX] = v;
                 Self::resume(ev, cpu, mem)
@@ -2181,5 +2312,115 @@ mod tests {
         assert_eq!(slot7.symbol, SymbolOrOrdinal::Ordinal(7));
         let functions_rva = STUB_REGION_RVA + 6 * STUB_STRIDE;
         assert_eq!(slot7.va, HMODULE_BASE + u64::from(functions_rva));
+    }
+    // ---- anti-debug / anti-VM clean answers ---------------------------------
+
+    fn call(h: &mut WinApiHook, f: &str, cpu: &Cpu, mem: &mut Memory, s: u64) -> Dispatch {
+        h.dispatch("kernel32.dll", f, cpu, mem, s)
+    }
+
+    #[test]
+    fn sandbox_and_vm_modules_are_absent() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let name = T_DATA + 0x100;
+        for (api, n) in [
+            ("GetModuleHandleA", "SbieDll.dll"),
+            ("GetModuleHandleA", "sbiedll"),
+            ("LoadLibraryA", "C:\\x\\dbghelp.dll"),
+            ("GetModuleHandleA", "vboxhook.dll"),
+            ("LoadLibraryA", "VMwareGuestLib.dll"),
+            ("GetModuleHandleA", "SxIn.dll"),
+        ] {
+            mem.poke(name, format!("{n}\0").as_bytes()).unwrap();
+            set_args(&mut cpu, [name, 0, 0, 0]);
+            assert_eq!(ret_of(call(&mut h, api, &cpu, &mut mem, s)), 0, "{n} must be absent");
+            assert_eq!(h.last_error, ERROR_MOD_NOT_FOUND);
+        }
+        // An ordinary system module still resolves.
+        mem.poke(name, b"kernel32.dll\0").unwrap();
+        assert_ne!(ret_of(call(&mut h, "GetModuleHandleA", &cpu, &mut mem, s)), 0);
+        // The wide variants honour the same list.
+        let w: Vec<u8> = "sbiedll.dll\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        mem.poke(name, &w).unwrap();
+        assert_eq!(ret_of(call(&mut h, "LoadLibraryW", &cpu, &mut mem, s)), 0);
+    }
+
+    #[test]
+    fn debug_registers_read_zero_and_set_is_noop() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let ctx = T_DATA + 0x400;
+        mem.write(ctx, &[0xAAu8; 0x4D0]).unwrap(); // dirty CONTEXT
+        mem.write_uint(ctx + 0x30, 4, 0x0010_0010).unwrap(); // CONTEXT_DEBUG_REGISTERS
+        set_args(&mut cpu, [0xFFFF_FFFF_FFFF_FFFE, ctx, 0, 0]);
+        assert_eq!(ret_of(call(&mut h, "GetThreadContext", &cpu, &mut mem, s)), 1);
+        for off in (0x48..0x78).step_by(8) {
+            assert_eq!(mem.read_uint(ctx + off, 8).unwrap(), 0, "Dr slot {off:#x}");
+        }
+        assert_eq!(mem.read_uint(ctx + 0x78, 8).unwrap(), 0xAAAA_AAAA_AAAA_AAAA, "only DRx written");
+        // SetThreadContext with armed breakpoints is accepted and changes nothing.
+        mem.write_uint(ctx + 0x48, 8, 0x1234).unwrap();
+        mem.write_uint(ctx + 0x70, 8, 0x401).unwrap();
+        assert_eq!(ret_of(call(&mut h, "SetThreadContext", &cpu, &mut mem, s)), 1);
+        // A request needing integer/control state is unmodeled, never half-answered.
+        mem.write_uint(ctx + 0x30, 4, 0x0010_0003).unwrap();
+        assert!(matches!(call(&mut h, "GetThreadContext", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn firmware_tables_carry_no_vm_signature() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let buf = T_DATA + 0x800;
+        const RSMB: u64 = 0x5253_4D42;
+        // GetSystemFirmwareTable('RSMB', 0, buf, 0x1000)
+        set_args(&mut cpu, [RSMB, 0, buf, 0x1000]);
+        let n = ret_of(call(&mut h, "GetSystemFirmwareTable", &cpu, &mut mem, s));
+        assert!(n > 8, "SMBIOS present");
+        let mut raw = vec![0u8; n as usize];
+        mem.read(buf, &mut raw).unwrap();
+        let text = String::from_utf8_lossy(&raw).to_lowercase();
+        for vm in ["vmware", "virtualbox", "vbox", "qemu", "xen", "innotek", "kvm", "parallels", "bochs", "hyper-v", "virtual"] {
+            assert!(!text.contains(vm), "SMBIOS must not mention {vm}");
+        }
+        // Too small: the required size is returned, nothing is written.
+        set_args(&mut cpu, [RSMB, 0, buf + 0x200, 4]);
+        assert_eq!(ret_of(call(&mut h, "GetSystemFirmwareTable", &cpu, &mut mem, s)), n);
+        assert_eq!(h.last_error, ERROR_INSUFFICIENT_BUFFER);
+        // FIRM / ACPI enumerate to nothing; an ACPI table lookup is not-found.
+        set_args(&mut cpu, [0x4649_524D, buf, 0x100, 0]);
+        assert_eq!(ret_of(call(&mut h, "EnumSystemFirmwareTables", &cpu, &mut mem, s)), 0);
+        set_args(&mut cpu, [0x4143_5049, 0x5041_4346, buf, 0x100]);
+        assert_eq!(ret_of(call(&mut h, "GetSystemFirmwareTable", &cpu, &mut mem, s)), 0);
+        // An unknown provider is unmodeled -> explicit stop.
+        set_args(&mut cpu, [0x5858_5858, 0, buf, 0x100]);
+        assert!(matches!(call(&mut h, "GetSystemFirmwareTable", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn debugger_probes_answer_clean() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        assert_eq!(ret_of(call(&mut h, "IsDebuggerPresent", &cpu, &mut mem, s)), 0);
+        let out = T_DATA + 0x40;
+        mem.write_uint(out, 4, 0xFFFF).unwrap();
+        set_args(&mut cpu, [0xFFFF_FFFF_FFFF_FFFF, out, 0, 0]);
+        assert_eq!(ret_of(call(&mut h, "CheckRemoteDebuggerPresent", &cpu, &mut mem, s)), 1);
+        assert_eq!(mem.read_uint(out, 4).unwrap(), 0);
+        set_args(&mut cpu, [T_DATA, 0, 0, 0]);
+        assert!(matches!(call(&mut h, "OutputDebugStringA", &cpu, &mut mem, s), Dispatch::Void));
+        assert!(matches!(call(&mut h, "OutputDebugStringW", &cpu, &mut mem, s), Dispatch::Void));
+    }
+
+    #[test]
+    fn close_handle_invalid_is_false_without_exception() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        for bad in [0u64, 0xFFFF_FFFF_FFFF_FFFF, 0xDEAD_BEEF] {
+            set_args(&mut cpu, [bad, 0, 0, 0]);
+            assert_eq!(ret_of(call(&mut h, "CloseHandle", &cpu, &mut mem, s)), 0);
+            assert_eq!(h.last_error, ERROR_INVALID_HANDLE);
+        }
+        // A handle we minted closes fine, and only once.
+        h.nt.handles_for_test(0x44);
+        set_args(&mut cpu, [0x44, 0, 0, 0]);
+        assert_eq!(ret_of(call(&mut h, "CloseHandle", &cpu, &mut mem, s)), 1);
+        assert_eq!(ret_of(call(&mut h, "CloseHandle", &cpu, &mut mem, s)), 0);
     }
 }
