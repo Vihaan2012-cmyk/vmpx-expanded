@@ -9,6 +9,8 @@
 //   SAMPLE   entries to sweep: a number for a sample, or "all" for the full
 //            image. OMITTED defaults to a SMALL memory-safe sample (50) so a
 //            naive run can never OOM; the full image is explicit opt-in ("all").
+//   env XPL_ENTRY_TIMEOUT_SECS  per-entry wall-clock cap (default 60, 0 = unbounded);
+//            a capped entry is reported Incomplete with limit WallClock.
 //   THREADS  worker threads (default 4). Use 1 for a low-memory single-threaded
 //            run.
 //
@@ -113,7 +115,12 @@ fn parse_hex_after(reason: &str, marker: &str) -> Option<u64> {
     u64::from_str_radix(&hex[..end], 16).ok()
 }
 
-fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_limit: usize) -> Outcome {
+fn recover_one(
+    pe: &PeImage<'_>,
+    entry: &vmpx_vm::VmEntryCandidate,
+    instruction_limit: usize,
+    max_wall_time: Option<std::time::Duration>,
+) -> Outcome {
     // Mirror cfgdiag's recovery budget: default CFG limits (which bound blocks,
     // visits, decoded instructions, and cross-profile transitions per entry),
     // with a bumped per-block instruction budget. Every entry is hard-bounded,
@@ -127,6 +134,7 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_
             instruction_limit,
             ..EntryProfileRecoveryLimits::default()
         },
+        max_wall_time,
         ..VmCfgLimits::default()
     };
     set_branch_refusal_diagnostics(true);
@@ -188,6 +196,15 @@ fn main() {
     // Per-block decode budget (4th arg). Default 512 keeps a naive run memory-safe;
     // raise it deliberately (with memory headroom) to reclaim InstructionLimit stalls.
     let instruction_limit: usize = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(512);
+    // Per-entry wall-clock cap in seconds via XPL_ENTRY_TIMEOUT_SECS. Default 60; 0 = unbounded.
+    let max_wall_time = match std::env::var("XPL_ENTRY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|a| a.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        None => Some(vmpx_vm::DEFAULT_MAX_WALL_TIME),
+    };
 
     let t0 = Instant::now();
     let bytes = std::fs::read(image_path).unwrap_or_else(|e| panic!("read {image_path}: {e}"));
@@ -268,7 +285,7 @@ fn main() {
                         .iter()
                         .map(|entry| EntryResult {
                             rva: entry.rva.0,
-                            outcome: recover_one(pe_ref, entry, instruction_limit),
+                            outcome: recover_one(pe_ref, entry, instruction_limit, max_wall_time),
                         })
                         .collect::<Vec<_>>()
                 })

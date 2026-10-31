@@ -60,7 +60,7 @@ pub use call_effects::{
 pub use cfg::{
     BranchRefusalDiagnostic, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
-    ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, recover_vm_cfg,
+    ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, DEFAULT_MAX_WALL_TIME, recover_vm_cfg,
     recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
 };
 pub use checksum::{

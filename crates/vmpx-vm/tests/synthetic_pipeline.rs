@@ -396,6 +396,34 @@ fn cfg_walk_of_a_linear_function_is_one_exit_block() {
 }
 
 #[test]
+fn cfg_walk_wall_clock_cap_cuts_off_incomplete_and_spares_a_quick_entry() {
+    let vm = synth_vm::build_const_branch(None);
+    let pe = parse(&vm);
+    let entry = entry_candidate(&pe);
+    let capped = VmCfgLimits {
+        max_wall_time: Some(std::time::Duration::ZERO),
+        ..VmCfgLimits::default()
+    };
+    let cut = recover_vm_cfg(&pe, &entry, capped).expect("cfg recovery starts");
+    assert_eq!(cut.limit_hit, Some(vmpx_vm::CfgLimitHit::WallClock), "{cut:#?}");
+    assert!(!cut.is_complete() && !cut.all_paths_reach_vm_exit(), "{cut:#?}");
+
+    let generous = VmCfgLimits {
+        max_wall_time: Some(std::time::Duration::from_secs(600)),
+        ..VmCfgLimits::default()
+    };
+    let unbounded = VmCfgLimits {
+        max_wall_time: None,
+        ..VmCfgLimits::default()
+    };
+    let quick = recover_vm_cfg(&pe, &entry, generous).expect("cfg recovery starts");
+    let free = recover_vm_cfg(&pe, &entry, unbounded).expect("cfg recovery starts");
+    assert!(quick.limit_hit.is_none() && quick.all_paths_reach_vm_exit(), "{quick:#?}");
+    assert_eq!(quick.blocks.keys().collect::<Vec<_>>(), free.blocks.keys().collect::<Vec<_>>());
+    assert_eq!(quick.edges, free.edges);
+}
+
+#[test]
 fn cfg_walk_follows_a_branch_through_a_pushed_constant_to_both_blocks() {
     let vm = synth_vm::build_const_branch(None);
     let cfg = walk_cfg(&vm);
