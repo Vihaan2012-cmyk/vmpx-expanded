@@ -36,6 +36,17 @@ const RETURN_SENTINEL: u64 = 0x0000_0040_DEAD_0000;
 // TEB/PEB field offsets (x64).
 const TEB_PEB_PTR: u64 = 0x60;
 const PEB_BEING_DEBUGGED: u64 = 0x02;
+const PEB_PROCESS_HEAP: u64 = 0x30;
+const PEB_NT_GLOBAL_FLAG: u64 = 0xBC;
+// PEB OS version block, consistent with KUSER_SHARED_DATA (Windows 10, build 19041).
+const PEB_OS_MAJOR: u64 = 0x118;
+// _HEAP.Flags / ForceFlags (Vista+ x64): a normal, non-debugged process heap is
+// HEAP_GROWABLE with no force flags; a debugger adds the tail/free-check bits.
+const HEAP_FLAGS: u64 = 0x70;
+const HEAP_FORCE_FLAGS: u64 = 0x74;
+const HEAP_GROWABLE: u32 = 0x2;
+/// The process heap (`PEB.ProcessHeap` == `GetProcessHeap()`).
+pub(crate) const PROCESS_HEAP: u64 = TEB_REGION + 0x1000;
 const PEB_IMAGE_BASE: u64 = 0x10;
 const PEB_LDR: u64 = 0x18;
 
@@ -199,20 +210,12 @@ pub fn load(pe: &PeImage, opts: &LoadOptions) -> Result<LoadedImage, LoadError> 
         }
     }
 
-    // TEB/PEB stubs (one page); gs: base = TEB.
-    let teb = TEB_REGION;
-    let peb = TEB_REGION + 0x400;
-    let ldr = TEB_REGION + 0x800;
-    mem.map(teb, PAGE_SIZE, Perm::RW)?;
-    mem.poke(teb + TEB_PEB_PTR, &peb.to_le_bytes())?;
-    mem.poke(peb + PEB_BEING_DEBUGGED, &[0u8])?;
-    mem.poke(peb + PEB_IMAGE_BASE, &image_base.to_le_bytes())?;
-    mem.poke(peb + PEB_LDR, &ldr.to_le_bytes())?;
-    // PEB_LDR_DATA: three module lists, each an empty (self-linked) LIST_ENTRY.
-    for list in [ldr + 0x10, ldr + 0x20, ldr + 0x30] {
-        mem.poke(list, &list.to_le_bytes())?;
-        mem.poke(list + 8, &list.to_le_bytes())?;
-    }
+    let teb = map_teb_peb(&mut mem, image_base)?;
+
+    // The synthetic return address is readable, non-breakpoint code (a protector
+    // may read the byte at its caller's return address to scan for `int3`).
+    mem.map(RETURN_SENTINEL, PAGE_SIZE, Perm::RX)?;
+    mem.poke(RETURN_SENTINEL, &[0x90u8; PAGE_SIZE as usize])?;
 
     // Stack region; RSP near top, 16-aligned, with slack below for red zone.
     let stack_base = STACK_REGION;
@@ -232,6 +235,35 @@ pub fn load(pe: &PeImage, opts: &LoadOptions) -> Result<LoadedImage, LoadError> 
         stack_top,
         initial_rsp,
     })
+}
+
+/// Map the TEB/PEB page (and the process-heap header page after it) with a clean
+/// no-debugger, bare-metal anti-debug state; returns the TEB (the `gs:` base).
+fn map_teb_peb(mem: &mut Memory, image_base: u64) -> Result<u64, LoadError> {
+    let teb = TEB_REGION;
+    let peb = TEB_REGION + 0x400;
+    let ldr = TEB_REGION + 0x800;
+    mem.map(teb, PAGE_SIZE, Perm::RW)?;
+    mem.poke(teb + TEB_PEB_PTR, &peb.to_le_bytes())?;
+    mem.poke(peb + PEB_BEING_DEBUGGED, &[0u8])?;
+    // Clean anti-debug state: NtGlobalFlag has no FLG_HEAP_* bits and the process
+    // heap carries normal (non-debug) Flags/ForceFlags.
+    mem.poke(peb + PEB_NT_GLOBAL_FLAG, &0u32.to_le_bytes())?;
+    mem.poke(peb + PEB_OS_MAJOR, &10u32.to_le_bytes())?; // OSMajorVersion
+    mem.poke(peb + PEB_OS_MAJOR + 8, &19041u16.to_le_bytes())?; // OSBuildNumber
+    mem.poke(peb + PEB_OS_MAJOR + 12, &2u32.to_le_bytes())?; // OSPlatformId = NT
+    mem.map(PROCESS_HEAP, PAGE_SIZE, Perm::RW)?;
+    mem.poke(PROCESS_HEAP + HEAP_FLAGS, &HEAP_GROWABLE.to_le_bytes())?;
+    mem.poke(PROCESS_HEAP + HEAP_FORCE_FLAGS, &0u32.to_le_bytes())?;
+    mem.poke(peb + PEB_PROCESS_HEAP, &PROCESS_HEAP.to_le_bytes())?;
+    mem.poke(peb + PEB_IMAGE_BASE, &image_base.to_le_bytes())?;
+    mem.poke(peb + PEB_LDR, &ldr.to_le_bytes())?;
+    // PEB_LDR_DATA: three module lists, each an empty (self-linked) LIST_ENTRY.
+    for list in [ldr + 0x10, ldr + 0x20, ldr + 0x30] {
+        mem.poke(list, &list.to_le_bytes())?;
+        mem.poke(list + 8, &list.to_le_bytes())?;
+    }
+    Ok(teb)
 }
 
 impl LoadedImage {
@@ -291,5 +323,32 @@ mod tests {
         assert!(!rx.contains(Perm::W));
         // No access bits default to readable so the page is still usable.
         assert_eq!(section_perm(0), Perm::R);
+    }
+    fn peb_of(mem: &Memory) -> u64 {
+        mem.read_uint(TEB_REGION + TEB_PEB_PTR, 8).unwrap()
+    }
+
+    #[test]
+    fn peb_reports_no_debugger() {
+        let mut mem = Memory::new();
+        let teb = map_teb_peb(&mut mem, 0x1_4000_0000).unwrap();
+        assert_eq!(teb, TEB_REGION);
+        let peb = peb_of(&mem);
+        assert_eq!(mem.read_uint(peb + PEB_BEING_DEBUGGED, 1).unwrap(), 0, "BeingDebugged");
+        // NtGlobalFlag carries none of FLG_HEAP_ENABLE_TAIL_CHECK (0x10),
+        // FLG_HEAP_ENABLE_FREE_CHECK (0x20), FLG_HEAP_VALIDATE_PARAMETERS (0x40).
+        let flag = mem.read_uint(peb + PEB_NT_GLOBAL_FLAG, 4).unwrap();
+        assert_eq!(flag & 0x70, 0, "no FLG_HEAP_* debug bits");
+        assert_eq!(flag, 0);
+    }
+
+    #[test]
+    fn process_heap_has_normal_flags() {
+        let mut mem = Memory::new();
+        map_teb_peb(&mut mem, 0x1_4000_0000).unwrap();
+        let heap = mem.read_uint(peb_of(&mem) + PEB_PROCESS_HEAP, 8).unwrap();
+        assert_eq!(heap, PROCESS_HEAP, "PEB.ProcessHeap == GetProcessHeap()");
+        assert_eq!(mem.read_uint(heap + HEAP_FLAGS, 4).unwrap(), 0x2, "Flags = HEAP_GROWABLE");
+        assert_eq!(mem.read_uint(heap + HEAP_FORCE_FLAGS, 4).unwrap(), 0, "ForceFlags clear");
     }
 }

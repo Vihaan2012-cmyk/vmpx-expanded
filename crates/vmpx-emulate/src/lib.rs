@@ -80,8 +80,8 @@ pub use differential::{
     RunResult, Target, differential, edge_values, input_set, run_function,
 };
 pub use emu::{
-    Emulator, FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent, ObserveConfig, Span, Stop,
-    TraceEntry,
+    Emulator, FlowEvent, FlowKind, Hook, HookAction, InsnAudit, Interest, MemEvent, ObserveConfig,
+    Span, Stop, TraceEntry,
 };
 pub use loader::{LoadError, LoadOptions, LoadedImage, load};
 pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
