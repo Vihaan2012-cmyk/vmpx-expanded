@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 vmpx-mutation = { path = "../vmpx-mutation" }
+vmpx-solvers = { path = "../vmpx-solvers" }
+vmpx-verify = { path = "../vmpx-verify" }
+vmpx-vm = { path = "../vmpx-vm" }
 
 [lints]
 workspace = true

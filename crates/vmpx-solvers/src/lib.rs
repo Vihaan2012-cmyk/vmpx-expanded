@@ -6,9 +6,11 @@
 pub mod dictionary;
 pub mod general_mba;
 pub mod linear_mba;
+pub mod local_search;
 pub mod opaque_predicate;
 pub mod substitution_solver;
 pub mod synthesis;
+pub mod theorem_mba;
 
 use vmpx_mutation::{Candidate, Cost, Problem, ProblemClass, SolverId};
 
