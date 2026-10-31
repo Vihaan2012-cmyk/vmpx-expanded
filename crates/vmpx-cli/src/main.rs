@@ -10,8 +10,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use vmpx_detect::{ProtectionReport, detect_packer, detect_vmprotect};
 use vmpx_disasm::{
-    IpRelativeReference, find_ip_relative_references_resync,
-    find_ip_relative_references_resync_in_ranges,
+    ImportStubReport, IpRelativeReference, find_ip_relative_references_resync,
+    find_ip_relative_references_resync_in_ranges, resolve_import_stubs,
 };
 use vmpx_pe::{PeImage, PeReport};
 use vmpx_unpack::{UnpackLimits, unpack_to_mapped_image};
@@ -230,6 +230,7 @@ struct ImportAnalysis {
     direct_native_references: Vec<ImportReference>,
     slots_with_direct_native_references: usize,
     slots_without_direct_native_references: usize,
+    import_stubs: ImportStubReport,
     warnings: Vec<String>,
 }
 
@@ -707,6 +708,7 @@ fn analyze_imports(pe: &PeImage<'_>, report: &PeReport) -> Result<ImportAnalysis
         direct_native_references,
         slots_with_direct_native_references: referenced_slots.len(),
         slots_without_direct_native_references: symbols.saturating_sub(referenced_slots.len()),
+        import_stubs: resolve_import_stubs(pe),
         warnings,
     })
 }
@@ -1348,6 +1350,35 @@ fn main() -> Result<()> {
                         reference.reference.instruction_rva,
                         reference.reference.target_rva,
                         reference.discovery
+                    );
+                }
+                let stubs = &report.import_stubs;
+                println!(
+                    "[imports] stub sites: {} examined, {} stubs, {} resolved to a named import, {} unresolved",
+                    stubs.sites_examined,
+                    stubs.stubs_examined,
+                    stubs.resolved.len(),
+                    stubs.unresolved.len()
+                );
+                for site in &stubs.resolved {
+                    let symbol = site
+                        .symbol
+                        .clone()
+                        .unwrap_or_else(|| format!("ordinal_{}", site.ordinal.unwrap_or_default()));
+                    println!(
+                        "  {} -> {}!{symbol} (stub {}, {:?}{}, bump {})",
+                        site.site,
+                        site.module,
+                        site.stub,
+                        site.shape,
+                        if site.tail_call { ", tail" } else { "" },
+                        site.return_bump
+                    );
+                }
+                for site in &stubs.unresolved {
+                    println!(
+                        "  {} unresolved (stub {}): {}",
+                        site.site, site.stub, site.reason
                     );
                 }
                 for warning in &report.warnings {

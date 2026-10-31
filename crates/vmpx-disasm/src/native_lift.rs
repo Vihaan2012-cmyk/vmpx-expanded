@@ -292,6 +292,9 @@ pub struct LiftOptions {
     /// Memory below block-entry `rsp` (the function's own frame) is not addressed
     /// through any pointer that is not derived from `rsp` in this block.
     pub assume_stack_disjoint: bool,
+    /// A load from a constant absolute address (e.g. a loaded-image slot) does not
+    /// alias any store addressed `rsp_in + k`: the thread stack is not image memory.
+    pub absolute_disjoint_from_frame: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -788,6 +791,14 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             let rel = match relate(key, width, &store.key, store.write.width) {
                 Rel::Unknown
                     if assume && frame_vs_clean(key, width, &store.key, store.write.width) =>
+                {
+                    skipped_by_assumption = true;
+                    Rel::Disjoint
+                }
+                Rel::Unknown
+                    if self.options.absolute_disjoint_from_frame
+                        && key.sym.is_none()
+                        && store.key.frame =>
                 {
                     skipped_by_assumption = true;
                     Rel::Disjoint

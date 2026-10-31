@@ -994,6 +994,7 @@ fn lift_assuming(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftErro
     let bytes = asm.assemble(0x1000).expect("assemble");
     let options = LiftOptions {
         assume_stack_disjoint: true,
+        ..LiftOptions::default()
     };
     lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, options)
 }
