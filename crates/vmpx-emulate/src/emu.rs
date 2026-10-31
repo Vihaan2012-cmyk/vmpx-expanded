@@ -999,19 +999,24 @@ impl Emulator {
             return Ok(ins.memory_displacement64());
         }
         let mut a = ins.memory_displacement64();
+        let idx = ins.memory_index();
+        // 0x67-prefixed addressing: 32-bit regs, address wraps at 32 bits.
+        let addr32 = base.is_gpr32() || idx.is_gpr32();
         if base != Register::None {
-            if !base.is_gpr64() {
+            if !(base.is_gpr64() || base.is_gpr32()) {
                 return Err(self.unsup());
             }
             a = a.wrapping_add(self.cpu.reg(base).ok_or_else(|| self.unsup())?);
         }
-        let idx = ins.memory_index();
         if idx != Register::None {
-            if !idx.is_gpr64() {
+            if !(idx.is_gpr64() || idx.is_gpr32()) {
                 return Err(self.unsup());
             }
             let v = self.cpu.reg(idx).ok_or_else(|| self.unsup())?;
             a = a.wrapping_add(v.wrapping_mul(u64::from(ins.memory_index_scale())));
+        }
+        if addr32 {
+            a &= 0xffff_ffff;
         }
         if seg == Register::GS {
             a = a.wrapping_add(self.cpu.gs_base);

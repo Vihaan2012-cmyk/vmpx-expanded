@@ -154,6 +154,8 @@ pub struct DetonationResult {
     pub stop: Stop,
     /// Retired instruction count.
     pub steps: usize,
+    /// Guest rip when the run ended.
+    pub rip: u64,
     /// VM-dispatcher observations, when a dispatcher/loop-head was configured.
     pub vm: Option<VmObservations>,
 }
@@ -279,7 +281,8 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
 
     let dump = opts.dump.then(|| dump_image(&emu.mem, image_base));
 
-    Ok(DetonationResult { observed, dump, stop, steps, vm })
+    let rip = emu.cpu.rip;
+    Ok(DetonationResult { observed, dump, stop, steps, rip, vm })
 }
 
 #[cfg(test)]
@@ -485,11 +488,12 @@ mod tests {
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
         eprintln!(
-            "sample={path} resolve_undef={}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?}\n  oep={:?}\n  imports captured={}",
+            "sample={path} resolve_undef={}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?} rip={:#x}\n  oep={:?}\n  imports captured={}",
             opts.resolve_undefined_flags,
             opts.export_reference.len(),
             res.steps,
             res.stop,
+            res.rip,
             res.observed.oep,
             res.observed.imports.len(),
         );
