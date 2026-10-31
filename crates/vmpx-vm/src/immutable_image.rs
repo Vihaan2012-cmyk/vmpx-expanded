@@ -1,11 +1,99 @@
 //! Memory source that exposes only bytes the loader maps read-only.
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
+
 use vmpx_pe::{ImageBase, ImportModule, PeImage, Va};
 
 use crate::{
     NativeCallImportDescriptor, NativeCallImportMatchKind, NativeCallImportResolution,
     SymbolicMemorySource,
 };
+
+/// Concrete runtime memory observed on ONE detonation: a plain, crate-owned map
+/// from virtual address to captured bytes. This is NOT a proof — it reflects a
+/// single run/environment. The CLI builds it from a detonation's observed
+/// globals; vmpx-vm never produces it and never trusts it on the sound path.
+///
+/// Kept deliberately free of any `vmpx-emulate` type (the crate owns this plain
+/// structure; the CLI converts `ObservedFacts.globals` into it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedMemory {
+    slots: BTreeMap<u64, Vec<u8>>,
+}
+
+impl ObservedMemory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds the seed from `(va, bytes)` slots, e.g. a detonation's observed
+    /// globals.
+    pub fn from_slots(slots: impl IntoIterator<Item = (u64, Vec<u8>)>) -> Self {
+        Self {
+            slots: slots.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Observed byte at `va`, if any recorded slot covers it.
+    #[must_use]
+    pub fn read_byte(&self, va: u64) -> Option<u8> {
+        let (&base, bytes) = self.slots.range(..=va).next_back()?;
+        let offset = usize::try_from(va.checked_sub(base)?).ok()?;
+        bytes.get(offset).copied()
+    }
+}
+
+/// Read-only image bytes overlaid with observed runtime memory.
+///
+/// `read_byte` returns only sound static-image bytes (identical to
+/// [`ReadOnlyImage`]). `observed_byte` exposes the observed seed: where a const
+/// slot is zero/absent in the static image, the symbolic executor may consult
+/// it to resolve a provably-null read. Consulting a recorded slot flips
+/// `seeded`, so the caller can label the recovery with the observed assumption.
+/// EXPERIMENTAL — never the sound path.
+pub struct ObservedImage<'a, 'data> {
+    image: ReadOnlyImage<'a, 'data>,
+    observed: &'a ObservedMemory,
+    seeded: &'a Cell<bool>,
+}
+
+impl<'a, 'data> ObservedImage<'a, 'data> {
+    #[must_use]
+    pub fn new(
+        image: ReadOnlyImage<'a, 'data>,
+        observed: &'a ObservedMemory,
+        seeded: &'a Cell<bool>,
+    ) -> Self {
+        Self {
+            image,
+            observed,
+            seeded,
+        }
+    }
+}
+
+impl SymbolicMemorySource for ObservedImage<'_, '_> {
+    fn read_byte(&self, address: Va) -> Option<u8> {
+        self.image.read_byte(address)
+    }
+
+    fn observed_byte(&self, address: Va) -> Option<u8> {
+        let byte = self.observed.read_byte(address.get())?;
+        self.seeded.set(true);
+        Some(byte)
+    }
+
+    fn resolve_native_call_import(&self, target: u64) -> Option<NativeCallImportResolution> {
+        self.image.resolve_native_call_import(target)
+    }
+}
 
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -142,6 +230,34 @@ pub(crate) mod tests {
         data[0x400..0x404].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
         data[0x600..0x604].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn observed_memory_reads_bytes_within_recorded_slots_only() {
+        let observed = ObservedMemory::from_slots([(0x1000_u64, vec![0xAA, 0xBB, 0xCC])]);
+        assert!(!observed.is_empty());
+        assert_eq!(observed.read_byte(0x1000), Some(0xAA));
+        assert_eq!(observed.read_byte(0x1002), Some(0xCC));
+        assert_eq!(observed.read_byte(0x1003), None); // past the slot
+        assert_eq!(observed.read_byte(0x0FFF), None); // before the slot
+        assert!(ObservedMemory::new().read_byte(0x1000).is_none());
+    }
+
+    #[test]
+    fn observed_image_overlays_the_seed_and_flags_consultation() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedMemory::from_slots([(DATA_VA, vec![0x99])]);
+        let seeded = Cell::new(false);
+        let image = ObservedImage::new(ReadOnlyImage(&pe), &observed, &seeded);
+        // read_byte stays the sound read-only view (writable .data stays hidden).
+        assert_eq!(image.read_byte(Va(DATA_VA)), None);
+        assert!(!seeded.get());
+        // observed_byte exposes the seed and flips the label flag.
+        assert_eq!(image.observed_byte(Va(DATA_VA)), Some(0x99));
+        assert!(seeded.get());
+        // An unrecorded address yields no seed.
+        assert_eq!(image.observed_byte(Va(DATA_VA + 1)), None);
     }
 
     #[test]

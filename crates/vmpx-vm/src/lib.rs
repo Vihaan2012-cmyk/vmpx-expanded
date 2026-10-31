@@ -59,7 +59,7 @@ pub use call_effects::{
 };
 pub use cfg::{
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, VmBasicBlock, VmCfg,
-    VmCfgAssumption, VmCfgLimits, recover_vm_cfg,
+    VmCfgAssumption, VmCfgLimits, recover_vm_cfg, recover_vm_cfg_with_observed_memory,
 };
 pub use checksum::{
     ChecksumAccumulatorSource, ChecksumCombine, ChecksumShift, ChecksumTableIndex,
@@ -123,7 +123,7 @@ pub use image_concretize::{
     ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
     concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
 };
-pub use immutable_image::ReadOnlyImage;
+pub use immutable_image::{ObservedImage, ObservedMemory, ReadOnlyImage};
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,

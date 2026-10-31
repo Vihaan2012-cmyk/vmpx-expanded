@@ -257,6 +257,15 @@ impl SymbolicVmExecutionReport {
 pub trait SymbolicMemorySource {
     fn read_byte(&self, address: Va) -> Option<u8>;
 
+    /// Observed runtime value for a slot that is zero or absent in the static
+    /// image. EXPERIMENTAL: a byte seen on ONE detonation, not a proof; valid
+    /// for one run/environment only. The sound path leaves this `None`; only an
+    /// observed overlay returns a byte, and the symbolic executor consults it
+    /// solely to resolve a provably-null image read it would otherwise fail on.
+    fn observed_byte(&self, _address: Va) -> Option<u8> {
+        None
+    }
+
     fn resolve_native_call_import(&self, _target: u64) -> Option<NativeCallImportResolution> {
         None
     }
@@ -533,10 +542,27 @@ impl<'a> SymbolicMachine<'a> {
                 && !self.image_reads_suppressed
             {
                 let byte_va = Va(value);
-                if let Some(byte) = self
+                let image_byte = self
                     .memory_source
-                    .and_then(|source| source.read_byte(byte_va))
-                {
+                    .and_then(|source| source.read_byte(byte_va));
+                // A slot that is zero (or absent) in the static image but
+                // runtime-initialized is the documented null-read stall: the
+                // image proves only the pre-init zero. If an observed-runtime
+                // seed records this slot, use it so recovery continues past the
+                // null read. EXPERIMENTAL, observed-labeled (not sound output);
+                // a non-zero image byte is genuinely resolvable and never
+                // overridden.
+                let seeded = if image_byte.is_none_or(|byte| byte == 0) {
+                    self.memory_source
+                        .and_then(|source| source.observed_byte(byte_va))
+                } else {
+                    None
+                };
+                if let Some(byte) = seeded {
+                    all_unknown = false;
+                    self.resolved_image_addresses.insert(byte_va);
+                    bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+                } else if let Some(byte) = image_byte {
                     all_unknown = false;
                     self.resolved_image_addresses.insert(byte_va);
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
@@ -3064,6 +3090,149 @@ mod tests {
         assert_eq!(error.instruction_index, 0);
         assert_eq!(error.semantic, VmHandlerSemantic::MemoryLoad);
         assert!(error.message.contains("requires exception-flow analysis"));
+    }
+
+    /// A static image overlaid with an observed-runtime seed. `read_byte` is the
+    /// sound static byte; `observed_byte` is the one-run seed and flips `seeded`
+    /// when it is actually consulted (mirrors `ObservedImage`).
+    #[derive(Default)]
+    struct SeededMemorySource {
+        image: BTreeMap<u64, u8>,
+        observed: BTreeMap<u64, u8>,
+        seeded: std::cell::Cell<bool>,
+    }
+
+    impl SeededMemorySource {
+        fn image_write(&mut self, address: u64, bytes: &[u8]) {
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                self.image.insert(address + offset as u64, byte);
+            }
+        }
+
+        fn observed_write(&mut self, address: u64, bytes: &[u8]) {
+            for (offset, byte) in bytes.iter().copied().enumerate() {
+                self.observed.insert(address + offset as u64, byte);
+            }
+        }
+    }
+
+    impl SymbolicMemorySource for SeededMemorySource {
+        fn read_byte(&self, address: Va) -> Option<u8> {
+            self.image.get(&address.get()).copied()
+        }
+
+        fn observed_byte(&self, address: Va) -> Option<u8> {
+            let byte = self.observed.get(&address.get()).copied()?;
+            self.seeded.set(true);
+            Some(byte)
+        }
+    }
+
+    const SWS_SLOT_VA: u64 = 0x1_8003_B900;
+    const OBSERVED_PTR: u64 = 0x1_4000_9000;
+
+    #[test]
+    fn observed_seed_resolves_a_provably_null_slot_read_and_labels_it() {
+        // The slot is zero in the static image (the documented null-read stall)
+        // but runtime-initialized; the observed seed records its real value.
+        let mut source = SeededMemorySource::default();
+        source.image_write(SWS_SLOT_VA, &[0_u8; 8]);
+        source.observed_write(SWS_SLOT_VA, &OBSERVED_PTR.to_le_bytes());
+
+        let initial = SymbolicVmInitialState::default();
+        let mut machine =
+            SymbolicMachine::new(&initial, Some(&source), SymbolicExecutionLimits::default())
+                .expect("machine");
+        let value = machine
+            .load_memory(Expr::constant(BitWidth::W64, SWS_SLOT_VA), BitWidth::W64)
+            .expect("seeded read resolves");
+        assert_eq!(value, Expr::constant(BitWidth::W64, OBSERVED_PTR));
+        assert!(source.seeded.get(), "the observed seed must be labeled as used");
+    }
+
+    #[test]
+    fn without_a_seed_the_null_slot_read_stays_zero_and_unlabeled() {
+        // Same zero slot, no observed seed: the read stays the sound static zero
+        // and nothing is labeled (so a later dereference still fails closed).
+        let mut source = SeededMemorySource::default();
+        source.image_write(SWS_SLOT_VA, &[0_u8; 8]);
+
+        let initial = SymbolicVmInitialState::default();
+        let mut machine =
+            SymbolicMachine::new(&initial, Some(&source), SymbolicExecutionLimits::default())
+                .expect("machine");
+        let value = machine
+            .load_memory(Expr::constant(BitWidth::W64, SWS_SLOT_VA), BitWidth::W64)
+            .expect("zero image read");
+        assert_eq!(value, Expr::constant(BitWidth::W64, 0));
+        assert!(!source.seeded.get());
+    }
+
+    #[test]
+    fn observed_seed_never_overrides_a_genuinely_resolvable_nonzero_read() {
+        // A non-zero static byte is genuinely resolvable; the seed must not touch
+        // it. This keeps the sound read unchanged even when a seed is present.
+        let mut source = SeededMemorySource::default();
+        source.image_write(SWS_SLOT_VA, &0xDEAD_BEEF_u32.to_le_bytes());
+        source.observed_write(SWS_SLOT_VA, &0x1111_2222_u32.to_le_bytes());
+
+        let initial = SymbolicVmInitialState::default();
+        let mut machine =
+            SymbolicMachine::new(&initial, Some(&source), SymbolicExecutionLimits::default())
+                .expect("machine");
+        let value = machine
+            .load_memory(Expr::constant(BitWidth::W64, SWS_SLOT_VA), BitWidth::W32)
+            .expect("image read");
+        assert_eq!(value, Expr::constant(BitWidth::W32, 0xDEAD_BEEF));
+        assert!(!source.seeded.get());
+    }
+
+    #[test]
+    fn seed_lets_a_null_pointer_chase_continue_past_the_stall() {
+        // End to end: load the slot pointer, then dereference it. The slot reads
+        // zero from the static image, so the second load would dereference null.
+        let instructions = [
+            instruction(VmHandlerSemantic::MemoryLoad, BitWidth::W64, None, Some(0)),
+            instruction(VmHandlerSemantic::MemoryLoad, BitWidth::W64, None, Some(0)),
+        ];
+        let initial = SymbolicVmInitialState {
+            memory_values: vec![(
+                stack_address(0),
+                Expr::constant(BitWidth::W64, SWS_SLOT_VA),
+            )],
+            ..SymbolicVmInitialState::default()
+        };
+
+        // Fail-closed without a seed: the slot reads zero, the dereference nulls.
+        let mut unseeded = SeededMemorySource::default();
+        unseeded.image_write(SWS_SLOT_VA, &[0_u8; 8]);
+        let error = execute_symbolic_linear_block_with_initial_state(
+            &instructions,
+            None,
+            SymbolicExecutionLimits::default(),
+            &initial,
+            Some(&unseeded),
+        )
+        .expect_err("null pointer chase must fail closed");
+        assert_eq!(error.instruction_index, 1);
+        assert!(error.message.contains("requires exception-flow analysis"));
+        assert!(!unseeded.seeded.get());
+
+        // With the observed seed the slot yields a non-null pointer and recovery
+        // continues through the dereference.
+        let mut seeded = SeededMemorySource::default();
+        seeded.image_write(SWS_SLOT_VA, &[0_u8; 8]);
+        seeded.observed_write(SWS_SLOT_VA, &OBSERVED_PTR.to_le_bytes());
+        let report = execute_symbolic_linear_block_with_initial_state(
+            &instructions,
+            None,
+            SymbolicExecutionLimits::default(),
+            &initial,
+            Some(&seeded),
+        )
+        .expect("seeded pointer chase continues");
+        assert_eq!(report.executed_instructions, 2);
+        assert!(seeded.seeded.get(), "the resolved read must be labeled observed");
     }
 
     #[test]

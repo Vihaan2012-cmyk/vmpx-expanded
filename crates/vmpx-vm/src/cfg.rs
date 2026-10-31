@@ -6,6 +6,7 @@
 //! execution, or the image of a target over a proven-exhaustive input domain.
 //! Anything unresolved stops that path and is reported; no edge is invented.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -165,6 +166,12 @@ pub enum VmCfgAssumption {
     /// host-CPU-specific dead path is conservatively included; no reachable
     /// behavior is dropped.
     OverApproximatedEnvironmentGate,
+    /// A provably-null image read (a global pointer slot that is zero in the
+    /// static image but runtime-initialized) was resolved using a concrete value
+    /// observed on ONE detonation, instead of failing closed. EXPERIMENTAL and
+    /// observed-tier: valid for that run/environment only, never sound output.
+    /// Present only when recovery was driven with an observed-memory seed.
+    ObservedGlobal,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -814,6 +821,26 @@ struct Walker<'a, 'p> {
     widened: BTreeMap<Va, SymbolicVmInitialState>,
     cfg: VmCfg,
     total_instructions: usize,
+    /// Observed runtime memory seed for the experimental tier (empty on the
+    /// sound path). Consulted only to resolve provably-null image reads.
+    observed: &'a crate::ObservedMemory,
+    /// Flipped by [`ObservedImage`](crate::ObservedImage) when a symbolic read
+    /// actually consumed an observed seed; read after each symbolic call so the
+    /// recovery records the `ObservedGlobal` assumption.
+    seeded: &'a Cell<bool>,
+}
+
+/// Builds the memory source for a symbolic call: the sound read-only image
+/// overlaid with the observed seed (which is empty on the sound path, so the
+/// overlay is then behaviourally identical to a bare [`ReadOnlyImage`]).
+fn observed_source<'a, 'p>(
+    walker: &Walker<'a, 'p>,
+) -> crate::ObservedImage<'a, 'p> {
+    crate::ObservedImage::new(
+        crate::immutable_image::ReadOnlyImage(walker.pe),
+        walker.observed,
+        walker.seeded,
+    )
 }
 
 /// An exit layout is carried only when its recovery was proven.
@@ -1420,12 +1447,13 @@ impl Walker<'_, '_> {
         }
         let symbolic_boundary =
             boundary.filter(|semantic| *semantic != VmHandlerSemantic::NativeCall);
+        self.seeded.set(false);
         let symbolic = match execute_symbolic_linear_block_with_initial_state(
             &instructions,
             symbolic_boundary,
             self.limits.entry.symbolic,
             &symbolic_in,
-            Some(&crate::immutable_image::ReadOnlyImage(self.pe)),
+            Some(&observed_source(self)),
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -1441,6 +1469,9 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if self.seeded.get() {
+            self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
         match boundary {
             Some(VmHandlerSemantic::VmExit) => {
@@ -1807,12 +1838,13 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        self.seeded.set(false);
         let call = match execute_symbolic_native_call_boundary_with_initial_state(
             decoded.state_before.vip,
             &decoded.outcome,
             self.limits.entry.symbolic,
             &symbolic.continuation_state(),
-            Some(&crate::immutable_image::ReadOnlyImage(self.pe)),
+            Some(&observed_source(self)),
         ) {
             Ok(call) => call,
             Err(error) => {
@@ -1820,6 +1852,9 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        if self.seeded.get() {
+            self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
+        }
         self.cfg.record_native_call(key, &decoded.outcome);
         self.add_edge(CfgEdge {
             from: key,
@@ -1851,6 +1886,31 @@ pub fn recover_vm_cfg(
     entry: &VmEntryCandidate,
     limits: VmCfgLimits,
 ) -> Result<VmCfg, CfgError> {
+    // Sound path: no observed seed. The empty seed makes the overlay memory
+    // source behaviourally identical to a bare read-only image.
+    recover_vm_cfg_with_observed_memory(pe, entry, limits, &crate::ObservedMemory::new())
+}
+
+/// Like [`recover_vm_cfg`], but seeds provably-null image reads from concrete
+/// runtime memory observed on ONE detonation.
+///
+/// This is the EXPERIMENTAL, observed tier: where a global pointer slot is zero
+/// in the static image but runtime-initialized, the matching observed slot lets
+/// recovery continue past the null-read stall instead of failing closed. Any
+/// block that consumes such a seed makes the returned CFG carry
+/// [`VmCfgAssumption::ObservedGlobal`]. Pass an empty [`ObservedMemory`] for the
+/// sound path (equivalent to [`recover_vm_cfg`]).
+///
+/// # Errors
+///
+/// Fails if the entry bootstrap cannot be recovered; everything after is a stall
+/// or hit limit in the returned [`VmCfg`].
+pub fn recover_vm_cfg_with_observed_memory(
+    pe: &PeImage<'_>,
+    entry: &VmEntryCandidate,
+    limits: VmCfgLimits,
+    observed: &crate::ObservedMemory,
+) -> Result<VmCfg, CfgError> {
     let setup = prepare_entry_stream(pe, entry, limits.entry)?;
     let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
         pe,
@@ -1865,6 +1925,7 @@ pub fn recover_vm_cfg(
         Err(note) => (SymbolicVmInitialState::default(), 0, Some(note)),
     };
     let entry_address = setup.bootstrap.initial_state.vip;
+    let seeded = Cell::new(false);
     let mut walker = Walker {
         pe,
         limits,
@@ -1891,6 +1952,8 @@ pub fn recover_vm_cfg(
             assumptions: BTreeSet::new(),
         },
         total_instructions: 0,
+        observed,
+        seeded: &seeded,
     };
     let mut pending = vec![Item {
         start: setup.first_state,
