@@ -7,8 +7,12 @@
 //! `vmpx-solvers` owns `Solver`, `vmpx-verify` owns `Scorer`/`Gate`,
 //! `vmpx-tournament` owns `Elo` — all depending on this crate, never the reverse.
 
+mod bvutil;
 pub mod cfg_recovery;
 pub mod dead_code;
+pub mod gate;
+pub mod linear_mba;
+pub mod state_model;
 pub mod substitution;
 
 pub use cfg_recovery::{
