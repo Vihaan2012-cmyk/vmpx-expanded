@@ -89,5 +89,5 @@ pub use observe::{
     Observed, ObservedFacts, ObservedGlobal, ObservedImport, ObservedLoopDepth, SymbolOrOrdinal,
 };
 pub use sysdll::{DEFAULT_SYSTEM_MODULES, SysDllDb, system_root};
-pub use vm_observe::{VmObservations, VmObserveHook};
+pub use vm_observe::{ObservedVmEdge, VmInstance, VmInstanceSpec, VmObservations, VmObserveHook};
 pub use winapi::WinApiHook;
