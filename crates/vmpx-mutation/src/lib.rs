@@ -10,6 +10,7 @@
 mod bvutil;
 pub mod cfg_recovery;
 pub mod dead_code;
+pub mod dictionary;
 pub mod gate;
 pub mod general_mba;
 pub mod linear_mba;
