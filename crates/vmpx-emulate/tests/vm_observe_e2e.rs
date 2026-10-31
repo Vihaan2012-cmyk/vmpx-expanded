@@ -6,7 +6,7 @@
 
 use iced_x86::code_asm::*;
 use vmpx_emulate::{
-    Cpu, Emulator, Memory, Observed, ObservedFacts, Perm, Stop, VmObserveHook,
+    Cpu, Emulator, Memory, Observed, ObservedFacts, Perm, Stop, SurveyHook, VipLoc, VmObserveHook,
 };
 
 const CODE: u64 = 0x1000;
@@ -120,4 +120,77 @@ fn back_edge_counter_records_concrete_recursion_depth() {
     assert_eq!(d.loop_head, loop_head);
     assert_eq!(d.depth, TRIPS - 1, "observed concrete depth for this input");
     assert_eq!(d.provenance, Observed, "stamped Observed, never sound output");
+}
+
+/// A threaded VM whose VIP lives only in a stack slot (`[rsp+0x20]`): three
+/// handlers chain through a `push rbp; ret` stub, each stepping the slot by -4.
+/// The survey must find the stub and the memory VIP on its own, and the
+/// observer must then record the real bytecode edges.
+#[test]
+fn survey_then_observe_a_memory_resident_vip_vm() {
+    const STUB: u64 = 0x1100;
+    const HANDLERS: [u64; 3] = [0x1200, 0x1240, 0x1280];
+    const EXIT: u64 = 0x1400;
+    const STACK: u64 = 0x20_0000;
+    const BYTECODE_TOP: u64 = 0x1_8000;
+    const DISPATCHES: u64 = 3_000;
+
+    let entry = asm_at(CODE, |a| {
+        a.mov(rbp, HANDLERS[0]).unwrap();
+        a.jmp(STUB).unwrap();
+    });
+    let stub = asm_at(STUB, |a| {
+        a.push(rbp).unwrap();
+        a.ret().unwrap();
+    });
+    let mut blobs = vec![(CODE, entry), (STUB, stub)];
+    for (k, &h) in HANDLERS.iter().enumerate() {
+        let next = HANDLERS[(k + 1) % 3];
+        blobs.push((
+            h,
+            asm_at(h, |a| {
+                a.sub(qword_ptr(rsp + 0x20), 4).unwrap();
+                a.dec(rcx).unwrap();
+                a.jz(EXIT).unwrap();
+                a.mov(rbp, next).unwrap();
+                a.jmp(STUB).unwrap();
+            }),
+        ));
+    }
+    let fresh = |hook: Box<dyn vmpx_emulate::Hook>| {
+        let mut emu = emu_over(&blobs);
+        emu.mem.map(STACK, 0x1000, Perm::RW).unwrap();
+        emu.mem.write_uint(STACK + 0x800 + 0x20, 8, BYTECODE_TOP).unwrap();
+        emu.cpu.set_reg(iced_x86::Register::RSP, STACK + 0x800);
+        emu.cpu.set_reg(iced_x86::Register::RCX, DISPATCHES);
+        emu.hook = Some(hook);
+        emu
+    };
+
+    // Survey run: discover the stub and the VIP location.
+    let survey_hook = SurveyHook::new();
+    let survey = survey_hook.survey();
+    let mut emu = fresh(Box::new(survey_hook));
+    assert_eq!(emu.run_until(EXIT, 100_000), Stop::Reached);
+    let vms = survey.borrow().discover((0x1_0000, 0x2_0000));
+    assert_eq!(vms.len(), 1, "{vms:?}");
+    assert_eq!(vms[0].entries.iter().map(|e| e.va).collect::<Vec<_>>(), vec![STUB + 1], "the stub's ret");
+    assert_eq!(
+        vms[0].vip.map(|v| v.loc),
+        Some(VipLoc::Mem { base: iced_x86::Register::RSP, disp: 0x20 })
+    );
+
+    // Observe run on a fresh emulator with the discovered specs.
+    let hook = VmObserveHook::with_instances(0, vms[0].specs(0, 1, (0x1_0000, 0x2_0000)), None);
+    let obs = hook.observations();
+    let mut emu = fresh(Box::new(hook));
+    assert_eq!(emu.run_until(EXIT, 100_000), Stop::Reached);
+
+    let o = obs.borrow();
+    assert_eq!(o.unattributed, 0);
+    assert_eq!(o.edges.len() as u64, DISPATCHES - 1, "one edge per consecutive dispatch pair");
+    assert!(o.edges.iter().all(|e| e.to_vip + 4 == e.from_vip), "VIP steps -4 every handler");
+    let first = o.edges[0];
+    assert_eq!((first.from_vip, first.to_vip, first.handler_va), (BYTECODE_TOP, BYTECODE_TOP - 4, HANDLERS[0]));
+    assert_eq!(o.edges[1].handler_va, HANDLERS[1], "handlers follow the threaded order");
 }

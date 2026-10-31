@@ -26,6 +26,7 @@ use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
 use crate::loader::{LoadError, LoadOptions, load};
 use crate::memory::Memory;
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
+use crate::vm_discover::{DiscoveredVm, SurveyHook};
 use crate::vm_observe::{VmInstanceSpec, VmObservations, VmObserveHook};
 use crate::winapi::WinApiHook;
 use crate::xplm::{RecordedCallback, Xplm};
@@ -54,6 +55,9 @@ pub struct DetonateOptions {
     /// Multi-instance VM observation: dispatchers keyed by RVA, resolved through
     /// the load base. Takes precedence over `vm_dispatcher` when non-empty.
     pub vm_instances: Vec<VmInstanceSpec>,
+    /// Discover the VM dispatch stubs and VIP location structurally (a survey
+    /// run, then the observed run). Ignored when `vm_instances` is non-empty.
+    pub vm_discover: bool,
     /// Loop-head / recursion-entry VA whose back-edge visits are counted.
     pub vm_loop_head: Option<u64>,
     /// Route XPLM/XPWidgets imports to the recording host-SDK model (never
@@ -85,6 +89,7 @@ impl Default for DetonateOptions {
             vm_dispatcher: None,
             vm_loop_head: None,
             vm_instances: Vec::new(),
+            vm_discover: false,
             xplm: false,
             export_reference: BTreeMap::new(),
             dump: true,
@@ -170,6 +175,8 @@ pub struct DetonationResult {
     pub vm: Option<VmObservations>,
     /// Recorded host-SDK activity, when `opts.xplm` was set.
     pub xplm: Option<XplmSummary>,
+    /// VMs found by the structural survey, when `opts.vm_discover` was set.
+    pub discovered: Vec<DiscoveredVm>,
 }
 
 /// What the recording host-SDK model captured during the run.
@@ -240,6 +247,40 @@ impl Hook for MultiHook {
 /// [`DetonateError::Load`] if the image cannot be mapped, [`DetonateError::NoEntry`]
 /// if it declares no entry point.
 pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult, DetonateError> {
+    if !(opts.vm_discover && opts.vm_instances.is_empty()) {
+        return detonate_with(pe, opts, None);
+    }
+    // Survey run: watch every threaded indirect transfer, no dump.
+    let survey_hook = SurveyHook::new();
+    let survey = survey_hook.survey();
+    let survey_opts = DetonateOptions {
+        dump: false,
+        vm_dispatcher: None,
+        vm_loop_head: None,
+        capture_globals: Vec::new(),
+        ..opts.clone()
+    };
+    detonate_with(pe, &survey_opts, Some(Box::new(survey_hook)))?;
+    let report = pe.report();
+    let base = report.optional.image_base.0;
+    let image = (base, base + u64::from(report.optional.size_of_image));
+    let found = survey.borrow().discover(image);
+    let vm_instances = found
+        .iter()
+        .zip(1u32..)
+        .flat_map(|(d, id)| d.specs(base, id, (0, image.1 - base)))
+        .collect();
+    let mut res =
+        detonate_with(pe, &DetonateOptions { vm_instances, vm_discover: false, ..opts.clone() }, None)?;
+    res.discovered = found;
+    Ok(res)
+}
+
+fn detonate_with(
+    pe: &PeImage,
+    opts: &DetonateOptions,
+    extra: Option<Box<dyn Hook>>,
+) -> Result<DetonationResult, DetonateError> {
     let mut img = load(pe, &LoadOptions { stack_size: opts.stack_size })?;
     let image_base = img.image_base;
     let entry = img.entry.ok_or(DetonateError::NoEntry)?;
@@ -265,8 +306,9 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     let oep = OepHook::wrapping(winapi, Rc::clone(&facts));
 
     // Fold in VM observation only when a dispatcher/loop-head is configured.
-    let (hook, vm_handle): (Box<dyn Hook>, _) =
-        if opts.vm_dispatcher.is_some()
+    let (hook, vm_handle): (Box<dyn Hook>, _) = if let Some(extra) = extra {
+        (Box::new(MultiHook { hooks: vec![Box::new(oep), extra] }), None)
+    } else if opts.vm_dispatcher.is_some()
             || opts.vm_loop_head.is_some()
             || !opts.vm_instances.is_empty()
         {
@@ -333,7 +375,7 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     let dump = opts.dump.then(|| dump_image(&emu.mem, image_base));
 
     let rip = emu.cpu.rip;
-    Ok(DetonationResult { observed, dump, stop, steps, rip, vm, xplm })
+    Ok(DetonationResult { observed, dump, stop, steps, rip, vm, xplm, discovered: Vec::new() })
 }
 
 #[cfg(test)]
@@ -569,10 +611,11 @@ mod tests {
                     _ => iced_x86::Register::RDI,
                 };
                 VmInstanceSpec {
+                    at: crate::vm_observe::DispatchAt::Arrival,
                     dispatcher_rva: u64::from_str_radix(rva.trim_start_matches("0x"), 16).unwrap(),
                     instance: crate::vm_observe::VmInstance {
                         id: 0,
-                        vip_reg: reg,
+                        vip: reg.into(),
                         bytecode_region: None,
                     },
                 }
@@ -585,6 +628,7 @@ mod tests {
             max_steps,
             resolve_undefined_flags,
             xplm: std::env::var("VMPX_XPLM").is_ok_and(|v| v == "1"),
+            vm_discover: std::env::var("VMPX_VM_DISCOVER").is_ok_and(|v| v == "1"),
             ..DetonateOptions::default()
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
@@ -598,6 +642,18 @@ mod tests {
             res.observed.oep,
             res.observed.imports.len(),
         );
+        for d in &res.discovered {
+            eprintln!(
+                "  discovered: dispatch_reg={:?} events={} entries={} vip={:?}",
+                d.dispatch_reg,
+                d.events,
+                d.entries.len(),
+                d.vip
+            );
+            for e in d.entries.iter().take(3) {
+                eprintln!("    site {:#x} hits={}", e.va, e.hits);
+            }
+        }
         if let Some(vm) = &res.vm {
             eprintln!(
                 "  vm: handlers={} edges={} unattributed={} branch_targets={}",
@@ -606,7 +662,34 @@ mod tests {
                 vm.unattributed,
                 vm.branch_targets.len()
             );
-            for e in vm.edges.iter().take(20) {
+            let mut per: BTreeMap<u32, (usize, u64, u64, usize, u64)> = BTreeMap::new();
+            for e in &vm.edges {
+                let p = per.entry(e.instance).or_insert((0, u64::MAX, 0, 0, 0));
+                p.0 += 1;
+                p.1 = p.1.min(e.from_vip.min(e.to_vip));
+                p.2 = p.2.max(e.from_vip.max(e.to_vip));
+                p.3 += usize::from(e.from_vip.abs_diff(e.to_vip) > 0x100);
+                p.4 += e.dispatch_count;
+            }
+            let base = pe.report().optional.image_base.0;
+            let sec = |va: u64| {
+                pe.report()
+                    .sections
+                    .iter()
+                    .find(|s| {
+                        let lo = base + u64::from(s.virtual_address.0);
+                        (lo..lo + u64::from(s.virtual_size)).contains(&va)
+                    })
+                    .map_or("-".to_owned(), |s| s.name.clone())
+            };
+            for (id, (n, lo, hi, far, disp)) in &per {
+                eprintln!(
+                    "    inst {id}: edges={n} dispatches={disp} vip=[{lo:#x},{hi:#x}] in [{},{}] far_jumps={far}",
+                    sec(*lo),
+                    sec(*hi)
+                );
+            }
+            for e in vm.edges.iter().take(12) {
                 eprintln!("    {e:?}");
             }
         }

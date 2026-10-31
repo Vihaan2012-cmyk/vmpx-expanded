@@ -61,6 +61,7 @@ mod ntdll;
 mod observe;
 mod predecode;
 mod sysdll;
+mod vm_discover;
 mod vm_observe;
 mod winapi;
 mod xplm;
@@ -89,6 +90,7 @@ pub use observe::{
     Observed, ObservedFacts, ObservedGlobal, ObservedImport, ObservedLoopDepth, SymbolOrOrdinal,
 };
 pub use sysdll::{DEFAULT_SYSTEM_MODULES, SysDllDb, system_root};
-pub use vm_observe::{ObservedVmEdge, VmInstance, VmInstanceSpec, VmObservations, VmObserveHook};
+pub use vm_discover::{DiscoveredVm, DispatchSite, Survey, SurveyHook, VipChoice};
+pub use vm_observe::{DispatchAt, ObservedVmEdge, VipLoc, VmInstance, VmInstanceSpec, VmObservations, VmObserveHook};
 pub use winapi::WinApiHook;
 pub use xplm::{CallbackKind, RecordedCallback, Xplm};

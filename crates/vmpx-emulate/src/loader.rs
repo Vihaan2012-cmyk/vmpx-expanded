@@ -29,9 +29,11 @@ const STACK_REGION: u64 = 0x0000_0010_0000_0000;
 const STUB_REGION: u64 = 0x0000_0020_0000_0000;
 const TEB_REGION: u64 = 0x0000_0030_0000_0000;
 const DEFAULT_STACK_SIZE: u64 = 256 * 1024;
-// Unmapped address used as the synthetic return target; `run_until` detects it
-// before executing there, so it never needs to be mapped.
+// Synthetic return target; `run_until` detects it before executing there.
+// `prepare` maps its page read-only (never executable): a protected entry reads
+// the byte at its return address (an int3 probe) and an unmapped page faulted.
 const RETURN_SENTINEL: u64 = 0x0000_0040_DEAD_0000;
+const RETURN_PROBE_BYTE: u8 = 0x90;
 
 // TEB/PEB field offsets (x64).
 const TEB_STACK_BASE: u64 = 0x08;
@@ -272,6 +274,10 @@ impl LoadedImage {
     pub fn prepare(&mut self, rip: u64, args: &[u64]) -> Result<Emulator, LoadError> {
         let mut mem = std::mem::take(&mut self.memory);
         let sp = self.initial_rsp - 8;
+        // A benign, non-0xCC byte: the caller's code is not breakpointed.
+        if mem.map(RETURN_SENTINEL & !(PAGE_SIZE - 1), PAGE_SIZE, Perm::R).is_ok() {
+            mem.poke(RETURN_SENTINEL, &[RETURN_PROBE_BYTE])?;
+        }
         mem.poke(sp, &RETURN_SENTINEL.to_le_bytes())?;
 
         let mut cpu = Cpu::new(rip);
