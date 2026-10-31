@@ -23,9 +23,11 @@ use crate::{
     LinearDecodeCache, LinearDecodeStop, ModuloImageTargetLimits, NativeCallSelectorOutcome,
     NativeFrameSource, RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits,
     SymbolicVmExecutionReport, SymbolicVmInitialState, UnaryOp, VmDiscoveryLimits, VmEntryCandidate,
-    VmExitReport, VmHandlerSemantic, analyze_vm_entry_at,
+    VmExitReport, VmHandlerSemantic, VmProfileRoleResolutionConfig, analyze_vm_entry_at,
+    analyze_vm_transition,
     dispatch_extract::canonical,
     entry_profile::{bootstrap_global_table, entry_stream_config, prepare_entry_stream},
+    resolve_vm_profile_roles,
     enumerate_symbolic_value, execute_symbolic_linear_block_with_initial_state,
     execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
     native_context::{
@@ -114,6 +116,11 @@ pub enum CfgEdgeKind {
     NativeCallReturn,
     /// A proven VM exit returns into another VM entry of the same VM.
     NestedEntry,
+    /// An unconditional-branch handler pops a target off the VM stack and the
+    /// VM continues under a PROVEN-DIFFERENT register profile (new VIP/key/
+    /// handler roles and possibly flipped bytecode direction). The successor
+    /// block is decoded under that new profile.
+    ProfileTransition,
     /// Back edge to a block already on the path whose entry state subsumes
     /// the re-entry state; accompanies the `Branch`/`GuardedBranch` edge.
     LoopBack,
@@ -585,6 +592,10 @@ struct Item {
     address: Option<Va>,
     symbolic: SymbolicVmInitialState,
     path: Option<Rc<PathNode>>,
+    /// Profile to walk this block under; `None` is the base profile. A block
+    /// reached through a proven cross-profile transition carries the new
+    /// profile, which then propagates to its successors.
+    profile: Option<ProfileContext>,
 }
 
 /// A block on the current walk path with the symbolic state it was entered in.
@@ -1039,6 +1050,19 @@ fn bounded_unroll_or_refuse(
     }
 }
 
+/// The decode profile a block is walked under. The walker holds a single base
+/// profile for the entry's VM; a proven cross-profile transition attaches a new
+/// one to the successor block it queues (see [`Walker::follow_cross_profile_transition`]).
+/// Block/handler VAs are profile-disjoint, so the VA-keyed caches stay sound.
+#[derive(Clone)]
+struct ProfileContext {
+    config: crate::HandlerCodecRecoveryConfig,
+    profile: crate::VmProfile,
+    direction: crate::BytecodeDirection,
+    global_table: Option<crate::GlobalTableBase>,
+    section: Option<usize>,
+}
+
 struct Walker<'a, 'p> {
     pe: &'a PeImage<'p>,
     limits: VmCfgLimits,
@@ -1049,6 +1073,11 @@ struct Walker<'a, 'p> {
     current: Option<Rc<PathNode>>,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
+    /// Profile of the block currently being visited: `None` means the base
+    /// profile (every sound-path block), `Some` a profile reached through a
+    /// proven cross-profile transition. Set at the top of each visit from the
+    /// item being walked.
+    active: Option<ProfileContext>,
     cache: LinearDecodeCache,
     decoded: BTreeMap<Va, DecodedBlock>,
     explored: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
@@ -1457,6 +1486,26 @@ impl Walker<'_, '_> {
         }
     }
 
+    // Profile of the block currently being visited: the active transition
+    // profile when one is attached, else the base profile. On the sound path
+    // `active` is always `None`, so each accessor returns the base value and
+    // behaviour is byte-for-byte unchanged.
+    fn ctx_direction(&self) -> crate::BytecodeDirection {
+        self.active.as_ref().map_or(self.direction, |c| c.direction)
+    }
+
+    fn ctx_section(&self) -> Option<usize> {
+        self.active.as_ref().map_or(self.section, |c| c.section)
+    }
+
+    fn ctx_global_table(&self) -> Option<crate::GlobalTableBase> {
+        self.active.as_ref().map_or(self.global_table, |c| c.global_table)
+    }
+
+    fn ctx_profile(&self) -> crate::VmProfile {
+        self.active.as_ref().map_or(self.profile, |c| c.profile)
+    }
+
     fn decode_block(&mut self, item: &Item) -> bool {
         let key = item.start.vip;
         if self.decoded.contains_key(&key) {
@@ -1476,12 +1525,16 @@ impl Walker<'_, '_> {
                 .get_or_insert(CfgLimitHit::TotalInstructions);
             return false;
         }
+        // Disjoint field borrows: `config`/`global_table` read `active`/`config`/
+        // `global_table`, the decode writes `cache` — a different field.
+        let config = self.active.as_ref().map_or(&self.config, |c| &c.config);
+        let global_table = self.active.as_ref().map_or(self.global_table, |c| c.global_table);
         let block = match recover_and_decode_linear_vm_stream_cached(
             self.pe,
             item.start,
-            &self.config,
+            config,
             self.limits.entry.instruction_limit.min(remaining),
-            self.global_table,
+            global_table,
             &mut self.cache,
         ) {
             Ok(report) => {
@@ -1634,6 +1687,9 @@ impl Walker<'_, '_> {
     }
 
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
+        // Walk this block (and the successors it queues) under its profile.
+        // `None` is the base profile, so the sound path is unchanged.
+        self.active.clone_from(&item.profile);
         let key = item.start.vip;
         if self.cfg.visits >= self.limits.max_visits {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
@@ -1696,6 +1752,23 @@ impl Walker<'_, '_> {
             return;
         }
         if stop != LinearDecodeStop::ControlFlowBoundary {
+            // The linear decoder stopped because the next handler has no spec
+            // under the current profile. That handler may be a proven
+            // cross-profile VM transition: it pops a concrete target off the VM
+            // stack and re-homes dispatch into a new register profile. If so,
+            // continue the walk at the target under the new profile; otherwise
+            // keep the exact fail-closed stall below.
+            if stop == LinearDecodeStop::MissingHandlerSpec
+                && self.follow_cross_profile_transition(
+                    key,
+                    final_state,
+                    &instructions,
+                    &symbolic_in,
+                    pending,
+                )
+            {
+                return;
+            }
             let detail = match stop {
                 LinearDecodeStop::MissingHandlerSpec => {
                     let recovery = self.cache.recoveries.get(&final_state.handler);
@@ -1907,9 +1980,10 @@ impl Walker<'_, '_> {
         // re-validated as bytecode, supersedes the data-pointing static target.
         let mut observed_consulted = false;
         let mut observed_followed = false;
+        let section = self.ctx_section();
         for value in targets {
             let target_va = Va(value);
-            if self.section.is_none() || bytecode_section(self.pe, target_va) != self.section {
+            if section.is_none() || bytecode_section(self.pe, target_va) != section {
                 if !observed_consulted {
                     observed_followed = self
                         .resolve_observed_branch_targets(key, vip, &dispatch, anchor, symbolic, pending);
@@ -1971,7 +2045,7 @@ impl Walker<'_, '_> {
                 rolling_key,
                 handler: anchor,
             },
-            self.direction,
+            self.ctx_direction(),
         ) {
             Ok(first) => first,
             Err(error) => {
@@ -1993,6 +2067,7 @@ impl Walker<'_, '_> {
             address: Some(target_va),
             symbolic: symbolic.continuation_state(),
             path: self.current.clone(),
+            profile: self.active.clone(),
         });
         true
     }
@@ -2019,7 +2094,7 @@ impl Walker<'_, '_> {
         pending: &mut Vec<Item>,
     ) -> bool {
         let targets =
-            followable_observed_targets(self.pe, self.section, self.observed_branch_targets, vip);
+            followable_observed_targets(self.pe, self.ctx_section(), self.observed_branch_targets, vip);
         if targets.is_empty() {
             return false;
         }
@@ -2108,9 +2183,9 @@ impl Walker<'_, '_> {
                 return;
             }
         };
-        if setup.profile != self.profile
-            || bootstrap_global_table(&setup.bootstrap) != self.global_table
-            || bytecode_section(self.pe, setup.bootstrap.initial_state.vip) != self.section
+        if setup.profile != self.ctx_profile()
+            || bootstrap_global_table(&setup.bootstrap) != self.ctx_global_table()
+            || bytecode_section(self.pe, setup.bootstrap.initial_state.vip) != self.ctx_section()
         {
             self.stall(
                 key,
@@ -2169,6 +2244,7 @@ impl Walker<'_, '_> {
             address: Some(setup.bootstrap.initial_state.vip),
             symbolic: initial,
             path: self.current.clone(),
+            profile: self.active.clone(),
         });
     }
 
@@ -2193,7 +2269,7 @@ impl Walker<'_, '_> {
             );
             return;
         };
-        let decoded = match spec.decode_direction(self.pe, final_state, self.direction) {
+        let decoded = match spec.decode_direction(self.pe, final_state, self.ctx_direction()) {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.stall(
@@ -2232,7 +2308,163 @@ impl Walker<'_, '_> {
             address: None,
             symbolic: call.continuation_state(),
             path: self.current.clone(),
+            profile: self.active.clone(),
         });
+    }
+
+    /// At a linear decode that stopped because the next handler has no spec
+    /// under the CURRENT profile, attempt a PROVEN cross-profile VM transition:
+    /// the unresolved handler pops a concrete target off the VM stack and the VM
+    /// resumes under a different register profile (new VIP/key/handler roles,
+    /// possibly a flipped bytecode direction). Returns `true` and queues the
+    /// target block under the new profile iff [`analyze_vm_transition`] proves
+    /// the popped-target shape, the popped target is concrete, and
+    /// [`resolve_vm_profile_roles`] proves the new profile recovers; otherwise
+    /// `false`, leaving the caller's fail-closed stall byte-for-byte unchanged.
+    ///
+    /// Soundness: nothing here is guessed. The transition fires only on positive
+    /// proof of both the pop shape and the new roles; a non-provable shape falls
+    /// through. A wrong switch cannot false-complete — it misdirects downstream
+    /// decoding, which then fails closed under the wrong profile (the completeness
+    /// oracle only ever stalls, never inflates). Termination is unchanged: the
+    /// successor is queued like any other block and re-reaching a VA is caught by
+    /// the existing VA-keyed visited/loop machinery (VAs are profile-disjoint).
+    #[allow(clippy::too_many_lines)]
+    fn follow_cross_profile_transition(
+        &mut self,
+        key: Va,
+        final_state: RelativeDispatchState,
+        instructions: &[DecodedVmInstruction],
+        symbolic_in: &SymbolicVmInitialState,
+        pending: &mut Vec<Item>,
+    ) -> bool {
+        let profile = self.ctx_profile();
+        let old_vsp = profile.effect_roles.vsp;
+        let context_base = profile.effect_roles.context_base;
+        let Some(entry_rva) = self.pe.optional.image_base.checked_rva_of(final_state.handler)
+        else {
+            return false;
+        };
+        // Prove the unresolved handler is a popped-target cross-profile transition.
+        let Ok(transition) = analyze_vm_transition(
+            self.pe,
+            entry_rva,
+            old_vsp,
+            context_base,
+            self.limits.entry.trace,
+        ) else {
+            return false;
+        };
+        let Some(recovered) = transition.recovered else {
+            return false;
+        };
+        debug_assert!(recovered.report.state_effects_proven);
+        // Symbolic state at the transition handler: the decoded prefix executed
+        // under the current profile, with no control boundary consumed.
+        self.seeded.set(false);
+        let Ok(symbolic) = execute_symbolic_linear_block_with_initial_state(
+            instructions,
+            None,
+            self.limits.entry.symbolic,
+            symbolic_in,
+            Some(&observed_source(self)),
+        ) else {
+            return false;
+        };
+        // Pop the concrete branch target off the VM stack.
+        let Ok(pop) = execute_symbolic_linear_block_with_initial_state(
+            &[],
+            Some(VmHandlerSemantic::UnconditionalBranch),
+            self.limits.entry.symbolic,
+            &symbolic.continuation_state(),
+            Some(&observed_source(self)),
+        ) else {
+            return false;
+        };
+        let Some(Expr {
+            kind: ExprKind::Const { value: target },
+            ..
+        }) = pop.branch_target
+        else {
+            return false;
+        };
+        // Decode the first dispatch at the target under the transition's proven
+        // direction and handler anchor.
+        let Ok(first) = recovered.dispatch.decode_direction(
+            self.pe,
+            RelativeDispatchState {
+                vip: Va(target),
+                rolling_key: target,
+                handler: recovered.handler_anchor,
+            },
+            recovered.report.bytecode_direction,
+        ) else {
+            return false;
+        };
+        // Resolve the new register profile from the target's first handler.
+        let Some(first_handler_rva) = self
+            .pe
+            .optional
+            .image_base
+            .checked_rva_of(first.state_after.handler)
+        else {
+            return false;
+        };
+        let Ok(roles) = resolve_vm_profile_roles(
+            self.pe,
+            first_handler_rva,
+            &VmProfileRoleResolutionConfig {
+                roles: recovered.roles,
+                bytecode_direction: recovered.report.bytecode_direction,
+                vsp_candidates: recovered.vsp_candidates.clone(),
+                context_base,
+                trace_limits: self.limits.entry.trace,
+                proof_limits: self.limits.entry.dispatch_proof,
+            },
+        ) else {
+            return false;
+        };
+        let Some(resolved) = roles.recovered else {
+            return false;
+        };
+        // Proven switch: build the successor's per-block profile context. A new
+        // profile recovers its own table anchors per handler, so none is threaded
+        // through the transition (mirrors the profile-chain explorer).
+        let new_profile = crate::VmProfile {
+            handler_roles: resolved.handler_roles,
+            effect_roles: resolved.effect_roles,
+            bytecode_direction: resolved.bytecode_direction,
+        };
+        let context = ProfileContext {
+            config: entry_stream_config(&new_profile, self.limits.entry),
+            profile: new_profile,
+            direction: resolved.bytecode_direction,
+            global_table: None,
+            section: bytecode_section(self.pe, Va(target)),
+        };
+        if symbolic.assumed_external_disjoint_from_vm_stack
+            || pop.assumed_external_disjoint_from_vm_stack
+        {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if self.seeded.get() {
+            self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
+        }
+        self.add_edge(CfgEdge {
+            from: key,
+            to: first.state_after.vip,
+            kind: CfgEdgeKind::ProfileTransition,
+        });
+        pending.push(Item {
+            start: first.state_after,
+            address: Some(Va(target)),
+            symbolic: pop.continuation_state(),
+            path: self.current.clone(),
+            profile: Some(context),
+        });
+        true
     }
 }
 
@@ -2333,6 +2565,7 @@ pub fn recover_vm_cfg_with_observed(
         current: None,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
+        active: None,
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
         explored: BTreeMap::new(),
@@ -2359,6 +2592,7 @@ pub fn recover_vm_cfg_with_observed(
         address: Some(entry_address),
         symbolic: initial,
         path: None,
+        profile: None,
     }];
     while let Some(item) = pending.pop() {
         walker.visit(&item, &mut pending);
@@ -2475,6 +2709,153 @@ mod tests {
             followable_observed_targets(&pe, section, &crate::ObservedBranchTargets::new(), site)
                 .is_empty()
         );
+    }
+
+    fn roles(vip: Register, key: Register, handler: Register) -> crate::HandlerRegisterRoles {
+        crate::HandlerRegisterRoles {
+            vip,
+            rolling_key: key,
+            handler,
+        }
+    }
+
+    fn profile(
+        handler_roles: crate::HandlerRegisterRoles,
+        vsp: Register,
+        direction: crate::BytecodeDirection,
+    ) -> crate::VmProfile {
+        crate::VmProfile {
+            handler_roles,
+            effect_roles: crate::HandlerEffectRoles {
+                vsp,
+                context_base: Register::RSP,
+            },
+            bytecode_direction: direction,
+        }
+    }
+
+    fn test_walker<'a, 'p>(
+        pe: &'a PeImage<'p>,
+        base: crate::VmProfile,
+        observed: &'a ObservedRun,
+        seeded: &'a Cell<bool>,
+    ) -> Walker<'a, 'p> {
+        let limits = VmCfgLimits::default();
+        Walker {
+            pe,
+            limits,
+            config: entry_stream_config(&base, limits.entry),
+            global_table: None,
+            profile: base,
+            nested_followed: 0,
+            current: None,
+            direction: base.bytecode_direction,
+            section: Some(0),
+            active: None,
+            cache: LinearDecodeCache::default(),
+            decoded: BTreeMap::new(),
+            explored: BTreeMap::new(),
+            widened: BTreeMap::new(),
+            cfg: VmCfg {
+                entry: Va(crate::immutable_image::tests::RDATA_VA),
+                blocks: BTreeMap::new(),
+                edges: Vec::new(),
+                stalls: Vec::new(),
+                limit_hit: None,
+                visits: 0,
+                frame_cells_known: 0,
+                frame_note: None,
+                assumptions: BTreeSet::new(),
+            },
+            total_instructions: 0,
+            observed: &observed.memory,
+            seeded,
+            observed_depths: &observed.loop_depths,
+            observed_branch_targets: &observed.branch_targets,
+        }
+    }
+
+    /// SOUND-PATH INVARIANCE: with no transition active, every profile accessor
+    /// returns the base profile, so a block without a cross-profile transition
+    /// decodes under exactly the inputs it did before this change. A proven
+    /// transition installs a DIFFERENT profile, which then redirects the
+    /// accessors (new VIP/key/handler roles and flipped bytecode direction).
+    #[test]
+    fn profile_context_accessors_default_to_base_and_follow_a_switch() {
+        use crate::immutable_image::tests::two_section_pe64;
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+
+        // No transition: base everywhere (byte-for-byte unchanged inputs).
+        assert_eq!(walker.ctx_profile(), base);
+        assert_eq!(walker.ctx_direction(), crate::BytecodeDirection::Descending);
+        assert_eq!(walker.ctx_section(), Some(0));
+        assert_eq!(walker.ctx_global_table(), None);
+
+        // A proven switch to a disjoint profile with a flipped direction.
+        let switched = profile(
+            roles(Register::R15, Register::RBP, Register::R14),
+            Register::R11,
+            crate::BytecodeDirection::Ascending,
+        );
+        walker.active = Some(ProfileContext {
+            config: entry_stream_config(&switched, walker.limits.entry),
+            profile: switched,
+            direction: switched.bytecode_direction,
+            global_table: None,
+            section: Some(1),
+        });
+        assert_eq!(walker.ctx_profile(), switched);
+        assert_ne!(walker.ctx_profile(), base);
+        assert_eq!(walker.ctx_direction(), crate::BytecodeDirection::Ascending);
+        assert_eq!(walker.ctx_section(), Some(1));
+    }
+
+    /// FAIL-CLOSED: an unresolved handler that is NOT a provable popped-target
+    /// transition must not switch profiles. `analyze_vm_transition` cannot prove
+    /// a transition from the synthetic image's bytes, so the walker queues
+    /// nothing and adds no edge — leaving the caller's exact stall in place.
+    #[test]
+    fn unprovable_transition_does_not_switch_profiles() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+
+        // The unresolved handler is an in-image VA that is not a real transition.
+        let final_state = RelativeDispatchState {
+            vip: Va(RDATA_VA),
+            rolling_key: RDATA_VA,
+            handler: Va(RDATA_VA),
+        };
+        let symbolic_in = SymbolicVmInitialState::default();
+        let mut pending = Vec::new();
+        let switched = walker.follow_cross_profile_transition(
+            Va(RDATA_VA),
+            final_state,
+            &[],
+            &symbolic_in,
+            &mut pending,
+        );
+        assert!(!switched, "a non-provable transition must fail closed");
+        assert!(pending.is_empty(), "no successor may be queued");
+        assert!(walker.cfg.edges.is_empty(), "no edge may be added");
+        assert!(walker.active.is_none(), "the base profile is untouched");
     }
 
     #[test]
