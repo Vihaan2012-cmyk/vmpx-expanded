@@ -12,6 +12,7 @@ mod effect_liveness;
 mod entry_frame;
 mod equivalence;
 mod expr_codegen;
+mod ir_semantics;
 mod live_in;
 mod nested_entry;
 mod passthrough;
@@ -20,7 +21,7 @@ mod replacement;
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
 pub use cfg_lift::{
-    CfgProbe, DecodedCfgInput, LiftedCfgFunction, lift_decoded_cfg, lift_decoded_cfg_with_nested,
+    CfgProbe, DecodedCfgInput, LiftedCfgFunction, LoopInfo, PathCondition, PathTerminal, PhiInfo, RecoveredPath, SegmentKey, lift_decoded_cfg, lift_decoded_cfg_with_nested,
     probe_decoded_cfg,
 };
 pub use nested_entry::{NestedEntry, NestedEntryResolver, PeNestedEntries};
@@ -41,6 +42,10 @@ pub use equivalence::{
     compare_exits, verify_over_domain,
 };
 pub use expr_codegen::ImportCall;
+pub use ir_semantics::{
+    IrCondition, IrExit, IrPath, Readback, RecompileStats, RecompiledPair, Terminator, evaluate_ir,
+    evaluate_ir_paths, evaluate_ir_segments, normalize_expr, recompiled_cfg_pairs, recompiled_pair,
+};
 pub use expr_codegen::{
     ExpressionCodegenConfig, ExpressionCodegenError, ExpressionInput, LoweredExpression,
     compile_expression, lower_expression,

@@ -2740,6 +2740,7 @@ dependencies = [
  "vmpx-rebuild",
  "vmpx-recompile",
  "vmpx-unpack",
+ "vmpx-verify",
  "vmpx-vm",
  "vmpx-vmlift",
 ]
@@ -2865,6 +2866,7 @@ name = "vmpx-verify"
 version = "0.1.0"
 dependencies = [
  "vmpx-mutation",
+ "vmpx-recompile",
  "vmpx-vm",
  "vmpx-vmlift",
  "z3",

@@ -250,7 +250,7 @@ fn pe_summary(pe: &PeImage<'_>) -> CleanPeReport {
 
 /// Walks every branch and direct call reachable from each export and records
 /// whether the reachable set stays outside the protector sections.
-fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
+pub(crate) fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
     let report = pe.report();
     let Some(exports) = &report.exports else {
         return Vec::new();
@@ -347,7 +347,7 @@ fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportReport> {
 
 /// Unifies executable-stub discovery with the VM entries reachable from exports
 /// into one deduplicated list. Inventory only: nothing here is recovered.
-fn build_vm_inventory(
+pub(crate) fn build_vm_inventory(
     pe: &PeImage<'_>,
     exports: &[CleanExportReport],
     warnings: &mut Vec<String>,
@@ -2299,17 +2299,17 @@ enum GroupKind {
     Tls(Rva),
 }
 
-/// Builds one replacement body, resolving its continuation target and import
-/// calls from `pe`. Shared by every reintegration group and the
-/// nested-continuation pass so they all use identical codegen.
-fn compile_replacement_body(
+/// The replacement configuration for one recovered exit, resolving its
+/// continuation target and import calls from `pe`. Shared by every
+/// reintegration group, the nested-continuation pass, and the equivalence gate
+/// so they all use identical codegen.
+pub(crate) fn replacement_config(
     pe: &PeImage<'_>,
     inputs: &[(String, vmpx_recompile::PhysicalRegister)],
     symbol_rewrites: &BTreeMap<String, vmpx_vm::Expr>,
     exit: &vmpx_vm::NativeExitState,
     effects: &vmpx_vmlift::CollectedEffects,
-    va: u64,
-) -> Result<Vec<u8>, String> {
+) -> vmpx_vmlift::ReplacementConfig {
     // The VM exit transfers to a protector continuation rather than returning
     // to the caller. Resolve that continuation so the replacement can
     // tail-jump into it after restoring the exit state, which is what makes
@@ -2323,7 +2323,7 @@ fn compile_replacement_body(
     .filter(|report| report.complete && report.targets.len() == 1)
     .map(|report| report.targets[0].va)
     .map(|va| va.0);
-    let config = vmpx_vmlift::ReplacementConfig {
+    vmpx_vmlift::ReplacementConfig {
         inputs: inputs.to_vec(),
         max_expression_nodes: 200_000,
         max_spill_slots: 64,
@@ -2358,7 +2358,19 @@ fn compile_replacement_body(
                 })
             })
             .collect(),
-    };
+    }
+}
+
+/// Builds one replacement body from [`replacement_config`].
+fn compile_replacement_body(
+    pe: &PeImage<'_>,
+    inputs: &[(String, vmpx_recompile::PhysicalRegister)],
+    symbol_rewrites: &BTreeMap<String, vmpx_vm::Expr>,
+    exit: &vmpx_vm::NativeExitState,
+    effects: &vmpx_vmlift::CollectedEffects,
+    va: u64,
+) -> Result<Vec<u8>, String> {
+    let config = replacement_config(pe, inputs, symbol_rewrites, exit, effects);
     vmpx_vmlift::build_replacement(&exit.registers, &config, vmpx_recompile::CodeAddress(va))
         .map(|replacement| replacement.compiled.bytes)
         .map_err(|error| error.to_string())
