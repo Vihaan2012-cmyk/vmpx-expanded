@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 vmpx-pe = { path = "../vmpx-pe" }
+vmpx-emulate = { path = "../vmpx-emulate" }
 vmpx-unpack = { path = "../vmpx-unpack" }
 vmpx-detect = { path = "../vmpx-detect" }
 vmpx-disasm = { path = "../vmpx-disasm" }

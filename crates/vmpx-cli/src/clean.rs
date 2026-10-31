@@ -64,6 +64,27 @@ pub struct CleanImportReport {
     pub proven_modules: usize,
     pub proven_symbols: usize,
     pub unresolved: Vec<String>,
+    /// EXPERIMENTAL dynamic-assist (`--dynamic`): Observed-tier import
+    /// reconstruction from a contained detonation. Absent on the default sound
+    /// path; never influences `blockers`/`ready_to_write`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<CleanObservedImportReport>,
+}
+
+/// Observed-tier (never sound) import reconstruction surfaced on the
+/// experimental `--dynamic` path. Every field reflects one concrete run.
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanObservedImportReport {
+    pub provenance: &'static str,
+    pub detonation_steps: usize,
+    pub detonation_stop: String,
+    pub observed_oep: Option<u64>,
+    pub observed_imports: usize,
+    pub reconstructed_modules: usize,
+    pub reconstructed_symbols: usize,
+    pub reconstruction_complete: bool,
+    pub import_directory_bytes: Option<usize>,
+    pub note: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -605,7 +626,7 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
 pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
-    analyze_clean_with_image(input_path, input, false).map(|(report, _, _)| report)
+    analyze_clean_with_image(input_path, input, false, false).map(|(report, _, _)| report)
 }
 
 /// Runs the same analysis and additionally returns the conventional-layout
@@ -622,6 +643,7 @@ pub fn analyze_clean_with_image(
     input_path: &str,
     input: &[u8],
     decoded_lift: bool,
+    dynamic: bool,
 ) -> Result<(CleanReport, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let input_pe = PeImage::parse(input).context("clean input is not a supported PE")?;
     let protection = detect_vmprotect(&input_pe);
@@ -651,6 +673,37 @@ pub fn analyze_clean_with_image(
     let mut warnings = protection.warnings.clone();
     let mut errors = Vec::new();
     let mut paths = Vec::new();
+    // EXPERIMENTAL dynamic-assist (`--dynamic`, requires `--experimental`): run
+    // the sample in the contained software emulator and collect its observed,
+    // dynamically-resolved imports. Observed-tier only — these NEVER touch the
+    // sound `blockers` gate below; they are surfaced separately in the report.
+    let mut dynamic_stop: Option<String> = None;
+    let mut dynamic_steps = 0usize;
+    let mut dynamic_oep: Option<u64> = None;
+    let observed_imports: Vec<vmpx_emulate::ObservedImport> = if dynamic {
+        match vmpx_emulate::detonate(&input_pe, &vmpx_emulate::DetonateOptions::default()) {
+            Ok(result) => {
+                warnings.push(format!(
+                    "[dynamic][experimental] detonation ran {} instr(s), stop={:?}, observed oep={:?}, GetProcAddress imports={}",
+                    result.steps,
+                    result.stop,
+                    result.observed.oep,
+                    result.observed.imports.len(),
+                ));
+                dynamic_stop = Some(format!("{:?}", result.stop));
+                dynamic_steps = result.steps;
+                dynamic_oep = result.observed.oep;
+                result.observed.imports
+            }
+            Err(error) => {
+                warnings
+                    .push(format!("[dynamic][experimental] detonation could not start: {error:?}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
     // Exact native exit states retained for the recompilation stage.
     // Each exit state carries the observable effects its replacement must
     // replay. A replacement that only restored registers would compute the right
@@ -1670,6 +1723,7 @@ pub fn analyze_clean_with_image(
     }
     let mut coverage: Option<CleanCoverageReport> = None;
     let mut import_proof: Option<clean_wiring::ImportProof> = None;
+    let mut observed_import_report: Option<CleanObservedImportReport> = None;
     if verified_noop {
         warnings
             .push("input has no strong VMProtect evidence; clean is a verified no-op".to_owned());
@@ -1697,12 +1751,56 @@ pub fn analyze_clean_with_image(
             dangling.has_unresolved,
             reintegrated.is_some(),
         ));
-        let proof =
-            clean_wiring::prove_imports(&report.imports, &clean_wiring::derive_referenced_slots());
+        // SOUND path is unchanged: referenced slots stay empty, so the import
+        // blocker is kept regardless of any dynamic observation.
+        let proof = clean_wiring::prove_imports(
+            &report.imports,
+            &clean_wiring::derive_referenced_slots(None),
+        );
         if !proof.complete {
             blockers.push(clean_wiring::IMPORT_BLOCKER.to_owned());
         }
         import_proof = Some(proof);
+
+        // EXPERIMENTAL Observed-tier reconstruction (report only; the sound
+        // blocker above is untouched). When the detonation resolved imports,
+        // reconstruct the IAT from them and run the real installer.
+        if !observed_imports.is_empty() {
+            let recon = clean_wiring::reconstruct_observed_imports(
+                pe.optional.kind,
+                Rva(0),
+                &observed_imports,
+            );
+            observed_import_report = Some(CleanObservedImportReport {
+                provenance: "Observed",
+                detonation_steps: dynamic_steps,
+                detonation_stop: dynamic_stop.clone().unwrap_or_default(),
+                observed_oep: dynamic_oep,
+                observed_imports: observed_imports.len(),
+                reconstructed_modules: recon.proof.proven_modules,
+                reconstructed_symbols: recon.proof.proven_symbols,
+                reconstruction_complete: recon.proof.complete,
+                import_directory_bytes: recon.directory_bytes,
+                note: "experimental dynamic-assist; Observed-tier, never sound output; the \
+                       import blocker above is unaffected"
+                    .to_owned(),
+            });
+        } else if dynamic {
+            observed_import_report = Some(CleanObservedImportReport {
+                provenance: "Observed",
+                detonation_steps: dynamic_steps,
+                detonation_stop: dynamic_stop.clone().unwrap_or_default(),
+                observed_oep: dynamic_oep,
+                observed_imports: 0,
+                reconstructed_modules: 0,
+                reconstructed_symbols: 0,
+                reconstruction_complete: false,
+                import_directory_bytes: None,
+                note: "experimental dynamic-assist; detonation reached no dynamically-resolved \
+                       imports before its next blocker (see warnings)"
+                    .to_owned(),
+            });
+        }
         coverage = Some(CleanCoverageReport {
             can_clear_oep: decision.can_clear_oep_blocker,
             can_clear_vmp_referenced: decision.can_clear_vmp_referenced_blocker
@@ -1853,6 +1951,7 @@ pub fn analyze_clean_with_image(
                         .to_owned(),
                 ]
                 },
+                observed: observed_import_report,
             },
             vm_instances: discovery.instances,
             vm_entries: discovery.entries,

@@ -59,6 +59,12 @@ enum Command {
         /// streams (slow: minutes on large inputs).
         #[arg(long, requires = "experimental")]
         decoded_lift: bool,
+        /// With `--experimental`, run the contained software-emulator detonation
+        /// and feed its Observed-tier dynamically-resolved imports into the
+        /// experimental import reconstruction. The default proof-gated `output`
+        /// path and its blockers are never affected.
+        #[arg(long, requires = "experimental")]
+        dynamic: bool,
         /// With `--experimental`, attempt to strip protector (non-standard-named)
         /// sections from the reintegrated image. Only removes them when the sound
         /// dangling-ref checker approves and the result validates; otherwise it
@@ -759,6 +765,7 @@ fn main() -> Result<()> {
             reconstructed,
             experimental,
             decoded_lift,
+            dynamic,
             strip,
         } => {
             if input == output {
@@ -799,6 +806,7 @@ fn main() -> Result<()> {
                     &input.display().to_string(),
                     &input_data,
                     decoded_lift,
+                    dynamic,
                 )?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",

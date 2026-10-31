@@ -5,8 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use vmpx_disasm::{DanglingKind, DanglingRef};
-use vmpx_pe::{ImportModule, Rva};
-use vmpx_rebuild::{ProvenImportSet, bindings_from_modules, reduce_to_proven_imports};
+use vmpx_emulate::{ObservedImport, SymbolOrOrdinal};
+use vmpx_pe::{ImportModule, PeKind, Rva};
+use vmpx_rebuild::{
+    ProvenImportSet, SlotBinding, SymbolRef, bindings_from_modules, plan_proven_imports,
+    reduce_to_proven_imports,
+};
 use vmpx_vm::{NeutralizeAction, NeutralizeOptions, RecoveredGuard, neutralize};
 
 use crate::{
@@ -123,12 +127,118 @@ pub(crate) fn coverage_blockers(
     blockers
 }
 
-/// IAT slots with a proven direct reference from native (non-`.vmp`) code.
-/// Always empty: a partial native scan cannot prove completeness, because
-/// protector-resident code also uses the table, so no reduced set is ever
-/// claimed as the full application import set.
-pub(crate) fn derive_referenced_slots() -> BTreeSet<Rva> {
-    BTreeSet::new()
+/// Synthetic IAT base for observed-tier reconstruction. Import protection
+/// strips the application IAT, so observed `(module,symbol)` bindings are laid
+/// out at deterministic synthetic slots. EXPERIMENTAL / Observed-tier only.
+const OBSERVED_IAT_BASE: u32 = 0x1000;
+
+/// IAT slots with a proven reference.
+///
+/// * SOUND path (`observed == None`): always empty. A partial native scan
+///   cannot prove completeness — protector-resident code also uses the table —
+///   so no reduced set is ever claimed as the full application import set.
+/// * EXPERIMENTAL path (`observed == Some`): the synthetic slots the dynamic
+///   detonation's resolved imports occupy. Every one is Observed-tier and never
+///   feeds the sound blocker gate.
+pub(crate) fn derive_referenced_slots(observed: Option<&[ObservedImport]>) -> BTreeSet<Rva> {
+    observed
+        .map(|imports| observed_slot_bindings(imports).iter().map(|b| b.slot).collect())
+        .unwrap_or_default()
+}
+
+/// Deduplicated `(module, symbol)` observed bindings, each at a deterministic
+/// synthetic slot. Observed-tier only; the real application IAT is stripped.
+fn observed_slot_bindings(imports: &[ObservedImport]) -> Vec<SlotBinding> {
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    for imp in imports {
+        let (symbol, key) = match &imp.symbol {
+            SymbolOrOrdinal::Name(n) => (SymbolRef::Name(n.clone()), n.clone()),
+            SymbolOrOrdinal::Ordinal(o) => (SymbolRef::Ordinal(*o), format!("#{o}")),
+        };
+        if !seen.insert((imp.module.to_ascii_lowercase(), key)) {
+            continue;
+        }
+        let index = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        let slot = Rva(OBSERVED_IAT_BASE + index * 8);
+        out.push(SlotBinding { slot, module: imp.module.clone(), symbol: Some(symbol), hint: None });
+    }
+    out
+}
+
+/// EXPERIMENTAL Observed-tier reconstruction of the application import set from
+/// a dynamic detonation's resolved imports. NEVER feeds the sound blocker gate.
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedImportReconstruction {
+    pub proof: ImportProof,
+    /// Kept for fidelity comparison on the experimental tier (see
+    /// [`import_fidelity`]); not consumed on the sound path.
+    #[allow(dead_code)]
+    pub proven: ProvenImportSet,
+    /// Serialized import-directory byte length when the installer produced a
+    /// valid (non-empty) directory from the observed bindings.
+    pub directory_bytes: Option<usize>,
+}
+
+/// Reconstruct an application IAT from observed imports and run the real import
+/// installer over it. Observed-tier: the result labels its provenance and is
+/// surfaced on the experimental path only.
+pub(crate) fn reconstruct_observed_imports(
+    kind: PeKind,
+    table_rva: Rva,
+    imports: &[ObservedImport],
+) -> ObservedImportReconstruction {
+    let bindings = observed_slot_bindings(imports);
+    let referenced: BTreeSet<Rva> = bindings.iter().map(|b| b.slot).collect();
+    let proven = reduce_to_proven_imports(&bindings, &referenced);
+    let complete = proven.unresolved.is_empty()
+        && !referenced.is_empty()
+        && proven.import_count() == referenced.len();
+    let directory_bytes = if proven.import_count() == 0 {
+        None
+    } else {
+        plan_proven_imports(kind, table_rva, &proven)
+            .ok()
+            .map(|plan| plan.table.bytes.len())
+    };
+    ObservedImportReconstruction {
+        proof: ImportProof {
+            complete,
+            proven_modules: proven.modules.len(),
+            proven_symbols: proven.import_count(),
+        },
+        proven,
+        directory_bytes,
+    }
+}
+
+/// Fidelity of an observed reconstruction against a known `(module, symbol)`
+/// import set (module compared case-insensitively). Returns `(matched, known)`.
+/// Used where the real imports are knowable (verification on the experimental
+/// tier); real protected samples cannot yet reach their imports (see probe).
+#[allow(dead_code)]
+pub(crate) fn import_fidelity(
+    proven: &ProvenImportSet,
+    known: &BTreeSet<(String, String)>,
+) -> (usize, usize) {
+    let got: BTreeSet<(String, String)> = proven
+        .modules
+        .iter()
+        .flat_map(|module| {
+            module.imports.iter().map(move |import| {
+                let sym = match &import.symbol {
+                    SymbolRef::Name(name) => name.clone(),
+                    SymbolRef::Ordinal(ordinal) => format!("#{ordinal}"),
+                };
+                (module.name.to_ascii_lowercase(), sym)
+            })
+        })
+        .collect();
+    let matched = known
+        .iter()
+        .filter(|(module, symbol)| got.contains(&(module.to_ascii_lowercase(), symbol.clone())))
+        .count();
+    (matched, known.len())
 }
 
 #[derive(Clone, Debug)]
@@ -334,9 +444,67 @@ mod tests {
 
     #[test]
     fn import_blocker_stays_when_referenced_is_empty() {
-        let proof = prove_imports(&[module()], &derive_referenced_slots());
+        let proof = prove_imports(&[module()], &derive_referenced_slots(None));
         assert!(!proof.complete);
         assert_eq!(proof.proven_symbols, 0);
+    }
+
+    fn observed(module: &str, name: &str) -> ObservedImport {
+        ObservedImport {
+            provenance: vmpx_emulate::Observed,
+            stub_va_or_slot: 0,
+            module: module.to_owned(),
+            symbol: SymbolOrOrdinal::Name(name.to_owned()),
+        }
+    }
+
+    #[test]
+    fn sound_referenced_slots_stay_empty_without_observation() {
+        assert!(derive_referenced_slots(None).is_empty());
+    }
+
+    #[test]
+    fn observed_imports_derive_nonempty_slots_and_install_a_directory() {
+        let imports = [
+            observed("kernel32.dll", "VirtualAlloc"),
+            observed("user32.dll", "MessageBoxA"),
+            observed("kernel32.dll", "VirtualAlloc"), // duplicate collapses
+        ];
+        // The bridge now yields a non-empty referenced set from observed facts.
+        let slots = derive_referenced_slots(Some(&imports));
+        assert_eq!(slots.len(), 2, "deduplicated to two distinct bindings");
+
+        // The real import installer serializes a valid, non-empty directory.
+        let recon = reconstruct_observed_imports(PeKind::Pe32Plus, Rva(0x6000), &imports);
+        assert!(recon.proof.complete, "all observed bindings proven");
+        assert_eq!(recon.proof.proven_symbols, 2);
+        assert_eq!(recon.proof.proven_modules, 2);
+        assert!(recon.directory_bytes.is_some_and(|n| n > 0), "directory produced");
+    }
+
+    #[test]
+    fn observed_reconstruction_matches_known_imports_full_fidelity() {
+        let imports = [
+            observed("KERNEL32.dll", "VirtualAlloc"),
+            observed("kernel32.dll", "GetProcAddress"),
+        ];
+        let recon = reconstruct_observed_imports(PeKind::Pe32Plus, Rva(0), &imports);
+        let known: BTreeSet<(String, String)> = [
+            ("kernel32.dll".to_owned(), "VirtualAlloc".to_owned()),
+            ("kernel32.dll".to_owned(), "GetProcAddress".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let (matched, total) = import_fidelity(&recon.proven, &known);
+        assert_eq!((matched, total), (2, 2), "reconstructed set matches known imports");
+    }
+
+    #[test]
+    fn empty_observation_installs_nothing() {
+        let recon = reconstruct_observed_imports(PeKind::Pe32Plus, Rva(0), &[]);
+        assert!(!recon.proof.complete);
+        assert_eq!(recon.proof.proven_symbols, 0);
+        assert!(recon.directory_bytes.is_none());
     }
 
     #[test]

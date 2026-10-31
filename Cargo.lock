@@ -2735,6 +2735,7 @@ dependencies = [
  "sha2",
  "vmpx-detect",
  "vmpx-disasm",
+ "vmpx-emulate",
  "vmpx-pe",
  "vmpx-rebuild",
  "vmpx-recompile",
