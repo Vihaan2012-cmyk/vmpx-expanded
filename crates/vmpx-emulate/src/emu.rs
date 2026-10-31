@@ -24,6 +24,22 @@ pub enum Stop {
 pub struct TraceEntry {
     pub rip: u64,
     pub mnemonic: Mnemonic,
+    /// Effective address of the step's last memory access (detail mode only).
+    pub ea: Option<u64>,
+    /// Value read/written by that access (detail mode only).
+    pub value: Option<u64>,
+    /// Post-step value of the configured VM stack pointer (detail mode only).
+    pub vsp: Option<u64>,
+}
+
+/// Opt-in richer trace capture. All-false default keeps the hot path cheap:
+/// nothing extra is computed unless `detail` is set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObserveConfig {
+    /// Record per-step effective address + accessed value.
+    pub detail: bool,
+    /// GPR treated as the VM stack pointer; its value is recorded each step.
+    pub vsp: Option<Register>,
 }
 
 /// A guest memory access, reported before it commits (`value` is set for writes).
@@ -49,22 +65,43 @@ pub struct FlowEvent {
     pub kind: FlowKind,
     pub from: u64,
     pub to: u64,
+    /// Fall-through address: the instruction after the branch. For a `Call`
+    /// this is the return address a stub hook redirects to.
+    pub next: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HookAction {
+    /// Let the instruction commit as decoded.
     Continue,
+    /// Abort the run with [`Stop::Hook`] (state rolled back as for any stop).
     Stop,
+    /// The hook has set `cpu.rip` (and any registers/memory it wants); resume
+    /// there instead of this instruction's own transfer. Honoured for
+    /// control-flow events; on a memory event it behaves like `Continue`
+    /// (there is no safe mid-instruction redirect point).
+    Redirect,
 }
 
-/// Observation/interception seam; both callbacks default to no-ops.
+/// Observation/interception seam; all callbacks default to no-ops.
+///
+/// A hook may mutate `cpu`/`mem` in place (e.g. set RAX and redirect `rip` to
+/// fake an API return) and then resume — see [`HookAction::Redirect`]. Because
+/// a memory callback fires *before* the access commits, writing `mem` there
+/// changes the value the pending load/store will see.
 pub trait Hook {
-    fn on_mem(&mut self, _ev: &MemEvent) -> HookAction {
+    fn on_mem(&mut self, _ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         HookAction::Continue
     }
-    fn on_flow(&mut self, _ev: &FlowEvent) -> HookAction {
+    fn on_flow(&mut self, _ev: &FlowEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         HookAction::Continue
     }
+}
+
+/// Internal resolution of a hook callback (a `Stop` is surfaced as `Err`).
+enum HookOutcome {
+    Continue,
+    Redirect,
 }
 
 pub struct Emulator {
@@ -72,13 +109,23 @@ pub struct Emulator {
     pub mem: Memory,
     pub trace: Vec<TraceEntry>,
     pub hook: Option<Box<dyn Hook>>,
+    pub observe: ObserveConfig,
     cur: (u64, Mnemonic),
+    det: (Option<u64>, Option<u64>),
 }
 
 impl Emulator {
     #[must_use]
     pub fn new(cpu: Cpu, mem: Memory) -> Self {
-        Self { cpu, mem, trace: Vec::new(), hook: None, cur: (0, Mnemonic::INVALID) }
+        Self {
+            cpu,
+            mem,
+            trace: Vec::new(),
+            hook: None,
+            observe: ObserveConfig::default(),
+            cur: (0, Mnemonic::INVALID),
+            det: (None, None),
+        }
     }
 
     /// Execute one instruction.
@@ -88,6 +135,7 @@ impl Emulator {
     pub fn step(&mut self) -> Result<(), Stop> {
         let rip = self.cpu.rip;
         self.cur = (rip, Mnemonic::INVALID);
+        self.det = (None, None);
         let mut buf = [0u8; 15];
         let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
         let ins = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE).decode();
@@ -98,7 +146,12 @@ impl Emulator {
         let next = rip.wrapping_add(ins.len() as u64);
         let new_rip = self.exec(&ins, next)?;
         self.cpu.rip = new_rip;
-        self.trace.push(TraceEntry { rip, mnemonic: ins.mnemonic() });
+        let (ea, value, vsp) = if self.observe.detail {
+            (self.det.0, self.det.1, self.observe.vsp.and_then(|r| self.cpu.reg(r)))
+        } else {
+            (None, None, None)
+        };
+        self.trace.push(TraceEntry { rip, mnemonic: ins.mnemonic(), ea, value, vsp });
         Ok(())
     }
 
@@ -135,25 +188,41 @@ impl Emulator {
     }
 
     fn mem_hook(&mut self, ev: MemEvent) -> Result<(), Stop> {
-        let act = self.hook.as_mut().map(|h| h.on_mem(&ev));
-        if act == Some(HookAction::Stop) { Err(Stop::Hook) } else { Ok(()) }
+        // Disjoint field borrows: the hook mutates cpu/mem while it fires.
+        let Self { hook, cpu, mem, .. } = self;
+        match hook.as_mut().map(|h| h.on_mem(&ev, cpu, mem)) {
+            Some(HookAction::Stop) => Err(Stop::Hook),
+            _ => Ok(()),
+        }
     }
 
-    fn flow_hook(&mut self, kind: FlowKind, to: u64) -> Result<(), Stop> {
-        let ev = FlowEvent { kind, from: self.cur.0, to };
-        let act = self.hook.as_mut().map(|h| h.on_flow(&ev));
-        if act == Some(HookAction::Stop) { Err(Stop::Hook) } else { Ok(()) }
+    fn flow_hook(&mut self, kind: FlowKind, to: u64, next: u64) -> Result<HookOutcome, Stop> {
+        let ev = FlowEvent { kind, from: self.cur.0, to, next };
+        let Self { hook, cpu, mem, .. } = self;
+        match hook.as_mut().map(|h| h.on_flow(&ev, cpu, mem)) {
+            Some(HookAction::Stop) => Err(Stop::Hook),
+            Some(HookAction::Redirect) => Ok(HookOutcome::Redirect),
+            _ => Ok(HookOutcome::Continue),
+        }
     }
 
     fn load(&mut self, addr: u64, size: u32) -> Result<u64, Stop> {
         self.mem_hook(MemEvent { addr, size, access: Access::Read, value: None })?;
-        self.mem.read_uint(addr, size as usize).map_err(|f| self.fault(f.addr, f.access))
+        let v = self.mem.read_uint(addr, size as usize).map_err(|f| self.fault(f.addr, f.access))?;
+        if self.observe.detail {
+            self.det = (Some(addr), Some(v));
+        }
+        Ok(v)
     }
 
     fn store(&mut self, addr: u64, size: u32, val: u64) -> Result<(), Stop> {
-        let value = Some(val & mask(size));
-        self.mem_hook(MemEvent { addr, size, access: Access::Write, value })?;
-        self.mem.write_uint(addr, size as usize, val).map_err(|f| self.fault(f.addr, f.access))
+        let value = val & mask(size);
+        self.mem_hook(MemEvent { addr, size, access: Access::Write, value: Some(value) })?;
+        self.mem.write_uint(addr, size as usize, val).map_err(|f| self.fault(f.addr, f.access))?;
+        if self.observe.detail {
+            self.det = (Some(addr), Some(value));
+        }
+        Ok(())
     }
 
     fn apply(&mut self, f: Flags) {
@@ -402,12 +471,16 @@ impl Emulator {
             }
             Mnemonic::Jmp => {
                 let t = self.branch_target(ins)?;
-                self.flow_hook(FlowKind::Jmp, t)?;
-                return Ok(t);
+                return Ok(match self.flow_hook(FlowKind::Jmp, t, next)? {
+                    HookOutcome::Redirect => self.cpu.rip,
+                    HookOutcome::Continue => t,
+                });
             }
             Mnemonic::Call => {
                 let t = self.branch_target(ins)?;
-                self.flow_hook(FlowKind::Call, t)?;
+                if let HookOutcome::Redirect = self.flow_hook(FlowKind::Call, t, next)? {
+                    return Ok(self.cpu.rip);
+                }
                 self.push64(next)?;
                 return Ok(t);
             }
@@ -418,7 +491,9 @@ impl Emulator {
                 let extra = if ins.op_count() == 1 { ins.immediate(0) } else { 0 };
                 let sp = self.cpu.regs[RSP];
                 let t = self.load(sp, 8)?;
-                self.flow_hook(FlowKind::Ret, t)?;
+                if let HookOutcome::Redirect = self.flow_hook(FlowKind::Ret, t, next)? {
+                    return Ok(self.cpu.rip);
+                }
                 self.cpu.regs[RSP] = sp.wrapping_add(8).wrapping_add(extra);
                 return Ok(t);
             }
@@ -428,8 +503,10 @@ impl Emulator {
             {
                 let taken = self.cond(ins.condition_code())?;
                 let t = if taken { ins.near_branch_target() } else { next };
-                self.flow_hook(FlowKind::Jcc { taken }, t)?;
-                return Ok(t);
+                return Ok(match self.flow_hook(FlowKind::Jcc { taken }, t, next)? {
+                    HookOutcome::Redirect => self.cpu.rip,
+                    HookOutcome::Continue => t,
+                });
             }
             _ => return Err(self.unsup()),
         }

@@ -18,10 +18,13 @@
 //! [`Cpu::undef_flags`]; reading one stops the run. A faulting instruction
 //! leaves registers, flags, memory and rip untouched.
 //!
-//! **Observation seam.** [`Emulator::trace`] records every retired instruction.
-//! A [`Hook`] sees each memory access and control-flow transfer *before* it
-//! commits and may stop the run; the caller can then patch [`Cpu`]/[`Memory`]
-//! (e.g. fake an API return) and resume with `step`/`run`.
+//! **Observation seam.** [`Emulator::trace`] records every retired instruction
+//! (optionally with effective address / value / VSP when [`ObserveConfig`] is
+//! enabled). A [`Hook`] sees each memory access and control-flow transfer
+//! *before* it commits; it may stop the run, or patch [`Cpu`]/[`Memory`] in
+//! place and redirect `rip` (the Layer-2 API-stub pattern) and resume. Facts a
+//! run surfaces for the static side are collected as [`ObservedFacts`], tagged
+//! [`Observed`] so they are never mistaken for sound output.
 //!
 //! # Layers
 //!
@@ -51,6 +54,7 @@ mod differential;
 mod emu;
 mod loader;
 mod memory;
+mod observe;
 
 pub use alu::{Alu, Flags, Shift};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
@@ -58,6 +62,11 @@ pub use differential::{
     DiffRecord, DiffReport, Divergence, Incomplete, Limits, Outcome, OutputRegion, RunError,
     RunResult, Target, differential, edge_values, input_set, run_function,
 };
-pub use emu::{Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, Stop, TraceEntry};
+pub use emu::{
+    Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, ObserveConfig, Stop, TraceEntry,
+};
 pub use loader::{LoadError, LoadOptions, LoadedImage, load};
 pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
+pub use observe::{
+    Observed, ObservedFacts, ObservedGlobal, ObservedImport, ObservedLoopDepth, SymbolOrOrdinal,
+};

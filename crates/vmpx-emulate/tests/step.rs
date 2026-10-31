@@ -1,8 +1,9 @@
 use iced_x86::Mnemonic as M;
+use iced_x86::Register;
 use iced_x86::code_asm::*;
 use vmpx_emulate::{
-    CF, Cpu, Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, Memory, OF, Perm, SF, Stop,
-    ZF,
+    CF, Cpu, Emulator, FlowEvent, FlowKind, Hook, HookAction, MemEvent, Memory, OF, ObserveConfig,
+    Observed, ObservedFacts, Perm, SF, Stop, SymbolOrOrdinal, ZF,
 };
 
 const CODE: u64 = 0x1000;
@@ -166,13 +167,13 @@ struct Rec {
 struct Shared(std::rc::Rc<std::cell::RefCell<Rec>>);
 
 impl Hook for Shared {
-    fn on_mem(&mut self, ev: &MemEvent) -> HookAction {
+    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         if ev.value.is_some() {
             self.0.borrow_mut().writes.push(*ev);
         }
         HookAction::Continue
     }
-    fn on_flow(&mut self, ev: &FlowEvent) -> HookAction {
+    fn on_flow(&mut self, ev: &FlowEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         self.0.borrow_mut().flows.push(*ev);
         if ev.kind == FlowKind::Call { HookAction::Stop } else { HookAction::Continue }
     }
@@ -198,4 +199,97 @@ fn hook_observes_and_can_stop() {
     assert_eq!(r.flows[0].kind, FlowKind::Call);
     assert_eq!(e.cpu.regs[4], STACK_TOP - 8);
     assert_eq!(e.trace.len(), 1);
+}
+
+/// API-stub pattern: a flow hook sets RAX and redirects rip past a `call`,
+/// skipping the callee (and the implicit push), then the run resumes cleanly.
+struct Stub;
+impl Hook for Stub {
+    fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
+        if ev.kind == FlowKind::Call {
+            cpu.regs[0] = 0x1234; // RAX
+            cpu.rip = ev.next; // return address
+            HookAction::Redirect
+        } else {
+            HookAction::Continue
+        }
+    }
+}
+
+#[test]
+fn hook_redirects_rip_and_resumes() {
+    let code = asm(|a| {
+        let mut stub = a.create_label();
+        let mut done = a.create_label();
+        a.mov(rax, 0u64).unwrap();
+        a.call(stub).unwrap();
+        a.add(rax, 1).unwrap(); // return lands here
+        a.jmp(done).unwrap();
+        a.set_label(&mut stub).unwrap();
+        a.mov(rax, 999u64).unwrap(); // must never execute
+        a.ret().unwrap();
+        a.set_label(&mut done).unwrap();
+        a.nop().unwrap();
+    });
+    let end = CODE + code.len() as u64 - 1;
+    let mut e = emu(&code);
+    e.hook = Some(Box::new(Stub));
+    assert_eq!(e.run_until(end, 50), Stop::Reached);
+    assert_eq!(e.cpu.regs[0], 0x1235); // 0x1234 from stub, +1 after return
+    assert_eq!(e.cpu.regs[4], STACK_TOP); // no push happened on redirect
+    let mns: Vec<M> = e.trace.iter().map(|t| t.mnemonic).collect();
+    assert_eq!(mns, [M::Mov, M::Call, M::Add, M::Jmp]);
+}
+
+#[test]
+fn detailed_trace_records_ea_value_and_vsp() {
+    let code = asm(|a| {
+        a.mov(rdx, DATA).unwrap();
+        a.mov(qword_ptr(rdx), rcx).unwrap(); // store: ea=DATA, value=rcx
+        a.mov(rax, qword_ptr(rdx)).unwrap(); // load: ea=DATA, value=rcx
+        a.nop().unwrap();
+    });
+    let mut e = emu(&code);
+    e.cpu.regs[1] = 0x55; // RCX
+    e.observe = ObserveConfig { detail: true, vsp: Some(Register::RSP) };
+    assert_eq!(e.run_until(CODE + code.len() as u64 - 1, 50), Stop::Reached);
+
+    // mov rdx, DATA: no memory access.
+    assert_eq!((e.trace[0].ea, e.trace[0].value), (None, None));
+    // store then load both touch DATA with value 0x55.
+    assert_eq!((e.trace[1].ea, e.trace[1].value), (Some(DATA), Some(0x55)));
+    assert_eq!((e.trace[2].ea, e.trace[2].value), (Some(DATA), Some(0x55)));
+    // VSP captured every step.
+    assert!(e.trace.iter().all(|t| t.vsp == Some(STACK_TOP)));
+}
+
+#[test]
+fn detailed_trace_is_off_by_default() {
+    let code = asm(|a| {
+        a.mov(rdx, DATA).unwrap();
+        a.mov(qword_ptr(rdx), rcx).unwrap();
+        a.nop().unwrap();
+    });
+    let mut e = emu(&code);
+    assert_eq!(e.run_until(CODE + code.len() as u64 - 1, 50), Stop::Reached);
+    assert!(e.trace.iter().all(|t| t.ea.is_none() && t.value.is_none() && t.vsp.is_none()));
+}
+
+#[test]
+fn observed_facts_roundtrip_with_provenance() {
+    let mut f = ObservedFacts::new();
+    f.record_import(0x2000_0000, "kernel32.dll", SymbolOrOrdinal::Name("GetProcAddress".into()));
+    f.record_import(0x2000_0008, "user32.dll", SymbolOrOrdinal::Ordinal(42));
+    f.record_global(0x4000, vec![1, 2, 3, 4]);
+    f.record_loop_depth(0x1100, 7);
+    f.set_oep(0x1000);
+
+    assert_eq!(f.imports[0].provenance, Observed);
+    assert_eq!(f.imports[0].module, "kernel32.dll");
+    assert_eq!(f.imports[0].symbol, SymbolOrOrdinal::Name("GetProcAddress".into()));
+    assert_eq!(f.imports[1].symbol, SymbolOrOrdinal::Ordinal(42));
+    assert_eq!(f.globals[0].bytes, vec![1, 2, 3, 4]);
+    assert_eq!(f.loop_depths[0].depth, 7);
+    assert_eq!(f.oep, Some(0x1000));
+    assert_eq!(f.clone(), f); // derives Clone + Eq for the hand-off
 }
