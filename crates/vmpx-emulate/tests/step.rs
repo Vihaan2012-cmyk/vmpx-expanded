@@ -116,6 +116,20 @@ fn unsupported_stops_cleanly() {
 }
 
 #[test]
+fn rep_ret_executes_as_near_return() {
+    // `F3 C3` (rep ret / the AMD branch-alignment idiom) is semantically a plain
+    // near return: the `F3` prefix is an architectural no-op here.
+    let mut e = emu(&[0xf3, 0xc3]);
+    // Seed a return address on the stack.
+    e.cpu.regs[4] = STACK_TOP - 8;
+    e.mem.write_uint(STACK_TOP - 8, 8, DATA).unwrap();
+    assert_eq!(e.step(), Ok(()));
+    assert_eq!(e.cpu.rip, DATA, "returned to [RSP]");
+    assert_eq!(e.cpu.regs[4], STACK_TOP, "RSP popped by 8");
+    assert_eq!(e.trace.last().unwrap().mnemonic, M::Ret);
+}
+
+#[test]
 fn invalid_encoding_is_decode_error() {
     let mut e = emu(&[0x06]);
     assert_eq!(e.step(), Err(Stop::DecodeError { rip: CODE }));

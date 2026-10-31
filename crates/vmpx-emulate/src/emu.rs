@@ -400,8 +400,13 @@ impl Emulator {
     fn exec(&mut self, ins: &Instruction, next: u64) -> Result<u64, Stop> {
         // `lock` is transparent in a single-threaded model. `rep`/`repne` are
         // only meaningful on the string ops that consume them below; anywhere
-        // else they stop rather than being silently ignored.
-        if (ins.has_rep_prefix() || ins.has_repne_prefix()) && string_kind(ins.code()).is_none() {
+        // else they stop rather than being silently ignored — except on `ret`,
+        // where `F3` is the architectural no-op the `rep ret` / branch-alignment
+        // idiom emits (semantically identical to a plain near return).
+        if (ins.has_rep_prefix() || ins.has_repne_prefix())
+            && string_kind(ins.code()).is_none()
+            && ins.mnemonic() != Mnemonic::Ret
+        {
             return Err(self.unsup());
         }
         let mn = ins.mnemonic();

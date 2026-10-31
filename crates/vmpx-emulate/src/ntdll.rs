@@ -50,8 +50,8 @@ const PAGE: u64 = 0x1000;
 // Deterministic plausible identifiers reported by the info queries. The process
 // id is shared between ProcessBasicInformation and the thread's CLIENT_ID so a
 // cross-check sees a consistent view.
-const FAKE_PID: u64 = 0x0000_01A4;
-const FAKE_TID: u64 = 0x0000_01A8;
+pub(crate) const FAKE_PID: u64 = 0x0000_01A4;
+pub(crate) const FAKE_TID: u64 = 0x0000_01A8;
 const STATUS_PENDING: u64 = 0x0000_0103;
 
 // Deterministic in-model address pools, far from the loader regions and from
@@ -181,6 +181,10 @@ impl NtState {
             "QueryInformationThread" => Self::query_thread(cpu, mem, stack_arg_base),
             "QuerySystemInformation" => Self::query_system(cpu, mem, stack_arg_base),
             "OpenFile" => Self::open_file(cpu, mem, stack_arg_base),
+            // No in-model registry: opening any key fails closed (NOT_FOUND),
+            // never fabricating a handle or key contents.
+            "OpenKey" | "OpenKeyEx" => Self::open_key(cpu, mem),
+            "RaiseHardError" => Self::raise_hard_error(cpu, mem, stack_arg_base),
             // A view unmap, thread/process info set, or sleep: a benign success.
             "UnmapViewOfSection"
             | "SetInformationThread"
@@ -472,6 +476,36 @@ impl NtState {
         }
         NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)
     }
+
+    /// `NtRaiseHardError(Status, NumberOfParameters, UnicodeStringParameterMask,
+    /// Parameters, ValidResponseOptions, *Response)`. The hard error is reported
+    /// as handled: write `ResponseReturnToCaller` (0) and succeed so a
+    /// continuable (informational) error does not abort the run.
+    fn raise_hard_error(cpu: &Cpu, mem: &mut Memory, sab: u64) -> NtDispatch {
+        let status = cpu.regs[ARG[0]] as u32;
+        // An error-severity hard error (top two bits set, 0xC0000000+) is meant
+        // to terminate the process: fail closed rather than fabricate a resume.
+        // A continuable (success/informational/warning) error returns to the
+        // caller with ResponseReturnToCaller.
+        if status >= 0xC000_0000 {
+            return NtDispatch::Stop;
+        }
+        let a = Args { cpu, mem: &*mem, stack_arg_base: sab };
+        if let Some(p_response) = a.get(5).filter(|&p| p != 0) {
+            let _ = mem.write_uint(p_response, 4, 0); // ResponseReturnToCaller
+        }
+        NtDispatch::Status(STATUS_SUCCESS)
+    }
+
+    /// `NtOpenKey(*KeyHandle, DesiredAccess, *ObjectAttributes)`. No in-model
+    /// registry: no handle is fabricated and the open fails closed.
+    fn open_key(cpu: &Cpu, mem: &mut Memory) -> NtDispatch {
+        let p_handle = cpu.regs[ARG[0]];
+        if p_handle != 0 {
+            let _ = mem.write_uint(p_handle, 8, 0);
+        }
+        NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)
+    }
 }
 
 /// Read a `u64` through `ptr` when non-null, else `None`.
@@ -667,6 +701,38 @@ mod tests {
         let (cpu, sab) = cpu_with([p_h2, 0, 0, p_max], &[PAGE_READWRITE, 0, 0x1234], &mut mem);
         let r = nt.dispatch("NtCreateSection", &cpu, &mut mem, sab);
         assert!(matches!(r, NtDispatch::Status(STATUS_INVALID_HANDLE)));
+    }
+
+    #[test]
+    fn open_key_fails_closed() {
+        let mut mem = fresh_mem();
+        let p_handle = STACK + 0x100;
+        mem.write_uint(p_handle, 8, 0xdead).unwrap();
+        let (cpu, sab) = cpu_with([p_handle, 0, 0, 0], &[], &mut mem);
+        let mut nt = NtState::new();
+        let r = nt.dispatch("NtOpenKey", &cpu, &mut mem, sab);
+        assert!(matches!(r, NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)));
+        assert_eq!(mem.read_uint(p_handle, 8).unwrap(), 0, "no key handle fabricated");
+    }
+
+    #[test]
+    fn raise_hard_error_continues_or_fails_by_severity() {
+        let mut mem = fresh_mem();
+        let p_resp = STACK + 0x100;
+        mem.write_uint(p_resp, 8, 0xFF).unwrap();
+        // Informational (continuable) status: return to caller, Response = 0.
+        let (cpu, sab) =
+            cpu_with([0x5000_0018, 4, 0, 0], &[0 /*opts*/, p_resp /*response*/], &mut mem);
+        let mut nt = NtState::new();
+        let r = nt.dispatch("NtRaiseHardError", &cpu, &mut mem, sab);
+        assert!(matches!(r, NtDispatch::Status(STATUS_SUCCESS)));
+        assert_eq!(mem.read_uint(p_resp, 4).unwrap(), 0, "ResponseReturnToCaller");
+        // Error-severity (0xC0000000+) hard error fails closed.
+        let (cpu, sab) = cpu_with([0xC000_0005, 0, 0, 0], &[0, 0], &mut mem);
+        assert!(matches!(
+            nt.dispatch("NtRaiseHardError", &cpu, &mut mem, sab),
+            NtDispatch::Stop
+        ));
     }
 
     #[test]

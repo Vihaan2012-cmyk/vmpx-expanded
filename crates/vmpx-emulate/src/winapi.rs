@@ -44,6 +44,8 @@ const ALLOC_BASE: u64 = 0x0000_0050_0000_0000; // VirtualAlloc/HeapAlloc pages
 const PROC_BASE: u64 = 0x0000_0060_0000_0000; // GetProcAddress result sentinels
 const HMODULE_BASE: u64 = 0x0000_0070_0000_0000; // LoadLibrary/GetModuleHandle
 const PROCESS_HEAP: u64 = 0x0000_0070_FFFF_0000; // GetProcessHeap sentinel
+const HEAP_BASE: u64 = 0x0000_0070_FFF0_0000; // HeapCreate handle pool
+const STDHANDLE_BASE: u64 = 0x0000_0070_FFE0_0000; // GetStdHandle sentinels
 
 // Each minted HMODULE gets this much private address space; a faithful, readable
 // PE-header image is mapped there so the protector can walk the module it just
@@ -65,8 +67,18 @@ const EXPORT_DIR_SIZE: u32 = STUB_REGION_RVA - EXPORT_RVA;
 
 // Fixed FILETIME (100ns ticks) written by GetSystemTimeAsFileTime.
 const FIXED_FILETIME: u64 = 0x01D0_0000_0000_0000;
+// Fixed monotonic clock readings (ms tick / QPC counter).
+const FIXED_TICK: u64 = 0x0100_0000;
+const FIXED_QPC: u64 = 0x0000_0001_0000_0000;
+// Fixed per-process pointer-encoding cookie (Encode/DecodePointer involution).
+const POINTER_COOKIE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
+// Deterministic process command line returned by GetCommandLineA/W.
+const CMDLINE: &str = "program.exe";
 
 const PAGE: u64 = 0x1000;
+
+// Fixed user-mode address of KUSER_SHARED_DATA (constant on every Windows x64).
+const KUSD_BASE: u64 = 0x7FFE_0000;
 
 fn round_up(v: u64) -> u64 {
     v.div_ceil(PAGE) * PAGE
@@ -92,6 +104,25 @@ pub struct WinApiHook {
     facts: Rc<RefCell<ObservedFacts>>,
     alloc_next: u64,
     hmodule_next: u64,
+    heap_next: u64,
+    /// Heap block base VA -> requested byte size (for HeapSize/HeapReAlloc).
+    heap_sizes: BTreeMap<u64, u64>,
+    /// Fiber/thread local storage slots: allocated index -> stored pointer. One
+    /// index space each; a Get returns exactly what the matching Set stored.
+    fls_slots: BTreeMap<u64, u64>,
+    fls_next: u64,
+    tls_slots: BTreeMap<u64, u64>,
+    tls_next: u64,
+    /// Cached guest VAs of the ANSI / wide command-line strings (0 = not built).
+    cmdline_a: u64,
+    cmdline_w: u64,
+    /// Cached guest VAs of the ANSI / wide environment blocks (0 = not built).
+    env_a: u64,
+    env_w: u64,
+    /// Thread last-error code (Get/SetLastError).
+    last_error: u64,
+    /// Whether the fixed `KUSER_SHARED_DATA` page has been mapped yet.
+    kusd_ready: bool,
     /// Base of the sample's own mapped image, returned for a `GetModuleHandle(NULL)`
     /// so the protector walks the real (already-mapped) headers. 0 = unknown.
     image_base: u64,
@@ -160,6 +191,18 @@ impl WinApiHook {
             facts: Rc::new(RefCell::new(ObservedFacts::new())),
             alloc_next: ALLOC_BASE,
             hmodule_next: HMODULE_BASE,
+            heap_next: HEAP_BASE,
+            heap_sizes: BTreeMap::new(),
+            fls_slots: BTreeMap::new(),
+            fls_next: 1,
+            tls_slots: BTreeMap::new(),
+            tls_next: 1,
+            cmdline_a: 0,
+            cmdline_w: 0,
+            env_a: 0,
+            env_w: 0,
+            last_error: 0,
+            kusd_ready: false,
             image_base: 0,
             handle_names: BTreeMap::new(),
             name_handles: BTreeMap::new(),
@@ -217,6 +260,95 @@ impl WinApiHook {
         }
         self.alloc_next = va + len;
         va
+    }
+
+    /// Map and populate the fixed `KUSER_SHARED_DATA` page with deterministic,
+    /// plausible values (Windows 10, no kernel debugger, single-processor). The
+    /// page is read-only; only non-zero fields are written (the map is zeroed).
+    fn map_kuser_shared_data(&mut self, mem: &mut Memory) -> Result<(), MapError> {
+        mem.map(KUSD_BASE, PAGE, Perm::R)?;
+        self.kusd_ready = true;
+        let mut w = |off: u64, bytes: &[u8]| {
+            let _ = mem.poke(KUSD_BASE + off, bytes);
+        };
+        w(0x004, &0x0FA0_0000u32.to_le_bytes()); // TickCountMultiplier
+        // SystemTime / InterruptTime (KSYSTEM_TIME: Low, High1, High2), fixed and
+        // consistent with GetSystemTimeAsFileTime's FIXED_FILETIME.
+        let (lo, hi) = (FIXED_FILETIME as u32, (FIXED_FILETIME >> 32) as u32);
+        for base in [0x008u64, 0x014] {
+            w(base, &lo.to_le_bytes());
+            w(base + 4, &hi.to_le_bytes());
+            w(base + 8, &hi.to_le_bytes());
+        }
+        // NtSystemRoot (WCHAR[260]) at 0x030.
+        let root: Vec<u8> =
+            "C:\\Windows".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        w(0x030, &root);
+        w(0x260, &19041u32.to_le_bytes()); // NtBuildNumber
+        w(0x264, &1u32.to_le_bytes()); // NtProductType = NtProductWinNt
+        w(0x268, &1u32.to_le_bytes()); // ProductTypeIsValid
+        w(0x26C, &10u32.to_le_bytes()); // NtMajorVersion
+        w(0x270, &0u32.to_le_bytes()); // NtMinorVersion
+        // KdDebuggerEnabled (0x2D4) stays 0: no kernel debugger.
+        Ok(())
+    }
+
+    /// The deterministic filesystem path reported for a module handle: the
+    /// process image for NULL/self, otherwise a System32 path from the resolved
+    /// module's name.
+    fn module_path(&self, hmod: u64) -> String {
+        if hmod == 0 || hmod == self.image_base {
+            "C:\\program.exe".to_string()
+        } else if let Some(name) = self.handle_names.get(&hmod) {
+            format!("C:\\Windows\\System32\\{name}")
+        } else {
+            "C:\\program.exe".to_string()
+        }
+    }
+
+    /// Shared body of `GetModuleFileNameA/W`: copy the module path (truncated to
+    /// `nsize` chars, always NUL-terminated) and return the char count written.
+    fn get_module_filename(
+        &self,
+        hmod: u64,
+        dst: u64,
+        nsize: u64,
+        wide: bool,
+        mem: &mut Memory,
+    ) -> Dispatch {
+        let nsize = nsize as u32 as usize;
+        if dst == 0 || nsize == 0 {
+            return Dispatch::Ret(0);
+        }
+        let path = self.module_path(hmod);
+        let elem = if wide { 2 } else { 1 };
+        // Characters of the path (ANSI bytes or UTF-16 units), then a NUL.
+        let units: Vec<u64> = if wide {
+            path.encode_utf16().map(u64::from).collect()
+        } else {
+            path.bytes().map(u64::from).collect()
+        };
+        // Copy at most nsize-1 chars, then a NUL terminator (Win10 semantics).
+        let copy = units.len().min(nsize - 1);
+        for (i, &u) in units.iter().take(copy).enumerate() {
+            if mem.write_uint(dst + (i * elem) as u64, elem, u).is_err() {
+                return Dispatch::Stop;
+            }
+        }
+        if mem.write_uint(dst + (copy * elem) as u64, elem, 0).is_err() {
+            return Dispatch::Stop;
+        }
+        Dispatch::Ret(copy as u64)
+    }
+
+    /// Bump-allocate a buffer and write `bytes` into it; returns the base VA, or
+    /// `None` if the map/write fails.
+    fn write_buf(&mut self, mem: &mut Memory, bytes: &[u8]) -> Option<u64> {
+        let va = self.alloc(mem, bytes.len() as u64);
+        if va == 0 || mem.poke(va, bytes).is_err() {
+            return None;
+        }
+        Some(va)
     }
 
     /// Resolve `name` to an HMODULE, mapping a readable module image behind it.
@@ -294,7 +426,17 @@ impl WinApiHook {
         *self.procs.entry(key).or_insert(PROC_BASE + n * 8)
     }
 
-    fn dispatch(&mut self, dll: &str, func: &str, cpu: &Cpu, mem: &mut Memory) -> Dispatch {
+    /// Read 0-based argument `i`: the first four from registers, `i >= 4` from
+    /// the guest stack starting at `sab` (the 5th argument's slot).
+    fn stack_arg(cpu: &Cpu, mem: &Memory, sab: u64, i: usize) -> Option<u64> {
+        if i < 4 {
+            Some(cpu.regs[ARG[i]])
+        } else {
+            mem.read_uint(sab + (i as u64 - 4) * 8, 8).ok()
+        }
+    }
+
+    fn dispatch(&mut self, dll: &str, func: &str, cpu: &Cpu, mem: &mut Memory, sab: u64) -> Dispatch {
         match (dll.to_lowercase().as_str(), func) {
             // ---- Memory ------------------------------------------------------
             // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
@@ -305,7 +447,48 @@ impl WinApiHook {
             // HeapAlloc(hHeap, dwFlags, dwBytes) — pages are already zeroed.
             (_, "HeapAlloc") => {
                 let size = Self::arg(cpu, 2);
-                Dispatch::Ret(self.alloc(mem, size))
+                let va = self.alloc(mem, size);
+                if va != 0 {
+                    self.heap_sizes.insert(va, size);
+                }
+                Dispatch::Ret(va)
+            }
+            // HeapReAlloc(hHeap, dwFlags, lpMem, dwBytes): a fresh block with the
+            // old contents copied in (the bump allocator never grows in place).
+            (_, "HeapReAlloc") => {
+                let old_ptr = Self::arg(cpu, 2);
+                let size = Self::arg(cpu, 3);
+                if old_ptr == 0 {
+                    let va = self.alloc(mem, size);
+                    if va != 0 {
+                        self.heap_sizes.insert(va, size);
+                    }
+                    return Dispatch::Ret(va);
+                }
+                let Some(&old_size) = self.heap_sizes.get(&old_ptr) else {
+                    return Dispatch::Stop; // unknown block: cannot copy soundly
+                };
+                let va = self.alloc(mem, size);
+                if va == 0 {
+                    return Dispatch::Ret(0);
+                }
+                let copy = old_size.min(size);
+                for i in 0..copy {
+                    let Ok(b) = mem.read_uint(old_ptr + i, 1) else {
+                        return Dispatch::Stop;
+                    };
+                    if mem.write_uint(va + i, 1, b).is_err() {
+                        return Dispatch::Stop;
+                    }
+                }
+                self.heap_sizes.insert(va, size);
+                Dispatch::Ret(va)
+            }
+            // HeapSize(hHeap, dwFlags, lpMem) -> SIZE_T: the recorded block size,
+            // or (SIZE_T)-1 for a block we did not allocate.
+            (_, "HeapSize") => {
+                let p = Self::arg(cpu, 2);
+                Dispatch::Ret(self.heap_sizes.get(&p).copied().unwrap_or(u64::MAX))
             }
             // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect):
             // report success; write a plausible old protection if asked. We do
@@ -320,6 +503,18 @@ impl WinApiHook {
             // Frees are a no-op in the bump model; report success.
             (_, "VirtualFree" | "HeapFree") => Dispatch::Ret(1),
             (_, "GetProcessHeap") => Dispatch::Ret(PROCESS_HEAP),
+            // HeapCreate(flOptions, dwInitialSize, dwMaximumSize) -> HANDLE: mint
+            // a distinct non-null heap sentinel (HeapAlloc ignores the heap arg
+            // and bump-allocates real guest pages regardless).
+            (_, "HeapCreate") => {
+                let h = self.heap_next;
+                self.heap_next += PAGE;
+                Dispatch::Ret(h)
+            }
+            (_, "HeapDestroy") => Dispatch::Ret(1),
+            // HeapSetInformation(...) -> BOOL: policy hint (e.g. enable LFH); a
+            // no-op success that does not change the bump allocator's behaviour.
+            (_, "HeapSetInformation") => Dispatch::Ret(1),
 
             // ---- Loader ------------------------------------------------------
             (_, "GetModuleHandleA" | "LoadLibraryA") => {
@@ -375,6 +570,359 @@ impl WinApiHook {
                 }
                 Dispatch::Void
             }
+            // GetProcessAffinityMask(h, *proc, *sys) -> BOOL: a single-processor
+            // system (both masks = 1).
+            (_, "GetProcessAffinityMask") => {
+                let p_proc = Self::arg(cpu, 1);
+                let p_sys = Self::arg(cpu, 2);
+                if (p_proc != 0 && mem.write_uint(p_proc, 8, 1).is_err())
+                    || (p_sys != 0 && mem.write_uint(p_sys, 8, 1).is_err())
+                {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+
+            // SetThreadAffinityMask(h, mask) -> previous mask (non-zero success).
+            (_, "SetThreadAffinityMask") => Dispatch::Ret(1),
+            // Scheduling yields are no-ops in deterministic single-threaded time.
+            (_, "Sleep") => Dispatch::Void,
+            (_, "SleepEx" | "SwitchToThread") => Dispatch::Ret(0),
+
+            // ---- Process / thread identity ----------------------------------
+            // Pseudo-handles (current process = -1, current thread = -2) and the
+            // fixed in-model ids, kept consistent with the NT info queries.
+            (_, "GetCurrentProcess") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFF),
+            (_, "GetCurrentThread") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFE),
+            (_, "GetCurrentProcessId") => Dispatch::Ret(crate::ntdll::FAKE_PID),
+            (_, "GetCurrentThreadId") => Dispatch::Ret(crate::ntdll::FAKE_TID),
+
+            // Fixed monotonic clocks: a constant reading makes any elapsed-time
+            // anti-debug delta zero (the no-debugger-present path). Deterministic.
+            (_, "GetTickCount") => Dispatch::Ret(FIXED_TICK),
+            (_, "GetTickCount64") => Dispatch::Ret(FIXED_TICK),
+            // QueryPerformanceCounter(*lpPerformanceCount) -> BOOL; fixed counter.
+            (_, "QueryPerformanceCounter") => {
+                let p = Self::arg(cpu, 0);
+                if p != 0 && mem.write_uint(p, 8, FIXED_QPC).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+            // QueryPerformanceFrequency(*lpFrequency) -> BOOL; fixed 10 MHz.
+            (_, "QueryPerformanceFrequency") => {
+                let p = Self::arg(cpu, 0);
+                if p != 0 && mem.write_uint(p, 8, 10_000_000).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+
+            // ---- Code-page conversion ---------------------------------------
+            // WideCharToMultiByte(cp, flags, lpWide, cchWide, lpMB, cbMB,
+            //   lpDefaultChar, lpUsedDefaultChar). UTF-8 (65001) converts exactly;
+            // any other code page is treated as Latin-1 (identity for 0x00-0xFF,
+            // default char '?' above) — deterministic and faithful for the ASCII
+            // the CRT startup converts. cch<0 = NUL-terminated (terminator and
+            // its count included); cb==0 = return the required byte count.
+            (_, "WideCharToMultiByte") => {
+                let cp = Self::arg(cpu, 0);
+                let src = Self::arg(cpu, 2);
+                let cch = Self::arg(cpu, 3) as u32 as i32;
+                let (Some(dst), Some(cb), Some(p_used)) = (
+                    Self::stack_arg(cpu, mem, sab, 4),
+                    Self::stack_arg(cpu, mem, sab, 5),
+                    Self::stack_arg(cpu, mem, sab, 7),
+                ) else {
+                    return Dispatch::Stop;
+                };
+                let cb = u64::from(cb as u32); // cbMultiByte is a 32-bit int
+                let Some(units) = read_wide_units(mem, src, cch) else {
+                    return Dispatch::Stop;
+                };
+                let (bytes, used_default) = wide_to_mb(cp, &units);
+                let need = bytes.len() as u64;
+                if cb != 0 {
+                    if need > cb {
+                        return Dispatch::Ret(0); // insufficient buffer
+                    }
+                    if mem.write(dst, &bytes).is_err() {
+                        return Dispatch::Stop;
+                    }
+                }
+                if p_used != 0 && mem.write_uint(p_used, 4, u64::from(used_default)).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(need)
+            }
+            // MultiByteToWideChar(cp, flags, lpMB, cbMB, lpWide, cchWide).
+            (_, "MultiByteToWideChar") => {
+                let cp = Self::arg(cpu, 0);
+                let src = Self::arg(cpu, 2);
+                let cb = Self::arg(cpu, 3) as u32 as i32;
+                let (Some(dst), Some(cch)) =
+                    (Self::stack_arg(cpu, mem, sab, 4), Self::stack_arg(cpu, mem, sab, 5))
+                else {
+                    return Dispatch::Stop;
+                };
+                let cch = u64::from(cch as u32); // cchWideChar is a 32-bit int
+                let Some(bytes) = read_mb_bytes(mem, src, cb) else {
+                    return Dispatch::Stop;
+                };
+                let units = mb_to_wide(cp, &bytes);
+                let need = units.len() as u64;
+                if cch != 0 {
+                    if need > cch {
+                        return Dispatch::Ret(0);
+                    }
+                    for (i, u) in units.iter().enumerate() {
+                        if mem.write_uint(dst + (i as u64) * 2, 2, u64::from(*u)).is_err() {
+                            return Dispatch::Stop;
+                        }
+                    }
+                }
+                Dispatch::Ret(need)
+            }
+
+            // GetStringTypeW(dwInfoType, lpSrcStr, cchSrc, lpCharType) -> BOOL:
+            // one WORD of character-type flags per source char. Only CT_CTYPE1
+            // (type 1) is modeled; other info types fail closed. cchSrc<0 =
+            // NUL-terminated (terminator not classified).
+            (_, "GetStringTypeW") => {
+                if Self::arg(cpu, 0) != 1 {
+                    return Dispatch::Stop; // only CT_CTYPE1 modeled
+                }
+                let src = Self::arg(cpu, 1);
+                let cch = Self::arg(cpu, 2) as u32 as i32;
+                let p_out = Self::arg(cpu, 3);
+                let Some(mut units) = read_wide_units(mem, src, cch) else {
+                    return Dispatch::Stop;
+                };
+                if cch < 0 {
+                    units.pop(); // drop the terminator
+                }
+                for (i, u) in units.iter().enumerate() {
+                    if mem.write_uint(p_out + (i as u64) * 2, 2, u64::from(ctype1(*u))).is_err() {
+                        return Dispatch::Stop;
+                    }
+                }
+                Dispatch::Ret(1)
+            }
+
+            // LCMapStringW(Locale, dwMapFlags, lpSrc, cchSrc, lpDest, cchDest).
+            // Only simple case mapping (LCMAP_UPPERCASE/LOWERCASE) is modeled;
+            // sort keys and other locale transforms fail closed. cchSrc<0 =
+            // NUL-terminated; cchDest==0 = return the required length.
+            (_, "LCMapStringW") => {
+                const LCMAP_LOWERCASE: u64 = 0x0100;
+                const LCMAP_UPPERCASE: u64 = 0x0200;
+                let flags = Self::arg(cpu, 1);
+                let src = Self::arg(cpu, 2);
+                let cch = Self::arg(cpu, 3) as u32 as i32;
+                let (Some(dst), Some(cch_dest)) =
+                    (Self::stack_arg(cpu, mem, sab, 4), Self::stack_arg(cpu, mem, sab, 5))
+                else {
+                    return Dispatch::Stop;
+                };
+                let cch_dest = u64::from(cch_dest as u32);
+                let upper = flags & LCMAP_UPPERCASE != 0;
+                if !upper && flags & LCMAP_LOWERCASE == 0 {
+                    return Dispatch::Stop; // only case mapping modeled
+                }
+                let Some(units) = read_wide_units(mem, src, cch) else {
+                    return Dispatch::Stop;
+                };
+                let mapped: Vec<u16> = units.iter().map(|&u| map_case(u, upper)).collect();
+                let need = mapped.len() as u64;
+                if cch_dest != 0 {
+                    if need > cch_dest {
+                        return Dispatch::Ret(0);
+                    }
+                    for (i, u) in mapped.iter().enumerate() {
+                        if mem.write_uint(dst + (i as u64) * 2, 2, u64::from(*u)).is_err() {
+                            return Dispatch::Stop;
+                        }
+                    }
+                }
+                Dispatch::Ret(need)
+            }
+
+            // EncodePointer/DecodePointer: a mutually-inverse transform over a
+            // per-process cookie. We own both sides, so a fixed-cookie XOR is a
+            // sound, deterministic involution (Decode(Encode(p)) == p); the exact
+            // encoded bits are never observed outside this pair.
+            (_, "EncodePointer" | "DecodePointer") => {
+                Dispatch::Ret(Self::arg(cpu, 0) ^ POINTER_COOKIE)
+            }
+
+            // ---- Process environment ----------------------------------------
+            // A deterministic command line, materialized once into guest memory;
+            // the same pointer is returned on repeat calls. Fail closed if the
+            // backing buffer cannot be mapped.
+            (_, "GetCommandLineA") => {
+                if self.cmdline_a == 0 {
+                    let mut bytes = CMDLINE.as_bytes().to_vec();
+                    bytes.push(0);
+                    match self.write_buf(mem, &bytes) {
+                        Some(va) => self.cmdline_a = va,
+                        None => return Dispatch::Stop,
+                    }
+                }
+                Dispatch::Ret(self.cmdline_a)
+            }
+            (_, "GetCommandLineW") => {
+                if self.cmdline_w == 0 {
+                    let mut bytes: Vec<u8> =
+                        CMDLINE.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    bytes.extend_from_slice(&[0, 0]);
+                    match self.write_buf(mem, &bytes) {
+                        Some(va) => self.cmdline_w = va,
+                        None => return Dispatch::Stop,
+                    }
+                }
+                Dispatch::Ret(self.cmdline_w)
+            }
+
+            // An empty (double-NUL-terminated) environment block: a legal,
+            // deterministic environment with no variables. Freed as a no-op.
+            (_, "GetEnvironmentStringsW") => {
+                if self.env_w == 0 {
+                    match self.write_buf(mem, &[0, 0, 0, 0]) {
+                        Some(va) => self.env_w = va,
+                        None => return Dispatch::Stop,
+                    }
+                }
+                Dispatch::Ret(self.env_w)
+            }
+            (_, "GetEnvironmentStrings" | "GetEnvironmentStringsA") => {
+                if self.env_a == 0 {
+                    match self.write_buf(mem, &[0, 0]) {
+                        Some(va) => self.env_a = va,
+                        None => return Dispatch::Stop,
+                    }
+                }
+                Dispatch::Ret(self.env_a)
+            }
+            (_, "FreeEnvironmentStringsW" | "FreeEnvironmentStringsA") => Dispatch::Ret(1),
+            // GetModuleFileNameA/W(hModule, lpFilename, nSize) -> DWORD: a
+            // deterministic module path (the process image for NULL/self, a
+            // System32 path for a resolved module). Truncates to nSize (the copy
+            // is always NUL-terminated); returns the char count written.
+            (_, "GetModuleFileNameA") => {
+                self.get_module_filename(Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), false, mem)
+            }
+            (_, "GetModuleFileNameW") => {
+                self.get_module_filename(Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), true, mem)
+            }
+            // GetStdHandle(nStdHandle) -> HANDLE: deterministic per-stream
+            // sentinel (-10/-11/-12 => in/out/err); any other id is invalid.
+            (_, "GetStdHandle") => {
+                let h = match Self::arg(cpu, 0) as u32 as i32 {
+                    -10 => STDHANDLE_BASE,
+                    -11 => STDHANDLE_BASE + 4,
+                    -12 => STDHANDLE_BASE + 8,
+                    _ => 0xFFFF_FFFF_FFFF_FFFF, // INVALID_HANDLE_VALUE
+                };
+                Dispatch::Ret(h)
+            }
+            // Fixed locale code pages: ANSI = Windows-1252, OEM = 437; every
+            // code page the sample asks about is reported valid.
+            (_, "GetACP") => Dispatch::Ret(1252),
+            (_, "GetOEMCP") => Dispatch::Ret(437),
+            (_, "IsValidCodePage") => Dispatch::Ret(1),
+            // GetCPInfo(CodePage, lpCPInfo) -> BOOL. CPINFO is 18 bytes:
+            // MaxCharSize (u32), DefaultChar[2], LeadByte[12]. Our modeled code
+            // pages are single-byte (UTF-8 reports MaxCharSize 4); no DBCS lead
+            // bytes, default char '?'.
+            (_, "GetCPInfo") => {
+                let cp = Self::arg(cpu, 0);
+                let p = Self::arg(cpu, 1);
+                let mut info = [0u8; 18];
+                let max = if cp == CP_UTF8 { 4u32 } else { 1 };
+                info[0..4].copy_from_slice(&max.to_le_bytes());
+                info[4] = b'?'; // DefaultChar[0]
+                if p != 0 && mem.write(p, &info).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+
+            // Thread last-error, stored in-model (Get returns what Set stored).
+            (_, "GetLastError") => Dispatch::Ret(self.last_error),
+            (_, "SetLastError") => {
+                self.last_error = Self::arg(cpu, 0) & 0xFFFF_FFFF;
+                Dispatch::Void
+            }
+            // SetHandleCount(uNumber) -> UINT: a legacy no-op that returns its
+            // argument unchanged.
+            (_, "SetHandleCount") => Dispatch::Ret(Self::arg(cpu, 0)),
+            // GetFileType(hFile) -> DWORD: the std sentinels are character
+            // devices (FILE_TYPE_CHAR = 2); anything else is FILE_TYPE_UNKNOWN.
+            (_, "GetFileType") => {
+                let h = Self::arg(cpu, 0);
+                let ty = if (STDHANDLE_BASE..STDHANDLE_BASE + 0x10).contains(&h) { 2 } else { 0 };
+                Dispatch::Ret(ty)
+            }
+            // GetStartupInfoA/W(lpStartupInfo) -> void: a fresh process's startup
+            // info is all-zero (dwFlags clear => the CRT uses GetStdHandle, no
+            // inherited handle table in lpReserved2). STARTUPINFO is 104 bytes on
+            // x64 (same size for A/W — only the string-pointer type differs).
+            (_, "GetStartupInfoA" | "GetStartupInfoW") => {
+                let p = Self::arg(cpu, 0);
+                if p != 0 && mem.write(p, &[0u8; 104]).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Void
+            }
+
+            // ---- Fiber / thread local storage -------------------------------
+            // Backed by real slot maps so Get returns what Set stored; indices
+            // are allocated monotonically (1-based). FLS callbacks are ignored
+            // (no fiber teardown in this run).
+            (_, "FlsAlloc") => {
+                let idx = self.fls_next;
+                self.fls_next += 1;
+                self.fls_slots.insert(idx, 0);
+                Dispatch::Ret(idx)
+            }
+            (_, "FlsSetValue") => {
+                self.fls_slots.insert(Self::arg(cpu, 0), Self::arg(cpu, 1));
+                Dispatch::Ret(1)
+            }
+            (_, "FlsGetValue") => {
+                Dispatch::Ret(self.fls_slots.get(&Self::arg(cpu, 0)).copied().unwrap_or(0))
+            }
+            (_, "FlsFree") => {
+                self.fls_slots.remove(&Self::arg(cpu, 0));
+                Dispatch::Ret(1)
+            }
+            (_, "TlsAlloc") => {
+                let idx = self.tls_next;
+                self.tls_next += 1;
+                self.tls_slots.insert(idx, 0);
+                Dispatch::Ret(idx)
+            }
+            (_, "TlsSetValue") => {
+                self.tls_slots.insert(Self::arg(cpu, 0), Self::arg(cpu, 1));
+                Dispatch::Ret(1)
+            }
+            (_, "TlsGetValue") => {
+                Dispatch::Ret(self.tls_slots.get(&Self::arg(cpu, 0)).copied().unwrap_or(0))
+            }
+            (_, "TlsFree") => {
+                self.tls_slots.remove(&Self::arg(cpu, 0));
+                Dispatch::Ret(1)
+            }
+
+            // ---- Critical sections ------------------------------------------
+            // Single-threaded, deterministic run: every lock is uncontended, so
+            // the whole family is a faithful no-op. Init variants return BOOL ok;
+            // enter/leave/delete are void; try-enter always acquires.
+            (_, "InitializeCriticalSectionAndSpinCount" | "InitializeCriticalSectionEx"
+                | "TryEnterCriticalSection") => Dispatch::Ret(1),
+            (_, "InitializeCriticalSection" | "EnterCriticalSection" | "LeaveCriticalSection"
+                | "DeleteCriticalSection") => Dispatch::Void,
+
             (_, "IsDebuggerPresent") => Dispatch::Ret(0),
             // CheckRemoteDebuggerPresent(hProcess, pbDebuggerPresent) -> BOOL ok
             (_, "CheckRemoteDebuggerPresent") => {
@@ -392,7 +940,16 @@ impl WinApiHook {
 }
 
 impl Hook for WinApiHook {
-    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
+    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+        // The fixed KUSER_SHARED_DATA page is provided by the OS at a constant
+        // address; map it in-model on first touch (on_mem runs before the read,
+        // so the faulting access then succeeds).
+        if !self.kusd_ready
+            && (KUSD_BASE..KUSD_BASE + PAGE).contains(&ev.addr)
+            && self.map_kuser_shared_data(mem).is_err()
+        {
+            return HookAction::Stop;
+        }
         if ev.access == Access::Read && !self.export_watches.is_empty() {
             self.note_export_read(ev.addr);
         }
@@ -434,6 +991,60 @@ fn is_nt_syscall(func: &str) -> bool {
     func.starts_with("Nt") || func.starts_with("Zw")
 }
 
+/// Whether a resolved import is a networking API that the contained, air-gapped
+/// emulator must refuse outright (belt-and-suspenders over the no-FFI design).
+///
+/// Matched by MODULE (the sockets/HTTP/DNS/TLS DLLs) or by FUNCTION-name pattern
+/// (the Winsock, WinINet, WinHTTP, DNS and URL-download surfaces), so a network
+/// call is un-serviceable regardless of which DLL happens to export it.
+fn is_network_api(module: &str, func: &str) -> bool {
+    const NET_MODULES: &[&str] = &[
+        "ws2_32.dll",
+        "wsock32.dll",
+        "mswsock.dll",
+        "wininet.dll",
+        "winhttp.dll",
+        "dnsapi.dll",
+        "iphlpapi.dll",
+        "urlmon.dll",
+        "ncrypt.dll",
+        "schannel.dll",
+        "secur32.dll",
+        "sspicli.dll",
+        "wsdapi.dll",
+    ];
+    if NET_MODULES.contains(&module.to_lowercase().as_str()) {
+        return true;
+    }
+    // Function-name prefixes covering the Winsock/HTTP/DNS/URL surfaces.
+    const NET_PREFIXES: &[&str] =
+        &["WSA", "Internet", "WinHttp", "Dns", "URLDownload", "HttpOpen", "HttpSend", "gethostby"];
+    if NET_PREFIXES.iter().any(|p| func.starts_with(p)) {
+        return true;
+    }
+    // Exact Winsock verbs (plain BSD-socket names that carry no distinctive prefix).
+    const NET_EXACT: &[&str] = &[
+        "socket",
+        "connect",
+        "send",
+        "sendto",
+        "recv",
+        "recvfrom",
+        "bind",
+        "listen",
+        "accept",
+        "closesocket",
+        "shutdown",
+        "getaddrinfo",
+        "GetAddrInfoW",
+        "freeaddrinfo",
+        "getnameinfo",
+        "select",
+        "ioctlsocket",
+    ];
+    NET_EXACT.contains(&func)
+}
+
 impl WinApiHook {
     /// Dispatch a Win32 API by `(dll, func)` and return into the guest.
     fn dispatch_win32(
@@ -444,7 +1055,16 @@ impl WinApiHook {
         cpu: &mut Cpu,
         mem: &mut Memory,
     ) -> HookAction {
-        match self.dispatch(dll, func, cpu, mem) {
+        // CONTAINMENT: a hard, un-bypassable network denylist, checked BEFORE any
+        // API modeling. These are untrusted real-world samples; no networking API
+        // is ever serviceable. A resolved network import stops the run (reason:
+        // "network access blocked: <module>!<func> — contained, air-gapped").
+        // This only guards; nothing here can reach the host (no FFI/syscall path).
+        if is_network_api(dll, func) {
+            return HookAction::Stop;
+        }
+        let sab = Self::stack_arg_base(ev, cpu);
+        match self.dispatch(dll, func, cpu, mem, sab) {
             Dispatch::Stop => HookAction::Stop,
             Dispatch::Ret(v) => {
                 cpu.regs[RAX] = v;
@@ -776,6 +1396,178 @@ fn read_cstr(mem: &Memory, mut addr: u64) -> Option<String> {
     None
 }
 
+/// Windows UTF-8 code page.
+const CP_UTF8: u64 = 65001;
+/// Bound on a single conversion's element count (guards a bogus length).
+const CONV_MAX: usize = 0x10_0000;
+
+/// Read the UTF-16 input for a code-page conversion. `cch < 0` means the source
+/// is NUL-terminated and the terminating `0x0000` is included in the result
+/// (so its byte/char count is counted); otherwise read exactly `cch` units.
+fn read_wide_units(mem: &Memory, addr: u64, cch: i32) -> Option<Vec<u16>> {
+    let mut units = Vec::new();
+    if cch < 0 {
+        let mut a = addr;
+        for _ in 0..CONV_MAX {
+            let u = mem.read_uint(a, 2).ok()? as u16;
+            units.push(u);
+            if u == 0 {
+                return Some(units);
+            }
+            a = a.wrapping_add(2);
+        }
+        None
+    } else {
+        let n = cch as usize;
+        if n > CONV_MAX {
+            return None;
+        }
+        for i in 0..n {
+            units.push(mem.read_uint(addr + (i as u64) * 2, 2).ok()? as u16);
+        }
+        Some(units)
+    }
+}
+
+/// Read the multi-byte input for a code-page conversion (`cb < 0` = NUL-terminated,
+/// terminator included).
+fn read_mb_bytes(mem: &Memory, addr: u64, cb: i32) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if cb < 0 {
+        let mut a = addr;
+        for _ in 0..CONV_MAX {
+            let b = mem.read_uint(a, 1).ok()? as u8;
+            bytes.push(b);
+            if b == 0 {
+                return Some(bytes);
+            }
+            a = a.wrapping_add(1);
+        }
+        None
+    } else {
+        let n = cb as usize;
+        if n > CONV_MAX {
+            return None;
+        }
+        for i in 0..n {
+            bytes.push(mem.read_uint(addr + i as u64, 1).ok()? as u8);
+        }
+        Some(bytes)
+    }
+}
+
+/// UTF-16 -> multi-byte. UTF-8 converts exactly (lossy-substituting unpaired
+/// surrogates); any other code page is Latin-1 (identity 0x00-0xFF, `?` above,
+/// flagging the default-char substitution).
+fn wide_to_mb(code_page: u64, units: &[u16]) -> (Vec<u8>, bool) {
+    if code_page == CP_UTF8 {
+        (String::from_utf16_lossy(units).into_bytes(), false)
+    } else {
+        let mut out = Vec::with_capacity(units.len());
+        let mut used_default = false;
+        for &u in units {
+            if u <= 0xFF {
+                out.push(u as u8);
+            } else {
+                out.push(b'?');
+                used_default = true;
+            }
+        }
+        (out, used_default)
+    }
+}
+
+/// Multi-byte -> UTF-16, the inverse of [`wide_to_mb`].
+fn mb_to_wide(code_page: u64, bytes: &[u8]) -> Vec<u16> {
+    if code_page == CP_UTF8 {
+        String::from_utf8_lossy(bytes).encode_utf16().collect()
+    } else {
+        bytes.iter().map(|&b| u16::from(b)).collect()
+    }
+}
+
+/// Simple (1:1) case mapping of one UTF-16 code unit, as `LCMapStringW` with
+/// `LCMAP_UPPERCASE`/`LCMAP_LOWERCASE` performs for the common case. A unit whose Unicode
+/// case expansion is not a single BMP scalar is left unchanged (sound: no
+/// length change, exact for ASCII/Latin).
+fn map_case(u: u16, upper: bool) -> u16 {
+    let Some(ch) = char::from_u32(u32::from(u)) else {
+        return u;
+    };
+    let mapped: Vec<char> =
+        if upper { ch.to_uppercase().collect() } else { ch.to_lowercase().collect() };
+    match mapped.as_slice() {
+        [c] if (*c as u32) <= 0xFFFF => *c as u16,
+        _ => u,
+    }
+}
+
+/// `CT_CTYPE1` character-type flags for one UTF-16 code unit (`GetStringTypeW`).
+/// The ASCII range is classified exactly; other BMP scalars use Rust's Unicode
+/// properties (deterministic best effort).
+fn ctype1(u: u16) -> u16 {
+    const UPPER: u16 = 0x0001;
+    const LOWER: u16 = 0x0002;
+    const DIGIT: u16 = 0x0004;
+    const SPACE: u16 = 0x0008;
+    const PUNCT: u16 = 0x0010;
+    const CNTRL: u16 = 0x0020;
+    const BLANK: u16 = 0x0040;
+    const XDIGIT: u16 = 0x0080;
+    const ALPHA: u16 = 0x0100;
+    let Some(ch) = char::from_u32(u32::from(u)) else {
+        return 0;
+    };
+    let mut t = 0u16;
+    if ch.is_ascii() {
+        let b = u as u8;
+        if ch.is_ascii_uppercase() {
+            t |= UPPER | ALPHA;
+        }
+        if ch.is_ascii_lowercase() {
+            t |= LOWER | ALPHA;
+        }
+        if ch.is_ascii_digit() {
+            t |= DIGIT;
+        }
+        if ch.is_ascii_hexdigit() {
+            t |= XDIGIT;
+        }
+        if matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+            t |= SPACE;
+        }
+        if matches!(b, b' ' | b'\t') {
+            t |= BLANK;
+        }
+        if ch.is_ascii_punctuation() {
+            t |= PUNCT;
+        }
+        if ch.is_ascii_control() {
+            t |= CNTRL;
+        }
+    } else {
+        if ch.is_alphabetic() {
+            t |= ALPHA;
+            if ch.is_uppercase() {
+                t |= UPPER;
+            }
+            if ch.is_lowercase() {
+                t |= LOWER;
+            }
+        }
+        if ch.is_numeric() {
+            t |= DIGIT;
+        }
+        if ch.is_whitespace() {
+            t |= SPACE;
+        }
+        if ch.is_control() {
+            t |= CNTRL;
+        }
+    }
+    t
+}
+
 /// Read a NUL-terminated UTF-16LE string from guest memory (bounded).
 fn read_wstr(mem: &Memory, mut addr: u64) -> Option<String> {
     let mut units = Vec::new();
@@ -894,6 +1686,202 @@ mod tests {
         let export_dir =
             HMODULE_BASE + mem.read_uint(HMODULE_BASE + e_lfanew + 24 + 112, 4).unwrap();
         assert_eq!(mem.read_uint(export_dir + 0x14, 4).unwrap(), 0);
+    }
+
+    const T_STACK: u64 = 0x0000_0010_0000_0000;
+    const T_DATA: u64 = 0x0000_0020_0000_0000;
+
+    fn harness() -> (WinApiHook, Cpu, Memory, u64) {
+        let mut mem = Memory::new();
+        mem.map(T_STACK, 0x8000, Perm::RW).unwrap();
+        mem.map(T_DATA, 0x8000, Perm::RW).unwrap();
+        let mut cpu = Cpu::new(0);
+        cpu.regs[RSP] = T_STACK + 0x4000;
+        let sab = cpu.regs[RSP] + 0x20; // Call convention
+        (WinApiHook::new(BTreeMap::new()), cpu, mem, sab)
+    }
+
+    fn set_args(cpu: &mut Cpu, args: [u64; 4]) {
+        for (i, &v) in args.iter().enumerate() {
+            cpu.regs[ARG[i]] = v;
+        }
+    }
+
+    fn ret_of(d: Dispatch) -> u64 {
+        match d {
+            Dispatch::Ret(v) => v,
+            Dispatch::Void => panic!("expected Ret, got Void"),
+            Dispatch::Stop => panic!("expected Ret, got Stop"),
+        }
+    }
+
+    #[test]
+    fn current_ids_match_nt_info_values() {
+        let (mut h, cpu, mut mem, s) = harness();
+        assert_eq!(
+            ret_of(h.dispatch("kernel32.dll", "GetCurrentProcessId", &cpu, &mut mem, s)),
+            crate::ntdll::FAKE_PID
+        );
+        assert_eq!(
+            ret_of(h.dispatch("kernel32.dll", "GetCurrentThreadId", &cpu, &mut mem, s)),
+            crate::ntdll::FAKE_TID
+        );
+        assert_eq!(
+            ret_of(h.dispatch("kernel32.dll", "GetCurrentProcess", &cpu, &mut mem, s)),
+            0xFFFF_FFFF_FFFF_FFFF
+        );
+    }
+
+    #[test]
+    fn encode_decode_pointer_is_an_involution() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let p = 0x1234_5678_9abc_def0;
+        set_args(&mut cpu, [p, 0, 0, 0]);
+        let enc = ret_of(h.dispatch("kernel32.dll", "EncodePointer", &cpu, &mut mem, s));
+        assert_ne!(enc, p);
+        set_args(&mut cpu, [enc, 0, 0, 0]);
+        let dec = ret_of(h.dispatch("kernel32.dll", "DecodePointer", &cpu, &mut mem, s));
+        assert_eq!(dec, p, "Decode(Encode(p)) == p");
+    }
+
+    #[test]
+    fn fls_tls_get_returns_set() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let idx = ret_of(h.dispatch("kernel32.dll", "FlsAlloc", &cpu, &mut mem, s));
+        set_args(&mut cpu, [idx, 0xCAFE, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "FlsSetValue", &cpu, &mut mem, s)), 1);
+        set_args(&mut cpu, [idx, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "FlsGetValue", &cpu, &mut mem, s)), 0xCAFE);
+    }
+
+    #[test]
+    fn widechar_multibyte_roundtrips_and_sizes() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        // Wide "Hi\0" at T_DATA.
+        for (i, u) in [u16::from(b'H'), u16::from(b'i'), 0].iter().enumerate() {
+            mem.write_uint(T_DATA + (i as u64) * 2, 2, u64::from(*u)).unwrap();
+        }
+        let dst = T_DATA + 0x100;
+        // cch = -1 (NUL-terminated); cb = 0 => sizing.
+        set_args(&mut cpu, [0, 0, T_DATA, u64::from(u32::MAX)]);
+        mem.write_uint(s, 8, dst).unwrap(); // arg5 lpMultiByteStr
+        mem.write_uint(s + 8, 8, 0).unwrap(); // arg6 cbMultiByte = 0 (size)
+        mem.write_uint(s + 24, 8, 0).unwrap(); // arg8 lpUsedDefaultChar
+        assert_eq!(ret_of(h.dispatch("k", "WideCharToMultiByte", &cpu, &mut mem, s)), 3);
+        // Now with a real buffer.
+        mem.write_uint(s + 8, 8, 0x100).unwrap();
+        assert_eq!(ret_of(h.dispatch("k", "WideCharToMultiByte", &cpu, &mut mem, s)), 3);
+        assert_eq!(&mem_bytes(&mem, dst, 3), b"Hi\0");
+        // Round-trip back to wide.
+        let wout = T_DATA + 0x200;
+        set_args(&mut cpu, [0, 0, dst, u64::from(u32::MAX)]);
+        mem.write_uint(s, 8, wout).unwrap();
+        mem.write_uint(s + 8, 8, 0x80).unwrap();
+        assert_eq!(ret_of(h.dispatch("k", "MultiByteToWideChar", &cpu, &mut mem, s)), 3);
+        assert_eq!(mem.read_uint(wout, 2).unwrap(), u64::from(b'H'));
+    }
+
+    fn mem_bytes(mem: &Memory, addr: u64, n: usize) -> Vec<u8> {
+        (0..n).map(|i| mem.read_uint(addr + i as u64, 1).unwrap() as u8).collect()
+    }
+
+    #[test]
+    fn string_type_classifies_and_fails_closed() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        for (i, u) in [u16::from(b'A'), u16::from(b'5'), 0].iter().enumerate() {
+            mem.write_uint(T_DATA + (i as u64) * 2, 2, u64::from(*u)).unwrap();
+        }
+        let out = T_DATA + 0x100;
+        set_args(&mut cpu, [1, T_DATA, u64::from(u32::MAX), out]); // CT_CTYPE1, NUL-term
+        assert_eq!(ret_of(h.dispatch("k", "GetStringTypeW", &cpu, &mut mem, s)), 1);
+        assert_ne!(mem.read_uint(out, 2).unwrap() & 0x0100, 0, "'A' is C1_ALPHA");
+        assert_ne!(mem.read_uint(out + 2, 2).unwrap() & 0x0004, 0, "'5' is C1_DIGIT");
+        // Unsupported info type fails closed.
+        set_args(&mut cpu, [2, T_DATA, u64::from(u32::MAX), out]);
+        assert!(matches!(
+            h.dispatch("k", "GetStringTypeW", &cpu, &mut mem, s),
+            Dispatch::Stop
+        ));
+    }
+
+    #[test]
+    fn lcmap_uppercases_and_fails_closed_on_sortkey() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        for (i, u) in [u16::from(b'a'), u16::from(b'b'), 0].iter().enumerate() {
+            mem.write_uint(T_DATA + (i as u64) * 2, 2, u64::from(*u)).unwrap();
+        }
+        let out = T_DATA + 0x100;
+        set_args(&mut cpu, [0, 0x200 /*UPPERCASE*/, T_DATA, u64::from(u32::MAX)]);
+        mem.write_uint(s, 8, out).unwrap();
+        mem.write_uint(s + 8, 8, 0x80).unwrap();
+        assert_eq!(ret_of(h.dispatch("k", "LCMapStringW", &cpu, &mut mem, s)), 3);
+        assert_eq!(mem.read_uint(out, 2).unwrap(), u64::from(b'A'));
+        // Sort key (no case flag) is not modeled: fail closed.
+        set_args(&mut cpu, [0, 0x400 /*SORTKEY*/, T_DATA, u64::from(u32::MAX)]);
+        assert!(matches!(h.dispatch("k", "LCMapStringW", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn heap_size_tracks_allocations() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        set_args(&mut cpu, [0, 0, 0x30, 0]); // HeapAlloc(,,0x30)
+        let va = ret_of(h.dispatch("k", "HeapAlloc", &cpu, &mut mem, s));
+        assert_ne!(va, 0);
+        set_args(&mut cpu, [0, 0, va, 0]);
+        assert_eq!(ret_of(h.dispatch("k", "HeapSize", &cpu, &mut mem, s)), 0x30);
+        set_args(&mut cpu, [0, 0, 0xdead_0000, 0]); // unknown block
+        assert_eq!(ret_of(h.dispatch("k", "HeapSize", &cpu, &mut mem, s)), u64::MAX);
+    }
+
+    #[test]
+    fn kuser_shared_data_is_populated() {
+        let (mut h, _cpu, mut mem, _s) = harness();
+        h.map_kuser_shared_data(&mut mem).expect("maps");
+        assert_eq!(mem.read_uint(KUSD_BASE + 0x030, 2).unwrap(), u64::from(b'C'), "NtSystemRoot");
+        assert_eq!(mem.read_uint(KUSD_BASE + 0x26C, 4).unwrap(), 10, "NtMajorVersion");
+        assert!(mem.perm_at(KUSD_BASE).is_some(), "page mapped");
+    }
+
+    #[test]
+    fn module_filename_writes_path_and_length() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let dst = T_DATA + 0x100;
+        set_args(&mut cpu, [0, dst, 0x100, 0]); // hModule=NULL, nSize large
+        let n = ret_of(h.dispatch("k", "GetModuleFileNameW", &cpu, &mut mem, s));
+        assert_eq!(n, "C:\\program.exe".encode_utf16().count() as u64);
+        assert_eq!(mem.read_uint(dst + n * 2, 2).unwrap(), 0, "NUL-terminated");
+        // Truncation: nSize = 4 => 3 chars + NUL, returns 3.
+        set_args(&mut cpu, [0, dst, 4, 0]);
+        assert_eq!(ret_of(h.dispatch("k", "GetModuleFileNameW", &cpu, &mut mem, s)), 3);
+    }
+
+    #[test]
+    fn network_apis_are_denied_before_modeling() {
+        // Module- and function-name matching both trip the denylist.
+        assert!(is_network_api("ws2_32.dll", "connect"));
+        assert!(is_network_api("WININET.dll", "InternetOpenA"));
+        assert!(is_network_api("ntdll.dll", "WSASocketW")); // by function pattern
+        assert!(is_network_api("winhttp.dll", "WinHttpConnect"));
+        assert!(!is_network_api("kernel32.dll", "GetProcAddress"));
+        assert!(!is_network_api("kernel32.dll", "HeapAlloc"));
+
+        // A resolved network stub stops the run at the Win32 dispatch chokepoint,
+        // before any modeling — and nothing touches the host (in-model only).
+        let (mut h, mut cpu, mut mem, _s) = harness();
+        let ev = FlowEvent { kind: FlowKind::Call, from: 0, to: 0, next: 0 };
+        assert!(
+            matches!(
+                h.dispatch_win32("ws2_32.dll", "connect", &ev, &mut cpu, &mut mem),
+                HookAction::Stop
+            ),
+            "network access blocked"
+        );
+    }
+
+    #[test]
+    fn unmodeled_api_stops() {
+        let (mut h, cpu, mut mem, s) = harness();
+        assert!(matches!(h.dispatch("k", "NoSuchApi", &cpu, &mut mem, s), Dispatch::Stop));
     }
 
     /// An ordinal-imported export lands at `functions[ordinal - 1]` so a walk's
