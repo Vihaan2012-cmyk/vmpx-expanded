@@ -432,6 +432,50 @@ impl Expr {
         intrinsics
     }
 
+    /// True if `register` occurs anywhere except inside the arguments of an
+    /// intrinsic for which `opaque` holds.
+    pub(crate) fn register_outside_intrinsic_args<'a>(
+        &'a self,
+        register: &str,
+        opaque: impl Fn(&str) -> bool,
+    ) -> bool {
+        let mut seen: HashSet<*const Node> = HashSet::new();
+        let mut pending = vec![self];
+        while let Some(expression) = pending.pop() {
+            let mut push = |child: &'a ExprRef, pending: &mut Vec<&'a Self>| {
+                if seen.insert(child.address()) {
+                    pending.push(child.as_ref());
+                }
+            };
+            match &expression.kind {
+                ExprKind::Const { .. } => {}
+                ExprKind::Register { name } => {
+                    if name == register {
+                        return true;
+                    }
+                }
+                ExprKind::Unary { value, .. }
+                | ExprKind::Load { address: value }
+                | ExprKind::Extract { value, .. }
+                | ExprKind::Resize { value, .. } => push(value, &mut pending),
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Concat {
+                    high: left,
+                    low: right,
+                } => {
+                    push(right, &mut pending);
+                    push(left, &mut pending);
+                }
+                ExprKind::Intrinsic { name, arguments } => {
+                    if !opaque(name) {
+                        pending.extend(arguments);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Visits this expression and every distinct shared descendant once.
     pub(crate) fn walk_distinct<'a>(&'a self, visit: &mut impl FnMut(&'a Self)) {
         let mut seen: HashSet<*const Node> = HashSet::new();
