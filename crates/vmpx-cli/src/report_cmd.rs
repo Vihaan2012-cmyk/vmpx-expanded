@@ -319,6 +319,10 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
         entries.truncate(opts.sample);
     }
 
+    eprintln!(
+        "[report] {discovered} entries discovered; sweeping {}",
+        entries.len()
+    );
     let outcomes = recover_all(&pe, &entries, opts, None);
     let sweep = tally(&outcomes, discovered, sampled);
 
