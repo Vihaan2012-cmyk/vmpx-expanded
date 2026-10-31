@@ -31,6 +31,7 @@ use crate::loader::LoadedImage;
 use crate::memory::{Access, MapError, Memory, Perm};
 use crate::ntdll::{NtDispatch, NtState};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
+use crate::xplm::{Call as XCall, Dispatch as XDispatch, GuestMem, Xplm};
 
 // Win64 integer-argument registers (RCX, RDX, R8, R9) and RAX/RSP by index
 // into `Cpu::regs`.
@@ -156,6 +157,8 @@ pub struct WinApiHook {
     watch_span: (u64, u64),
     /// In-model NT object + memory state for the emulated ntdll syscall stubs.
     nt: NtState,
+    /// Recording host-SDK model; XPLM/XPWidgets imports route here (never forwarded).
+    xplm: Option<Rc<RefCell<Xplm>>>,
 }
 
 /// A read-watch over one module's `AddressOfFunctions` array. When the protector
@@ -223,6 +226,7 @@ impl WinApiHook {
             walk_recorded: BTreeSet::new(),
             export_stub_addrs: BTreeMap::new(),
             nt: NtState::new(),
+            xplm: None,
         }
     }
 
@@ -247,6 +251,13 @@ impl WinApiHook {
     ) -> Self {
         self.export_reference =
             reference.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        self
+    }
+
+    /// Route XPLM/XPWidgets imports to this recording model.
+    #[must_use]
+    pub fn with_xplm(mut self, xplm: Rc<RefCell<Xplm>>) -> Self {
+        self.xplm = Some(xplm);
         self
     }
 
@@ -1078,6 +1089,30 @@ impl Hook for WinApiHook {
     }
 }
 
+/// `Memory` as the XPLM model's guest-memory interface.
+struct MemAdapter<'a> {
+    mem: &'a mut Memory,
+    alloc_next: &'a mut u64,
+}
+
+impl GuestMem for MemAdapter<'_> {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        self.mem.read(addr, buf).is_ok()
+    }
+
+    fn write(&mut self, addr: u64, data: &[u8]) -> bool {
+        self.mem.write(addr, data).is_ok()
+    }
+
+    fn alloc(&mut self, len: usize) -> Option<u64> {
+        let va = *self.alloc_next;
+        let n = round_up((len as u64).max(1));
+        self.mem.map(va, n, Perm::RW).ok()?;
+        *self.alloc_next = va + n;
+        Some(va)
+    }
+}
+
 /// An ntdll export is a syscall stub when its name is an `Nt*`/`Zw*` pair.
 fn is_nt_syscall(func: &str) -> bool {
     func.starts_with("Nt") || func.starts_with("Zw")
@@ -1156,6 +1191,24 @@ impl WinApiHook {
             return HookAction::Stop;
         }
         let sab = Self::stack_arg_base(ev, cpu);
+        if let Some(x) = self.xplm.clone() {
+            let call = XCall {
+                args: [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)],
+                rsp: sab.wrapping_sub(0x28),
+            };
+            let mut gm = MemAdapter { mem, alloc_next: &mut self.alloc_next };
+            match x.borrow_mut().dispatch(dll, func, &call, &mut gm) {
+                XDispatch::NotXplm => {}
+                XDispatch::Unlisted => return HookAction::Stop,
+                XDispatch::Handled(r) => {
+                    cpu.regs[RAX] = r.rax;
+                    if let Some(v) = r.xmm0 {
+                        cpu.xmm[0] = u128::from(v);
+                    }
+                    return Self::resume(ev, cpu, mem);
+                }
+            }
+        }
         match self.dispatch(dll, func, cpu, mem, sab) {
             Dispatch::Stop => HookAction::Stop,
             Dispatch::Ret(v) => {

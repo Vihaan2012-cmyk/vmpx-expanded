@@ -34,6 +34,11 @@ const DEFAULT_STACK_SIZE: u64 = 256 * 1024;
 const RETURN_SENTINEL: u64 = 0x0000_0040_DEAD_0000;
 
 // TEB/PEB field offsets (x64).
+const TEB_STACK_BASE: u64 = 0x08;
+const TEB_STACK_LIMIT: u64 = 0x10;
+const TEB_SELF: u64 = 0x30;
+const TEB_PID: u64 = 0x40;
+const TEB_TID: u64 = 0x48;
 const TEB_PEB_PTR: u64 = 0x60;
 const PEB_BEING_DEBUGGED: u64 = 0x02;
 const PEB_IMAGE_BASE: u64 = 0x10;
@@ -204,6 +209,9 @@ pub fn load(pe: &PeImage, opts: &LoadOptions) -> Result<LoadedImage, LoadError> 
     let peb = TEB_REGION + 0x400;
     let ldr = TEB_REGION + 0x800;
     mem.map(teb, PAGE_SIZE, Perm::RW)?;
+    mem.poke(teb + TEB_SELF, &teb.to_le_bytes())?;
+    mem.poke(teb + TEB_PID, &0x1000u64.to_le_bytes())?;
+    mem.poke(teb + TEB_TID, &0x1004u64.to_le_bytes())?;
     mem.poke(teb + TEB_PEB_PTR, &peb.to_le_bytes())?;
     mem.poke(peb + PEB_BEING_DEBUGGED, &[0u8])?;
     mem.poke(peb + PEB_IMAGE_BASE, &image_base.to_le_bytes())?;
@@ -220,6 +228,8 @@ pub fn load(pe: &PeImage, opts: &LoadOptions) -> Result<LoadedImage, LoadError> 
     let stack_top = stack_base + stack_size;
     mem.map(stack_base, stack_size, Perm::RW)?;
     let initial_rsp = (stack_top - 0x200) & !0xF;
+    mem.poke(teb + TEB_STACK_BASE, &stack_top.to_le_bytes())?;
+    mem.poke(teb + TEB_STACK_LIMIT, &stack_base.to_le_bytes())?;
 
     Ok(LoadedImage {
         memory: mem,

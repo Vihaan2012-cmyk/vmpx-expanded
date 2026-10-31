@@ -26,8 +26,10 @@ use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
 use crate::loader::{LoadError, LoadOptions, load};
 use crate::memory::Memory;
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
-use crate::vm_observe::{VmObservations, VmObserveHook};
+use crate::vm_observe::{VmInstanceSpec, VmObservations, VmObserveHook};
 use crate::winapi::WinApiHook;
+use crate::xplm::{RecordedCallback, Xplm};
+use std::cell::RefCell;
 
 const DEFAULT_MAX_STEPS: u64 = 2_000_000;
 
@@ -49,8 +51,14 @@ pub struct DetonateOptions {
     pub capture_globals: Vec<(u64, usize)>,
     /// VM dispatcher VA to watch for a handler trace (enables VM observation).
     pub vm_dispatcher: Option<u64>,
+    /// Multi-instance VM observation: dispatchers keyed by RVA, resolved through
+    /// the load base. Takes precedence over `vm_dispatcher` when non-empty.
+    pub vm_instances: Vec<VmInstanceSpec>,
     /// Loop-head / recursion-entry VA whose back-edge visits are counted.
     pub vm_loop_head: Option<u64>,
+    /// Route XPLM/XPWidgets imports to the recording host-SDK model (never
+    /// forwarded anywhere); unmodeled XPLM calls stop the run.
+    pub xplm: bool,
     /// OFFLINE export reference `{ module -> [name|ordinal] }`: fills each
     /// resolved module's fake export table so a protector resolving imports by
     /// manually walking the export table finds them (and the walk is captured).
@@ -76,6 +84,8 @@ impl Default for DetonateOptions {
             capture_globals: Vec::new(),
             vm_dispatcher: None,
             vm_loop_head: None,
+            vm_instances: Vec::new(),
+            xplm: false,
             export_reference: BTreeMap::new(),
             dump: true,
             resolve_undefined_flags: true,
@@ -154,8 +164,23 @@ pub struct DetonationResult {
     pub stop: Stop,
     /// Retired instruction count.
     pub steps: usize,
+    /// Guest rip when the run ended.
+    pub rip: u64,
     /// VM-dispatcher observations, when a dispatcher/loop-head was configured.
     pub vm: Option<VmObservations>,
+    /// Recorded host-SDK activity, when `opts.xplm` was set.
+    pub xplm: Option<XplmSummary>,
+}
+
+/// What the recording host-SDK model captured during the run.
+#[derive(Clone, Debug, Default)]
+pub struct XplmSummary {
+    /// Callbacks the plugin registered, in registration order.
+    pub callbacks: Vec<RecordedCallback>,
+    /// Modeled-call counts by function name.
+    pub call_counts: BTreeMap<String, u64>,
+    /// XPLM imports hit with no stub: `(dll, func, count)`.
+    pub unlisted: Vec<(String, String, u64)>,
 }
 
 /// A hook that fans every event out to several inner hooks. `Stop` from any
@@ -230,15 +255,30 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     };
 
     // Import emulation + OEP detection share one ObservedFacts.
-    let winapi =
+    let mut winapi =
         WinApiHook::from_image(&img).with_export_reference(opts.export_reference.clone());
+    let xplm = opts.xplm.then(|| Rc::new(RefCell::new(Xplm::new())));
+    if let Some(x) = &xplm {
+        winapi = winapi.with_xplm(Rc::clone(x));
+    }
     let facts = winapi.facts();
     let oep = OepHook::wrapping(winapi, Rc::clone(&facts));
 
     // Fold in VM observation only when a dispatcher/loop-head is configured.
     let (hook, vm_handle): (Box<dyn Hook>, _) =
-        if opts.vm_dispatcher.is_some() || opts.vm_loop_head.is_some() {
-            let vm = VmObserveHook::new(opts.vm_dispatcher, opts.vm_loop_head);
+        if opts.vm_dispatcher.is_some()
+            || opts.vm_loop_head.is_some()
+            || !opts.vm_instances.is_empty()
+        {
+            let vm = if opts.vm_instances.is_empty() {
+                VmObserveHook::new(opts.vm_dispatcher, opts.vm_loop_head)
+            } else {
+                VmObserveHook::with_instances(
+                    image_base,
+                    opts.vm_instances.iter().copied(),
+                    opts.vm_loop_head,
+                )
+            };
             let handle = vm.observations();
             let multi = MultiHook { hooks: vec![Box::new(oep), Box::new(vm)] };
             (Box::new(multi), Some(handle))
@@ -277,9 +317,23 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
         h.borrow().clone()
     });
 
+    let xplm = xplm.map(|x| {
+        let x = x.borrow();
+        XplmSummary {
+            callbacks: x.callbacks().to_vec(),
+            call_counts: x.call_counts().clone(),
+            unlisted: x
+                .unlisted()
+                .into_iter()
+                .map(|((d, f), n)| (d.clone(), f.clone(), n))
+                .collect(),
+        }
+    });
+
     let dump = opts.dump.then(|| dump_image(&emu.mem, image_base));
 
-    Ok(DetonationResult { observed, dump, stop, steps, vm })
+    let rip = emu.cpu.rip;
+    Ok(DetonationResult { observed, dump, stop, steps, rip, vm, xplm })
 }
 
 #[cfg(test)]
@@ -329,6 +383,33 @@ mod tests {
         a.mov(qword_ptr(rax), rcx).unwrap(); // [0x20E0] = hinstDLL
         a.mov(rax, IMAGE_BASE + 0x20E8).unwrap();
         a.mov(qword_ptr(rax), rdx).unwrap(); // [0x20E8] = fdwReason
+        a.mov(rbx, OEP_TARGET).unwrap();
+        a.mov(qword_ptr(rbx), rbx).unwrap();
+        a.jmp(rbx).unwrap();
+        a.assemble(IMAGE_BASE + ENTRY_RVA).unwrap()
+    }
+
+    /// Reads the TEB/PEB the way a protector does and stores each result in a global:
+    /// `gs:[0x60]` (PEB), `gs:[eax=0x30]` (TEB self, 32-bit addressing), TEB
+    /// StackBase, PEB ImageBaseAddress, PEB->Ldr.
+    fn teb_peb_code() -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let store = |a: &mut CodeAssembler, slot: u64| {
+            a.mov(rbx, IMAGE_BASE + slot).unwrap();
+            a.mov(qword_ptr(rbx), rax).unwrap();
+        };
+        a.mov(rax, qword_ptr(0x60).gs()).unwrap();
+        store(&mut a, 0x2140);
+        a.mov(rdx, rax).unwrap(); // peb
+        a.mov(rax, qword_ptr(rdx + 0x10)).unwrap();
+        store(&mut a, 0x2148);
+        a.mov(rax, qword_ptr(rdx + 0x18)).unwrap();
+        store(&mut a, 0x2150);
+        a.mov(eax, 0x30).unwrap();
+        a.mov(rax, qword_ptr(eax).gs()).unwrap();
+        store(&mut a, 0x2158);
+        a.mov(rax, qword_ptr(rax + 8)).unwrap();
+        store(&mut a, 0x2160);
         a.mov(rbx, OEP_TARGET).unwrap();
         a.mov(qword_ptr(rbx), rbx).unwrap();
         a.jmp(rbx).unwrap();
@@ -477,22 +558,66 @@ mod tests {
         // VMPX_RESOLVE_UNDEF=0 reproduces the sound fail-closed stop; default on.
         let resolve_undefined_flags =
             std::env::var("VMPX_RESOLVE_UNDEF").map_or(true, |v| v != "0");
+        // VMPX_VM_DISPATCH_RVA=<hex>[:reg] observes one dispatcher (VIP reg default RDI).
+        let vm_instances = std::env::var("VMPX_VM_DISPATCH_RVA")
+            .ok()
+            .map(|v| {
+                let (rva, reg) = v.split_once(':').unwrap_or((&v, "rdi"));
+                let reg = match reg {
+                    "rsi" => iced_x86::Register::RSI,
+                    "rbx" => iced_x86::Register::RBX,
+                    _ => iced_x86::Register::RDI,
+                };
+                VmInstanceSpec {
+                    dispatcher_rva: u64::from_str_radix(rva.trim_start_matches("0x"), 16).unwrap(),
+                    instance: crate::vm_observe::VmInstance {
+                        id: 0,
+                        vip_reg: reg,
+                        bytecode_region: None,
+                    },
+                }
+            })
+            .into_iter()
+            .collect();
         let opts = DetonateOptions {
+            vm_instances,
             export_reference,
             max_steps,
             resolve_undefined_flags,
+            xplm: std::env::var("VMPX_XPLM").is_ok_and(|v| v == "1"),
             ..DetonateOptions::default()
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
         eprintln!(
-            "sample={path} resolve_undef={}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?}\n  oep={:?}\n  imports captured={}",
+            "sample={path} resolve_undef={}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?} rip={:#x}\n  oep={:?}\n  imports captured={}",
             opts.resolve_undefined_flags,
             opts.export_reference.len(),
             res.steps,
             res.stop,
+            res.rip,
             res.observed.oep,
             res.observed.imports.len(),
         );
+        if let Some(vm) = &res.vm {
+            eprintln!(
+                "  vm: handlers={} edges={} unattributed={} branch_targets={}",
+                vm.handlers.len(),
+                vm.edges.len(),
+                vm.unattributed,
+                vm.branch_targets.len()
+            );
+            for e in vm.edges.iter().take(20) {
+                eprintln!("    {e:?}");
+            }
+        }
+        if let Some(x) = &res.xplm {
+            eprintln!(
+                "  xplm: callbacks={} calls={:?} unlisted={:?}",
+                x.callbacks.len(),
+                x.call_counts,
+                x.unlisted
+            );
+        }
         for imp in res.observed.imports.iter().take(30) {
             eprintln!("    {} :: {:?}", imp.module, imp.symbol);
         }
@@ -519,6 +644,31 @@ mod tests {
         };
         assert_eq!(read(IMAGE_BASE + 0x20E0), IMAGE_BASE, "hinstDLL == image base");
         assert_eq!(read(IMAGE_BASE + 0x20E8), 1, "fdwReason == DLL_PROCESS_ATTACH");
+    }
+
+    #[test]
+    fn guest_reads_valid_teb_and_peb() {
+        let data = synth_pe_with_entry(&teb_peb_code());
+        let pe = PeImage::parse(&data).unwrap();
+        let slots = [0x2140u64, 0x2148, 0x2150, 0x2158, 0x2160];
+        let opts = DetonateOptions {
+            capture_globals: slots.iter().map(|s| (IMAGE_BASE + s, 8)).collect(),
+            ..DetonateOptions::default()
+        };
+        let res = detonate(&pe, &opts).expect("detonation starts");
+        assert_eq!(res.stop, Stop::Hook, "reached the OEP transfer, no fault");
+        let g = &res.observed.globals;
+        let read = |s: u64| -> u64 {
+            let b = &g.iter().find(|x| x.va == IMAGE_BASE + s).expect("captured").bytes;
+            u64::from_le_bytes(b[..8].try_into().unwrap())
+        };
+        let (peb, image_base, ldr, teb, stack_base) =
+            (read(0x2140), read(0x2148), read(0x2150), read(0x2158), read(0x2160));
+        assert_ne!(peb, 0, "gs:[0x60] is a non-null PEB");
+        assert_eq!(peb, teb + 0x400, "PEB hangs off the TEB the guest sees at gs:[0x30]");
+        assert_eq!(image_base, IMAGE_BASE, "PEB.ImageBaseAddress");
+        assert_ne!(ldr, 0, "PEB.Ldr");
+        assert_ne!(stack_base, 0, "TEB.StackBase");
     }
 
     #[test]
