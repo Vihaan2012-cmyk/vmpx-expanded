@@ -491,14 +491,25 @@ impl WinApiHook {
                 Dispatch::Ret(self.heap_sizes.get(&p).copied().unwrap_or(u64::MAX))
             }
             // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect):
-            // report success; write a plausible old protection if asked. We do
-            // not re-permission pages (allocations are already RW).
+            // honor the stub's own reprotect. A packer (e.g. UPX) flips the
+            // R-only image header page to RW to patch a few header bytes, then
+            // restores it; emulating this as a no-op left the write faulting.
+            // We apply exactly the requested R/W/X to the covered pages and
+            // report the real prior protection. An out-of-image protect over
+            // unmapped pages still fails (FALSE) — nothing is silently widened.
             (_, "VirtualProtect") => {
+                let addr = Self::arg(cpu, 0);
+                let size = Self::arg(cpu, 1);
+                let new_prot = Self::arg(cpu, 2);
                 let old_ptr = Self::arg(cpu, 3);
-                if old_ptr != 0 && mem.write_uint(old_ptr, 4, 0x40).is_err() {
+                let old = mem.perm_at(addr).map_or(PAGE_READONLY, perm_to_page);
+                if old_ptr != 0 && mem.write_uint(old_ptr, 4, u64::from(old)).is_err() {
                     return Dispatch::Stop;
                 }
-                Dispatch::Ret(1)
+                match mem.protect(addr, size, page_to_perm(new_prot)) {
+                    Ok(()) => Dispatch::Ret(1),
+                    Err(_) => Dispatch::Ret(0),
+                }
             }
             // Frees are a no-op in the bump model; report success.
             (_, "VirtualFree" | "HeapFree") => Dispatch::Ret(1),
@@ -1382,6 +1393,36 @@ fn plan_exports(exports: &[SymbolOrOrdinal]) -> Option<ExportPlan> {
     })
 }
 
+// Windows memory-protection constant we report as a page's prior protection.
+const PAGE_READONLY: u32 = 0x02;
+
+/// Map a Windows `PAGE_*` protection constant to a guest [`Perm`]. The low byte
+/// selects the base protection; GUARD/NOCACHE/WRITECOMBINE modifiers are
+/// ignored. Unknown/`PAGE_NOACCESS` map to no access.
+fn page_to_perm(flags: u64) -> Perm {
+    match flags & 0xff {
+        0x02 => Perm::R,          // PAGE_READONLY
+        0x04 | 0x08 => Perm::RW,  // PAGE_READWRITE / PAGE_WRITECOPY
+        0x10 => Perm::X,          // PAGE_EXECUTE
+        0x20 => Perm::RX,         // PAGE_EXECUTE_READ
+        0x40 | 0x80 => Perm::RWX, // PAGE_EXECUTE_READWRITE / _WRITECOPY
+        _ => Perm(0),             // PAGE_NOACCESS (0x01) / unknown
+    }
+}
+
+/// Map a guest [`Perm`] back to the nearest Windows `PAGE_*` constant, used to
+/// report `lpflOldProtect`.
+fn perm_to_page(perm: Perm) -> u32 {
+    match perm.0 & 7 {
+        1 => 0x02,         // R   -> PAGE_READONLY
+        2 | 3 => 0x04,     // W/RW -> PAGE_READWRITE
+        4 => 0x10,         // X   -> PAGE_EXECUTE
+        5 => 0x20,         // RX  -> PAGE_EXECUTE_READ
+        6 | 7 => 0x40,     // WX/RWX -> PAGE_EXECUTE_READWRITE
+        _ => 0x01,         // none -> PAGE_NOACCESS
+    }
+}
+
 /// Read a NUL-terminated ASCII/ANSI string from guest memory (bounded).
 fn read_cstr(mem: &Memory, mut addr: u64) -> Option<String> {
     let mut bytes = Vec::new();
@@ -1585,6 +1626,57 @@ fn read_wstr(mem: &Memory, mut addr: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest `VirtualProtect` flipping a mapped read-only page to RW is
+    /// honored: the subsequent write succeeds and the real prior protection is
+    /// reported, then a restoring call makes it read-only again. This is the
+    /// real-UPX case — the stub reprotects its own image-header page to patch a
+    /// byte, then restores it.
+    #[test]
+    fn virtual_protect_reprotects_a_mapped_page() {
+        const PAGE: u64 = 0x1_4000_0000;
+        let mut mem = Memory::new();
+        mem.map(PAGE, 0x1000, Perm::R).unwrap();
+        mem.map(PAGE + 0x1000, 0x1000, Perm::RW).unwrap(); // lpflOldProtect lives here
+        let old_ptr = PAGE + 0x1000;
+        // A write to the R-only page faults before the reprotect.
+        assert!(mem.write_uint(PAGE + 0x10, 1, 0xAB).is_err());
+
+        let mut hook = WinApiHook::new(BTreeMap::new());
+        let mut cpu = Cpu::new(0);
+        cpu.regs[ARG[0]] = PAGE; // lpAddress
+        cpu.regs[ARG[1]] = 0x1000; // dwSize
+        cpu.regs[ARG[2]] = 0x04; // flNewProtect = PAGE_READWRITE
+        cpu.regs[ARG[3]] = old_ptr;
+
+        let d = hook.dispatch("kernel32.dll", "VirtualProtect", &cpu, &mut mem, 0);
+        assert!(matches!(d, Dispatch::Ret(1)), "reports success");
+        assert_eq!(mem.read_uint(old_ptr, 4).unwrap(), 0x02, "old protection = PAGE_READONLY");
+        // The page is now writable: the patch the stub would make succeeds.
+        assert!(mem.write_uint(PAGE + 0x10, 1, 0xAB).is_ok());
+
+        // Restore the old protection: the page is read-only again.
+        cpu.regs[ARG[2]] = 0x02;
+        let d = hook.dispatch("kernel32.dll", "VirtualProtect", &cpu, &mut mem, 0);
+        assert!(matches!(d, Dispatch::Ret(1)));
+        assert!(mem.write_uint(PAGE + 0x10, 1, 0xCD).is_err(), "restored to read-only");
+    }
+
+    /// `VirtualProtect` over an unmapped range fails (FALSE) rather than
+    /// silently mapping memory: a wild protect never widens the model.
+    #[test]
+    fn virtual_protect_over_unmapped_fails() {
+        let mut mem = Memory::new();
+        let mut hook = WinApiHook::new(BTreeMap::new());
+        let mut cpu = Cpu::new(0);
+        cpu.regs[ARG[0]] = 0x1_4000_0000; // unmapped
+        cpu.regs[ARG[1]] = 0x1000;
+        cpu.regs[ARG[2]] = 0x40;
+        cpu.regs[ARG[3]] = 0;
+        let d = hook.dispatch("kernel32.dll", "VirtualProtect", &cpu, &mut mem, 0);
+        assert!(matches!(d, Dispatch::Ret(0)), "fails closed");
+        assert!(mem.perm_at(0x1_4000_0000).is_none(), "no page was created");
+    }
 
     /// Resolve `target` exactly as a protector's direct export walk does: parse
     /// DOS -> NT -> export directory, binary-search `AddressOfNames`, follow the

@@ -40,6 +40,8 @@ use crate::observe::ObservedFacts;
 
 const COFF_HEADER_SIZE: u64 = 20;
 const SECTION_HEADER_SIZE: u64 = 40;
+const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -136,7 +138,17 @@ impl Hook for OepHook {
     }
 
     fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
-        if self.facts.borrow().oep.is_none() && self.written.borrow().contains(&page_base(ev.to)) {
+        // Write-then-execute OEP: a transfer INTO a page written this run. The
+        // transfer must leave its own page — an unpacker hands control to a
+        // freshly-unpacked destination region, never a same-page branch. This
+        // excludes a stub that self-patches a byte in its own code page (e.g.
+        // UPX writes a `cld` into its TLS-dispatch stub) and then branches
+        // within it, which would otherwise read as a spurious OEP inside the
+        // packer stub rather than in the decompressed image.
+        if self.facts.borrow().oep.is_none()
+            && page_base(ev.from) != page_base(ev.to)
+            && self.written.borrow().contains(&page_base(ev.to))
+        {
             self.facts.borrow_mut().set_oep(ev.to);
             if self.stop_on_oep {
                 return HookAction::Stop;
@@ -237,10 +249,18 @@ pub enum RebuildModuleError {
     Validation(#[source] LoaderValidationError),
 }
 
-/// Observed in-memory permissions → PE section characteristics, preserving the
-/// section's content-type bits and replacing only R/W/X.
-fn perm_to_characteristics(base: u32, perm: Perm) -> u32 {
+/// Observed in-memory permissions → PE section characteristics, replacing the
+/// R/W/X bits. When `has_content`, the section also reclassifies as initialized
+/// data: an unpacker's decompression target (e.g. UPX marks `UPX0` as
+/// `CNT_UNINITIALIZED_DATA`) now holds real bytes, and the conventional
+/// relayout would otherwise emit a `CNT_UNINITIALIZED_DATA`/zero-`SizeOfRawData`
+/// section as zero pages, discarding the unpacked image.
+fn perm_to_characteristics(base: u32, perm: Perm, has_content: bool) -> u32 {
     let mut chars = base & !(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE);
+    if has_content {
+        chars &= !IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+        chars |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+    }
     if perm.contains(Perm::R) {
         chars |= IMAGE_SCN_MEM_READ;
     }
@@ -338,7 +358,13 @@ pub fn rebuild_module_pe(
                 let chars = dump
                     .region_containing(base + u64::from(va))
                     .map_or(section.characteristics, |region| {
-                        perm_to_characteristics(section.characteristics, region.perm)
+                        // Observed content means the section was written this
+                        // run (unpacked into), so it must be emitted as real
+                        // bytes rather than zero-fill.
+                        let has_content = dump
+                            .read(base + u64::from(va), raw_size as usize)
+                            .is_some_and(|b| b.iter().any(|&x| x != 0));
+                        perm_to_characteristics(section.characteristics, region.perm, has_content)
                     });
                 let header_offset = section_table + index as u64 * SECTION_HEADER_SIZE;
                 (header_offset, raw_size, va, chars)
