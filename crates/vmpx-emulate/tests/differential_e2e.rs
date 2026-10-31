@@ -1,6 +1,6 @@
 //! SP5 differential-execution harness checks against the real unitops.dll:
-//! same-function agreement, cross-function divergence, and that an unsupported
-//! instruction is surfaced as incomplete (never silently counted as agreement).
+//! same-function agreement, cross-function divergence, and that an incomplete
+//! run is surfaced as incomplete (never silently counted as agreement).
 
 use vmpx_emulate::{Limits, Outcome, Target, differential, input_set, run_function};
 use vmpx_pe::PeImage;
@@ -52,22 +52,23 @@ fn different_functions_diverge_at_specific_input() {
 }
 
 #[test]
-fn unsupported_instruction_is_incomplete_not_agreement() {
+fn incomplete_run_is_not_agreement() {
     let pe = pe();
-    // op_mul32 lowers to `imul`, which the interpreter does not model.
-    let mul: Target = "op_mul32".into();
-    let r = run_function(&pe, &mul, &[6, 7], &Limits::default()).expect("setup");
-    assert!(!r.completed(), "mul run must not complete: {:?}", r.stop);
+    // A run that stops before the sentinel (here: a loop starved by a tight step
+    // budget, which stands in for any early stop) must never count as agreement.
+    let loop_mul: Target = "op_loop_mul".into();
+    let tight = Limits { max_steps: 1, ..Limits::default() };
+    let r = run_function(&pe, &loop_mul, &[6, 7], &tight).expect("setup");
+    assert!(!r.completed(), "a 1-step budget cannot complete: {:?}", r.stop);
 
-    // A diff of an unmodeled function must report incomplete, never agreement.
     let inputs = input_set(2, 8, 1);
-    let report = differential(&pe, &mul, &pe, &mul, &inputs, &Limits::default()).expect("diff");
+    let report = differential(&pe, &loop_mul, &pe, &loop_mul, &inputs, &tight).expect("diff");
     assert_eq!(report.agreed, 0, "an incomplete run is never agreement");
     assert_eq!(report.incomplete, report.total);
     assert!(!report.all_agreed());
     let inc = report.first_incomplete.as_ref().expect("an incomplete");
     assert!(!inc.completed_a && !inc.completed_b);
-    eprintln!("unsupported surfaced: {} first_stop={:?}", report.summary(), inc.stop_a);
+    eprintln!("incomplete surfaced: {} first_stop={:?}", report.summary(), inc.stop_a);
 }
 
 #[test]
