@@ -50,6 +50,10 @@ impl ObservedMemory {
     }
 }
 
+/// A dispatch step of more than this many bytecode bytes is a real VM branch
+/// (straight-line handlers advance the VIP by a few bytes at a time).
+pub const FAR_BRANCH_DELTA: u64 = 0x100;
+
 /// Concrete VM branch targets observed on ONE detonation: a plain, crate-owned
 /// map from a branch SITE identity (the VM branch's VIP / bytecode address) to
 /// the concrete target VIP(s) the branch reached on that run. This is NOT a
@@ -80,9 +84,40 @@ impl ObservedBranchTargets {
         }
     }
 
+    /// Builds the seed from raw dynamic VIP->VIP dispatch edges `(from, to)`
+    /// (e.g. the emulate observer's `ObservedVmEdge`s). Only FAR edges —
+    /// `|to - from| > FAR_BRANCH_DELTA` — are real VM branches; the rest are
+    /// straight-line dispatch steps and are dropped. Targets are de-duplicated
+    /// and sorted per site. Evidence only: the edge set is a lower bound (only
+    /// branches actually executed on one run).
+    pub fn from_vip_edges(edges: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        let mut sites: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (from, to) in edges {
+            if from.abs_diff(to) > FAR_BRANCH_DELTA {
+                sites.entry(from).or_default().push(to);
+            }
+        }
+        for targets in sites.values_mut() {
+            targets.sort_unstable();
+            targets.dedup();
+        }
+        Self { sites }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sites.is_empty()
+    }
+
+    /// Branch site VIPs with at least one recorded target, ascending.
+    pub fn sites(&self) -> impl Iterator<Item = u64> + '_ {
+        self.sites.keys().copied()
+    }
+
+    /// Number of distinct branch sites with at least one observed target.
+    #[must_use]
+    pub fn site_count(&self) -> usize {
+        self.sites.len()
     }
 
     /// Observed concrete target VIP(s) for the branch at `site`, or an empty
@@ -292,6 +327,21 @@ pub(crate) mod tests {
         assert_eq!(observed.read_byte(0x1003), None); // past the slot
         assert_eq!(observed.read_byte(0x0FFF), None); // before the slot
         assert!(ObservedMemory::new().read_byte(0x1000).is_none());
+    }
+
+    #[test]
+    fn vip_edges_keep_only_far_branches_deduped_per_site() {
+        let observed = ObservedBranchTargets::from_vip_edges([
+            (0x1000_u64, 0x1004_u64), // straight-line step: dropped
+            (0x1004, 0x2000),         // far branch
+            (0x1004, 0x2000),         // duplicate
+            (0x1004, 0x0800),         // far, backwards
+            (0x3000, 0x3100),         // exactly at the threshold: not far
+        ]);
+        assert_eq!(observed.site_count(), 1);
+        assert_eq!(observed.targets_for(0x1004), &[0x0800, 0x2000]);
+        assert!(observed.targets_for(0x1000).is_empty());
+        assert!(observed.targets_for(0x3000).is_empty());
     }
 
     #[test]

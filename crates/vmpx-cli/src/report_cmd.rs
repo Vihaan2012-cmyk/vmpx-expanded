@@ -60,7 +60,8 @@ pub fn tier_of<'a>(assumptions: impl IntoIterator<Item = &'a VmCfgAssumption>) -
         let this = match a {
             VmCfgAssumption::ObservedGlobal
             | VmCfgAssumption::ObservedRecursionDepth
-            | VmCfgAssumption::ObservedBranchTarget => Tier::Observed,
+            | VmCfgAssumption::ObservedBranchTarget
+            | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => Tier::Observed,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
             | VmCfgAssumption::AssumesImageProtectionStable => Tier::UnprovenAssumption,
             VmCfgAssumption::PreferredImageBase

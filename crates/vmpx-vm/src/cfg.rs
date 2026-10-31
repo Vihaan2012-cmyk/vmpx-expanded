@@ -284,6 +284,13 @@ pub enum VmCfgAssumption {
     /// never turns a data address into code. EXPERIMENTAL and observed-tier:
     /// valid for that run/input only, never sound output.
     ObservedBranchTarget,
+    /// Companion to [`Self::ObservedBranchTarget`]: the walker treated the
+    /// dynamically observed target set of a stalled branch as ITS COMPLETE
+    /// successor set. Observation is a lower bound (only branches executed on
+    /// ONE run), so an unobserved arm is silently missing and the CFG is NOT
+    /// proven complete. Always present whenever an observed branch target was
+    /// followed; marks the result experimental-tier.
+    AssumesDynamicBranchTargetsComplete,
 }
 
 /// Observed back-edge trip counts per loop head, captured on ONE detonation: a
@@ -410,6 +417,33 @@ impl VmCfg {
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.stalls.is_empty() && self.limit_hit.is_none()
+    }
+
+    /// True when any observed-tier (single-detonation) evidence helped this
+    /// recovery. Such a CFG may be reported only on the experimental tier,
+    /// never as proven, even when `all_paths_reach_vm_exit` holds.
+    #[must_use]
+    pub fn used_observed_evidence(&self) -> bool {
+        self.assumptions.iter().any(|assumption| {
+            matches!(
+                assumption,
+                VmCfgAssumption::ObservedGlobal
+                    | VmCfgAssumption::ObservedRecursionDepth
+                    | VmCfgAssumption::ObservedBranchTarget
+                    | VmCfgAssumption::AssumesDynamicBranchTargetsComplete
+            )
+        })
+    }
+
+    /// Complete only thanks to observed branch targets: reaches a VM exit on
+    /// every walked path, but at least one branch was resolved from dynamic
+    /// evidence. The separately-counted experimental tier.
+    #[must_use]
+    pub fn complete_with_observed_branch_help(&self) -> bool {
+        self.all_paths_reach_vm_exit()
+            && self
+                .assumptions
+                .contains(&VmCfgAssumption::AssumesDynamicBranchTargetsComplete)
     }
 
     #[must_use]
@@ -684,12 +718,17 @@ fn followable_observed_targets(
     observed: &crate::ObservedBranchTargets,
     site: Va,
 ) -> Vec<Va> {
-    observed
-        .targets_for(site.get())
-        .iter()
-        .map(|&value| Va(value))
-        .filter(|&target| section.is_some() && bytecode_section(pe, target) == section)
-        .collect()
+    let targets = observed.targets_for(site.get());
+    // Ambiguous evidence (any target failing validation) is refused whole:
+    // following only the valid subset would guess which arm is real.
+    let all_valid = section.is_some()
+        && targets
+            .iter()
+            .all(|&value| bytecode_section(pe, Va(value)) == section);
+    if !all_valid {
+        return Vec::new();
+    }
+    targets.iter().map(|&value| Va(value)).collect()
 }
 
 const NESTED_ENTRY_CONFIDENCE: u8 = 60;
@@ -2487,7 +2526,7 @@ impl Walker<'_, '_> {
     ) -> bool {
         let targets =
             followable_observed_targets(self.pe, self.ctx_section(), self.observed_branch_targets, vip);
-        if targets.is_empty() {
+        if targets.is_empty() || targets.len() > self.limits.max_targets {
             return false;
         }
         let mut followed = false;
@@ -2510,6 +2549,9 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::ObservedBranchTarget);
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesDynamicBranchTargetsComplete);
         }
         followed
     }
@@ -3189,6 +3231,10 @@ mod tests {
         assert!(followable_observed_targets(&pe, section, &unmapped, site).is_empty());
         // No observation for this site: empty, so the caller keeps its stall.
         assert!(followable_observed_targets(&pe, section, &valid, Va(IMAGE_BASE + 0x7777)).is_empty());
+        // AMBIGUOUS evidence (one valid + one invalid target) is refused whole.
+        let mixed =
+            crate::ObservedBranchTargets::from_sites([(site.get(), vec![RDATA_VA, DATA_VA])]);
+        assert!(followable_observed_targets(&pe, section, &mixed, site).is_empty());
         // No entry bytecode section: nothing is followable.
         assert!(followable_observed_targets(&pe, None, &valid, site).is_empty());
         // Default/sound path: an empty seed yields nothing (fail-closed unchanged).

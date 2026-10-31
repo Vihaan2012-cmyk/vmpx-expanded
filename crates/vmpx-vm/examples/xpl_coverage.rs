@@ -22,9 +22,9 @@ use std::time::Instant;
 
 use vmpx_pe::PeImage;
 use vmpx_vm::{
-    BranchRefusalDiagnostic, EntryProfileRecoveryLimits, VmCfgAssumption, VmCfgLimits,
-    VmDiscoveryLimits, discover_vm_entries, recover_vm_cfg, set_branch_refusal_diagnostics,
-    take_branch_refusal_diagnostics,
+    BranchRefusalDiagnostic, EntryProfileRecoveryLimits, ObservedBranchTargets, ObservedRun,
+    VmCfgAssumption, VmCfgLimits, VmDiscoveryLimits, discover_vm_entries, recover_vm_cfg,
+    recover_vm_cfg_with_observed, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
 };
 
 const DEFAULT_IMAGE: &str = "E:/downloads/systems.original.xpl";
@@ -169,6 +169,99 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_
     }
 }
 
+fn parse_u64(token: &str) -> Option<u64> {
+    token
+        .strip_prefix("0x")
+        .map_or_else(|| token.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+}
+
+fn run_bridge_pass(
+    pe: &PeImage<'_>,
+    entries: &[vmpx_vm::VmEntryCandidate],
+    results: &[EntryResult],
+    path: &str,
+    instruction_limit: usize,
+) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let edges: Vec<(u64, u64)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            Some((parse_u64(it.next()?)?, parse_u64(it.next()?)?))
+        })
+        .collect();
+    let seed = ObservedBranchTargets::from_vip_edges(edges.iter().copied());
+    println!("\n==================== OBSERVED-BRIDGE PASS (EXPERIMENTAL) ====================");
+    println!(
+        "observed edges read: {}; far-jump branch sites kept: {}",
+        edges.len(),
+        seed.site_count()
+    );
+    let mut run = ObservedRun::default();
+    run.branch_targets = seed.clone();
+    let limits = VmCfgLimits {
+        entry: EntryProfileRecoveryLimits { instruction_limit, ..EntryProfileRecoveryLimits::default() },
+        ..VmCfgLimits::default()
+    };
+    let (mut retried, mut gained, mut still_stalled, mut errors) = (0usize, 0usize, 0usize, 0usize);
+    let (mut stalled_sites, mut sites_with_evidence, mut near_miss) = (0usize, 0usize, 0usize);
+    let seed_sites: Vec<u64> = seed.sites().collect();
+    let mut engaged = 0usize;
+    let mut keyed_reasons: Vec<String> = Vec::new();
+    let mut gained_rvas: Vec<u32> = Vec::new();
+    let hook = panic::take_hook();
+    panic::set_hook(Box::new(|_| {}));
+    for (entry, result) in entries.iter().zip(results) {
+        if !matches!(result.outcome, Outcome::Incomplete { .. }) {
+            continue;
+        }
+        retried += 1;
+        let cfg = panic::catch_unwind(AssertUnwindSafe(|| {
+            recover_vm_cfg_with_observed(pe, entry, limits, &run)
+        }));
+        match cfg {
+            Ok(Ok(cfg)) => {
+                for stall in &cfg.stalls {
+                    stalled_sites += 1;
+                    if !seed.targets_for(stall.vip.get()).is_empty() {
+                        sites_with_evidence += 1;
+                        if keyed_reasons.len() < 12 {
+                            keyed_reasons.push(format!("{:#x} {}", entry.rva.0, stall.reason));
+                        }
+                    } else if seed_sites.iter().any(|s| s.abs_diff(stall.vip.get()) <= 0x40) {
+                        near_miss += 1;
+                    }
+                }
+                if cfg.assumptions.contains(&VmCfgAssumption::ObservedBranchTarget) {
+                    engaged += 1;
+                }
+                if cfg.complete_with_observed_branch_help() {
+                    gained += 1;
+                    gained_rvas.push(entry.rva.0);
+                } else {
+                    still_stalled += 1;
+                }
+            }
+            _ => errors += 1,
+        }
+    }
+    panic::set_hook(hook);
+    println!("  re-walked non-complete entries                    : {retried}");
+    println!("  NEW complete-with-observed-help (EXPERIMENTAL tier): {gained}");
+    println!("  still not complete                                : {still_stalled}");
+    println!("  error/panic                                       : {errors}");
+    println!(
+        "  residual stalled sites: {stalled_sites}; of which keyed in observed evidence: {sites_with_evidence}; within 0x40 of an observed site but not exact (keying-offset suspects): {near_miss}"
+    );
+    println!("  entries where the bridge followed >=1 observed target   : {engaged}");
+    for r in &keyed_reasons {
+        println!("  keyed-but-unresolved: {r}");
+    }
+    let ex: Vec<String> = gained_rvas.iter().take(10).map(|r| format!("{r:#x}")).collect();
+    println!("  e.g. {}", ex.join(", "));
+    println!("  (observed-tier only: lower-bound evidence, NEVER added to the proven count)");
+}
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -285,6 +378,15 @@ fn main() {
     });
     panic::set_hook(prev_hook);
     let sweep_secs = ts.elapsed().as_secs_f64();
+
+    // ---------------- EXPERIMENTAL observed-branch bridge pass ----------------
+    // Only when VMPX_OBSERVED_EDGES names a file of dynamic VIP->VIP edges
+    // ("from to" per line, hex or decimal). Re-walks ONLY the non-complete
+    // entries seeded with the observed far-jump targets; the proven tier above
+    // is untouched. Observed-tier numbers are reported separately.
+    if let Ok(path) = std::env::var("VMPX_OBSERVED_EDGES") {
+        run_bridge_pass(&pe, &entries, &results, &path, instruction_limit);
+    }
 
     // Tally.
     let mut complete = 0usize;
@@ -684,7 +786,8 @@ fn main() {
                 let this = match x {
                     VmCfgAssumption::ObservedGlobal
                     | VmCfgAssumption::ObservedRecursionDepth
-                    | VmCfgAssumption::ObservedBranchTarget => "OBSERVED",
+                    | VmCfgAssumption::ObservedBranchTarget
+                    | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => "OBSERVED",
                     VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
                     | VmCfgAssumption::AssumesImageProtectionStable => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase

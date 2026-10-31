@@ -38,9 +38,10 @@ use vmpx_disasm::{decode_one, is_executable_rva};
 use vmpx_pe::{PeImage, Rva, Va};
 use vmpx_vm::{
     BitWidth, BlockExit, CfgEdgeKind, EntryPathRecoveryLimits, Expr, ExprKind, NativeExitState,
-    RecoveryStatus, VmCfgLimits, VmDiscoveryLimits, VmEntryReachability, VmEntrySource,
-    X64NativeRegister, analyze_vm_entry_at, discover_vm_entries, recover_bootstrap_dispatch,
-    recover_entry_paths, recover_vm_cfg,
+    ObservedBranchTargets, ObservedRun, RecoveryStatus, VmCfgAssumption, VmCfgLimits,
+    VmDiscoveryLimits, VmEntryReachability, VmEntrySource, X64NativeRegister,
+    analyze_vm_entry_at, discover_vm_entries, recover_bootstrap_dispatch, recover_entry_paths,
+    recover_vm_cfg, recover_vm_cfg_with_observed,
 };
 
 use synth_vm::SyntheticVm;
@@ -429,6 +430,80 @@ fn cfg_walk_stops_at_a_branch_target_it_cannot_prove() {
         stall.reason
     );
     assert!(!cfg.is_complete() && !cfg.all_paths_reach_vm_exit());
+}
+
+fn walk_cfg_observed(
+    vm: &SyntheticVm,
+    targets: ObservedBranchTargets,
+) -> vmpx_vm::VmCfg {
+    let pe = parse(vm);
+    let entry = entry_candidate(&pe);
+    let mut run = ObservedRun::default();
+    run.branch_targets = targets;
+    recover_vm_cfg_with_observed(&pe, &entry, VmCfgLimits::default(), &run)
+        .expect("cfg recovery starts")
+}
+
+/// The static/dynamic bridge: a computed branch the static walk stalls on
+/// continues using the dynamically observed target, labeled experimental.
+#[test]
+fn observed_branch_target_completes_a_stalled_computed_branch_as_experimental() {
+    let vm = synth_vm::build_branching();
+    let baseline = walk_cfg(&vm);
+    let [stall] = baseline.stalls.as_slice() else {
+        panic!("one stall expected: {baseline:#?}");
+    };
+    assert!(!baseline.used_observed_evidence());
+    let site = stall.vip.get();
+
+    // Matching observation: the observed edge (site -> block 1) is followed.
+    let cfg = walk_cfg_observed(
+        &vm,
+        ObservedBranchTargets::from_sites([(site, vec![vm.block_vas[1]])]),
+    );
+    assert!(cfg.stalls.is_empty(), "{cfg:#?}");
+    assert!(cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+    assert!(cfg.edges.iter().any(|edge| edge.to != cfg.entry));
+    assert!(cfg.used_observed_evidence());
+    assert!(cfg.complete_with_observed_branch_help());
+    assert!(cfg.assumptions.contains(&VmCfgAssumption::ObservedBranchTarget));
+    assert!(
+        cfg.assumptions
+            .contains(&VmCfgAssumption::AssumesDynamicBranchTargetsComplete)
+    );
+    // The seed is a lower bound: block 2 (the other arm) is not in the CFG.
+    assert_eq!(cfg.blocks.len(), 2, "{cfg:#?}");
+}
+
+#[test]
+fn observed_branch_target_that_does_not_match_keeps_the_stall() {
+    let vm = synth_vm::build_branching();
+    let baseline = walk_cfg(&vm);
+    let site = baseline.stalls[0].vip.get();
+    let off_image = 0x7777_0000_u64;
+
+    // Observation keyed to a DIFFERENT site: no help.
+    let other_site = walk_cfg_observed(
+        &vm,
+        ObservedBranchTargets::from_sites([(site + 0x40, vec![vm.block_vas[1]])]),
+    );
+    // Target that is not in-section bytecode: refused.
+    let bad_target = walk_cfg_observed(
+        &vm,
+        ObservedBranchTargets::from_sites([(site, vec![off_image])]),
+    );
+    // One valid + one invalid target is ambiguous: refused whole.
+    let ambiguous = walk_cfg_observed(
+        &vm,
+        ObservedBranchTargets::from_sites([(site, vec![vm.block_vas[1], off_image])]),
+    );
+    for cfg in [other_site, bad_target, ambiguous] {
+        assert!(!cfg.is_complete() && !cfg.all_paths_reach_vm_exit(), "{cfg:#?}");
+        assert!(cfg.stalls.iter().any(|s| s.reason.contains("unresolved branch target")));
+        assert!(cfg.edges.is_empty(), "no edge may be invented: {cfg:#?}");
+        assert!(!cfg.used_observed_evidence());
+        assert!(!cfg.complete_with_observed_branch_help());
+    }
 }
 
 #[test]
