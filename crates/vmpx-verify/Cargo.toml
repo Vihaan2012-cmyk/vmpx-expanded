@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 vmpx-mutation = { path = "../vmpx-mutation" }
 vmpx-vm = { path = "../vmpx-vm" }
+vmpx-vmlift = { path = "../vmpx-vmlift" }
 z3 = { version = "0.22", optional = true }
 
 [features]

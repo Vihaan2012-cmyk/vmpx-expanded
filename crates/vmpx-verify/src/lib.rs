@@ -1,10 +1,13 @@
 //! SP6 verification: the [`Scorer`] (differential input-testing, the workhorse)
 //! and the [`Gate`] (SMT equivalence, promotion to the sound tier). Two roles,
 //! never one: input-testing ranks + feeds the experimental tier; the Gate
-//! upgrades an eligible candidate to proven. Depends on `vmpx-mutation` only.
+//! upgrades an eligible candidate to proven. [`equiv`] is the per-function
+//! end-to-end gate (PROVEN / REFUTED / TIMEOUT) over whole exit states.
 
+pub mod equiv;
 pub mod input_testing;
 pub mod smt;
+pub mod smtlib;
 
 use vmpx_mutation::{Candidate, Score};
 use vmpx_vm::Expr;

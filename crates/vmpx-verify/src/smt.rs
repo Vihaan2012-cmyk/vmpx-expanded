@@ -217,7 +217,7 @@ mod z3_backend {
 }
 
 /// Substitutes every register and requires a constant result.
-fn fold(expr: &Expr, env: &BTreeMap<String, Expr>) -> Option<u64> {
+pub(crate) fn fold(expr: &Expr, env: &BTreeMap<String, Expr>) -> Option<u64> {
     match expr.substitute(env).ok()?.kind {
         ExprKind::Const { value } => Some(value),
         _ => None,
@@ -225,7 +225,7 @@ fn fold(expr: &Expr, env: &BTreeMap<String, Expr>) -> Option<u64> {
 }
 
 /// Register names with widths across both expressions; `None` on a width clash.
-fn free_registers<'a>(a: &'a Expr, b: &'a Expr) -> Option<BTreeMap<String, BitWidth>> {
+pub(crate) fn free_registers<'a>(a: &'a Expr, b: &'a Expr) -> Option<BTreeMap<String, BitWidth>> {
     let mut vars = BTreeMap::new();
     #[allow(clippy::mutable_key_type)] // hash/eq are pointer-based; the atomic is a cache flag
     let mut seen: HashSet<ExprRef> = HashSet::new();
@@ -275,7 +275,11 @@ mod tests {
 
     #[test]
     fn structural_identity_is_proven() {
-        let a = bin(BinaryOp::Add, reg("a", BitWidth::W64), reg("b", BitWidth::W64));
+        let a = bin(
+            BinaryOp::Add,
+            reg("a", BitWidth::W64),
+            reg("b", BitWidth::W64),
+        );
         assert_eq!(SmtGate.verify(&a, &a.clone()), Verdict::Proven);
     }
 
