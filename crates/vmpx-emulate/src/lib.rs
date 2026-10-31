@@ -61,7 +61,10 @@ mod vm_observe;
 mod winapi;
 
 pub use alu::{Alu, Flags, Shift};
-pub use detonate::{DetonateError, DetonateOptions, DetonationResult, detonate};
+pub use detonate::{
+    DetonateError, DetonateOptions, DetonationResult, detonate, export_reference_from_exports,
+    export_reference_from_imports,
+};
 pub use dump::{DumpImage, DumpRegion, OepHook, capture_globals, dump_image};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
 pub use differential::{

@@ -22,13 +22,13 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::cpu::Cpu;
-use crate::emu::{FlowEvent, FlowKind, Hook, HookAction};
+use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, MemEvent};
 use crate::loader::LoadedImage;
-use crate::memory::{MapError, Memory, Perm};
+use crate::memory::{Access, MapError, Memory, Perm};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 
 // Win64 integer-argument registers (RCX, RDX, R8, R9) and RAX/RSP by index
@@ -47,7 +47,20 @@ const PROCESS_HEAP: u64 = 0x0000_0070_FFFF_0000; // GetProcessHeap sentinel
 // Each minted HMODULE gets this much private address space; a faithful, readable
 // PE-header image is mapped there so the protector can walk the module it just
 // resolved (VMProtect dereferences GetModuleHandle results to parse headers).
-const MODULE_IMAGE_SIZE: u64 = 0x1_0000;
+// Sized to hold a full system-DLL export table (ntdll exports ~2.5k functions).
+const MODULE_IMAGE_SIZE: u64 = 0x8_0000;
+
+// Within a module image: the export directory + its name/ordinal/address arrays
+// and the name-string blob live in [EXPORT_RVA, STUB_REGION_RVA); each exported
+// function's address points into the stub region above it. The data-directory
+// export Size spans exactly the former range so a function RVA in the stub region
+// is read as a real address, never mistaken for a forwarder string.
+const EXPORT_RVA: u32 = 0x1000;
+const MODULE_NAME_RVA: u32 = 0x1100;
+const EXPORT_DATA_RVA: u32 = 0x1200; // arrays + name strings bump from here
+const STUB_REGION_RVA: u32 = 0x4_0000; // per-function fake addresses from here
+const STUB_STRIDE: u32 = 0x10;
+const EXPORT_DIR_SIZE: u32 = STUB_REGION_RVA - EXPORT_RVA;
 
 // Fixed FILETIME (100ns ticks) written by GetSystemTimeAsFileTime.
 const FIXED_FILETIME: u64 = 0x01D0_0000_0000_0000;
@@ -87,6 +100,48 @@ pub struct WinApiHook {
     name_handles: BTreeMap<String, u64>,
     /// (module, symbol) -> fake proc VA (stable across repeated lookups).
     procs: BTreeMap<(String, String), u64>,
+    /// Lowercase module name -> exports to publish in that module's fake export
+    /// table, from an OFFLINE reference (names are never invented). A module
+    /// with no entry here exports nothing (the original empty-directory shape).
+    export_reference: BTreeMap<String, Vec<SymbolOrOrdinal>>,
+    /// Read-watches over each populated export address table: a read of a slot
+    /// is the protector resolving that export via the direct walk.
+    export_watches: Vec<ExportWatch>,
+    /// (module, symbol-key) already recorded from the walk, to dedupe the
+    /// repeated reads a binary search performs.
+    walk_recorded: BTreeSet<(String, String)>,
+}
+
+/// A read-watch over one module's `AddressOfFunctions` array. When the protector
+/// reads a slot (to obtain a function RVA and compute its VA), we know which
+/// export it resolved and record it as an [`ObservedImport`].
+struct ExportWatch {
+    module: String,
+    /// VA of the `AddressOfFunctions` array.
+    functions_va: u64,
+    /// functions-array index -> the export published at that slot, when any.
+    slots: Vec<Option<ResolvedExport>>,
+}
+
+/// An export published at a functions-array slot and the fake VA the protector
+/// obtains when it reads that slot (`module_base + stub_rva`).
+struct ResolvedExport {
+    symbol: SymbolOrOrdinal,
+    va: u64,
+}
+
+/// Computed export-table layout returned by [`map_module_image`] so the hook can
+/// register the matching read-watch.
+struct ExportLayout {
+    functions_va: u64,
+    slots: Vec<Option<ResolvedExport>>,
+}
+
+fn symbol_key(symbol: &SymbolOrOrdinal) -> String {
+    match symbol {
+        SymbolOrOrdinal::Name(n) => n.clone(),
+        SymbolOrOrdinal::Ordinal(o) => format!("#{o}"),
+    }
 }
 
 impl WinApiHook {
@@ -101,6 +156,9 @@ impl WinApiHook {
             handle_names: BTreeMap::new(),
             name_handles: BTreeMap::new(),
             procs: BTreeMap::new(),
+            export_reference: BTreeMap::new(),
+            export_watches: Vec::new(),
+            walk_recorded: BTreeSet::new(),
         }
     }
 
@@ -111,6 +169,21 @@ impl WinApiHook {
         let mut h = Self::new(img.import_stubs.clone());
         h.image_base = img.image_base;
         h
+    }
+
+    /// Attach an OFFLINE export reference: `{ module -> [name|ordinal] }`. Each
+    /// resolved module's fake export directory is populated from its entry so a
+    /// protector that resolves imports by manually walking the export table
+    /// (a classic protector anti-hook) finds the functions it is looking for.
+    /// Keys are matched case-insensitively. Names come only from this reference.
+    #[must_use]
+    pub fn with_export_reference(
+        mut self,
+        reference: BTreeMap<String, Vec<SymbolOrOrdinal>>,
+    ) -> Self {
+        self.export_reference =
+            reference.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        self
     }
 
     /// Shared handle to the observations collected during the run. Clone it
@@ -158,13 +231,44 @@ impl WinApiHook {
             return h;
         }
         let h = self.hmodule_next;
-        if map_module_image(mem, h, &key).is_err() {
-            return 0;
+        let exports = self.export_reference.get(&key).cloned().unwrap_or_default();
+        match map_module_image(mem, h, &key, &exports) {
+            Ok(Some(layout)) => self.export_watches.push(ExportWatch {
+                module: key.clone(),
+                functions_va: layout.functions_va,
+                slots: layout.slots,
+            }),
+            Ok(None) => {}
+            Err(_) => return 0,
         }
         self.hmodule_next += MODULE_IMAGE_SIZE;
         self.name_handles.insert(key.clone(), h);
         self.handle_names.insert(h, key);
         h
+    }
+
+    /// A read landing in a watched `AddressOfFunctions` slot is the protector
+    /// resolving that export through the direct walk: record the function it
+    /// just obtained the address of (deduped across the binary search's reads).
+    fn note_export_read(&mut self, addr: u64) {
+        for watch in &self.export_watches {
+            if addr < watch.functions_va {
+                continue;
+            }
+            let idx = ((addr - watch.functions_va) / 4) as usize;
+            let Some(Some(export)) = watch.slots.get(idx) else {
+                continue;
+            };
+            let key = (watch.module.clone(), symbol_key(&export.symbol));
+            if self.walk_recorded.insert(key) {
+                self.facts.borrow_mut().record_import(
+                    export.va,
+                    watch.module.clone(),
+                    export.symbol.clone(),
+                );
+            }
+            return;
+        }
     }
 
     /// Deterministic fake proc VA for `(module, symbol)`.
@@ -272,6 +376,13 @@ impl WinApiHook {
 }
 
 impl Hook for WinApiHook {
+    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
+        if ev.access == Access::Read && !self.export_watches.is_empty() {
+            self.note_export_read(ev.addr);
+        }
+        HookAction::Continue
+    }
+
     fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         if !matches!(ev.kind, FlowKind::Call | FlowKind::Jmp) {
             return HookAction::Continue;
@@ -322,24 +433,41 @@ impl WinApiHook {
 }
 
 /// Map a readable, structurally faithful PE-header image for a resolved module
-/// at `base` and label its export directory with `name`.
+/// at `base`, label it `name`, and populate its export directory from the
+/// OFFLINE `exports` reference.
 ///
-/// This is the minimal shape the OS loader guarantees behind every HMODULE: a
-/// DOS stub (`MZ` + `e_lfanew`), NT headers (`PE\0\0`, a PE32+ optional header
-/// whose `ImageBase` is `base`), and a valid IMAGE_EXPORT_DIRECTORY. A module
-/// resolved here exports *nothing* — the directory is well-formed but empty.
-/// That is deliberate and sound: the module is faithfully present and its
-/// headers parse, but we do not fabricate export addresses we do not have. A
-/// protector that walks the table finds no entry and resolves NULL; any later
-/// use of that NULL faults and stops the run rather than proceeding on a guessed
-/// address. Everything is deterministic and self-contained (no host access).
-fn map_module_image(mem: &mut Memory, base: u64, name: &str) -> Result<(), MapError> {
+/// This is the shape the OS loader guarantees behind every HMODULE: a DOS stub
+/// (`MZ` + `e_lfanew`), NT headers (`PE\0\0`, a PE32+ optional header whose
+/// `ImageBase` is `base`), and a valid `IMAGE_EXPORT_DIRECTORY`. When `exports` is
+/// empty the directory is well-formed but empty (the module exports nothing);
+/// otherwise its name/ordinal/address tables are filled so a protector that
+/// resolves imports by manually walking the export table (parse DOS->NT->export
+/// dir->binary-search names) resolves each one.
+///
+/// Each exported function gets a deterministic fake address inside the module's
+/// own stub region (`base + STUB_REGION_RVA + index*STUB_STRIDE`); the export
+/// data-directory `Size` is set so those addresses sit *outside* it and are read
+/// as real addresses, not forwarder strings. Names come only from the reference
+/// — nothing is invented — and everything is self-contained (no host access).
+///
+/// Returns the [`ExportLayout`] (for the read-watch) when a populated table was
+/// written, `None` for the empty case, or [`MapError`] if the backing map fails.
+fn map_module_image(
+    mem: &mut Memory,
+    base: u64,
+    name: &str,
+    exports: &[SymbolOrOrdinal],
+) -> Result<Option<ExportLayout>, MapError> {
     const E_LFANEW: u32 = 0x40;
-    const EXPORT_RVA: u32 = 0x1000;
-    const NAME_RVA: u32 = 0x1100;
-    const EMPTY_ARR_RVA: u32 = 0x1200;
+    const EMPTY_ARR_RVA: u32 = EXPORT_DATA_RVA;
 
-    mem.map(base, MODULE_IMAGE_SIZE, Perm::R)?;
+    let plan = plan_exports(exports);
+    // Map only what this module needs (headers + any populated export table and
+    // stubs), rounded to a page and capped at the per-module stride. An empty
+    // module needs just its headers and the (empty) export directory.
+    let map_len = plan.as_ref().map_or(0x2000, |p| round_up(u64::from(p.image_end)));
+    let map_len = map_len.min(MODULE_IMAGE_SIZE);
+    mem.map(base, map_len, Perm::R)?;
     let mut w = |off: u64, bytes: &[u8]| {
         // Within a region we just mapped; poke ignores perms and only faults if
         // unmapped, which cannot happen here.
@@ -362,27 +490,195 @@ fn map_module_image(mem: &mut Memory, base: u64, name: &str) -> Result<(), MapEr
     let opt = nt + 24;
     w(opt, &0x20Bu16.to_le_bytes()); // Magic = PE32+
     w(opt + 24, &base.to_le_bytes()); // ImageBase
-    w(opt + 56, &(MODULE_IMAGE_SIZE as u32).to_le_bytes()); // SizeOfImage
+    w(opt + 56, &(map_len as u32).to_le_bytes()); // SizeOfImage
     w(opt + 108, &16u32.to_le_bytes()); // NumberOfRvaAndSizes
-    // Data directory[0] = export table.
-    w(opt + 112, &EXPORT_RVA.to_le_bytes());
-    w(opt + 116, &0x28u32.to_le_bytes()); // size (one IMAGE_EXPORT_DIRECTORY)
-
-    // IMAGE_EXPORT_DIRECTORY at EXPORT_RVA: well-formed, zero exports.
-    let exp = u64::from(EXPORT_RVA);
-    w(exp + 0x0C, &NAME_RVA.to_le_bytes()); // Name
-    w(exp + 0x10, &1u32.to_le_bytes()); // Base (ordinal base)
-    w(exp + 0x14, &0u32.to_le_bytes()); // NumberOfFunctions
-    w(exp + 0x18, &0u32.to_le_bytes()); // NumberOfNames
-    w(exp + 0x1C, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfFunctions
-    w(exp + 0x20, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNames
-    w(exp + 0x24, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNameOrdinals
 
     // Module name string (for a protector that reads the export Name field).
     let mut nm = name.as_bytes().to_vec();
     nm.push(0);
-    w(u64::from(NAME_RVA), &nm);
-    Ok(())
+    w(u64::from(MODULE_NAME_RVA), &nm);
+
+    let Some(plan) = plan else {
+        // Empty (or over-large): keep the well-formed, zero-export directory.
+        w(opt + 112, &EXPORT_RVA.to_le_bytes());
+        w(opt + 116, &0x28u32.to_le_bytes());
+        let exp = u64::from(EXPORT_RVA);
+        w(exp + 0x0C, &MODULE_NAME_RVA.to_le_bytes()); // Name
+        w(exp + 0x10, &1u32.to_le_bytes()); // Base (ordinal base)
+        w(exp + 0x14, &0u32.to_le_bytes()); // NumberOfFunctions
+        w(exp + 0x18, &0u32.to_le_bytes()); // NumberOfNames
+        w(exp + 0x1C, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfFunctions
+        w(exp + 0x20, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNames
+        w(exp + 0x24, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNameOrdinals
+        return Ok(None);
+    };
+
+    // Data directory[0] = export table, sized to span the directory and its
+    // arrays/strings but NOT the stub region above them.
+    w(opt + 112, &EXPORT_RVA.to_le_bytes());
+    w(opt + 116, &EXPORT_DIR_SIZE.to_le_bytes());
+
+    // Functions array: RVA of each function's stub (or 0 for an empty slot).
+    for (i, slot) in plan.functions.iter().enumerate() {
+        w(u64::from(plan.functions_rva) + (i as u64) * 4, &slot.to_le_bytes());
+    }
+    // Name array (sorted ascending by bytes) + parallel name-ordinal array.
+    for (i, (name_rva, ordinal_index)) in plan.names.iter().enumerate() {
+        w(u64::from(plan.names_rva) + (i as u64) * 4, &name_rva.to_le_bytes());
+        w(u64::from(plan.ordinals_rva) + (i as u64) * 2, &ordinal_index.to_le_bytes());
+    }
+    // Name strings blob.
+    for (rva, bytes) in &plan.strings {
+        w(u64::from(*rva), bytes);
+    }
+
+    // IMAGE_EXPORT_DIRECTORY.
+    let exp = u64::from(EXPORT_RVA);
+    w(exp + 0x0C, &MODULE_NAME_RVA.to_le_bytes()); // Name
+    w(exp + 0x10, &1u32.to_le_bytes()); // Base (ordinal base)
+    w(exp + 0x14, &plan.function_count.to_le_bytes()); // NumberOfFunctions
+    w(exp + 0x18, &plan.name_count.to_le_bytes()); // NumberOfNames
+    w(exp + 0x1C, &plan.functions_rva.to_le_bytes()); // AddressOfFunctions
+    w(exp + 0x20, &plan.names_rva.to_le_bytes()); // AddressOfNames
+    w(exp + 0x24, &plan.ordinals_rva.to_le_bytes()); // AddressOfNameOrdinals
+
+    Ok(Some(ExportLayout {
+        functions_va: base + u64::from(plan.functions_rva),
+        slots: plan
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, &stub_rva)| {
+                plan.slot_symbol(i).map(|symbol| ResolvedExport {
+                    symbol,
+                    va: base + u64::from(stub_rva),
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// A planned export table: the RVAs and byte arrays to write, plus the symbol at
+/// each functions-array slot (for the read-watch). `None` from [`plan_exports`]
+/// means nothing to publish (empty reference) or a table too large to fit the
+/// module image — both fall back to the empty directory.
+struct ExportPlan {
+    functions_rva: u32,
+    names_rva: u32,
+    ordinals_rva: u32,
+    function_count: u32,
+    name_count: u32,
+    /// First RVA past everything written (headers excluded): the module image
+    /// need only be mapped this far.
+    image_end: u32,
+    /// functions[i] = stub RVA (0 = unused slot).
+    functions: Vec<u32>,
+    /// Sorted name RVA + its functions-array index (nameOrdinal).
+    names: Vec<(u32, u16)>,
+    /// (RVA, NUL-terminated bytes) for each name string.
+    strings: Vec<(u32, Vec<u8>)>,
+    /// functions-array index -> symbol, for the read-watch.
+    slot_symbols: Vec<Option<SymbolOrOrdinal>>,
+}
+
+impl ExportPlan {
+    fn slot_symbol(&self, index: usize) -> Option<SymbolOrOrdinal> {
+        self.slot_symbols.get(index).cloned().flatten()
+    }
+}
+
+/// Compute an [`ExportPlan`] from a module's reference exports.
+///
+/// Ordinal base is 1. Ordinal-imported exports occupy `functions[ordinal - 1]`
+/// (so a walk's `functions[ordinal - Base]` lands on them); name-imported
+/// exports are placed in the slots above the highest such ordinal, and each
+/// gets a sorted name-table entry pointing at its slot. Names are sorted by
+/// byte value so a protector's binary search over `AddressOfNames` resolves.
+fn plan_exports(exports: &[SymbolOrOrdinal]) -> Option<ExportPlan> {
+    if exports.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut ordinals: Vec<u16> = Vec::new();
+    for e in exports {
+        match e {
+            SymbolOrOrdinal::Name(n) => names.push(n.clone()),
+            SymbolOrOrdinal::Ordinal(o) => ordinals.push(*o),
+        }
+    }
+    // Slots below `named_base` are reserved for ordinal exports at index
+    // `ordinal - 1`; named exports fill the slots from `named_base` up.
+    let named_base = ordinals.iter().map(|o| u32::from(*o)).max().unwrap_or(0);
+    let function_count = named_base + u32::try_from(names.len()).ok()?;
+
+    let mut slot_symbols: Vec<Option<SymbolOrOrdinal>> = vec![None; function_count as usize];
+    for o in &ordinals {
+        if *o >= 1 {
+            slot_symbols[(*o - 1) as usize] = Some(SymbolOrOrdinal::Ordinal(*o));
+        }
+    }
+    // Named exports sorted by bytes so the name table is binary-searchable; each
+    // keeps its functions-array slot index.
+    let mut named_sorted: Vec<String> = names;
+    named_sorted.sort();
+    let mut name_slots: Vec<(String, u32)> = Vec::new();
+    for (k, n) in named_sorted.iter().enumerate() {
+        let slot = named_base + u32::try_from(k).ok()?;
+        slot_symbols[slot as usize] = Some(SymbolOrOrdinal::Name(n.clone()));
+        name_slots.push((n.clone(), slot));
+    }
+
+    // Lay out: functions array, names array, ordinals array, name strings.
+    let name_count = u32::try_from(name_slots.len()).ok()?;
+    let functions_rva = EXPORT_DATA_RVA;
+    let names_rva = functions_rva + function_count * 4;
+    let ordinals_rva = names_rva + name_count * 4;
+    let mut cursor = ordinals_rva + name_count * 2;
+
+    let mut strings: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut names_table: Vec<(u32, u16)> = Vec::new();
+    for (n, slot) in &name_slots {
+        let mut bytes = n.as_bytes().to_vec();
+        bytes.push(0);
+        let rva = cursor;
+        cursor += u32::try_from(bytes.len()).ok()?;
+        names_table.push((rva, u16::try_from(*slot).ok()?));
+        strings.push((rva, bytes));
+    }
+    // The arrays and strings must not reach into the stub region, and the stub
+    // region must fit the module image. Otherwise fall back to empty (sound).
+    if cursor > STUB_REGION_RVA {
+        return None;
+    }
+    let stub_end = u64::from(STUB_REGION_RVA)
+        + u64::from(function_count) * u64::from(STUB_STRIDE);
+    if stub_end > MODULE_IMAGE_SIZE {
+        return None;
+    }
+    let image_end = u32::try_from(stub_end).ok()?;
+
+    let functions: Vec<u32> = (0..function_count)
+        .map(|i| {
+            if slot_symbols[i as usize].is_some() {
+                STUB_REGION_RVA + i * STUB_STRIDE
+            } else {
+                0
+            }
+        })
+        .collect();
+
+    Some(ExportPlan {
+        functions_rva,
+        names_rva,
+        ordinals_rva,
+        function_count,
+        name_count,
+        image_end,
+        functions,
+        names: names_table,
+        strings,
+        slot_symbols,
+    })
 }
 
 /// Read a NUL-terminated ASCII/ANSI string from guest memory (bounded).
@@ -411,4 +707,126 @@ fn read_wstr(mem: &Memory, mut addr: u64) -> Option<String> {
         addr = addr.wrapping_add(2);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resolve `target` exactly as a protector's direct export walk does: parse
+    /// DOS -> NT -> export directory, binary-search `AddressOfNames`, follow the
+    /// parallel `AddressOfNameOrdinals` into `AddressOfFunctions`, and compute the
+    /// function VA. Returns `(resolved_va, functions_slot_va)`.
+    fn walk_export_by_name(mem: &Memory, base: u64, target: &str) -> Option<(u64, u64)> {
+        let rd32 = |va: u64| mem.read_uint(va, 4).ok().map(|v| v as u32);
+        let rd16 = |va: u64| mem.read_uint(va, 2).ok().map(|v| v as u16);
+        assert_eq!(mem.read_uint(base, 2).ok()?, 0x5A4D, "MZ");
+        let e_lfanew = rd32(base + 0x3C)?;
+        let nt = base + u64::from(e_lfanew);
+        assert_eq!(rd32(nt)?, 0x0000_4550, "PE\\0\\0");
+        let opt = nt + 24;
+        let export_dir = base + u64::from(rd32(opt + 112)?);
+        let number_of_names = rd32(export_dir + 0x18)?;
+        let functions_rva = rd32(export_dir + 0x1C)?;
+        let names_rva = rd32(export_dir + 0x20)?;
+        let ordinals_rva = rd32(export_dir + 0x24)?;
+
+        // Binary search the (sorted) name table.
+        let name_at = |i: u32| -> Option<String> {
+            let name_rva = rd32(base + u64::from(names_rva) + u64::from(i) * 4)?;
+            read_cstr(mem, base + u64::from(name_rva))
+        };
+        let (mut lo, mut hi) = (0i64, i64::from(number_of_names) - 1);
+        let mut found: Option<u32> = None;
+        while lo <= hi {
+            let mid = ((lo + hi) / 2) as u32;
+            match name_at(mid)?.as_str().cmp(target) {
+                std::cmp::Ordering::Equal => {
+                    found = Some(mid);
+                    break;
+                }
+                std::cmp::Ordering::Less => lo = i64::from(mid) + 1,
+                std::cmp::Ordering::Greater => hi = i64::from(mid) - 1,
+            }
+        }
+        let name_index = found?;
+        let ordinal_index = rd16(base + u64::from(ordinals_rva) + u64::from(name_index) * 2)?;
+        let functions_slot_va = base + u64::from(functions_rva) + u64::from(ordinal_index) * 4;
+        let func_rva = rd32(functions_slot_va)?;
+        Some((base + u64::from(func_rva), functions_slot_va))
+    }
+
+    /// A populated fake module is walkable end to end, the walk resolves the
+    /// planned deterministic stub VA, and a read of the resolved functions slot
+    /// is recorded once (deduped) as an ObservedImport.
+    #[test]
+    fn populated_export_table_is_walkable_and_recorded() {
+        let base = HMODULE_BASE;
+        let exports = vec![
+            SymbolOrOrdinal::Name("GetTickCount".into()),
+            SymbolOrOrdinal::Name("CreateFileW".into()),
+            SymbolOrOrdinal::Name("Sleep".into()),
+        ];
+        let mut mem = Memory::new();
+        let layout = map_module_image(&mut mem, base, "kernel32.dll", &exports)
+            .expect("module image maps")
+            .expect("exports populated");
+
+        let (resolved_va, functions_slot_va) =
+            walk_export_by_name(&mem, base, "CreateFileW").expect("name resolves via walk");
+        let planned = layout
+            .slots
+            .iter()
+            .flatten()
+            .find(|e| matches!(&e.symbol, SymbolOrOrdinal::Name(n) if n == "CreateFileW"))
+            .expect("CreateFileW present in layout");
+        assert_eq!(resolved_va, planned.va, "walk resolves the planned stub VA");
+
+        // Drive the read-watch directly (as on_mem would during a run).
+        let mut hook = WinApiHook::new(BTreeMap::new());
+        let facts = hook.facts();
+        hook.export_watches.push(ExportWatch {
+            module: "kernel32.dll".into(),
+            functions_va: layout.functions_va,
+            slots: layout.slots,
+        });
+        hook.note_export_read(functions_slot_va);
+        hook.note_export_read(functions_slot_va); // repeated reads dedupe
+
+        let facts = facts.borrow();
+        assert_eq!(facts.imports.len(), 1, "one import recorded, deduped");
+        assert_eq!(facts.imports[0].module, "kernel32.dll");
+        assert_eq!(facts.imports[0].symbol, SymbolOrOrdinal::Name("CreateFileW".into()));
+        assert_eq!(facts.imports[0].stub_va_or_slot, resolved_va);
+    }
+
+    /// An empty reference keeps the well-formed zero-export directory and
+    /// registers no watch (the prior behaviour is unchanged).
+    #[test]
+    fn empty_reference_keeps_empty_directory() {
+        let mut mem = Memory::new();
+        let layout =
+            map_module_image(&mut mem, HMODULE_BASE, "kernel32.dll", &[]).expect("maps");
+        assert!(layout.is_none(), "no export layout for an empty reference");
+        // NumberOfFunctions == 0 in the directory.
+        let e_lfanew = mem.read_uint(HMODULE_BASE + 0x3C, 4).unwrap();
+        let export_dir =
+            HMODULE_BASE + mem.read_uint(HMODULE_BASE + e_lfanew + 24 + 112, 4).unwrap();
+        assert_eq!(mem.read_uint(export_dir + 0x14, 4).unwrap(), 0);
+    }
+
+    /// An ordinal-imported export lands at `functions[ordinal - 1]` so a walk's
+    /// `functions[ordinal - Base]` (Base = 1) resolves it.
+    #[test]
+    fn ordinal_export_lands_at_ordinal_slot() {
+        let mut mem = Memory::new();
+        let exports = vec![SymbolOrOrdinal::Ordinal(7), SymbolOrOrdinal::Name("A".into())];
+        let layout = map_module_image(&mut mem, HMODULE_BASE, "mod.dll", &exports)
+            .expect("maps")
+            .expect("populated");
+        let slot7 = layout.slots.get(6).and_then(|s| s.as_ref()).expect("slot 6 (ordinal 7)");
+        assert_eq!(slot7.symbol, SymbolOrOrdinal::Ordinal(7));
+        let functions_rva = STUB_REGION_RVA + 6 * STUB_STRIDE;
+        assert_eq!(slot7.va, HMODULE_BASE + u64::from(functions_rva));
+    }
 }

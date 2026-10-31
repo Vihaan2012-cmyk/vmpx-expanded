@@ -623,6 +623,109 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
     }
 }
 
+/// Build the OFFLINE export reference `{ module -> [name|ordinal] }` for the
+/// experimental `--dynamic` detonation. Every source is a static, offline file
+/// read (like loading the input); nothing here touches the network or the
+/// emulator's pure runtime path.
+///
+/// Two complementary offline sources, both optional:
+///
+/// * The UNPROTECTED original's import directory (its imports grouped by module
+///   are the application functions the protected twin resolves). Located via
+///   `VMPX_IMPORT_REFERENCE`, else a sibling `originals/<name without .vmp>`.
+/// * A bundled system-DLL export list (`VMPX_SYSDLL_REFERENCE`, comma-separated
+///   DLL paths): the protector's own runtime resolves functions from modules
+///   like `ntdll.dll`/`user32.dll` by walking THEIR export tables, so those
+///   modules' full export lists must be available for the walk to resolve. In
+///   production this is bundled static data; here a reference DLL stands in for
+///   it. Keyed by file name, so the walk of each resolved module finds it.
+fn dynamic_export_reference(
+    input_path: &str,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Vec<vmpx_emulate::SymbolOrOrdinal>> {
+    let mut reference: BTreeMap<String, Vec<vmpx_emulate::SymbolOrOrdinal>> = BTreeMap::new();
+
+    // (1) The unprotected original's imports.
+    let original_path = std::env::var("VMPX_IMPORT_REFERENCE")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| locate_original(input_path));
+    if let Some(path) = original_path {
+        match std::fs::read(&path) {
+            Ok(bytes) => match PeImage::parse(&bytes) {
+                Ok(pe) => {
+                    let from_original = vmpx_emulate::export_reference_from_imports(&pe);
+                    let (m, s) = (
+                        from_original.len(),
+                        from_original.values().map(Vec::len).sum::<usize>(),
+                    );
+                    for (module, names) in from_original {
+                        reference.entry(module).or_default().extend(names);
+                    }
+                    warnings.push(format!(
+                        "[dynamic][experimental] export reference: {m} module(s)/{s} symbol(s) from original import directory {}",
+                        path.display()
+                    ));
+                }
+                Err(error) => warnings.push(format!(
+                    "[dynamic][experimental] could not parse import reference {}: {error:?}",
+                    path.display()
+                )),
+            },
+            Err(error) => warnings.push(format!(
+                "[dynamic][experimental] could not read import reference {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    // (2) Bundled offline system-DLL export lists.
+    if let Ok(list) = std::env::var("VMPX_SYSDLL_REFERENCE") {
+        for path in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let key = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            match std::fs::read(path).ok().and_then(|b| PeImage::parse(&b).ok().map(|pe| {
+                vmpx_emulate::export_reference_from_exports(&pe)
+            })) {
+                Some(names) => {
+                    warnings.push(format!(
+                        "[dynamic][experimental] export reference: {} export(s) for {key} from system-DLL reference {path}",
+                        names.len()
+                    ));
+                    reference.insert(key, names);
+                }
+                None => warnings.push(format!(
+                    "[dynamic][experimental] could not load system-DLL reference {path}"
+                )),
+            }
+        }
+    }
+
+    reference
+}
+
+/// Best-effort sibling lookup of the unprotected original for a protected input
+/// path, by stripping a `.vmp` marker from the file name and checking a sibling
+/// `originals/` directory and the input's own directory.
+fn locate_original(input_path: &str) -> Option<std::path::PathBuf> {
+    let input = std::path::Path::new(input_path);
+    let file = input.file_name()?.to_string_lossy();
+    let stripped = file.replacen(".vmp", "", 1);
+    if stripped == file {
+        return None;
+    }
+    let dir = input.parent()?;
+    let candidates = [
+        dir.parent().map(|p| p.join("originals").join(&stripped)),
+        Some(dir.join("originals").join(&stripped)),
+        Some(dir.join(&stripped)),
+    ];
+    candidates.into_iter().flatten().find(|p| p.is_file())
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(dead_code)]
 pub fn analyze_clean(input_path: &str, input: &[u8]) -> Result<CleanReport> {
@@ -691,13 +794,25 @@ pub fn analyze_clean_with_image(
     // experimental bounded-recursion unroll; `None` on the sound path.
     let mut dynamic_loop_depths: Vec<(u64, u64)> = Vec::new();
     let observed_imports: Vec<vmpx_emulate::ObservedImport> = if dynamic {
-        match vmpx_emulate::detonate(&input_pe, &vmpx_emulate::DetonateOptions::default()) {
+        let export_reference = dynamic_export_reference(input_path, &mut warnings);
+        let ref_symbols: usize = export_reference.values().map(Vec::len).sum();
+        let base = vmpx_emulate::DetonateOptions::default();
+        // The direct-export-walk resolution runs well past the early DllMain
+        // return, so the experimental path takes an optional larger budget.
+        let max_steps = std::env::var("VMPX_DYNAMIC_MAXSTEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(base.max_steps);
+        let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, ..base };
+        match vmpx_emulate::detonate(&input_pe, &opts) {
             Ok(result) => {
                 warnings.push(format!(
-                    "[dynamic][experimental] detonation ran {} instr(s), stop={:?}, observed oep={:?}, GetProcAddress imports={}, observed globals={}, observed loop depths={}",
+                    "[dynamic][experimental] detonation ran {} instr(s), stop={:?}, observed oep={:?}, export-reference modules={}/symbols={}, imports captured={}, observed globals={}, observed loop depths={}",
                     result.steps,
                     result.stop,
                     result.observed.oep,
+                    opts.export_reference.len(),
+                    ref_symbols,
                     result.observed.imports.len(),
                     result.observed.globals.len(),
                     result.observed.loop_depths.len(),

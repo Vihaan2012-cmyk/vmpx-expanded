@@ -15,6 +15,7 @@
 //! reflect ONE concrete path and must stay on the experimental/quarantined tier
 //! on the static side — never sound output.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use vmpx_pe::PeImage;
@@ -24,7 +25,7 @@ use crate::dump::{DumpImage, OepHook, capture_globals, dump_image};
 use crate::emu::{FlowEvent, Hook, HookAction, MemEvent, Stop};
 use crate::loader::{LoadError, LoadOptions, load};
 use crate::memory::Memory;
-use crate::observe::ObservedFacts;
+use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 use crate::vm_observe::{VmObservations, VmObserveHook};
 use crate::winapi::WinApiHook;
 
@@ -50,6 +51,11 @@ pub struct DetonateOptions {
     pub vm_dispatcher: Option<u64>,
     /// Loop-head / recursion-entry VA whose back-edge visits are counted.
     pub vm_loop_head: Option<u64>,
+    /// OFFLINE export reference `{ module -> [name|ordinal] }`: fills each
+    /// resolved module's fake export table so a protector resolving imports by
+    /// manually walking the export table finds them (and the walk is captured).
+    /// Empty = every fake module exports nothing (the prior behaviour).
+    pub export_reference: BTreeMap<String, Vec<SymbolOrOrdinal>>,
     /// Snapshot the mapped image after the run.
     pub dump: bool,
 }
@@ -63,9 +69,53 @@ impl Default for DetonateOptions {
             capture_globals: Vec::new(),
             vm_dispatcher: None,
             vm_loop_head: None,
+            export_reference: BTreeMap::new(),
             dump: true,
         }
     }
+}
+
+/// Build an export reference `{ module -> [name|ordinal] }` from a PE's import
+/// directory, grouping each imported symbol under the module it comes from.
+///
+/// For the real direct-export-walk capture, this is derived from the UNPROTECTED
+/// original (its imports are exactly the functions the protected twin resolves
+/// by walking those modules' export tables). In production the same shape is a
+/// bundled OFFLINE system-DLL export list — static data, never a network fetch.
+#[must_use]
+pub fn export_reference_from_imports(
+    pe: &PeImage,
+) -> BTreeMap<String, Vec<SymbolOrOrdinal>> {
+    let mut reference: BTreeMap<String, Vec<SymbolOrOrdinal>> = BTreeMap::new();
+    for module in &pe.report().imports {
+        let key = module.name.to_lowercase();
+        let entry = reference.entry(key).or_default();
+        for symbol in &module.entries {
+            if let Some(name) = &symbol.name {
+                entry.push(SymbolOrOrdinal::Name(name.clone()));
+            } else if let Some(ordinal) = symbol.ordinal {
+                entry.push(SymbolOrOrdinal::Ordinal(ordinal));
+            }
+        }
+    }
+    reference
+}
+
+/// The named exports of a PE's export directory, as reference entries.
+///
+/// This is how a bundled OFFLINE system-DLL export list is turned into a
+/// reference entry for the module the protector resolves and walks (e.g. the
+/// `ntdll.dll` / `user32.dll` the protector's own runtime imports from). Reading
+/// a static reference DLL is a file read, never a network fetch.
+#[must_use]
+pub fn export_reference_from_exports(pe: &PeImage) -> Vec<SymbolOrOrdinal> {
+    pe.report().exports.map_or_else(Vec::new, |exports| {
+        exports
+            .symbols
+            .iter()
+            .filter_map(|symbol| symbol.name.clone().map(SymbolOrOrdinal::Name))
+            .collect()
+    })
 }
 
 /// Why a detonation could not even start.
@@ -168,7 +218,8 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     };
 
     // Import emulation + OEP detection share one ObservedFacts.
-    let winapi = WinApiHook::from_image(&img);
+    let winapi =
+        WinApiHook::from_image(&img).with_export_reference(opts.export_reference.clone());
     let facts = winapi.facts();
     let oep = OepHook::wrapping(winapi, Rc::clone(&facts));
 
@@ -352,21 +403,66 @@ mod tests {
         assert!(res.steps >= 8, "retired the entry block");
     }
 
-    /// Informational probe of a real sample's reach/next-blocker:
-    /// `VMPX_DETONATE_SAMPLE=<pe> cargo test -p vmpx-emulate detonate_probe -- --ignored --nocapture`
+    /// Informational probe of a real sample's reach/next-blocker. Optionally
+    /// derives an export reference from an UNPROTECTED original so the
+    /// direct-export-walk import capture runs:
+    /// `VMPX_DETONATE_SAMPLE=<protected.pe> VMPX_IMPORT_REFERENCE=<original.pe> \
+    ///   cargo test -p vmpx-emulate --lib detonate_probe -- --ignored --nocapture`
     #[test]
     #[ignore = "needs VMPX_DETONATE_SAMPLE"]
     fn detonate_probe_real_sample() {
         let path = std::env::var("VMPX_DETONATE_SAMPLE").unwrap();
         let data = std::fs::read(&path).unwrap();
         let pe = PeImage::parse(&data).expect("parse sample");
-        let res = detonate(&pe, &DetonateOptions::default()).expect("detonation starts");
-        let getproc = res.observed.imports.len();
+        // Reference bytes must outlive the parsed original.
+        let reference_data = std::env::var("VMPX_IMPORT_REFERENCE")
+            .ok()
+            .map(|p| std::fs::read(p).expect("read reference"));
+        let mut export_reference = reference_data
+            .as_ref()
+            .map(|bytes| {
+                let original = PeImage::parse(bytes).expect("parse reference");
+                export_reference_from_imports(&original)
+            })
+            .unwrap_or_default();
+        // Experiment: merge full EXPORT tables of listed system DLLs (offline),
+        // keyed by file stem, so the protector's runtime walk of them resolves.
+        let sys_bytes: Vec<(String, Vec<u8>)> = std::env::var("VMPX_SYS_DLLS")
+            .ok()
+            .into_iter()
+            .flat_map(|list| list.split(',').map(str::to_owned).collect::<Vec<_>>())
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let key = std::path::Path::new(&p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_lowercase();
+                (key, std::fs::read(&p).expect("read sys dll"))
+            })
+            .collect();
+        for (key, bytes) in &sys_bytes {
+            let pe = PeImage::parse(bytes).expect("parse sys dll");
+            let names = export_reference_from_exports(&pe);
+            eprintln!("[probe] merged {} exports for {key}", names.len());
+            export_reference.insert(key.clone(), names);
+        }
+        let ref_syms: usize = export_reference.values().map(Vec::len).sum();
+        let max_steps = std::env::var("VMPX_DETONATE_MAXSTEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_STEPS);
+        let opts = DetonateOptions { export_reference, max_steps, ..DetonateOptions::default() };
+        let res = detonate(&pe, &opts).expect("detonation starts");
         eprintln!(
-            "sample={path}\n  steps={} stop={:?}\n  oep={:?}\n  GetProcAddress imports captured={getproc}",
-            res.steps, res.stop, res.observed.oep,
+            "sample={path}\n  reference modules={} symbols={ref_syms}\n  steps={} stop={:?}\n  oep={:?}\n  imports captured={}",
+            opts.export_reference.len(),
+            res.steps,
+            res.stop,
+            res.observed.oep,
+            res.observed.imports.len(),
         );
-        for imp in res.observed.imports.iter().take(20) {
+        for imp in res.observed.imports.iter().take(30) {
             eprintln!("    {} :: {:?}", imp.module, imp.symbol);
         }
     }
