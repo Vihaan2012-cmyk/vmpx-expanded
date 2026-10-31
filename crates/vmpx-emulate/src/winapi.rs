@@ -48,6 +48,18 @@ const HMODULE_BASE: u64 = 0x0000_0070_0000_0000; // LoadLibrary/GetModuleHandle
 use crate::loader::PROCESS_HEAP; // GetProcessHeap == PEB.ProcessHeap
 const HEAP_BASE: u64 = 0x0000_0070_FFF0_0000; // HeapCreate handle pool
 const STDHANDLE_BASE: u64 = 0x0000_0070_FFE0_0000; // GetStdHandle sentinels
+const REGHANDLE_BASE: u64 = 0x0000_0070_FFC0_0000; // RegOpenKeyEx handles
+const SNAPHANDLE_BASE: u64 = 0x0000_0070_FFB0_0000; // Toolhelp snapshot handles
+
+// Win32 error codes returned/stored by the host-identity models.
+const ERROR_FILE_NOT_FOUND: u64 = 2;
+const ERROR_NO_MORE_FILES: u64 = 18;
+const ERROR_BAD_LENGTH: u64 = 24;
+const ERROR_INVALID_PARAMETER: u64 = 87;
+const ERROR_BUFFER_OVERFLOW: u64 = 111;
+const ERROR_MORE_DATA: u64 = 234;
+const ERROR_UNSUPPORTED_TYPE: u64 = 1630;
+const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 // Each minted HMODULE gets this much private address space; a faithful, readable
 // PE-header image is mapped there so the protector can walk the module it just
@@ -183,6 +195,34 @@ pub struct WinApiHook {
     addr_book: AddressBook,
     /// Anti-analysis probes seen (see [`WinApiHook::audit`]).
     audit: Rc<RefCell<BTreeMap<String, u64>>>,
+    /// Open registry key handle -> canonical lowercase key path.
+    reg_handles: BTreeMap<u64, String>,
+    reg_next: u64,
+    /// Open Toolhelp snapshot handle -> snapshot.
+    snapshots: BTreeMap<u64, Snapshot>,
+    snap_next: u64,
+    /// Last filter passed to `SetUnhandledExceptionFilter` (never invoked).
+    unhandled_filter: u64,
+}
+
+/// A module as reported by the module enumeration APIs.
+struct ModEntry {
+    base: u64,
+    size: u64,
+    entry: u64,
+    name: String,
+    path: String,
+}
+
+enum SnapKind {
+    Procs(Vec<crate::hostmodel::ProcEntry>),
+    Mods(Vec<ModEntry>),
+}
+
+struct Snapshot {
+    kind: SnapKind,
+    /// Index of the entry the next `*Next` returns (`*First` resets to 0).
+    cursor: usize,
 }
 
 /// A read-watch over one module's `AddressOfFunctions` array. When the protector
@@ -266,6 +306,11 @@ impl WinApiHook {
             xplm: None,
             addr_book,
             audit: Rc::new(RefCell::new(BTreeMap::new())),
+            reg_handles: BTreeMap::new(),
+            reg_next: REGHANDLE_BASE,
+            snapshots: BTreeMap::new(),
+            snap_next: SNAPHANDLE_BASE,
+            unhandled_filter: 0,
         }
     }
 
@@ -384,11 +429,18 @@ impl WinApiHook {
         wide: bool,
         mem: &mut Memory,
     ) -> Dispatch {
+        let path = self.module_path(hmod);
+        Self::copy_str_trunc(&path, dst, nsize, wide, mem)
+    }
+
+    /// Copy `s` (truncated to `nsize` chars, always NUL-terminated); returns the
+    /// char count written.
+    fn copy_str_trunc(s: &str, dst: u64, nsize: u64, wide: bool, mem: &mut Memory) -> Dispatch {
         let nsize = nsize as u32 as usize;
         if dst == 0 || nsize == 0 {
             return Dispatch::Ret(0);
         }
-        let path = self.module_path(hmod);
+        let path = s;
         let elem = if wide { 2 } else { 1 };
         // Characters of the path (ANSI bytes or UTF-16 units), then a NUL.
         let units: Vec<u64> = if wide {
@@ -476,6 +528,11 @@ impl WinApiHook {
         h
     }
 
+    fn fail(&mut self, err: u64) -> Dispatch {
+        self.last_error = err;
+        Dispatch::Ret(0)
+    }
+
     /// `GetModuleHandle`/`LoadLibrary` front-end: sandbox / analysis / VM-guest
     /// modules are absent (NULL, `ERROR_MOD_NOT_FOUND`), as on a clean bare-metal
     /// host; everything else resolves via [`Self::module_handle`].
@@ -512,6 +569,348 @@ impl WinApiHook {
     #[must_use]
     pub fn audit(&self) -> Rc<RefCell<BTreeMap<String, u64>>> {
         Rc::clone(&self.audit)
+    }
+
+    /// The sample's own module: header-derived size and entry point.
+    fn self_entry(&self, mem: &Memory) -> Option<ModEntry> {
+        let b = self.image_base;
+        if b == 0 {
+            return None;
+        }
+        let nt = b + mem.read_uint(b + 0x3C, 4).ok()?;
+        Some(ModEntry {
+            base: b,
+            size: mem.read_uint(nt + 24 + 56, 4).ok()?,
+            entry: b + mem.read_uint(nt + 24 + 16, 4).ok()?,
+            name: "program.exe".to_string(),
+            path: "C:\\program.exe".to_string(),
+        })
+    }
+
+    /// Info for a module handle we modeled (self or a minted fake module).
+    fn module_info(&self, mem: &Memory, hmod: u64) -> Option<ModEntry> {
+        if hmod == 0 || hmod == self.image_base {
+            return self.self_entry(mem);
+        }
+        let name = self.handle_names.get(&hmod)?;
+        Some(ModEntry {
+            base: hmod,
+            size: MODULE_IMAGE_SIZE,
+            entry: 0, // synthetic module: no real entry point
+            name: name.clone(),
+            path: format!("C:\\Windows\\System32\\{name}"),
+        })
+    }
+
+    /// The loaded-module list: the sample, ntdll/kernel32/kernelbase (minted on
+    /// demand), then every other module the sample resolved, in load order.
+    /// `None` if the sample image is unknown or a backing map fails.
+    fn module_entries(&mut self, mem: &mut Memory) -> Option<Vec<ModEntry>> {
+        let mut out = vec![self.self_entry(mem)?];
+        for n in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+            if self.module_handle(mem, n) == 0 {
+                return None;
+            }
+        }
+        let mut hs: Vec<u64> = self.handle_names.keys().copied().collect();
+        let rank = |n: &str| ["ntdll.dll", "kernel32.dll", "kernelbase.dll"].iter().position(|x| *x == n);
+        hs.sort_by_key(|h| (rank(&self.handle_names[h]).unwrap_or(3), *h));
+        for h in hs {
+            out.push(self.module_info(mem, h)?);
+        }
+        Some(out)
+    }
+
+    /// Whether a process handle is the current process.
+    fn is_self_process(h: u64) -> bool {
+        h == u64::MAX
+    }
+
+    /// Registry key path for an open or predefined HKEY.
+    fn reg_path(&self, hkey: u64) -> Option<String> {
+        crate::hostmodel::predefined_root(hkey)
+            .map(str::to_string)
+            .or_else(|| self.reg_handles.get(&hkey).cloned())
+    }
+
+    /// Read an optional ANSI/wide string argument (NULL = empty); `None` on a
+    /// bad pointer.
+    fn opt_str(mem: &Memory, p: u64, wide: bool) -> Option<String> {
+        if p == 0 {
+            Some(String::new())
+        } else if wide {
+            read_wstr(mem, p)
+        } else {
+            read_cstr(mem, p)
+        }
+    }
+
+    /// Shared tail of `RegQueryValueEx`/`RegGetValue`: write type/data/size and
+    /// return the Win32 error code. `Err` = guest fault (stop).
+    fn reg_copy_out(
+        mem: &mut Memory,
+        v: crate::hostmodel::RegVal,
+        wide: bool,
+        (p_type, p_data, p_cb): (u64, u64, u64),
+    ) -> Result<u64, ()> {
+        let bytes = v.bytes(wide);
+        if p_type != 0 {
+            mem.write_uint(p_type, 4, u64::from(v.reg_type())).map_err(|_| ())?;
+        }
+        if p_data != 0 && p_cb == 0 {
+            return Ok(ERROR_INVALID_PARAMETER);
+        }
+        let mut status = 0;
+        if p_data != 0 {
+            let cap = mem.read_uint(p_cb, 4).map_err(|_| ())?;
+            if cap < bytes.len() as u64 {
+                status = ERROR_MORE_DATA;
+            } else {
+                mem.write(p_data, &bytes).map_err(|_| ())?;
+            }
+        }
+        if p_cb != 0 {
+            mem.write_uint(p_cb, 4, bytes.len() as u64).map_err(|_| ())?;
+        }
+        Ok(status)
+    }
+
+    /// Shared body of `GetUserName*`/`GetComputerName*`: copy `s` to `buf` and
+    /// update the in/out char count at `pcb`. `succ_with_nul` selects whether
+    /// the success count includes the terminator (GetUserName) or not.
+    fn name_inout(
+        &mut self,
+        mem: &mut Memory,
+        s: &str,
+        wide: bool,
+        (buf, pcb): (u64, u64),
+        succ_with_nul: bool,
+        small_err: u64,
+    ) -> Dispatch {
+        if pcb == 0 {
+            return self.fail(ERROR_INVALID_PARAMETER);
+        }
+        let Ok(cap) = mem.read_uint(pcb, 4) else {
+            return Dispatch::Stop;
+        };
+        let len = s.len() as u64; // names are ASCII
+        if buf == 0 || cap < len + 1 {
+            if mem.write_uint(pcb, 4, len + 1).is_err() {
+                return Dispatch::Stop;
+            }
+            return self.fail(small_err);
+        }
+        let bytes: Vec<u8> = if wide {
+            s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+        } else {
+            s.bytes().chain([0]).collect()
+        };
+        let reported = if succ_with_nul { len + 1 } else { len };
+        if mem.write(buf, &bytes).is_err() || mem.write_uint(pcb, 4, reported).is_err() {
+            return Dispatch::Stop;
+        }
+        Dispatch::Ret(1)
+    }
+
+    /// `RegOpenKeyExA/W(hKey, lpSubKey, ulOptions, samDesired, phkResult)`.
+    fn reg_open(&mut self, mem: &mut Memory, cpu: &Cpu, sab: u64, wide: bool) -> Dispatch {
+        let Some(base) = self.reg_path(Self::arg(cpu, 0)) else {
+            return Dispatch::Ret(ERROR_INVALID_HANDLE);
+        };
+        let (Some(sub), Some(phk)) =
+            (Self::opt_str(mem, Self::arg(cpu, 1), wide), Self::stack_arg(cpu, mem, sab, 4))
+        else {
+            return Dispatch::Stop;
+        };
+        let path = crate::hostmodel::join_path(&base, &sub);
+        if phk != 0 && mem.write_uint(phk, 8, 0).is_err() {
+            return Dispatch::Stop;
+        }
+        if !crate::hostmodel::key_exists(&path) {
+            return Dispatch::Ret(ERROR_FILE_NOT_FOUND);
+        }
+        let h = self.reg_next;
+        self.reg_next += 4;
+        self.reg_handles.insert(h, path);
+        if phk != 0 && mem.write_uint(phk, 8, h).is_err() {
+            return Dispatch::Stop;
+        }
+        Dispatch::Ret(0)
+    }
+
+    /// `RegQueryValueExA/W(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData)`.
+    fn reg_query(&mut self, mem: &mut Memory, cpu: &Cpu, sab: u64, wide: bool) -> Dispatch {
+        let (Some(p_data), Some(p_cb)) =
+            (Self::stack_arg(cpu, mem, sab, 4), Self::stack_arg(cpu, mem, sab, 5))
+        else {
+            return Dispatch::Stop;
+        };
+        let Some(name) = Self::opt_str(mem, Self::arg(cpu, 1), wide) else {
+            return Dispatch::Stop;
+        };
+        let Some(path) = self.reg_path(Self::arg(cpu, 0)) else {
+            return Dispatch::Ret(ERROR_INVALID_HANDLE);
+        };
+        let Some(v) = crate::hostmodel::value(&path, &name.to_lowercase()) else {
+            return Dispatch::Ret(ERROR_FILE_NOT_FOUND);
+        };
+        match Self::reg_copy_out(mem, v, wide, (Self::arg(cpu, 3), p_data, p_cb)) {
+            Ok(status) => Dispatch::Ret(status),
+            Err(()) => Dispatch::Stop,
+        }
+    }
+
+    /// `RegGetValueA/W(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData)`.
+    fn reg_get_value(&mut self, mem: &mut Memory, cpu: &Cpu, sab: u64, wide: bool) -> Dispatch {
+        const RRF_RT_REG_SZ: u64 = 0x2;
+        const RRF_RT_REG_DWORD: u64 = 0x10;
+        let (Some(p_type), Some(p_data), Some(p_cb)) = (
+            Self::stack_arg(cpu, mem, sab, 4),
+            Self::stack_arg(cpu, mem, sab, 5),
+            Self::stack_arg(cpu, mem, sab, 6),
+        ) else {
+            return Dispatch::Stop;
+        };
+        let flags = Self::arg(cpu, 3) as u32 as u64;
+        if flags & !0xFFFF != 0 {
+            return Dispatch::Stop; // WOW64/NOEXPAND/ZEROONFAILURE not modeled
+        }
+        if flags == 0 {
+            return Dispatch::Ret(ERROR_INVALID_PARAMETER);
+        }
+        let (Some(sub), Some(name)) = (
+            Self::opt_str(mem, Self::arg(cpu, 1), wide),
+            Self::opt_str(mem, Self::arg(cpu, 2), wide),
+        ) else {
+            return Dispatch::Stop;
+        };
+        let Some(base) = self.reg_path(Self::arg(cpu, 0)) else {
+            return Dispatch::Ret(ERROR_INVALID_HANDLE);
+        };
+        let path = crate::hostmodel::join_path(&base, &sub);
+        let Some(v) = crate::hostmodel::value(&path, &name.to_lowercase()) else {
+            return Dispatch::Ret(ERROR_FILE_NOT_FOUND);
+        };
+        let allowed = match v {
+            crate::hostmodel::RegVal::Sz(_) => RRF_RT_REG_SZ,
+            crate::hostmodel::RegVal::Dword(_) => RRF_RT_REG_DWORD,
+        };
+        if flags & allowed == 0 {
+            return Dispatch::Ret(ERROR_UNSUPPORTED_TYPE);
+        }
+        match Self::reg_copy_out(mem, v, wide, (p_type, p_data, p_cb)) {
+            Ok(status) => Dispatch::Ret(status),
+            Err(()) => Dispatch::Stop,
+        }
+    }
+
+    /// `CreateToolhelp32Snapshot(dwFlags, th32ProcessID)`: process (`TH32CS_SNAPPROCESS`)
+    /// or module (`SNAPMODULE`/`SNAPMODULE32`) snapshots of the current process only;
+    /// thread/heap snapshots and flag mixes fail closed.
+    fn create_snapshot(&mut self, mem: &mut Memory, cpu: &Cpu) -> Dispatch {
+        let flags = Self::arg(cpu, 0) as u32 & !0x8000_0000; // drop TH32CS_INHERIT
+        let pid = Self::arg(cpu, 1) as u32 as u64;
+        let kind = if flags == 0x2 {
+            let mut procs = crate::hostmodel::SYSTEM_PROCESSES.to_vec();
+            procs.push((crate::ntdll::FAKE_PID, crate::hostmodel::PARENT_PID, "program.exe", 4));
+            procs.sort_by_key(|p| p.0);
+            SnapKind::Procs(procs)
+        } else if flags & 0x18 != 0 && flags & !0x18 == 0 {
+            if pid != 0 && pid != crate::ntdll::FAKE_PID {
+                self.last_error = ERROR_INVALID_PARAMETER;
+                return Dispatch::Ret(INVALID_HANDLE_VALUE);
+            }
+            match self.module_entries(mem) {
+                Some(m) => SnapKind::Mods(m),
+                None => return Dispatch::Stop,
+            }
+        } else {
+            return Dispatch::Stop;
+        };
+        let h = self.snap_next;
+        self.snap_next += 4;
+        self.snapshots.insert(h, Snapshot { kind, cursor: 0 });
+        Dispatch::Ret(h)
+    }
+
+    /// `Process32First/Next[W]` and `Module32First/Next[W]`.
+    fn snap_step(
+        &mut self,
+        mem: &mut Memory,
+        cpu: &Cpu,
+        (modules, wide, first): (bool, bool, bool),
+    ) -> Dispatch {
+        let (h, out) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+        let size: u64 = match (modules, wide) {
+            (false, true) => 568,
+            (false, false) => 304,
+            (true, true) => 1080,
+            (true, false) => 568,
+        };
+        let le = &mut self.last_error;
+        let err = |le: &mut u64, e: u64| {
+            *le = e;
+            Dispatch::Ret(0)
+        };
+        let Some(snap) = self.snapshots.get_mut(&h) else {
+            return err(le, ERROR_INVALID_HANDLE);
+        };
+        if matches!(snap.kind, SnapKind::Mods(_)) != modules {
+            return err(le, ERROR_INVALID_HANDLE);
+        }
+        let Ok(dw_size) = mem.read_uint(out, 4) else {
+            return Dispatch::Stop;
+        };
+        if dw_size != size {
+            return err(le, ERROR_BAD_LENGTH);
+        }
+        if first {
+            snap.cursor = 0;
+        }
+        let idx = snap.cursor;
+        let mut b = vec![0u8; size as usize];
+        let put_str = |b: &mut [u8], off: usize, s: &str| {
+            if wide {
+                for (i, u) in s.encode_utf16().enumerate() {
+                    b[off + i * 2..off + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+                }
+            } else {
+                b[off..off + s.len()].copy_from_slice(s.as_bytes());
+            }
+        };
+        b[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+        match &snap.kind {
+            SnapKind::Procs(p) => {
+                let Some(&(pid, parent, name, threads)) = p.get(idx) else {
+                    return err(le, ERROR_NO_MORE_FILES);
+                };
+                b[4..8].copy_from_slice(&1u32.to_le_bytes()); // cntUsage
+                b[8..12].copy_from_slice(&(pid as u32).to_le_bytes());
+                b[28..32].copy_from_slice(&threads.to_le_bytes());
+                b[32..36].copy_from_slice(&(parent as u32).to_le_bytes());
+                b[36..40].copy_from_slice(&8u32.to_le_bytes()); // pcPriClassBase
+                put_str(&mut b, 44, name);
+            }
+            SnapKind::Mods(m) => {
+                let Some(e) = m.get(idx) else {
+                    return err(le, ERROR_NO_MORE_FILES);
+                };
+                b[4..8].copy_from_slice(&1u32.to_le_bytes()); // th32ModuleID
+                b[8..12].copy_from_slice(&(crate::ntdll::FAKE_PID as u32).to_le_bytes());
+                b[12..16].copy_from_slice(&1u32.to_le_bytes()); // GlblcntUsage
+                b[16..20].copy_from_slice(&1u32.to_le_bytes()); // ProccntUsage
+                b[24..32].copy_from_slice(&e.base.to_le_bytes());
+                b[32..36].copy_from_slice(&(e.size as u32).to_le_bytes());
+                b[40..48].copy_from_slice(&e.base.to_le_bytes()); // hModule
+                put_str(&mut b, 48, &e.name);
+                put_str(&mut b, if wide { 560 } else { 304 }, &e.path);
+            }
+        }
+        snap.cursor = idx + 1;
+        if mem.write(out, &b).is_err() {
+            return Dispatch::Stop;
+        }
+        Dispatch::Ret(1)
     }
 
     /// A read landing in a watched `AddressOfFunctions` slot is the protector
@@ -1103,6 +1502,184 @@ impl WinApiHook {
                 self.note("IsDebuggerPresent -> FALSE");
                 Dispatch::Ret(0)
             }
+            // ---- Host identity (clean, deterministic; see hostmodel) ---------
+            // User/computer name: a generic benign user and host.
+            (_, "GetUserNameA" | "GetUserNameW") => {
+                let (buf, pcb) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+                let wide = func.ends_with('W');
+                self.name_inout(mem, crate::hostmodel::USER_NAME, wide, (buf, pcb), true, ERROR_INSUFFICIENT_BUFFER)
+            }
+            (_, "GetComputerNameA" | "GetComputerNameW") => {
+                let (buf, pcb) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+                let wide = func.ends_with('W');
+                self.name_inout(mem, crate::hostmodel::COMPUTER_NAME, wide, (buf, pcb), false, ERROR_BUFFER_OVERFLOW)
+            }
+            // GetComputerNameExA/W(NameType, buf, *size): host-name formats give the
+            // host; the DNS-domain formats give "" (a workgroup machine). The
+            // remaining formats fail closed.
+            (_, "GetComputerNameExA" | "GetComputerNameExW") => {
+                let s = match Self::arg(cpu, 0) as u32 {
+                    0 | 1 | 3 | 4 | 5 | 7 => crate::hostmodel::COMPUTER_NAME,
+                    2 | 6 => "",
+                    _ => return Dispatch::Stop,
+                };
+                let (buf, pcb) = (Self::arg(cpu, 1), Self::arg(cpu, 2));
+                let wide = func.ends_with('W');
+                self.name_inout(mem, s, wide, (buf, pcb), false, ERROR_MORE_DATA)
+            }
+
+            // Registry: a read-only closed-world model. Writes, enumeration and
+            // key creation are not modeled (they stop the run).
+            (_, "RegOpenKeyExA") => self.reg_open(mem, cpu, sab, false),
+            (_, "RegOpenKeyExW") => self.reg_open(mem, cpu, sab, true),
+            (_, "RegQueryValueExA") => self.reg_query(mem, cpu, sab, false),
+            (_, "RegQueryValueExW") => self.reg_query(mem, cpu, sab, true),
+            (_, "RegGetValueA") => self.reg_get_value(mem, cpu, sab, false),
+            (_, "RegGetValueW") => self.reg_get_value(mem, cpu, sab, true),
+            // RegCloseKey returns the error code directly; predefined roots close
+            // as a no-op success.
+            (_, "RegCloseKey") => {
+                let h = Self::arg(cpu, 0);
+                let known = crate::hostmodel::predefined_root(h).is_some()
+                    || self.reg_handles.remove(&h).is_some();
+                Dispatch::Ret(if known { 0 } else { ERROR_INVALID_HANDLE })
+            }
+
+            // Toolhelp: current-process process/module snapshots only.
+            (_, "CreateToolhelp32Snapshot") => self.create_snapshot(mem, cpu),
+            (_, "Process32FirstW") => self.snap_step(mem, cpu, (false, true, true)),
+            (_, "Process32NextW") => self.snap_step(mem, cpu, (false, true, false)),
+            (_, "Process32First") => self.snap_step(mem, cpu, (false, false, true)),
+            (_, "Process32Next") => self.snap_step(mem, cpu, (false, false, false)),
+            (_, "Module32FirstW") => self.snap_step(mem, cpu, (true, true, true)),
+            (_, "Module32NextW") => self.snap_step(mem, cpu, (true, true, false)),
+            (_, "Module32First") => self.snap_step(mem, cpu, (true, false, true)),
+            (_, "Module32Next") => self.snap_step(mem, cpu, (true, false, false)),
+
+            // PSAPI, current process only. EnumProcessModulesEx(.., dwFilterFlag):
+            // default/64-bit/all filters list every module; the 32-bit filter is
+            // unmodeled.
+            (_, "EnumProcessModules" | "K32EnumProcessModules" | "EnumProcessModulesEx"
+                | "K32EnumProcessModulesEx") => {
+                if !Self::is_self_process(Self::arg(cpu, 0)) {
+                    return Dispatch::Stop;
+                }
+                if func.contains("Ex") && !matches!(Self::stack_arg(cpu, mem, sab, 4), Some(0 | 2 | 3)) {
+                    return Dispatch::Stop;
+                }
+                let (lph, cb, p_need) = (Self::arg(cpu, 1), Self::arg(cpu, 2) as u32 as u64, Self::arg(cpu, 3));
+                let Some(mods) = self.module_entries(mem) else {
+                    return Dispatch::Stop;
+                };
+                for (i, m) in mods.iter().enumerate().take((cb / 8) as usize) {
+                    if mem.write_uint(lph + i as u64 * 8, 8, m.base).is_err() {
+                        return Dispatch::Stop;
+                    }
+                }
+                if p_need != 0 && mem.write_uint(p_need, 4, mods.len() as u64 * 8).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+            (_, "GetModuleFileNameExA" | "GetModuleFileNameExW" | "K32GetModuleFileNameExA"
+                | "K32GetModuleFileNameExW" | "GetModuleBaseNameA" | "GetModuleBaseNameW"
+                | "K32GetModuleBaseNameA" | "K32GetModuleBaseNameW") => {
+                if !Self::is_self_process(Self::arg(cpu, 0)) {
+                    return Dispatch::Stop;
+                }
+                let Some(m) = self.module_info(mem, Self::arg(cpu, 1)) else {
+                    return self.fail(ERROR_INVALID_HANDLE);
+                };
+                let s = if func.contains("BaseName") { m.name } else { m.path };
+                Self::copy_str_trunc(&s, Self::arg(cpu, 2), Self::arg(cpu, 3), func.ends_with('W'), mem)
+            }
+            // GetModuleInformation(hProcess, hModule, lpmodinfo, cb): MODULEINFO
+            // { lpBaseOfDll, SizeOfImage, EntryPoint } (24 bytes).
+            (_, "GetModuleInformation" | "K32GetModuleInformation") => {
+                if !Self::is_self_process(Self::arg(cpu, 0)) {
+                    return Dispatch::Stop;
+                }
+                if (Self::arg(cpu, 3) as u32) < 24 {
+                    return self.fail(ERROR_INSUFFICIENT_BUFFER);
+                }
+                let hmod = Self::arg(cpu, 1);
+                let Some(m) = self.module_info(mem, hmod).filter(|_| hmod != 0) else {
+                    return self.fail(ERROR_INVALID_HANDLE);
+                };
+                let mut b = [0u8; 24];
+                b[0..8].copy_from_slice(&m.base.to_le_bytes());
+                b[8..12].copy_from_slice(&(m.size as u32).to_le_bytes());
+                b[16..24].copy_from_slice(&m.entry.to_le_bytes());
+                if mem.write(Self::arg(cpu, 2), &b).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+
+            // GetModuleHandleExA/W(dwFlags, lpModuleName | address, phModule):
+            // consistent with GetModuleHandle; FROM_ADDRESS resolves an address
+            // inside a modeled module. PIN/UNCHANGED_REFCOUNT are no-ops.
+            (_, "GetModuleHandleExA" | "GetModuleHandleExW") => {
+                let flags = Self::arg(cpu, 0) as u32;
+                let (p, phm) = (Self::arg(cpu, 1), Self::arg(cpu, 2));
+                if flags & !0x7 != 0 {
+                    return Dispatch::Stop;
+                }
+                if phm == 0 {
+                    return self.fail(ERROR_INVALID_PARAMETER);
+                }
+                let h = if flags & 0x4 != 0 {
+                    let mut hit = self
+                        .self_entry(mem)
+                        .filter(|m| (m.base..m.base + m.size).contains(&p))
+                        .map(|m| m.base);
+                    if hit.is_none() {
+                        hit = self
+                            .handle_names
+                            .keys()
+                            .copied()
+                            .find(|&b| (b..b + MODULE_IMAGE_SIZE).contains(&p));
+                    }
+                    hit.unwrap_or(0)
+                } else {
+                    let name = if p == 0 {
+                        "<self>".to_string()
+                    } else {
+                        match Self::opt_str(mem, p, func.ends_with('W')) {
+                            Some(s) => s,
+                            None => return Dispatch::Stop,
+                        }
+                    };
+                    self.lookup_module(mem, &name, func)
+                };
+                if mem.write_uint(phm, 8, h).is_err() {
+                    return Dispatch::Stop;
+                }
+                if h == 0 {
+                    return self.fail(ERROR_MOD_NOT_FOUND);
+                }
+                Dispatch::Ret(1)
+            }
+
+            // SetUnhandledExceptionFilter(lpFilter) -> previous filter. Stored and
+            // never invoked; not an anti-debug signal. UnhandledExceptionFilter
+            // (no debugger => EXCEPTION_EXECUTE_HANDLER) cannot run a stored
+            // guest filter, so that case fails closed.
+            (_, "SetUnhandledExceptionFilter") => {
+                let prev = self.unhandled_filter;
+                self.unhandled_filter = Self::arg(cpu, 0);
+                Dispatch::Ret(prev)
+            }
+            (_, "UnhandledExceptionFilter") => {
+                if self.unhandled_filter != 0 {
+                    Dispatch::Stop
+                } else {
+                    Dispatch::Ret(1)
+                }
+            }
+            // DebugBreak raises a breakpoint exception we do not deliver: stop.
+            (_, "DebugBreak") => Dispatch::Stop,
+
             // CheckRemoteDebuggerPresent(hProcess, pbDebuggerPresent) -> BOOL ok
             (_, "CheckRemoteDebuggerPresent") => {
                 let p = Self::arg(cpu, 1);
@@ -1122,6 +1699,9 @@ impl WinApiHook {
             // exception (a debugger would raise EXCEPTION_INVALID_HANDLE).
             (_, "CloseHandle") => {
                 let h = Self::arg(cpu, 0);
+                if self.snapshots.remove(&h).is_some() {
+                    return Dispatch::Ret(1);
+                }
                 let std = (STDHANDLE_BASE..STDHANDLE_BASE + 0x10).contains(&h);
                 if std || self.nt.owns_handle(h) {
                     let _ = self.nt.dispatch("NtClose", cpu, mem, sab);
@@ -2422,5 +3002,255 @@ mod tests {
         set_args(&mut cpu, [0x44, 0, 0, 0]);
         assert_eq!(ret_of(call(&mut h, "CloseHandle", &cpu, &mut mem, s)), 1);
         assert_eq!(ret_of(call(&mut h, "CloseHandle", &cpu, &mut mem, s)), 0);
+    }
+
+    // ---- host identity models ------------------------------------------------
+    const T_IMG: u64 = 0x0000_0030_0000_0000;
+
+    fn put_w(mem: &mut Memory, at: u64, s: &str) {
+        for (i, u) in s.encode_utf16().chain([0]).enumerate() {
+            mem.write_uint(at + i as u64 * 2, 2, u64::from(u)).unwrap();
+        }
+    }
+
+    fn rd_w(mem: &Memory, at: u64) -> String {
+        read_wstr(mem, at).unwrap()
+    }
+
+    /// `harness` plus a mapped sample image with a minimal PE header.
+    fn img_harness() -> (WinApiHook, Cpu, Memory, u64) {
+        let (mut h, cpu, mut mem, s) = harness();
+        mem.map(T_IMG, 0x1000, Perm::RW).unwrap();
+        mem.write_uint(T_IMG + 0x3C, 4, 0x40).unwrap();
+        mem.write_uint(T_IMG + 0x40 + 24 + 16, 4, 0x1000).unwrap(); // entry RVA
+        mem.write_uint(T_IMG + 0x40 + 24 + 56, 4, 0x5000).unwrap(); // SizeOfImage
+        h.image_base = T_IMG;
+        (h, cpu, mem, s)
+    }
+
+    #[test]
+    fn user_and_computer_names_are_benign() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let (buf, pcb) = (T_DATA, T_DATA + 0x400);
+        mem.write_uint(pcb, 4, 64).unwrap();
+        set_args(&mut cpu, [buf, pcb, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "GetUserNameW", &cpu, &mut mem, s)), 1);
+        assert_eq!(rd_w(&mem, buf), "user");
+        assert_eq!(mem.read_uint(pcb, 4).unwrap(), 5, "count includes the NUL");
+        // Too small: fails with the required size + ERROR_INSUFFICIENT_BUFFER.
+        mem.write_uint(pcb, 4, 2).unwrap();
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "GetUserNameW", &cpu, &mut mem, s)), 0);
+        assert_eq!(mem.read_uint(pcb, 4).unwrap(), 5);
+        assert_eq!(h.last_error, ERROR_INSUFFICIENT_BUFFER);
+        // ANSI computer name; success count excludes the NUL.
+        mem.write_uint(pcb, 4, 64).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetComputerNameA", &cpu, &mut mem, s)), 1);
+        assert_eq!(read_cstr(&mem, buf).unwrap(), "DESKTOP-GENERIC");
+        assert_eq!(mem.read_uint(pcb, 4).unwrap(), 15);
+        // Ex: DNS hostname = host, DNS domain = empty, unmodeled format stops.
+        set_args(&mut cpu, [1, buf, pcb, 0]);
+        mem.write_uint(pcb, 4, 64).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetComputerNameExW", &cpu, &mut mem, s)), 1);
+        assert_eq!(rd_w(&mem, buf), "DESKTOP-GENERIC");
+        set_args(&mut cpu, [2, buf, pcb, 0]);
+        mem.write_uint(pcb, 4, 64).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetComputerNameExW", &cpu, &mut mem, s)), 1);
+        assert_eq!(rd_w(&mem, buf), "");
+        set_args(&mut cpu, [99, buf, pcb, 0]);
+        assert!(matches!(h.dispatch("kernel32.dll", "GetComputerNameExW", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn registry_hides_sandbox_keys_and_serves_benign_values() {
+        const HKLM: u64 = 0xFFFF_FFFF_8000_0002;
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let (sub, phk) = (T_DATA, T_DATA + 0x800);
+        mem.write_uint(s, 8, phk).unwrap(); // arg5 phkResult
+        for key in [
+            "SOFTWARE\\Oracle\\VirtualBox Guest Additions",
+            "SOFTWARE\\VMware, Inc.\\VMware Tools",
+            "SYSTEM\\CurrentControlSet\\Services\\VBoxGuest",
+            "SOFTWARE\\Sandboxie",
+        ] {
+            put_w(&mut mem, sub, key);
+            set_args(&mut cpu, [HKLM, sub, 0, 0x20019]);
+            assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegOpenKeyExW", &cpu, &mut mem, s)), 2, "{key}");
+            assert_eq!(mem.read_uint(phk, 8).unwrap(), 0);
+        }
+        // A normal key opens; a value reads back; the handle closes once.
+        put_w(&mut mem, sub, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        set_args(&mut cpu, [HKLM, sub, 0, 0x20019]);
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegOpenKeyExW", &cpu, &mut mem, s)), 0);
+        let hk = mem.read_uint(phk, 8).unwrap();
+        assert_ne!(hk, 0);
+        let (name, data, cb) = (T_DATA + 0x100, T_DATA + 0x200, T_DATA + 0x300);
+        put_w(&mut mem, name, "ProductName");
+        mem.write_uint(cb, 4, 0x100).unwrap();
+        mem.write_uint(s, 8, data).unwrap(); // arg5 lpData
+        mem.write_uint(s + 8, 8, cb).unwrap(); // arg6 lpcbData
+        set_args(&mut cpu, [hk, name, 0, T_DATA + 0x380]); // lpType
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegQueryValueExW", &cpu, &mut mem, s)), 0);
+        assert_eq!(rd_w(&mem, data), "Windows 10 Pro");
+        assert_eq!(mem.read_uint(T_DATA + 0x380, 4).unwrap(), 1, "REG_SZ");
+        // Missing value -> NOT_FOUND; too-small buffer -> MORE_DATA with size.
+        put_w(&mut mem, name, "NoSuchValue");
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegQueryValueExW", &cpu, &mut mem, s)), 2);
+        put_w(&mut mem, name, "ProductName");
+        mem.write_uint(cb, 4, 4).unwrap();
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegQueryValueExW", &cpu, &mut mem, s)), 234);
+        assert_eq!(mem.read_uint(cb, 4).unwrap(), 30);
+        set_args(&mut cpu, [hk, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegCloseKey", &cpu, &mut mem, s)), 0);
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegCloseKey", &cpu, &mut mem, s)), 6);
+    }
+
+    #[test]
+    fn reg_get_value_dword_and_type_filter() {
+        const HKLM: u64 = 0xFFFF_FFFF_8000_0002;
+        let (mut h, mut cpu, mut mem, s) = harness();
+        let (sub, val, data, cb) = (T_DATA, T_DATA + 0x100, T_DATA + 0x200, T_DATA + 0x300);
+        put_w(&mut mem, sub, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        put_w(&mut mem, val, "CurrentMajorVersionNumber");
+        mem.write_uint(cb, 4, 4).unwrap();
+        mem.write_uint(s, 8, 0).unwrap(); // pdwType
+        mem.write_uint(s + 8, 8, data).unwrap();
+        mem.write_uint(s + 16, 8, cb).unwrap();
+        set_args(&mut cpu, [HKLM, sub, val, 0x10]); // RRF_RT_REG_DWORD
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegGetValueW", &cpu, &mut mem, s)), 0);
+        assert_eq!(mem.read_uint(data, 4).unwrap(), 10);
+        set_args(&mut cpu, [HKLM, sub, val, 0x2]); // wants REG_SZ
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegGetValueW", &cpu, &mut mem, s)), 1630);
+        // ANSI path with a sandbox subkey.
+        mem.write(sub, b"SOFTWARE\\Oracle\\VirtualBox Guest Additions\0").unwrap();
+        mem.write(val, b"Version\0").unwrap();
+        set_args(&mut cpu, [HKLM, sub, val, 0xFFFF]);
+        assert_eq!(ret_of(h.dispatch("advapi32.dll", "RegGetValueA", &cpu, &mut mem, s)), 2);
+    }
+
+    #[test]
+    fn toolhelp_process_list_is_clean() {
+        let (mut h, mut cpu, mut mem, s) = img_harness();
+        set_args(&mut cpu, [2, 0, 0, 0]);
+        let snap = ret_of(h.dispatch("kernel32.dll", "CreateToolhelp32Snapshot", &cpu, &mut mem, s));
+        assert_ne!(snap, INVALID_HANDLE_VALUE);
+        let pe = T_DATA;
+        let mut names = Vec::new();
+        let mut api = "Process32FirstW";
+        loop {
+            mem.write_uint(pe, 4, 568).unwrap();
+            set_args(&mut cpu, [snap, pe, 0, 0]);
+            if ret_of(h.dispatch("kernel32.dll", api, &cpu, &mut mem, s)) == 0 {
+                break;
+            }
+            api = "Process32NextW";
+            names.push((mem.read_uint(pe + 8, 4).unwrap(), rd_w(&mem, pe + 44)));
+        }
+        assert_eq!(h.last_error, ERROR_NO_MORE_FILES);
+        assert!(names.contains(&(crate::ntdll::FAKE_PID, "program.exe".to_string())));
+        for (_, n) in &names {
+            let n = n.to_lowercase();
+            for bad in ["dbg", "ida", "wireshark", "procmon", "vbox", "vmware", "sandbox", "fiddler", "hacker"] {
+                assert!(!n.contains(bad), "{n}");
+            }
+        }
+        // Wrong dwSize is rejected; the snapshot closes; a thread snapshot is unmodeled.
+        mem.write_uint(pe, 4, 100).unwrap();
+        set_args(&mut cpu, [snap, pe, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "Process32FirstW", &cpu, &mut mem, s)), 0);
+        assert_eq!(h.last_error, ERROR_BAD_LENGTH);
+        set_args(&mut cpu, [snap, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "CloseHandle", &cpu, &mut mem, s)), 1);
+        set_args(&mut cpu, [4, 0, 0, 0]);
+        assert!(matches!(h.dispatch("kernel32.dll", "CreateToolhelp32Snapshot", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn enum_process_modules_and_module_snapshot_agree() {
+        let (mut h, mut cpu, mut mem, s) = img_harness();
+        let (list, need, out) = (T_DATA, T_DATA + 0x100, T_DATA + 0x200);
+        set_args(&mut cpu, [u64::MAX, list, 0x100, need]);
+        assert_eq!(ret_of(h.dispatch("psapi.dll", "EnumProcessModules", &cpu, &mut mem, s)), 1);
+        let n = (mem.read_uint(need, 4).unwrap() / 8) as usize;
+        let mods: Vec<u64> = (0..n).map(|i| mem.read_uint(list + i as u64 * 8, 8).unwrap()).collect();
+        assert_eq!(mods[0], T_IMG, "sample first");
+        assert_eq!(mods.len(), 4, "sample + ntdll + kernel32 + kernelbase");
+        // Consistent with GetModuleHandle.
+        mem.write(out, b"KERNEL32.DLL\0").unwrap();
+        set_args(&mut cpu, [out, 0, 0, 0]);
+        let k32 = ret_of(h.dispatch("kernel32.dll", "GetModuleHandleA", &cpu, &mut mem, s));
+        assert!(mods.contains(&k32));
+        // GetModuleFileNameExW names the module; GetModuleInformation sizes it.
+        set_args(&mut cpu, [u64::MAX, k32, out, 0x100]);
+        assert!(ret_of(h.dispatch("psapi.dll", "GetModuleFileNameExW", &cpu, &mut mem, s)) > 0);
+        assert_eq!(rd_w(&mem, out), "C:\\Windows\\System32\\kernel32.dll");
+        set_args(&mut cpu, [u64::MAX, T_IMG, out, 24]);
+        assert_eq!(ret_of(h.dispatch("psapi.dll", "GetModuleInformation", &cpu, &mut mem, s)), 1);
+        assert_eq!(mem.read_uint(out, 8).unwrap(), T_IMG);
+        assert_eq!(mem.read_uint(out + 8, 4).unwrap(), 0x5000);
+        assert_eq!(mem.read_uint(out + 16, 8).unwrap(), T_IMG + 0x1000);
+        // Too small a buffer still reports the needed size.
+        set_args(&mut cpu, [u64::MAX, list, 8, need]);
+        assert_eq!(ret_of(h.dispatch("psapi.dll", "EnumProcessModules", &cpu, &mut mem, s)), 1);
+        assert_eq!(mem.read_uint(need, 4).unwrap(), 32);
+        // A foreign process handle is unmodeled.
+        set_args(&mut cpu, [0x1234, list, 0x100, need]);
+        assert!(matches!(h.dispatch("psapi.dll", "EnumProcessModules", &cpu, &mut mem, s), Dispatch::Stop));
+        // Module snapshot lists the same set.
+        set_args(&mut cpu, [0x8, 0, 0, 0]);
+        let snap = ret_of(h.dispatch("kernel32.dll", "CreateToolhelp32Snapshot", &cpu, &mut mem, s));
+        let (me, mut api, mut seen) = (T_DATA + 0x400, "Module32FirstW", Vec::new());
+        loop {
+            mem.write_uint(me, 4, 1080).unwrap();
+            set_args(&mut cpu, [snap, me, 0, 0]);
+            if ret_of(h.dispatch("kernel32.dll", api, &cpu, &mut mem, s)) == 0 {
+                break;
+            }
+            api = "Module32NextW";
+            seen.push(mem.read_uint(me + 24, 8).unwrap());
+        }
+        assert_eq!(seen, mods);
+    }
+
+    #[test]
+    fn module_handle_ex_and_artifact_modules() {
+        let (mut h, mut cpu, mut mem, s) = img_harness();
+        let (name, out) = (T_DATA, T_DATA + 0x100);
+        put_w(&mut mem, name, "ntdll.dll");
+        set_args(&mut cpu, [0, name, out, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetModuleHandleExW", &cpu, &mut mem, s)), 1);
+        mem.write(name, b"ntdll.dll\0").unwrap();
+        set_args(&mut cpu, [name, 0, 0, 0]);
+        let plain = ret_of(h.dispatch("kernel32.dll", "GetModuleHandleA", &cpu, &mut mem, s));
+        assert_eq!(mem.read_uint(out, 8).unwrap(), plain, "Ex agrees with GetModuleHandle");
+        // FROM_ADDRESS inside the sample resolves to its base; outside any module fails.
+        set_args(&mut cpu, [4, T_IMG + 0x10, out, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetModuleHandleExW", &cpu, &mut mem, s)), 1);
+        assert_eq!(mem.read_uint(out, 8).unwrap(), T_IMG);
+        set_args(&mut cpu, [4, T_DATA, out, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetModuleHandleExW", &cpu, &mut mem, s)), 0);
+        // Sandbox/VM modules are never present, by either path.
+        for m in ["SbieDll.dll", "vboxmrxnp.dll", "C:\\x\\VBoxHook.dll"] {
+            let mut b = m.as_bytes().to_vec();
+            b.push(0);
+            mem.write(name, &b).unwrap();
+            set_args(&mut cpu, [name, 0, 0, 0]);
+            assert_eq!(ret_of(h.dispatch("kernel32.dll", "GetModuleHandleA", &cpu, &mut mem, s)), 0, "{m}");
+            assert_eq!(h.last_error, ERROR_MOD_NOT_FOUND);
+            assert_eq!(ret_of(h.dispatch("kernel32.dll", "LoadLibraryA", &cpu, &mut mem, s)), 0, "{m}");
+        }
+    }
+
+    #[test]
+    fn unhandled_exception_filter_stores_previous_and_debugbreak_stops() {
+        let (mut h, mut cpu, mut mem, s) = harness();
+        set_args(&mut cpu, [0, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "UnhandledExceptionFilter", &cpu, &mut mem, s)), 1);
+        set_args(&mut cpu, [0xAAAA, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "SetUnhandledExceptionFilter", &cpu, &mut mem, s)), 0);
+        set_args(&mut cpu, [0xBBBB, 0, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "SetUnhandledExceptionFilter", &cpu, &mut mem, s)), 0xAAAA);
+        // Cannot run a stored guest filter: fail closed.
+        assert!(matches!(h.dispatch("kernel32.dll", "UnhandledExceptionFilter", &cpu, &mut mem, s), Dispatch::Stop));
+        assert!(matches!(h.dispatch("kernel32.dll", "DebugBreak", &cpu, &mut mem, s), Dispatch::Stop));
     }
 }

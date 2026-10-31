@@ -56,6 +56,7 @@ mod differential;
 mod dump;
 mod emu;
 mod iat_fill;
+mod hostmodel;
 mod loader;
 mod memory;
 mod ntdll;
