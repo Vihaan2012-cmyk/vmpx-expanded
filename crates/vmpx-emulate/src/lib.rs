@@ -63,6 +63,7 @@ mod predecode;
 mod sysdll;
 mod vm_observe;
 mod winapi;
+mod xplm;
 
 pub use alu::{Alu, Flags, Shift};
 pub use detonate::{
