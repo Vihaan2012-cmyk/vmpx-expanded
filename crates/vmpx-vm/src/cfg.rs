@@ -31,6 +31,7 @@ use crate::{
     distinct_node_count_bounded, enumerate_symbolic_value,
     execute_symbolic_linear_block_with_initial_state,
     execute_symbolic_native_call_boundary_with_initial_state, infer_branch_input_domains,
+    diagnose_branch_refusals, RefusalCause,
     native_context::{
         Provenance, caller_push_source, defines_flags, initial_provenance, is_cursor_capture,
         observe_target_push, update_provenance,
@@ -198,6 +199,36 @@ pub enum CfgLimitHit {
     /// The byte-accounted per-entry memory cap was exceeded (see
     /// `VmCfgLimits::max_memory_bytes`). The entry fails closed.
     Memory,
+}
+
+/// DIAGNOSTIC ONLY: every offending leaf of one unresolved branch target.
+#[derive(Clone, Debug)]
+pub struct BranchRefusalDiagnostic {
+    pub vip: Va,
+    pub stall_reason: String,
+    /// Offset above `vsp_initial` where the proven entry frame ends, when known.
+    pub frame_hi: Option<u64>,
+    pub causes: Vec<RefusalCause>,
+}
+
+thread_local! {
+    static DIAG_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static DIAG_FRAME_HI: Cell<Option<u64>> = const { Cell::new(None) };
+    static DIAG_SINK: std::cell::RefCell<Vec<BranchRefusalDiagnostic>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Switches the per-thread branch-refusal diagnostic collection on or off and
+/// clears anything collected. Off by default; it never influences recovery.
+pub fn set_branch_refusal_diagnostics(enabled: bool) {
+    DIAG_ENABLED.with(|flag| flag.set(enabled));
+    DIAG_SINK.with(|sink| sink.borrow_mut().clear());
+}
+
+/// Drains the diagnostics collected on this thread since the last call.
+#[must_use]
+pub fn take_branch_refusal_diagnostics() -> Vec<BranchRefusalDiagnostic> {
+    DIAG_SINK.with(|sink| std::mem::take(&mut *sink.borrow_mut()))
 }
 
 /// A labeled assumption the recovery relied on, surfaced rather than folded
@@ -2256,7 +2287,23 @@ impl Walker<'_, '_> {
                         // bytecode) resolved it; nothing else to enumerate here.
                         return;
                     } else {
-                        self.stall(key, vip, format!("unresolved branch target: {reason}"));
+                        let reason = format!("unresolved branch target: {reason}");
+                        if DIAG_ENABLED.with(Cell::get) {
+                            let causes = diagnose_branch_refusals(
+                                &bound_target.simplify(),
+                                self.limits.input_domain,
+                            );
+                            let frame_hi = DIAG_FRAME_HI.with(Cell::get);
+                            DIAG_SINK.with(|sink| {
+                                sink.borrow_mut().push(BranchRefusalDiagnostic {
+                                    vip,
+                                    stall_reason: reason.clone(),
+                                    frame_hi,
+                                    causes,
+                                });
+                            });
+                        }
+                        self.stall(key, vip, reason);
                         return;
                     }
                 }
@@ -2883,9 +2930,15 @@ pub fn recover_vm_cfg_with_observed(
     ) {
         Ok((cells, top_offset)) => {
             let (initial, known) = frame_initial_state(&cells, top_offset);
+            DIAG_FRAME_HI.with(|hi| {
+                hi.set(Some(top_offset.wrapping_add((cells.len() as u64).wrapping_mul(8))));
+            });
             (initial, known, None)
         }
-        Err(note) => (SymbolicVmInitialState::default(), 0, Some(note)),
+        Err(note) => {
+            DIAG_FRAME_HI.with(|hi| hi.set(None));
+            (SymbolicVmInitialState::default(), 0, Some(note))
+        }
     };
     let entry_address = setup.bootstrap.initial_state.vip;
     let seeded = Cell::new(false);

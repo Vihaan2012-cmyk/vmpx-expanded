@@ -58,6 +58,7 @@ pub use call_effects::{
     opaque_call_return_intrinsic_name, resolve_native_call_import,
 };
 pub use cfg::{
+    BranchRefusalDiagnostic, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
     ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, recover_vm_cfg,
     recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
@@ -128,7 +129,8 @@ pub use immutable_image::{ObservedBranchTargets, ObservedImage, ObservedMemory, 
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
-    InputDomainRefusal, abstract_epoch_loads, add_flags_cover, infer_branch_input_domains,
+    InputDomainRefusal, RefusalCause, abstract_epoch_loads, add_flags_cover,
+    diagnose_branch_refusals, infer_branch_input_domains,
 };
 pub use model::{
     BytecodeDirection, EffectKnowledge, RecoveryStatus, StateValue, VmContextLayout, VmDecodeState,

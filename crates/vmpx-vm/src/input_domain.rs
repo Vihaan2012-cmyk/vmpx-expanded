@@ -653,6 +653,18 @@ struct Uses {
 struct Scan {
     uses: BTreeMap<String, Uses>,
     refusal: Option<InputDomainRefusal>,
+    /// Diagnostic only: every offending leaf, not just the first. Filled only
+    /// when `collect` is set; never read by recovery.
+    collect: bool,
+    all_refusals: Vec<RawLeaf>,
+}
+
+/// One offending leaf as the scan saw it (diagnostic).
+struct RawLeaf {
+    intrinsic: Option<String>,
+    reason: String,
+    dependencies: Vec<String>,
+    load_address: Option<Expr>,
 }
 
 impl Scan {
@@ -660,10 +672,31 @@ impl Scan {
         self.refusal.get_or_insert(refusal);
     }
 
+    fn refuse_at(&mut self, register: &str, reason: &str, intrinsic: Option<&str>, arguments: &[Expr]) {
+        if self.collect {
+            let mut dependencies: Vec<String> = arguments
+                .iter()
+                .flat_map(Expr::dependencies)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if dependencies.is_empty() {
+                dependencies.push(register.to_owned());
+            }
+            self.all_refusals.push(RawLeaf {
+                intrinsic: intrinsic.map(str::to_owned),
+                reason: reason.to_owned(),
+                dependencies,
+                load_address: None,
+            });
+        }
+        self.refuse(unsupported(register, reason));
+    }
+
     fn note_width(&mut self, register: &str, width: BitWidth) {
         let uses = self.uses.entry(register.to_owned()).or_default();
         if uses.width.is_some_and(|known| known != width) {
-            self.refuse(unsupported(register, "register is used at two widths"));
+            self.refuse_at(register, "register is used at two widths", None, &[]);
         } else {
             uses.width = Some(width);
         }
@@ -672,7 +705,17 @@ impl Scan {
     fn visit(&mut self, expr: &Expr) {
         match &expr.kind {
             ExprKind::Const { .. } => {}
-            ExprKind::Load { .. } => self.refuse(InputDomainRefusal::MemoryDependent),
+            ExprKind::Load { address } => {
+                if self.collect {
+                    self.all_refusals.push(RawLeaf {
+                        intrinsic: None,
+                        reason: "branch target depends on memory".to_owned(),
+                        dependencies: Vec::new(),
+                        load_address: Some((**address).clone()),
+                    });
+                }
+                self.refuse(InputDomainRefusal::MemoryDependent);
+            }
             ExprKind::Register { name } => {
                 self.note_width(name, expr.width);
                 let uses = self.uses.entry(name.clone()).or_default();
@@ -730,10 +773,12 @@ impl Scan {
                         .flat_map(Expr::dependencies)
                         .next()
                         .unwrap_or_default();
-                    self.refuse(unsupported(
+                    self.refuse_at(
                         &register,
                         "observed through an intrinsic other than add flags",
-                    ));
+                        Some(name.as_str()),
+                        arguments,
+                    );
                     return;
                 };
                 self.visit_add_flags(name, bits, subtract, arguments);
@@ -884,10 +929,12 @@ impl Scan {
                 bits,
             };
             if uses.pair.get_or_insert_with(|| pair.clone()) != &pair {
-                self.refuse(unsupported(
+                self.refuse_at(
                     register,
                     "register is compared against several partners",
-                ));
+                    None,
+                    &[],
+                );
             }
         }
         true
@@ -958,10 +1005,12 @@ impl Scan {
             .next()
             .unwrap_or_default();
         let [left, right] = arguments else {
-            self.refuse(unsupported(
+            self.refuse_at(
                 &register,
                 "add flags need exactly two operands",
-            ));
+                Some(name),
+                arguments,
+            );
             return;
         };
         let (left_constant, right_constant) =
@@ -972,10 +1021,12 @@ impl Scan {
         }
         if let (true, Some(constant), None) = (subtract, left_constant, right_constant) {
             let Some(view) = affine(right).filter(|view| view.bits >= bits) else {
-                self.refuse(unsupported(
+                self.refuse_at(
                     &register,
                     &format!("{name} operand is not an affine view of one register"),
-                ));
+                    Some(name),
+                    arguments,
+                );
                 return;
             };
             let atom = FlagsAtom::SubConstLeft {
@@ -992,10 +1043,12 @@ impl Scan {
             (None, Some(c)) => (left, c),
             (Some(c), None) if !subtract => (right, c),
             _ => {
-                self.refuse(unsupported(
+                self.refuse_at(
                     &register,
                     "add flags of two input-dependent or non-constant operands",
-                ));
+                    Some(name),
+                    arguments,
+                );
                 return;
             }
         };
@@ -1008,10 +1061,12 @@ impl Scan {
             constant
         };
         let Some(view) = affine(symbolic).filter(|view| view.bits >= bits) else {
-            self.refuse(unsupported(
+            self.refuse_at(
                 &register,
                 &format!("{name} operand is not an affine view of one register"),
-            ));
+                Some(name),
+                arguments,
+            );
             return;
         };
         let atom = FlagsAtom::AddConst(AddFlagsObservation {
@@ -1032,10 +1087,12 @@ impl Scan {
         let same_width = uses.atoms.iter().all(|(known, _)| *known == bits);
         uses.atoms.push((bits, atom));
         if *uses.view.get_or_insert(range) != range && same_width {
-            self.refuse(unsupported(
+            self.refuse_at(
                 &view.register,
                 "register is observed through differently shifted or bounded views",
-            ));
+                None,
+                &[],
+            );
         }
     }
 
@@ -1050,10 +1107,12 @@ impl Scan {
                 && (l.shift, l.span) == (r.shift, r.span)
         });
         let Some((l, r)) = views else {
-            self.refuse(unsupported(
+            self.refuse_at(
                 register,
                 &format!("{name} of two input-dependent operands that are not parallel views of one register"),
-            ));
+                Some(name),
+                &[left.clone(), right.clone()],
+            );
             return;
         };
         let view = |a: &Affine| View {
@@ -1069,8 +1128,12 @@ impl Scan {
 }
 
 /// A paired register must be used by nothing but its own pair: any other
-/// observation would need a joint cover with the partner's values.
-fn check_pairs(uses: &BTreeMap<String, Uses>) -> Result<(), InputDomainRefusal> {
+/// observation would need a joint cover with the partner's values. Every
+/// violation, in register order.
+fn pair_refusal_pairs(
+    uses: &BTreeMap<String, Uses>,
+) -> Vec<(String, String, InputDomainRefusal)> {
+    let mut refusals = Vec::new();
     for (register, entry) in uses {
         let Some(pair) = &entry.pair else { continue };
         let mutual = uses
@@ -1078,19 +1141,121 @@ fn check_pairs(uses: &BTreeMap<String, Uses>) -> Result<(), InputDomainRefusal> 
             .and_then(|partner| partner.pair.as_ref())
             .is_some_and(|back| back.partner == *register && back.bits == pair.bits);
         if !mutual {
-            return Err(unsupported(
-                register,
-                "compare partner is observed differently",
+            refusals.push((
+                register.clone(),
+                pair.partner.clone(),
+                unsupported(register, "compare partner is observed differently"),
             ));
-        }
-        if entry.direct_mask != 0 || !entry.atoms.is_empty() {
-            return Err(unsupported(
-                register,
-                "free compare operand is also observed beyond its compare flags",
+        } else if entry.direct_mask != 0 || !entry.atoms.is_empty() {
+            refusals.push((
+                register.clone(),
+                pair.partner.clone(),
+                unsupported(
+                    register,
+                    "free compare operand is also observed beyond its compare flags",
+                ),
             ));
         }
     }
-    Ok(())
+    refusals
+}
+
+fn check_pairs(uses: &BTreeMap<String, Uses>) -> Result<(), InputDomainRefusal> {
+    pair_refusal_pairs(uses)
+        .into_iter()
+        .next()
+        .map_or(Ok(()), |(_, _, refusal)| Err(refusal))
+}
+
+/// The finite value cover and its certificate for one scanned register.
+fn register_domain(
+    register: &str,
+    uses: &Uses,
+    limits: InputDomainLimits,
+) -> Result<(Vec<Expr>, DomainCertificate), InputDomainRefusal> {
+    let width = uses
+        .width
+        .ok_or_else(|| unsupported(register, "register width unknown"))?;
+    if let Some(pair) = &uses.pair {
+        return Ok((
+            sign_order_cover(width.bits(), pair.bits)
+                .into_iter()
+                .map(|value| Expr::constant(width, value))
+                .collect(),
+            DomainCertificate::SignOrderCover { bits: pair.bits },
+        ));
+    }
+    let atom_bits = uses
+        .atoms
+        .iter()
+        .map(|(bits, _)| *bits)
+        .collect::<BTreeSet<_>>();
+    if atom_bits.len() > 1 {
+        return Err(unsupported(
+            register,
+            "add flags observed at several widths",
+        ));
+    }
+    let atom_width = atom_bits.first().copied();
+    let shift = uses.view.map_or(0, |(shift, _)| shift);
+    let (values, certificate) = match (uses.direct_mask, atom_width) {
+        (direct, atom) if direct != 0 => {
+            if shift != 0 {
+                return Err(unsupported(
+                    register,
+                    "register is used directly beside a shifted view",
+                ));
+            }
+            let observed = direct | mask(atom.unwrap_or(0));
+            if observed.count_ones() > limits.max_exhaustive_bits {
+                let reason = if register.contains('@') {
+                    "read is used directly beyond the exhaustive width and memory bounds none of its bits"
+                } else {
+                    "register is used directly beyond the exhaustive width"
+                };
+                return Err(unsupported(register, reason));
+            }
+            let certificate = if observed & (observed + 1) == 0 {
+                DomainCertificate::Exhaustive {
+                    bits: observed.count_ones(),
+                }
+            } else {
+                DomainCertificate::MaskedExhaustive { mask: observed }
+            };
+            (submasks(observed, limits), certificate)
+        }
+        (_, Some(bits)) => {
+            let observations: Vec<_> = uses.atoms.iter().map(|(_, atom)| *atom).collect();
+            let certificate = if bits <= limits.max_exhaustive_bits {
+                DomainCertificate::Exhaustive { bits }
+            } else {
+                DomainCertificate::AddFlagsCover {
+                    bits,
+                    observations: observations.len(),
+                }
+            };
+            let range_bits = uses.view.map_or(bits, |(_, range)| range);
+            (
+                flags_cover_in(bits, &observations, range_bits, limits),
+                certificate,
+            )
+        }
+        (_, None) if uses.ignored => (Some(vec![0]), DomainCertificate::Exhaustive { bits: 0 }),
+        (_, None) => {
+            return Err(unsupported(register, "register has no recognized use"));
+        }
+    };
+    let values = values.ok_or_else(|| InputDomainRefusal::TooManyValues {
+        register: register.to_owned(),
+        limit: limits.max_values_per_variable,
+    })?;
+    Ok((
+        values
+            .into_iter()
+            .map(|value| Expr::constant(width, value << shift))
+            .collect(),
+        certificate,
+    ))
 }
 
 /// Infers a finite, proven-exhaustive domain for every register the
@@ -1109,6 +1274,8 @@ pub fn infer_branch_input_domains(
     let mut scan = Scan {
         uses: BTreeMap::new(),
         refusal: None,
+        collect: false,
+        all_refusals: Vec::new(),
     };
     scan.visit(target);
     if let Some(refusal) = scan.refusal {
@@ -1118,100 +1285,301 @@ pub fn infer_branch_input_domains(
     let mut domains = BTreeMap::new();
     let mut certificates = BTreeMap::new();
     for (register, uses) in scan.uses {
-        let width = uses
-            .width
-            .ok_or_else(|| unsupported(&register, "register width unknown"))?;
-        if let Some(pair) = &uses.pair {
-            domains.insert(
-                register.clone(),
-                sign_order_cover(width.bits(), pair.bits)
-                    .into_iter()
-                    .map(|value| Expr::constant(width, value))
-                    .collect(),
-            );
-            certificates.insert(
-                register,
-                DomainCertificate::SignOrderCover { bits: pair.bits },
-            );
-            continue;
-        }
-        let atom_bits = uses
-            .atoms
-            .iter()
-            .map(|(bits, _)| *bits)
-            .collect::<BTreeSet<_>>();
-        if atom_bits.len() > 1 {
-            return Err(unsupported(
-                &register,
-                "add flags observed at several widths",
-            ));
-        }
-        let atom_width = atom_bits.first().copied();
-        let shift = uses.view.map_or(0, |(shift, _)| shift);
-        let (values, certificate) = match (uses.direct_mask, atom_width) {
-            (direct, atom) if direct != 0 => {
-                if shift != 0 {
-                    return Err(unsupported(
-                        &register,
-                        "register is used directly beside a shifted view",
-                    ));
-                }
-                let observed = direct | mask(atom.unwrap_or(0));
-                if observed.count_ones() > limits.max_exhaustive_bits {
-                    let reason = if register.contains('@') {
-                        "read is used directly beyond the exhaustive width and memory bounds none of its bits"
-                    } else {
-                        "register is used directly beyond the exhaustive width"
-                    };
-                    return Err(unsupported(&register, reason));
-                }
-                let certificate = if observed & (observed + 1) == 0 {
-                    DomainCertificate::Exhaustive {
-                        bits: observed.count_ones(),
-                    }
-                } else {
-                    DomainCertificate::MaskedExhaustive { mask: observed }
-                };
-                (submasks(observed, limits), certificate)
-            }
-            (_, Some(bits)) => {
-                let observations: Vec<_> = uses.atoms.iter().map(|(_, atom)| *atom).collect();
-                let certificate = if bits <= limits.max_exhaustive_bits {
-                    DomainCertificate::Exhaustive { bits }
-                } else {
-                    DomainCertificate::AddFlagsCover {
-                        bits,
-                        observations: observations.len(),
-                    }
-                };
-                let range_bits = uses.view.map_or(bits, |(_, range)| range);
-                (
-                    flags_cover_in(bits, &observations, range_bits, limits),
-                    certificate,
-                )
-            }
-            (_, None) if uses.ignored => (Some(vec![0]), DomainCertificate::Exhaustive { bits: 0 }),
-            (_, None) => {
-                return Err(unsupported(&register, "register has no recognized use"));
-            }
-        };
-        let values = values.ok_or_else(|| InputDomainRefusal::TooManyValues {
-            register: register.clone(),
-            limit: limits.max_values_per_variable,
-        })?;
-        domains.insert(
-            register.clone(),
-            values
-                .into_iter()
-                .map(|value| Expr::constant(width, value << shift))
-                .collect(),
-        );
+        let (values, certificate) = register_domain(&register, &uses, limits)?;
+        domains.insert(register.clone(), values);
         certificates.insert(register, certificate);
     }
     Ok(InferredInputDomains {
         domains,
         certificates,
     })
+}
+
+/// One offending leaf of a refused branch target, for reporting only. Recovery
+/// never reads it (see [`diagnose_branch_refusals`]).
+#[derive(Clone, Debug, Serialize)]
+pub struct RefusalCause {
+    /// `"X"` when the leaf consumes an external memory read, else `"NONX"`.
+    pub class: &'static str,
+    /// The intrinsic that consumes the leaf (`vm_flags_nor_w32`, `multiply`, ...),
+    /// `"load"` for a raw load, or `"register"` for a plain register use.
+    pub leaf_name: String,
+    pub reason: String,
+    /// Which scan stage refused: `scan`, `pairs` or `domain`.
+    pub phase: &'static str,
+    /// For an external read: the root (innermost, when the address chases
+    /// further reads) address, rendered.
+    pub root: Option<String>,
+    /// `constant_global`, `native_register`, `vsp` or `other`.
+    pub root_class: Option<&'static str>,
+    pub constant_address: Option<u64>,
+    /// Offset from the stack pointer when the root is `vsp + constant`.
+    pub vsp_offset: Option<i64>,
+    /// Number of further external reads the address itself goes through.
+    pub chain_depth: usize,
+    pub width: u32,
+    /// The leaf's other dependencies, as `kind:name`.
+    pub companions: Vec<String>,
+}
+
+struct EpochRead {
+    load: String,
+    address: Expr,
+    width: BitWidth,
+}
+
+fn dependency_kind(name: &str) -> &'static str {
+    if name.contains('@') {
+        "ext_read"
+    } else if name.starts_with("native_r") {
+        "native_register"
+    } else if name.starts_with("vsp") {
+        "vsp"
+    } else {
+        "register"
+    }
+}
+
+/// `(constant offset, number of vsp occurrences)` of a sum of constants and the
+/// stack-pointer register, or `None` for any other shape.
+fn linear_vsp_offset(expr: &Expr) -> Option<(i64, usize)> {
+    match &expr.kind {
+        ExprKind::Const { value } => Some((value.cast_signed(), 0)),
+        ExprKind::Register { name } if name.starts_with("vsp") => Some((0, 1)),
+        ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            let (a, x) = linear_vsp_offset(left)?;
+            let (b, y) = linear_vsp_offset(right)?;
+            Some((a.wrapping_add(b), x + y))
+        }
+        ExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } => {
+            let (a, x) = linear_vsp_offset(left)?;
+            let ExprKind::Const { value } = right.kind else {
+                return None;
+            };
+            Some((a.wrapping_sub(value.cast_signed()), x))
+        }
+        _ => None,
+    }
+}
+
+struct AddressRoot {
+    root: String,
+    class: &'static str,
+    constant: Option<u64>,
+    vsp_offset: Option<i64>,
+    chain: usize,
+}
+
+fn classify_address(address: &Expr, reads: &[EpochRead], chain: usize) -> AddressRoot {
+    // A nested read was already abstracted to a `load@index` register.
+    let nested = address.dependencies().into_iter().find_map(|name| {
+        let (_, index) = name.split_once('@')?;
+        reads.get(index.parse::<usize>().ok()?)
+    });
+    if let Some(read) = nested
+        && chain < 8
+    {
+        return classify_address(&read.address, reads, chain + 1);
+    }
+    let simplified = address.simplify();
+    if let ExprKind::Const { value } = simplified.kind {
+        return AddressRoot {
+            root: format!("{value:#x}"),
+            class: "constant_global",
+            constant: Some(value),
+            vsp_offset: None,
+            chain,
+        };
+    }
+    let dependencies = simplified.dependencies();
+    let names = dependencies.iter().cloned().collect::<Vec<_>>().join(",");
+    if dependencies.iter().any(|name| name.starts_with("native_r")) {
+        return AddressRoot {
+            root: names,
+            class: "native_register",
+            constant: None,
+            vsp_offset: None,
+            chain,
+        };
+    }
+    if dependencies.iter().any(|name| name.starts_with("vsp")) {
+        let vsp_offset = linear_vsp_offset(&simplified)
+            .filter(|(_, count)| *count == 1)
+            .map(|(offset, _)| offset);
+        return AddressRoot {
+            root: names,
+            class: "vsp",
+            constant: None,
+            vsp_offset,
+            chain,
+        };
+    }
+    AddressRoot {
+        root: names,
+        class: "other",
+        constant: None,
+        vsp_offset: None,
+        chain,
+    }
+}
+
+/// DIAGNOSTIC ONLY. Every offending leaf of a refused branch `target`, where
+/// [`infer_branch_input_domains`] reports just the first. Runs the same scan
+/// with collection switched on, so the recovery path is unchanged. Each external
+/// read (`memory_load_epoch_N(address)`) is traced to the root of its address.
+#[must_use]
+pub fn diagnose_branch_refusals(target: &Expr, limits: InputDomainLimits) -> Vec<RefusalCause> {
+    let mut reads: Vec<EpochRead> = Vec::new();
+    let Ok(abstracted) = target.rewrite_intrinsics(&mut |width, name, arguments| {
+        if !(name.starts_with("memory_load_epoch_") && arguments.len() == 1) {
+            return None;
+        }
+        let index = reads
+            .iter()
+            .position(|read| read.load == name && read.width == width && read.address == arguments[0])
+            .unwrap_or_else(|| {
+                reads.push(EpochRead {
+                    load: name.to_owned(),
+                    address: arguments[0].clone(),
+                    width,
+                });
+                reads.len() - 1
+            });
+        Some(Expr::register(width, format!("{name}@{index}")))
+    }) else {
+        return Vec::new();
+    };
+    let mut scan = Scan {
+        uses: BTreeMap::new(),
+        refusal: None,
+        collect: true,
+        all_refusals: Vec::new(),
+    };
+    scan.visit(&abstracted);
+    let mut leaves: Vec<(&'static str, RawLeaf)> = std::mem::take(&mut scan.all_refusals)
+        .into_iter()
+        .map(|leaf| ("scan", leaf))
+        .collect();
+    let reason_of = |refusal: &InputDomainRefusal| match refusal {
+        InputDomainRefusal::Unsupported { reason, .. } => reason.clone(),
+        other => other.to_string(),
+    };
+    for (register, partner, refusal) in pair_refusal_pairs(&scan.uses) {
+        leaves.push((
+            "pairs",
+            RawLeaf {
+                intrinsic: Some("vm_flags_sub".to_owned()),
+                reason: reason_of(&refusal),
+                dependencies: vec![register, partner],
+                load_address: None,
+            },
+        ));
+    }
+    for (register, uses) in &scan.uses {
+        if let Err(refusal) = register_domain(register, uses, limits) {
+            leaves.push((
+                "domain",
+                RawLeaf {
+                    intrinsic: None,
+                    reason: reason_of(&refusal),
+                    dependencies: vec![register.clone()],
+                    load_address: None,
+                },
+            ));
+        }
+    }
+    let mut causes: Vec<RefusalCause> = Vec::new();
+    let push = |cause: RefusalCause, causes: &mut Vec<RefusalCause>| {
+        let duplicate = causes.iter().any(|known| {
+            known.class == cause.class
+                && known.leaf_name == cause.leaf_name
+                && known.reason == cause.reason
+                && known.root == cause.root
+                && known.companions == cause.companions
+        });
+        if !duplicate {
+            causes.push(cause);
+        }
+    };
+    for (phase, leaf) in leaves {
+        let leaf_name = leaf
+            .intrinsic
+            .clone()
+            .unwrap_or_else(|| if leaf.load_address.is_some() { "load" } else { "register" }.to_owned());
+        let mut externals: Vec<(String, AddressRoot, u32)> = Vec::new();
+        if let Some(address) = &leaf.load_address {
+            externals.push(("load".to_owned(), classify_address(address, &reads, 0), 0));
+        }
+        let mut others: Vec<String> = Vec::new();
+        for dependency in &leaf.dependencies {
+            let read = dependency
+                .split_once('@')
+                .and_then(|(_, index)| index.parse::<usize>().ok())
+                .and_then(|index| reads.get(index));
+            match read {
+                Some(read) => externals.push((
+                    read.load.clone(),
+                    classify_address(&read.address, &reads, 0),
+                    read.width.bits(),
+                )),
+                None => others.push(format!("{}:{dependency}", dependency_kind(dependency))),
+            }
+        }
+        if externals.is_empty() {
+            push(
+                RefusalCause {
+                    class: "NONX",
+                    leaf_name,
+                    reason: leaf.reason,
+                    phase,
+                    root: None,
+                    root_class: None,
+                    constant_address: None,
+                    vsp_offset: None,
+                    chain_depth: 0,
+                    width: 0,
+                    companions: others,
+                },
+                &mut causes,
+            );
+            continue;
+        }
+        for (index, (load, root, width)) in externals.iter().enumerate() {
+            let mut companions = others.clone();
+            companions.extend(
+                externals
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, (name, root, _))| format!("ext_read:{name}[{}]", root.class)),
+            );
+            push(
+                RefusalCause {
+                    class: "X",
+                    leaf_name: leaf_name.clone(),
+                    reason: leaf.reason.clone(),
+                    phase,
+                    root: Some(format!("{load}@{}", root.root)),
+                    root_class: Some(root.class),
+                    constant_address: root.constant,
+                    vsp_offset: root.vsp_offset,
+                    chain_depth: root.chain,
+                    width: *width,
+                    companions,
+                },
+                &mut causes,
+            );
+        }
+    }
+    causes
 }
 
 #[cfg(test)]
@@ -2412,5 +2780,43 @@ mod tests {
             .expect("constant left operand");
         assert_eq!(inferred.domains["ignored"].len(), 1);
         assert_eq!(enumerate(&target, &inferred), TWO_TARGETS);
+    }
+
+    #[test]
+    fn diagnosis_reports_every_leaf_and_the_address_root_of_each_read() {
+        let limits = InputDomainLimits::default();
+        let global = Expr::intrinsic(
+            BitWidth::W32,
+            "memory_load_epoch_5",
+            vec![Expr::constant(BitWidth::W64, 0x2000)],
+        );
+        let native = Expr::intrinsic(
+            BitWidth::W32,
+            "memory_load_epoch_6",
+            vec![Expr::register(BitWidth::W64, "native_rcx_initial")],
+        );
+        let chained = Expr::intrinsic(
+            BitWidth::W32,
+            "memory_load_epoch_7",
+            vec![Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, stack_load(73, 16)).expect("zext")],
+        );
+        let target = Expr::intrinsic(
+            BitWidth::W32,
+            "mystery",
+            vec![stack_load(73, 8), global, native, chained],
+        );
+        assert!(infer_branch_input_domains(&target, limits).is_err());
+        let causes = diagnose_branch_refusals(&target, limits);
+        let leaf = |class: &str, chain: usize| {
+            causes
+                .iter()
+                .find(|c| c.root_class == Some(class) && c.chain_depth == chain)
+                .unwrap_or_else(|| panic!("{class}/{chain} in {causes:?}"))
+        };
+        assert!(causes.iter().all(|c| c.class == "X" && c.leaf_name == "mystery"));
+        assert_eq!(leaf("vsp", 0).vsp_offset, Some(8));
+        assert_eq!(leaf("constant_global", 0).constant_address, Some(0x2000));
+        leaf("native_register", 0);
+        assert_eq!(leaf("vsp", 1).vsp_offset, Some(16));
     }
 }

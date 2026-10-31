@@ -4,7 +4,7 @@
 // the `cfgdiag` example), catches per-entry panics, and tallies completeness
 // plus the stall-cause distribution. READ-ONLY: no engine changes, static only.
 //
-// Usage: xpl_coverage [IMAGE] [SAMPLE] [THREADS]
+// Usage: xpl_coverage [IMAGE] [SAMPLE] [THREADS] [INSTRUCTION_LIMIT] [X_DIAG_JSONL] [CAUSE_DUMP]
 //   IMAGE    defaults to E:/downloads/systems.original.xpl
 //   SAMPLE   entries to sweep: a number for a sample, or "all" for the full
 //            image. OMITTED defaults to a SMALL memory-safe sample (50) so a
@@ -22,17 +22,24 @@ use std::time::Instant;
 
 use vmpx_pe::PeImage;
 use vmpx_vm::{
-    EntryProfileRecoveryLimits, VmCfgLimits, VmDiscoveryLimits, discover_vm_entries, recover_vm_cfg,
+    BranchRefusalDiagnostic, EntryProfileRecoveryLimits, VmCfgAssumption, VmCfgLimits,
+    VmDiscoveryLimits, discover_vm_entries, recover_vm_cfg, set_branch_refusal_diagnostics,
+    take_branch_refusal_diagnostics,
 };
 
 const DEFAULT_IMAGE: &str = "E:/downloads/systems.original.xpl";
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 
 enum Outcome {
-    Complete,
+    Complete { assumptions: Vec<VmCfgAssumption> },
     // Non-complete but recovery returned a CFG: distinct normalized stall
     // causes this entry exhibited, and the resource limit hit (if any).
-    Incomplete { causes: Vec<String>, raw: Vec<String>, limit: Option<String> },
+    Incomplete {
+        causes: Vec<String>,
+        raw: Vec<String>,
+        limit: Option<String>,
+        diags: Vec<BranchRefusalDiagnostic>,
+    },
     // recover_vm_cfg returned Err before producing a CFG.
     Error(String),
     Panic,
@@ -122,13 +129,15 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_
         },
         ..VmCfgLimits::default()
     };
+    set_branch_refusal_diagnostics(true);
     let result = panic::catch_unwind(AssertUnwindSafe(|| recover_vm_cfg(pe, entry, limits)));
+    let diags = take_branch_refusal_diagnostics();
     match result {
         Err(_) => Outcome::Panic,
         Ok(Err(error)) => Outcome::Error(normalize(&error.to_string())),
         Ok(Ok(cfg)) => {
             if cfg.all_paths_reach_vm_exit() {
-                Outcome::Complete
+                Outcome::Complete { assumptions: cfg.assumptions.iter().copied().collect() }
             } else {
                 let mut causes: Vec<String> = cfg
                     .stalls
@@ -149,6 +158,7 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_
                     causes,
                     raw,
                     limit: cfg.limit_hit.map(|hit| format!("{hit:?}")),
+                    diags,
                 }
             }
         }
@@ -293,16 +303,20 @@ fn main() {
     // Per-unrecovered-function diagnostic data: category set, raw reasons.
     let mut fn_sets: Vec<(u32, BTreeSet<char>)> = Vec::new();
     let mut d_vas: Vec<(u32, u64)> = Vec::new();
+    let mut complete_sets: Vec<(u32, Vec<VmCfgAssumption>)> = Vec::new();
     for r in &results {
         match &r.outcome {
-            Outcome::Complete => complete += 1,
+            Outcome::Complete { assumptions } => {
+                complete += 1;
+                complete_sets.push((r.rva, assumptions.clone()));
+            }
             Outcome::Panic => panics += 1,
             Outcome::Error(msg) => {
                 errors += 1;
                 fn_sets.push((r.rva, BTreeSet::from(['J'])));
                 add(&mut error_causes, format!("cfg_error: {msg}"), r.rva);
             }
-            Outcome::Incomplete { causes: cs, raw, limit } => {
+            Outcome::Incomplete { causes: cs, raw, limit, .. } => {
                 incomplete += 1;
                 let mut set: BTreeSet<char> = raw.iter().map(|x| categorize(x)).collect();
                 if set.is_empty() {
@@ -657,7 +671,321 @@ fn main() {
         }
     }
 
-    if let Some(path) = args.get(5) {
+
+    // ---------------- assumption-tier split of the complete set ----------------
+    {
+        let tier = |a: &[VmCfgAssumption]| -> &'static str {
+            let mut t = "PROVEN";
+            for x in a {
+                let this = match x {
+                    VmCfgAssumption::ObservedGlobal
+                    | VmCfgAssumption::ObservedRecursionDepth
+                    | VmCfgAssumption::ObservedBranchTarget => "OBSERVED",
+                    VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack => "UNPROVEN-ASSUMPTION",
+                    VmCfgAssumption::PreferredImageBase
+                    | VmCfgAssumption::OverApproximatedEnvironmentGate => "BENIGN-LABELED",
+                };
+                let rank = |t: &str| match t {
+                    "OBSERVED" => 3,
+                    "UNPROVEN-ASSUMPTION" => 2,
+                    "BENIGN-LABELED" => 1,
+                    _ => 0,
+                };
+                if rank(this) > rank(t) {
+                    t = this;
+                }
+            }
+            t
+        };
+        let mut tiers: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut exact: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, a) in &complete_sets {
+            *tiers.entry(tier(a)).or_insert(0) += 1;
+            *exact.entry(format!("{a:?}")).or_insert(0) += 1;
+        }
+        println!("\n==================== ASSUMPTION-TIER SPLIT OF THE COMPLETE SET ====================");
+        println!("complete (all_paths_reach_vm_exit): {complete}");
+        for t in ["PROVEN", "BENIGN-LABELED", "UNPROVEN-ASSUMPTION", "OBSERVED"] {
+            println!("  {t:<22}: {}", tiers.get(t).copied().unwrap_or(0));
+        }
+        if tiers.get("OBSERVED").copied().unwrap_or(0) > 0 {
+            println!("  !!!!!! OBSERVED-tier assumptions present in a SOUND static sweep: INVESTIGATE !!!!!!");
+        }
+        println!("  exact assumption sets:");
+        for (k, n) in &exact {
+            println!("    {n:>4}  {k}");
+        }
+        let proven = tiers.get("PROVEN").copied().unwrap_or(0);
+        let benign = tiers.get("BENIGN-LABELED").copied().unwrap_or(0);
+        println!(
+            "  honest proven count: {proven} strict (no assumptions); {} incl. benign labels (of {complete} reported)",
+            proven + benign
+        );
+    }
+
+    // ---------------- merged-X address-root classification ----------------
+    {
+        let base = pe.optional.image_base;
+        let mut slots: BTreeMap<u32, u32> = BTreeMap::new();
+        for block in &pe.report().relocations {
+            for e in &block.entries {
+                if e.kind == 0 {
+                    continue;
+                }
+                let size = if e.kind == 10 { 8 } else { 4 };
+                slots.insert(block.page_rva.0 + u32::from(e.offset), size);
+            }
+        }
+        println!("\n==================== MERGED-X ADDRESS-ROOT CLASSIFICATION ====================");
+        println!("image base reloc slots parsed: {}", slots.len());
+        let reloc_covers = |rva: u32, width: u32| -> bool {
+            let end = rva.saturating_add((width / 8).max(1));
+            slots
+                .range(rva.saturating_sub(7)..end)
+                .any(|(s, sz)| *s < end && rva < s + sz)
+        };
+        let refine = |c: &vmpx_vm::RefusalCause, frame_hi: Option<u64>| -> String {
+            let root = c.root_class.unwrap_or("none");
+            let mut out = match root {
+                "constant_global" => "CONSTANT-GLOBAL".to_owned(),
+                "native_register" => "NATIVE-REGISTER".to_owned(),
+                "vsp" => match (c.vsp_offset, frame_hi) {
+                    (None, _) => "VSP-INDEXED".to_owned(),
+                    (Some(_), None) => "VSP-UNKNOWN-FRAME".to_owned(),
+                    (Some(o), Some(h)) => {
+                        if o >= h.cast_signed() {
+                            "VSP-ABOVE-FRAME".to_owned()
+                        } else {
+                            "VSP-INSIDE-FRAME".to_owned()
+                        }
+                    }
+                },
+                _ => "OTHER".to_owned(),
+            };
+            if c.chain_depth > 0 {
+                out.push_str("+CHAIN");
+            }
+            out
+        };
+        let ab_fns: BTreeSet<u32> = fn_sets
+            .iter()
+            .filter(|(_, s)| s.contains(&'A') || s.contains(&'B'))
+            .map(|(r, _)| *r)
+            .collect();
+        let jsonl_path = args.get(5).map(String::as_str).unwrap_or("xpl_x_diag.jsonl");
+        let mut out = String::new();
+        // per function: refined root classes of X leaves
+        let mut x_fn_roots: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+        let mut leaf_hist: BTreeMap<String, usize> = BTreeMap::new();
+        let mut leaf_name_hist: BTreeMap<String, usize> = BTreeMap::new();
+        let mut const_sections: BTreeMap<String, usize> = BTreeMap::new();
+        let mut const_reloc: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut fns_with_diag = 0usize;
+        let mut nonx_names: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+        let mut fn_has_nonx: BTreeSet<u32> = BTreeSet::new();
+        let mut nodiag_ab = Vec::new();
+        for r in &results {
+            let Outcome::Incomplete { diags, raw, .. } = &r.outcome else { continue };
+            if diags.is_empty() {
+                continue;
+            }
+            fns_with_diag += 1;
+            let mut js_causes = Vec::new();
+            for d in diags {
+                for c in &d.causes {
+                    let refined = if c.class == "X" { refine(c, d.frame_hi) } else { "-".to_owned() };
+                    let mut section = None;
+                    let mut covered = None;
+                    if c.class == "X" {
+                        x_fn_roots.entry(r.rva).or_default().insert(refined.clone());
+                        *leaf_hist.entry(refined.clone()).or_insert(0) += 1;
+                        *leaf_name_hist.entry(c.leaf_name.clone()).or_insert(0) += 1;
+                        if let Some(addr) = c.constant_address {
+                            let rva = base.checked_rva_of(vmpx_pe::Va(addr)).map(|v| v.0);
+                            let sec = rva.and_then(|rv| {
+                                pe.sections.iter().find(|s| s.contains_mapped_rva(vmpx_pe::Rva(rv)))
+                            });
+                            let name = sec.map_or_else(
+                                || "(outside image)".to_owned(),
+                                |s| {
+                                    let w = if s.characteristics & 0x8000_0000 != 0 { "W" } else { "RO" };
+                                    format!("{}[{w}]", s.name)
+                                },
+                            );
+                            let cov = rva.is_some_and(|rv| reloc_covers(rv, c.width));
+                            *const_sections.entry(name.clone()).or_insert(0) += 1;
+                            *const_reloc.entry(if cov { "reloc-covered" } else { "no-reloc" }).or_insert(0) += 1;
+                            section = Some(name);
+                            covered = Some(cov);
+                        }
+                    } else {
+                        fn_has_nonx.insert(r.rva);
+                        nonx_names.entry(c.leaf_name.clone()).or_default().insert(r.rva);
+                    }
+                    js_causes.push(serde_json::json!({
+                        "class": c.class,
+                        "leaf_name": c.leaf_name,
+                        "root": c.root,
+                        "root_class": refined,
+                        "width": c.width,
+                        "companions": c.companions,
+                        "reason": c.reason,
+                        "phase": c.phase,
+                        "constant_address": c.constant_address.map(|a| format!("{a:#x}")),
+                        "section": section,
+                        "reloc_covered": covered,
+                        "vsp_offset": c.vsp_offset,
+                        "frame_hi": d.frame_hi,
+                        "chain_depth": c.chain_depth,
+                        "vip": format!("{:#x}", d.vip.0),
+                    }));
+                }
+            }
+            out.push_str(&serde_json::json!({
+                "rva": format!("{:#x}", r.rva),
+                "x_by_stall_label": ab_fns.contains(&r.rva),
+                "first_win_stalls": raw,
+                "causes": js_causes,
+            }).to_string());
+            out.push('\n');
+        }
+        for rva in &ab_fns {
+            if !x_fn_roots.contains_key(rva) {
+                nodiag_ab.push(*rva);
+            }
+        }
+        std::fs::write(jsonl_path, &out).expect("write jsonl");
+        println!("per-function JSONL ({fns_with_diag} functions with a diagnosed branch) -> {jsonl_path}");
+
+        let xd: BTreeSet<u32> = x_fn_roots.keys().copied().collect();
+        println!("\nX functions by first-win stall label (A or B): {}", ab_fns.len());
+        println!("X functions by ALL-refusals diagnostic (>=1 X leaf) : {}", xd.len());
+        println!(
+            "  overlap: {}; stall-label X without any diagnosed X leaf: {}; diagnosed X not stall-labeled X: {}",
+            ab_fns.intersection(&xd).count(),
+            nodiag_ab.len(),
+            xd.difference(&ab_fns).count()
+        );
+        println!("\n-- X leaves by refined address-root class (leaf count, deduped within a stall) --");
+        for (k, n) in &leaf_hist {
+            println!("  {n:>6}  {k}");
+        }
+        println!("\n-- X leaves by consuming leaf name --");
+        let mut lh: Vec<_> = leaf_name_hist.iter().collect();
+        lh.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (k, n) in lh {
+            println!("  {n:>6}  {k}");
+        }
+        println!("\n-- CONSTANT-GLOBAL leaves: section --");
+        for (k, n) in &const_sections {
+            println!("  {n:>6}  {k}");
+        }
+        println!("-- CONSTANT-GLOBAL leaves: base-relocation coverage of the slot --");
+        for (k, n) in &const_reloc {
+            println!("  {n:>6}  {k}");
+        }
+        let external = |k: &str| matches!(k.trim_end_matches("+CHAIN"), "CONSTANT-GLOBAL" | "NATIVE-REGISTER" | "VSP-ABOVE-FRAME");
+        let inside = |k: &str| matches!(k.trim_end_matches("+CHAIN"), "VSP-INSIDE-FRAME" | "VSP-INDEXED" | "VSP-UNKNOWN-FRAME");
+        println!("\n-- X FUNCTIONS: address-root split (function-level; a function can span classes) --");
+        let mut per_fn: BTreeMap<String, usize> = BTreeMap::new();
+        for roots in x_fn_roots.values() {
+            for k in roots {
+                *per_fn.entry(k.clone()).or_insert(0) += 1;
+            }
+        }
+        for (k, n) in &per_fn {
+            println!("  {n:>5} functions with >=1 {k} leaf");
+        }
+        let all_ext = x_fn_roots.values().filter(|r| r.iter().all(|k| external(k))).count();
+        let has_inside = x_fn_roots.values().filter(|r| r.iter().any(|k| inside(k))).count();
+        let only_inside = x_fn_roots.values().filter(|r| r.iter().all(|k| inside(k))).count();
+        let direct_inside = x_fn_roots
+            .values()
+            .filter(|r| r.iter().any(|k| matches!(k.as_str(), "VSP-INSIDE-FRAME")))
+            .count();
+        let has_other = x_fn_roots
+            .values()
+            .filter(|r| r.iter().any(|k| !external(k) && !inside(k)))
+            .count();
+        println!("  X functions (diagnosed): {}", xd.len());
+        println!("  ALL X leaves externally rooted (CONSTANT/NATIVE/VSP-ABOVE; genuinely closed): {all_ext}");
+        println!("  >=1 VSP-inside/indexed/unknown-frame leaf (any chain; potential precision loss): {has_inside}");
+        println!("  ONLY inside-frame-ish leaves (every X leaf is inside/indexed/unknown): {only_inside}");
+        println!("  >=1 direct (unchained) VSP-INSIDE-FRAME leaf: {direct_inside}");
+        println!("  >=1 OTHER-rooted leaf (unclassified): {has_other}");
+
+        // ---------------- ceilings ----------------
+        let proven_n = complete_sets.iter().filter(|(_, a)| a.is_empty()).count();
+        let benign_n = complete_sets
+            .iter()
+            .filter(|(_, a)| {
+                !a.is_empty()
+                    && a.iter().all(|x| {
+                        matches!(
+                            x,
+                            VmCfgAssumption::PreferredImageBase
+                                | VmCfgAssumption::OverApproximatedEnvironmentGate
+                        )
+                    })
+            })
+            .count();
+        let total = swept.max(1) as f64;
+        let pct = |n: usize| n as f64 * 100.0 / total;
+        let is_rt = |c: &char| matches!(c, 'A' | 'B' | 'N');
+        let addr_only: BTreeSet<u32> =
+            fn_sets.iter().filter(|(_, s)| !s.iter().any(is_rt)).map(|(r, _)| *r).collect();
+        let addr_only_nodiagx: usize = addr_only.iter().filter(|r| !xd.contains(r)).count();
+        // Functions whose only runtime cause is X-with-inside-frame (recoverable precision sub-case).
+        let recoverable: BTreeSet<u32> = fn_sets
+            .iter()
+            .filter(|(r, s)| {
+                x_fn_roots.get(r).is_some_and(|roots| roots.iter().all(|k| inside(k)))
+                    && !s.contains(&'N')
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        println!("\n==================== TRUE STATIC CEILING, THREE WAYS (swept {swept}) ====================");
+        println!("addressable-only incomplete functions (no A/B/N stall label): {}", addr_only.len());
+        println!("  ... of which also with no diagnosed X leaf: {addr_only_nodiagx}");
+        println!(
+            "  (1) as-reported : {complete} complete + {} addressable = {} -> {:.1}%",
+            addr_only.len(),
+            complete + addr_only.len(),
+            pct(complete + addr_only.len())
+        );
+        println!(
+            "  (2) honest proven+benign: {} + {} = {} -> {:.1}%",
+            proven_n + benign_n,
+            addr_only.len(),
+            proven_n + benign_n + addr_only.len(),
+            pct(proven_n + benign_n + addr_only.len())
+        );
+        println!(
+            "  (3) strict proven only  : {} + {} = {} -> {:.1}%",
+            proven_n,
+            addr_only.len(),
+            proven_n + addr_only.len(),
+            pct(proven_n + addr_only.len())
+        );
+        println!(
+            "  functions whose X leaves are ALL inside-frame-ish (recoverable precision sub-case, no N): {}",
+            recoverable.len()
+        );
+        println!(
+            "  (4) as-reported + addressable + recoverable-inside-frame X: {} -> {:.1}%",
+            complete + addr_only.len() + recoverable.difference(&addr_only).count(),
+            pct(complete + addr_only.len() + recoverable.difference(&addr_only).count())
+        );
+        println!("\n-- non-X leaves (by consuming leaf name; functions) --");
+        let mut nn: Vec<_> = nonx_names.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+        nn.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (k, n) in nn.iter().take(25) {
+            println!("  {n:>5}  {k}");
+        }
+        let _ = fn_has_nonx;
+    }
+
+    if let Some(path) = args.get(6) {
         let mut out = String::new();
         for (rva, set) in &fn_sets {
             let vas: Vec<String> =
