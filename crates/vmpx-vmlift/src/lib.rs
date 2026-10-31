@@ -766,6 +766,8 @@ mod tests {
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
             served_read_only_image: false,
+            vm_stack_address_escapes: false,
+            vm_stack_store_hi: None,
             external_writes: vec![SymbolicMemoryWrite {
                 instruction_index: 2,
                 address: address.clone(),
