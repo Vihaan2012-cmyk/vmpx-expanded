@@ -2,6 +2,7 @@ mod import_reconstruct;
 mod import_table;
 mod layout;
 mod reintegrate;
+mod unpacked;
 
 pub use import_reconstruct::{
     CleanImportDirectory, ProvenImport, ProvenImportSet, ProvenModule, SlotBinding, SymbolRef,
@@ -20,6 +21,10 @@ pub use layout::{
 };
 pub use reintegrate::{
     ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate, set_tls_callback,
+};
+
+pub use unpacked::{
+    DumpedRegion, ResolvedSlot, UnpackedError, UnpackedInput, UnpackedReport, rebuild_unpacked,
 };
 
 use thiserror::Error;

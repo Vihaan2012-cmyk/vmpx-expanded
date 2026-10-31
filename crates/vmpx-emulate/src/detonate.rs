@@ -804,6 +804,64 @@ mod tests {
         }
         eprintln!("  image_base={:#x} import modules={:?}", pe.report().optional.image_base.0, pe.report().imports.iter().map(|m| (m.name.clone(), m.entries.len())).collect::<Vec<_>>());
         report_iat_fill(&pe, &res.iat_fill, res.dump.as_ref());
+        report_rebuild_unpacked(&res);
+    }
+
+    /// `VMPX_REBUILD_UNPACKED=1`: rebuild an unpacked, import-fixed PE from the
+    /// OEP dump + resolved IAT-fill and re-parse it. `VMPX_REBUILD_OUT=<path>`
+    /// also writes the analysis artifact (never run).
+    fn report_rebuild_unpacked(res: &DetonationResult) {
+        use vmpx_rebuild::{DumpedRegion, ResolvedSlot, UnpackedInput, rebuild_unpacked};
+        if !std::env::var("VMPX_REBUILD_UNPACKED").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let (Some(dump), Some(oep)) = (res.dump.as_ref(), res.observed.oep) else {
+            eprintln!("  rebuild: no dump/OEP, nothing to rebuild");
+            return;
+        };
+        let regions: Vec<DumpedRegion> = dump
+            .regions
+            .iter()
+            .map(|r| DumpedRegion {
+                va: r.va,
+                bytes: &r.bytes,
+                write: r.perm.contains(crate::memory::Perm::W),
+                exec: r.perm.contains(crate::memory::Perm::X),
+            })
+            .collect();
+        let resolved: Vec<ResolvedSlot> = res
+            .iat_fill
+            .resolved
+            .iter()
+            .map(|s| ResolvedSlot { slot_rva: s.slot_rva, module: s.module.clone(), name: s.name.clone() })
+            .collect();
+        let unresolved: Vec<u64> = res.iat_fill.unresolved.iter().map(|s| s.slot_rva).collect();
+        let input = UnpackedInput {
+            image_base: dump.image_base,
+            oep_rva: u32::try_from(oep - dump.image_base).unwrap(),
+            regions: &regions,
+            resolved: &resolved,
+            unresolved: &unresolved,
+        };
+        match rebuild_unpacked(&input) {
+            Err(e) => eprintln!("  rebuild: REJECTED: {e}"),
+            Ok((bytes, rep)) => {
+                let pe = PeImage::parse(&bytes).expect("rebuilt PE re-parses");
+                let n: usize = pe.report().imports.iter().map(|m| m.entries.len()).sum();
+                eprintln!(
+                    "  rebuild: ok size={} MiB image={:#x} oep_rva={:#x} resolved_in={} imports_reparsed={n} modules={} descriptors={} unresolved_flagged={} table@{:#x}+{:#x} iat_span={:#x?} cleared_dirs={:?} loader_issue={:?}",
+                    bytes.len() >> 20, rep.size_of_image, rep.oep_rva, resolved.len(), rep.modules.len(),
+                    rep.descriptors, rep.unresolved_slots.len(), rep.import_table_rva, rep.import_table_size,
+                    rep.iat_span, rep.cleared_directories, rep.loader_issue,
+                );
+                eprintln!("  rebuild: modules={:?}", rep.modules);
+                assert_eq!(n, rep.imports_written);
+                if let Ok(out) = std::env::var("VMPX_REBUILD_OUT") {
+                    std::fs::write(&out, &bytes).expect("write rebuilt PE");
+                    eprintln!("  rebuild: wrote {out}");
+                }
+            }
+        }
     }
 
     /// Print the IAT-fill mapping, plus how many of the slots `.text` actually
