@@ -44,6 +44,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    clippy::inline_always,
     clippy::many_single_char_names,
     clippy::too_many_lines
 )]
@@ -58,6 +59,7 @@ mod loader;
 mod memory;
 mod ntdll;
 mod observe;
+mod predecode;
 mod sysdll;
 mod vm_observe;
 mod winapi;

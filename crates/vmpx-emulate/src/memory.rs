@@ -55,6 +55,9 @@ pub enum MapError {
 struct Page {
     data: Box<[u8]>,
     perm: Perm,
+    /// Set once a cached code block was built from this page: any later write
+    /// to it bumps [`Memory::code_gen`] so cached blocks revalidate.
+    code: bool,
 }
 
 /// Direct-mapped page lookup cache size (entries).
@@ -72,6 +75,7 @@ pub struct Memory {
     index: BTreeMap<u64, u32>,
     slab: Vec<Page>,
     tlb: [Cell<(u64, u32)>; TLB_SIZE],
+    xgen: u64,
 }
 
 impl Default for Memory {
@@ -80,6 +84,7 @@ impl Default for Memory {
             index: BTreeMap::new(),
             slab: Vec::new(),
             tlb: std::array::from_fn(|_| Cell::new((TLB_EMPTY, 0))),
+            xgen: 1,
         }
     }
 }
@@ -90,15 +95,20 @@ impl Memory {
         Self::default()
     }
 
-    #[inline]
+    #[inline(always)]
     fn slot(&self, base: u64) -> Option<usize> {
-        let e = &self.tlb[(base >> 12) as usize & (TLB_SIZE - 1)];
-        let (tag, idx) = e.get();
+        let (tag, idx) = self.tlb[(base >> 12) as usize & (TLB_SIZE - 1)].get();
         if tag == base {
             return Some(idx as usize);
         }
+        self.slot_miss(base)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slot_miss(&self, base: u64) -> Option<usize> {
         let idx = *self.index.get(&base)?;
-        e.set((base, idx));
+        self.tlb[(base >> 12) as usize & (TLB_SIZE - 1)].set((base, idx));
         Some(idx as usize)
     }
 
@@ -127,11 +137,12 @@ impl Memory {
         if self.index.range(addr..end).next().is_some() {
             return Err(MapError::Overlap);
         }
+        self.xgen += 1;
         let mut a = addr;
         while a < end {
             let data = vec![0u8; PAGE_SIZE as usize].into_boxed_slice();
             self.index.insert(a, self.slab.len() as u32);
-            self.slab.push(Page { data, perm });
+            self.slab.push(Page { data, perm, code: false });
             a += PAGE_SIZE;
         }
         Ok(())
@@ -179,6 +190,9 @@ impl Memory {
             let n = (PAGE_SIZE as usize - off).min(data.len() - done);
             let page = self.page_mut(base).expect("checked");
             page.data[off..off + n].copy_from_slice(&data[done..done + n]);
+            if page.code {
+                self.xgen += 1;
+            }
             done += n;
             a = a.wrapping_add(n as u64);
         }
@@ -212,6 +226,9 @@ impl Memory {
             return match self.page_mut(addr & !PAGE_MASK) {
                 Some(p) if p.perm.contains(Perm::W) => {
                     p.data[off..off + data.len()].copy_from_slice(data);
+                    if p.code {
+                        self.xgen += 1;
+                    }
                     Ok(())
                 }
                 _ => Err(MemFault { addr, access: Access::Write }),
@@ -279,7 +296,23 @@ impl Memory {
     ///
     /// # Errors
     /// Faults like [`Memory::read`].
+    #[inline(always)]
     pub fn read_uint(&self, addr: u64, bytes: usize) -> Result<u64, MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
+        if matches!(bytes, 1 | 2 | 4 | 8) && off + bytes <= PAGE_SIZE as usize {
+            return match self.page(addr & !PAGE_MASK) {
+                Some(p) if p.perm.contains(Perm::R) => {
+                    let d = &p.data[off..];
+                    Ok(match bytes {
+                        1 => u64::from(d[0]),
+                        2 => u64::from(u16::from_le_bytes([d[0], d[1]])),
+                        4 => u64::from(u32::from_le_bytes([d[0], d[1], d[2], d[3]])),
+                        _ => u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]),
+                    })
+                }
+                _ => Err(MemFault { addr, access: Access::Read }),
+            };
+        }
         let mut b = [0u8; 8];
         self.read(addr, &mut b[..bytes])?;
         Ok(u64::from_le_bytes(b))
@@ -289,7 +322,27 @@ impl Memory {
     ///
     /// # Errors
     /// Faults like [`Memory::write`].
+    #[inline(always)]
     pub fn write_uint(&mut self, addr: u64, bytes: usize, val: u64) -> Result<(), MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
+        if matches!(bytes, 1 | 2 | 4 | 8) && off + bytes <= PAGE_SIZE as usize {
+            return match self.page_mut(addr & !PAGE_MASK) {
+                Some(p) if p.perm.contains(Perm::W) => {
+                    let d = &mut p.data[off..];
+                    match bytes {
+                        1 => d[0] = val as u8,
+                        2 => d[..2].copy_from_slice(&(val as u16).to_le_bytes()),
+                        4 => d[..4].copy_from_slice(&(val as u32).to_le_bytes()),
+                        _ => d[..8].copy_from_slice(&val.to_le_bytes()),
+                    }
+                    if p.code {
+                        self.xgen += 1;
+                    }
+                    Ok(())
+                }
+                _ => Err(MemFault { addr, access: Access::Write }),
+            };
+        }
         self.write(addr, &val.to_le_bytes()[..bytes])
     }
 
@@ -308,6 +361,40 @@ impl Memory {
         self.page(addr & !PAGE_MASK).map(|p| p.perm)
     }
 
+    /// Generation counter bumped by every change that can invalidate cached
+    /// decoded code: a write to a page code was cached from, a loader poke, a
+    /// reprotect or a new mapping.
+    #[inline]
+    #[must_use]
+    pub fn code_gen(&self) -> u64 {
+        self.xgen
+    }
+
+    /// The bytes from `addr` to the end of its page, when that page is
+    /// executable; marks the page as holding cached code so later writes to it
+    /// bump [`Memory::code_gen`].
+    pub fn code_bytes(&mut self, addr: u64) -> Option<&[u8]> {
+        let slot = self.slot(addr & !PAGE_MASK)?;
+        let p = &mut self.slab[slot];
+        if !p.perm.contains(Perm::X) {
+            return None;
+        }
+        p.code = true;
+        Some(&p.data[(addr & PAGE_MASK) as usize..])
+    }
+
+    /// `len` executable bytes at `addr` within one page, if any.
+    #[inline]
+    #[must_use]
+    pub fn exec_slice(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let off = (addr & PAGE_MASK) as usize;
+        if off + len > PAGE_SIZE as usize {
+            return None;
+        }
+        let p = self.page(addr & !PAGE_MASK)?;
+        p.perm.contains(Perm::X).then(|| &p.data[off..off + len])
+    }
+
     /// Change the permission of every page overlapping `[addr, addr+len)` to
     /// `perm` (an NT reprotect). The range is rounded out to page boundaries.
     ///
@@ -321,6 +408,7 @@ impl Memory {
         }
         let base = addr & !PAGE_MASK;
         let end = addr.checked_add(len).ok_or_else(|| fault(addr))?;
+        self.xgen += 1;
         let mut a = base;
         while a < end {
             match self.page_mut(a) {

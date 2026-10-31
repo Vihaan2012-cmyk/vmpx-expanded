@@ -46,6 +46,15 @@ fn locate(r: Register) -> Option<Loc> {
     }
 }
 
+/// `(regs index, byte width, bit shift)` of a GPR operand, or `None` for a
+/// non-GPR. Pre-resolution twin of [`Cpu::reg`]/[`Cpu::set_reg`]'s addressing.
+pub(crate) fn locate_reg(r: Register) -> Option<(u8, u8, u8)> {
+    Some(match locate(r)? {
+        Loc::Full(i, b) => (i as u8, b as u8, 0),
+        Loc::High8(i) => (i as u8, 1, 8),
+    })
+}
+
 impl Cpu {
     #[must_use]
     pub fn new(rip: u64) -> Self {

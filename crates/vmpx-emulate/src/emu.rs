@@ -6,6 +6,7 @@ use iced_x86::{
 use crate::alu::{self, Alu, Flags, Rotate, Shift};
 use crate::cpu::{AF, CF, Cpu, OF, PF, RSP, SF, ZF, mask};
 use crate::memory::{Access, Memory};
+use crate::predecode::{self, K, Opnd, Pre, T_MEM, T_REG};
 
 // GPR indices into `Cpu::regs` (RSP lives in cpu.rs).
 const RAX: usize = 0;
@@ -145,6 +146,48 @@ pub struct Emulator {
     /// unpacking code re-decodes instead of reusing a stale entry. A colliding
     /// RIP simply evicts; a miss always re-decodes, so results are unchanged.
     dcache: Box<[DEntry]>,
+    /// Direct-mapped cache of straight-line blocks of pre-resolved ops, keyed
+    /// by start RIP (see [`Block`]); used by `run`/`run_until` when no trace is
+    /// being recorded.
+    bcache: Vec<Option<Box<Block>>>,
+}
+
+/// A straight-line run of pre-resolved instructions starting at `start`,
+/// ending at the first control transfer / unmodeled instruction (included), a
+/// page-end fetch boundary, or `BLOCK_MAX` ops.
+///
+/// Soundness: the block records the exact instruction bytes it was built from
+/// and the [`Memory::code_gen`] it was last validated at. While the generation
+/// is unchanged no executable-cached page was written, so the bytes cannot
+/// have changed; otherwise they are re-compared before reuse, and a store that
+/// bumps the generation mid-block ends the block so the next instruction is
+/// re-fetched fresh.
+struct Block {
+    start: u64,
+    epoch: u64,
+    /// The instruction bytes the ops were decoded from, segment by segment.
+    bytes: Vec<u8>,
+    segs: Vec<Seg>,
+    /// Ops in execution order; a direct `jmp`/`call` is followed into its
+    /// target, a `jcc` falls through (taken branches simply leave the block).
+    ops: Vec<Pre>,
+    /// Generic-path instructions for `K::Slow` ops (indexed by `Pre::t`).
+    slow: Vec<Instruction>,
+}
+
+/// A contiguous run of guest code inside a [`Block`].
+struct Seg {
+    start: u64,
+    off: u32,
+    len: u32,
+}
+
+const BLOCK_MAX: usize = 64;
+const BCACHE_SIZE: usize = 1 << 13;
+
+#[inline]
+fn bslot(rip: u64) -> usize {
+    ((rip ^ (rip >> 13)) as usize) & (BCACHE_SIZE - 1)
 }
 
 #[derive(Clone, Copy)]
@@ -154,10 +197,12 @@ struct DEntry {
     len: u8,
     bytes: [u8; 15],
     ins: Instruction,
+    /// Pre-resolved execution form of `ins`; valid exactly while `bytes` match.
+    pre: Pre,
 }
 
 /// Decode-cache slots (power of two).
-const DCACHE_SIZE: usize = 1 << 15;
+const DCACHE_SIZE: usize = 1 << 13;
 
 /// `code[..len] == stored[..len]`, with `len <= code.len()`. A full 15-byte
 /// fetch (the common case) compares via two 8-byte loads instead of a memcmp.
@@ -196,10 +241,11 @@ impl Emulator {
             det: (None, None),
             steps: 0,
             dcache: vec![
-                DEntry { rip: 0, len: 0, bytes: [0; 15], ins: Instruction::default() };
+                DEntry { rip: 0, len: 0, bytes: [0; 15], ins: Instruction::default(), pre: Pre::INVALID };
                 DCACHE_SIZE
             ]
             .into_boxed_slice(),
+            bcache: (0..BCACHE_SIZE).map(|_| None).collect(),
         }
     }
 
@@ -216,14 +262,52 @@ impl Emulator {
     pub fn step(&mut self) -> Result<(), Stop> {
         let rip = self.cpu.rip;
         self.cur = (rip, Mnemonic::INVALID);
-        self.det = (None, None);
-        let ins = if let Some(code) = self.mem.fetch15(rip) {
+        // `det` is only ever set and read while `detail` is on.
+        if self.observe.detail {
+            self.det = (None, None);
+        }
+        let slot = if let Some(code) = self.mem.fetch15(rip) {
             Self::decode(&mut self.dcache, rip, code)
         } else {
             let mut buf = [0u8; 15];
             let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
             Self::decode(&mut self.dcache, rip, &buf[..n])
         };
+        let Some(slot) = slot else {
+            return Err(Stop::DecodeError { rip });
+        };
+        let p = self.dcache[slot].pre;
+        self.cur.1 = p.mn;
+        let next = rip.wrapping_add(u64::from(p.len));
+        let new_rip = if p.kind == K::Slow {
+            let ins = self.dcache[slot].ins;
+            self.exec(&ins, next)?
+        } else {
+            self.exec_fast(&p, next)?
+        };
+        self.cpu.rip = new_rip;
+        self.steps += 1;
+        if self.record_trace {
+            let (ea, value, vsp) = if self.observe.detail {
+                (self.det.0, self.det.1, self.observe.vsp.and_then(|r| self.cpu.reg(r)))
+            } else {
+                (None, None, None)
+            };
+            self.trace.push(TraceEntry { rip, mnemonic: p.mn, ea, value, vsp });
+        }
+        Ok(())
+    }
+
+    /// Test oracle: the original decode-every-step interpreter (no decode cache,
+    /// no pre-resolved ops, no blocks).
+    #[cfg(test)]
+    fn step_ref(&mut self) -> Result<(), Stop> {
+        let rip = self.cpu.rip;
+        self.cur = (rip, Mnemonic::INVALID);
+        self.det = (None, None);
+        let mut buf = [0u8; 15];
+        let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
+        let ins = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE).decode();
         if ins.is_invalid() {
             return Err(Stop::DecodeError { rip });
         }
@@ -245,26 +329,179 @@ impl Emulator {
 
     /// Step until a stop; returns the reason ([`Stop::StepLimit`] after `max_steps`).
     pub fn run(&mut self, max_steps: u64) -> Stop {
-        for _ in 0..max_steps {
-            if let Err(s) = self.step() {
-                return s;
-            }
-        }
-        Stop::StepLimit
+        self.run_to(None, max_steps)
     }
 
     /// Like [`Emulator::run`] but stops with [`Stop::Reached`] when rip == `addr`
     /// (checked before executing there).
     pub fn run_until(&mut self, addr: u64, max_steps: u64) -> Stop {
-        for _ in 0..max_steps {
-            if self.cpu.rip == addr {
+        self.run_to(Some(addr), max_steps)
+    }
+
+    #[allow(clippy::collapsible_if)]
+    fn run_to(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
+        let mut left = max_steps;
+        // Per-step trace/detail capture needs the single-step path.
+        let blocks = !self.record_trace && !self.observe.detail;
+        while left > 0 {
+            let rip = self.cpu.rip;
+            if target == Some(rip) {
                 return Stop::Reached;
+            }
+            if blocks {
+                if let Some((slot, b)) = self.block_for(rip) {
+                    // Run whole only if it fits the budget (it may still exit
+                    // early at a taken branch, a redirect, the target or a
+                    // code write).
+                    if b.ops.len() as u64 <= left {
+                        let (done, stop) = self.exec_block(&b, target);
+                        self.bcache[slot] = Some(b);
+                        left -= done;
+                        if let Some(s) = stop {
+                            return s;
+                        }
+                        continue;
+                    }
+                    self.bcache[slot] = Some(b);
+                }
             }
             if let Err(s) = self.step() {
                 return s;
             }
+            left -= 1;
         }
         Stop::StepLimit
+    }
+
+    /// Cached (revalidated) or freshly built block starting at `rip`, taken
+    /// out of its slot (the caller puts it back).
+    fn block_for(&mut self, rip: u64) -> Option<(usize, Box<Block>)> {
+        // Two-way set: the block lives in `s0` or its neighbour.
+        let s0 = bslot(rip);
+        for slot in [s0, s0 ^ 1] {
+            if self.bcache[slot].as_ref().is_some_and(|b| b.start == rip) {
+                let mut b = self.bcache[slot].take()?;
+                let g = self.mem.code_gen();
+                if b.epoch == g {
+                    return Some((slot, b));
+                }
+                let intact = b.segs.iter().all(|s| {
+                    self.mem.exec_slice(s.start, s.len as usize)
+                        == Some(&b.bytes[s.off as usize..(s.off + s.len) as usize])
+                });
+                if intact {
+                    b.epoch = g;
+                    return Some((slot, b));
+                }
+                return self.build_block(rip).map(|b| (slot, b));
+            }
+        }
+        let slot = if self.bcache[s0].is_none() || self.bcache[s0 ^ 1].is_some() { s0 } else { s0 ^ 1 };
+        self.build_block(rip).map(|b| (slot, b))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn build_block(&mut self, rip: u64) -> Option<Box<Block>> {
+        let mut b = Block {
+            start: rip,
+            epoch: 0,
+            bytes: Vec::new(),
+            segs: Vec::new(),
+            ops: Vec::new(),
+            slow: Vec::new(),
+        };
+        let mut seg_ip = rip;
+        'segments: while let Some(page) = self.mem.code_bytes(seg_ip) {
+            let (seg_off, mut off, mut ip) = (b.bytes.len(), 0usize, seg_ip);
+            let mut follow = None;
+            while b.ops.len() < BLOCK_MAX && off + 15 <= page.len() {
+                let ins = Decoder::with_ip(64, &page[off..off + 15], ip, DecoderOptions::NONE).decode();
+                if ins.is_invalid() {
+                    break;
+                }
+                let len = ins.len();
+                let mut pre = predecode::resolve(&ins);
+                pre.rip = ip;
+                // `stop`: nothing after this op is statically known.
+                let mut stop = false;
+                match pre.kind {
+                    K::Slow => {
+                        pre.t = b.slow.len() as u64;
+                        b.slow.push(ins);
+                        stop = ins.flow_control() != FlowControl::Next;
+                    }
+                    // Direct transfers: keep building at the target.
+                    K::JmpD | K::CallD => follow = Some(pre.a.v),
+                    K::Jmp | K::Call | K::Ret => stop = true,
+                    _ => {}
+                }
+                b.bytes.extend_from_slice(&page[off..off + len]);
+                b.ops.push(pre);
+                off += len;
+                ip = ip.wrapping_add(len as u64);
+                if stop || follow.is_some() {
+                    break;
+                }
+            }
+            if b.bytes.len() > seg_off {
+                b.segs.push(Seg { start: seg_ip, off: seg_off as u32, len: (b.bytes.len() - seg_off) as u32 });
+            }
+            match follow {
+                Some(t) if b.ops.len() < BLOCK_MAX => seg_ip = t,
+                _ => break 'segments,
+            }
+        }
+        if b.ops.is_empty() {
+            return None;
+        }
+        b.epoch = self.mem.code_gen();
+        Some(Box::new(b))
+    }
+
+    /// Execute `b` from its first op; returns `(ops retired, stop)`. State on a
+    /// stop is exactly as after the last retired op (as `step` leaves it). The
+    /// block is left as soon as control does not reach the next op in the block
+    /// (taken branch, hook redirect), reaches `target`, or the guest code was
+    /// written.
+    fn exec_block(&mut self, b: &Block, target: Option<u64>) -> (u64, Option<Stop>) {
+        let base = self.steps;
+        let epoch = b.epoch;
+        let n = b.ops.len();
+        let mut i = 0usize;
+        let end = loop {
+            let p = &b.ops[i];
+            let rip = p.rip;
+            self.cur.0 = rip;
+            self.cpu.rip = rip;
+            let next = rip.wrapping_add(u64::from(p.len));
+            let r = if p.kind == K::Slow {
+                self.cur.1 = p.mn;
+                self.steps = base + i as u64;
+                let ins = b.slow[p.t as usize];
+                self.exec(&ins, next)
+            } else {
+                self.exec_fast(p, next)
+            };
+            let nr = match r {
+                Ok(nr) => nr,
+                Err(s) => {
+                    self.steps = base + i as u64;
+                    return (i as u64, Some(s));
+                }
+            };
+            i += 1;
+            if i == n
+                || nr != b.ops[i].rip
+                || self.mem.code_gen() != epoch
+                || target == Some(nr)
+            {
+                break nr;
+            }
+        };
+        self.cpu.rip = end;
+        self.steps = base + i as u64;
+        (i as u64, None)
     }
 
     /// Decode the instruction at `rip` from `code` (the executable prefix, up
@@ -273,28 +510,40 @@ impl Emulator {
     /// decode afresh and store the result. Invalid decodes are not cached; the
     /// caller surfaces them as [`Stop::DecodeError`].
     #[inline]
-    fn decode(dcache: &mut [DEntry], rip: u64, code: &[u8]) -> Instruction {
+    fn decode(dcache: &mut [DEntry], rip: u64, code: &[u8]) -> Option<usize> {
         let n = code.len();
-        let e = &mut dcache[dslot(rip)];
+        let slot = dslot(rip);
+        let e = &mut dcache[slot];
         let len = usize::from(e.len);
         if e.rip == rip && len != 0 && len <= n && same_bytes(code, &e.bytes, len) {
-            return e.ins;
+            return Some(slot);
         }
+        Self::fill(e, rip, code)
+    }
+
+    /// Cache miss / stale entry: decode afresh and store the decode plus its
+    /// pre-resolved form. `None` for an invalid decode (never cached).
+    #[cold]
+    #[inline(never)]
+    fn fill(e: &mut DEntry, rip: u64, code: &[u8]) -> Option<usize> {
         let ins = Decoder::with_ip(64, code, rip, DecoderOptions::NONE).decode();
         let len = ins.len();
-        if !ins.is_invalid() && len <= n {
-            e.rip = rip;
-            e.len = len as u8;
-            e.bytes[..len].copy_from_slice(&code[..len]);
-            e.ins = ins;
+        if ins.is_invalid() || len > code.len() {
+            return None;
         }
-        ins
+        e.rip = rip;
+        e.len = len as u8;
+        e.bytes[..len].copy_from_slice(&code[..len]);
+        e.ins = ins;
+        e.pre = predecode::resolve(&ins);
+        Some(dslot(rip))
     }
 
     fn unsup(&self) -> Stop {
         Stop::Unsupported { rip: self.cur.0, mnemonic: self.cur.1 }
     }
 
+    #[cold]
     fn fault(&self, addr: u64, access: Access) -> Stop {
         Stop::Fault { rip: self.cur.0, addr, access }
     }
@@ -318,6 +567,7 @@ impl Emulator {
         }
     }
 
+    #[inline]
     fn load(&mut self, addr: u64, size: u32) -> Result<u64, Stop> {
         self.mem_hook(MemEvent { addr, size, access: Access::Read, value: None })?;
         let v = self.mem.read_uint(addr, size as usize).map_err(|f| self.fault(f.addr, f.access))?;
@@ -327,6 +577,7 @@ impl Emulator {
         Ok(v)
     }
 
+    #[inline]
     fn store(&mut self, addr: u64, size: u32, val: u64) -> Result<(), Stop> {
         let value = val & mask(size);
         self.mem_hook(MemEvent { addr, size, access: Access::Write, value: Some(value) })?;
@@ -337,6 +588,7 @@ impl Emulator {
         Ok(())
     }
 
+    #[inline(always)]
     fn apply(&mut self, f: Flags) {
         if self.resolve_undefined_flags {
             // Detonation concretization: an architecturally-undefined bit takes
@@ -483,6 +735,365 @@ impl Emulator {
             }
             _ => Err(self.unsup()),
         }
+    }
+
+    #[inline(always)]
+    fn rreg(&self, o: &Opnd) -> u64 {
+        (self.cpu.regs[usize::from(o.r & 15)] >> o.sh) & o.v
+    }
+
+    /// Register write with x64 partial-write rules (matches `Cpu::set_reg`).
+    #[inline(always)]
+    fn wreg(&mut self, o: &Opnd, v: u64) {
+        let vm = o.v << o.sh;
+        let keep = if o.bytes >= 4 { 0 } else { !vm };
+        let r = &mut self.cpu.regs[usize::from(o.r & 15)];
+        *r = (*r & keep) | ((v << o.sh) & vm);
+    }
+
+    /// Effective address of a pre-resolved memory operand (branchless; matches `ea`).
+    #[inline(always)]
+    fn ea_of(&self, o: &Opnd) -> u64 {
+        let neg = |b: u8| 0u64.wrapping_sub(u64::from(b));
+        let regs = &self.cpu.regs;
+        o.v.wrapping_add(regs[usize::from(o.r & 15)] & neg(o.fl & 1))
+            .wrapping_add(regs[usize::from(o.x & 15)].wrapping_mul(u64::from(o.sc)))
+            .wrapping_add(self.cpu.gs_base & neg((o.fl >> 1) & 1))
+    }
+
+    #[inline(always)]
+    fn rd(&mut self, o: &Opnd) -> Result<u64, Stop> {
+        match o.tag {
+            T_REG => Ok(self.rreg(o)),
+            T_MEM => {
+                let a = self.ea_of(o);
+                self.load(a, u32::from(o.bytes))
+            }
+            _ => Ok(o.v),
+        }
+    }
+
+    #[inline(always)]
+    fn wr(&mut self, o: &Opnd, v: u64) -> Result<(), Stop> {
+        if o.tag == T_REG {
+            self.wreg(o, v);
+            Ok(())
+        } else {
+            let a = self.ea_of(o);
+            self.store(a, u32::from(o.bytes), v)
+        }
+    }
+
+    #[inline(always)]
+    fn alu_rr<const OP: u8, const W: bool>(&mut self, p: &Pre) {
+        let a = self.rreg(&p.a);
+        let b = self.rreg(&p.b);
+        let (r, fl) = alu::arith(alu_op(OP), a, b, u32::from(p.n));
+        if W {
+            self.wreg(&p.a, r);
+        }
+        self.apply(fl);
+    }
+
+    #[inline(always)]
+    fn alu_ri<const OP: u8, const W: bool>(&mut self, p: &Pre) {
+        let a = self.rreg(&p.a);
+        let (r, fl) = alu::arith(alu_op(OP), a, p.b.v, u32::from(p.n));
+        if W {
+            self.wreg(&p.a, r);
+        }
+        self.apply(fl);
+    }
+
+    #[inline(always)]
+    fn alu_rm<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Stop> {
+        let a = self.rreg(&p.a);
+        let ea = self.ea_of(&p.b);
+        let b = self.load(ea, u32::from(p.n))?;
+        let (r, fl) = alu::arith(alu_op(OP), a, b, u32::from(p.n));
+        if W {
+            self.wreg(&p.a, r);
+        }
+        self.apply(fl);
+        Ok(())
+    }
+
+    /// Memory-destination ALU op; `src` is a register or an immediate.
+    #[inline(always)]
+    fn alu_m<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Stop> {
+        let ea = self.ea_of(&p.a);
+        let a = self.load(ea, u32::from(p.n))?;
+        let b = if p.b.tag == T_REG { self.rreg(&p.b) } else { p.b.v };
+        let (r, fl) = alu::arith(alu_op(OP), a, b, u32::from(p.n));
+        if W {
+            let ea = self.ea_of(&p.a);
+            self.store(ea, u32::from(p.n), r)?;
+        }
+        self.apply(fl);
+        Ok(())
+    }
+
+    /// Unary r/m op (`inc`/`dec`/`neg`/`not` = 0/1/2/3); flags unchanged for `not`.
+    #[inline(always)]
+    fn unary(&mut self, p: &Pre, kind: u8) -> Result<(), Stop> {
+        let n = u32::from(p.n);
+        let a = self.rd(&p.a)?;
+        let (r, fl) = match kind {
+            0 => alu::incdec(a, false, n),
+            1 => alu::incdec(a, true, n),
+            2 => alu::neg(a, n),
+            _ => (!a & mask(n), Flags { def: 0, val: 0, undef: 0 }),
+        };
+        self.wr(&p.a, r)?;
+        if kind != 3 {
+            self.apply(fl);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn exec_fast(&mut self, p: &Pre, next: u64) -> Result<u64, Stop> {
+        let n = u32::from(p.n);
+        match p.kind {
+            K::Nop => {}
+            K::Slow => return Err(self.unsup()),
+            K::MovRR | K::ZxRR => {
+                let v = self.rreg(&p.b);
+                self.wreg(&p.a, v);
+            }
+            K::MovRI => self.wreg(&p.a, p.b.v),
+            K::MovRM => {
+                let ea = self.ea_of(&p.b);
+                let v = self.load(ea, n)?;
+                self.wreg(&p.a, v);
+            }
+            K::MovMR => {
+                let v = self.rreg(&p.b);
+                let ea = self.ea_of(&p.a);
+                self.store(ea, n, v)?;
+            }
+            K::MovMI => {
+                let ea = self.ea_of(&p.a);
+                self.store(ea, n, p.b.v)?;
+            }
+            K::ZxRM => {
+                let ea = self.ea_of(&p.b);
+                let v = self.load(ea, u32::from(p.b.bytes))?;
+                self.wreg(&p.a, v);
+            }
+            K::SxRR => {
+                let v = self.rreg(&p.b);
+                self.wreg(&p.a, (((v << p.sub) as i64) >> p.sub) as u64);
+            }
+            K::SxRM => {
+                let ea = self.ea_of(&p.b);
+                let v = self.load(ea, u32::from(p.b.bytes))?;
+                self.wreg(&p.a, (((v << p.sub) as i64) >> p.sub) as u64);
+            }
+            K::Lea => {
+                let a = self.ea_of(&p.b);
+                self.wreg(&p.a, a);
+            }
+            K::AddRR => self.alu_rr::<0, true>(p),
+            K::AddRI => self.alu_ri::<0, true>(p),
+            K::AddRM => self.alu_rm::<0, true>(p)?,
+            K::AddMR | K::AddMI => self.alu_m::<0, true>(p)?,
+            K::SubRR => self.alu_rr::<1, true>(p),
+            K::SubRI => self.alu_ri::<1, true>(p),
+            K::SubRM => self.alu_rm::<1, true>(p)?,
+            K::SubMR | K::SubMI => self.alu_m::<1, true>(p)?,
+            K::AndRR => self.alu_rr::<2, true>(p),
+            K::AndRI => self.alu_ri::<2, true>(p),
+            K::AndRM => self.alu_rm::<2, true>(p)?,
+            K::AndMR | K::AndMI => self.alu_m::<2, true>(p)?,
+            K::OrRR => self.alu_rr::<3, true>(p),
+            K::OrRI => self.alu_ri::<3, true>(p),
+            K::OrRM => self.alu_rm::<3, true>(p)?,
+            K::OrMR | K::OrMI => self.alu_m::<3, true>(p)?,
+            K::XorRR => self.alu_rr::<4, true>(p),
+            K::XorRI => self.alu_ri::<4, true>(p),
+            K::XorRM => self.alu_rm::<4, true>(p)?,
+            K::XorMR | K::XorMI => self.alu_m::<4, true>(p)?,
+            K::CmpRR => self.alu_rr::<1, false>(p),
+            K::CmpRI => self.alu_ri::<1, false>(p),
+            K::CmpRM => self.alu_rm::<1, false>(p)?,
+            K::CmpMR | K::CmpMI => self.alu_m::<1, false>(p)?,
+            K::TestRR => self.alu_rr::<2, false>(p),
+            K::TestRI => self.alu_ri::<2, false>(p),
+            K::TestRM => self.alu_rm::<2, false>(p)?,
+            K::TestMR | K::TestMI => self.alu_m::<2, false>(p)?,
+            K::IncR | K::IncM => self.unary(p, 0)?,
+            K::DecR | K::DecM => self.unary(p, 1)?,
+            K::NegR | K::NegM => self.unary(p, 2)?,
+            K::NotR | K::NotM => self.unary(p, 3)?,
+            K::ShR | K::ShM => {
+                let a = self.rd(&p.a)?;
+                let c = self.rd(&p.b)?;
+                let kind = match p.sub {
+                    0 => Shift::Shl,
+                    1 => Shift::Shr,
+                    _ => Shift::Sar,
+                };
+                if let Some((r, fl)) = alu::shift(kind, a, c, n) {
+                    self.wr(&p.a, r)?;
+                    self.apply(fl);
+                }
+            }
+            K::RotR | K::RotM => {
+                let a = self.rd(&p.a)?;
+                let c = self.rd(&p.b)?;
+                let kind = match p.sub {
+                    0 => Rotate::Rol,
+                    1 => Rotate::Ror,
+                    2 => Rotate::Rcl,
+                    _ => Rotate::Rcr,
+                };
+                if p.sub >= 2 && self.cpu.undef_flags & CF != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                }
+                let cf_in = self.cpu.flag(CF);
+                if let Some((r, fl)) = alu::rotate(kind, a, c, cf_in, n) {
+                    self.wr(&p.a, r)?;
+                    self.apply(fl);
+                }
+            }
+            K::PushR => {
+                let v = self.rreg(&p.a);
+                self.push64(v)?;
+            }
+            K::PushI => self.push64(p.a.v)?,
+            K::PopR => {
+                let sp = self.cpu.regs[RSP];
+                let v = self.load(sp, 8)?;
+                self.cpu.regs[RSP] = sp.wrapping_add(8);
+                self.wreg(&p.a, v);
+            }
+            K::Jmp => {
+                let t = self.rd(&p.a)?;
+                return Ok(match self.flow_hook(FlowKind::Jmp, t, next)? {
+                    HookOutcome::Redirect => self.cpu.rip,
+                    HookOutcome::Continue => t,
+                });
+            }
+            K::JmpD => {
+                let t = p.a.v;
+                return Ok(match self.flow_hook(FlowKind::Jmp, t, next)? {
+                    HookOutcome::Redirect => self.cpu.rip,
+                    HookOutcome::Continue => t,
+                });
+            }
+            K::CallD => {
+                let t = p.a.v;
+                if let HookOutcome::Redirect = self.flow_hook(FlowKind::Call, t, next)? {
+                    return Ok(self.cpu.rip);
+                }
+                self.push64(next)?;
+                return Ok(t);
+            }
+            K::Call => {
+                let t = self.rd(&p.a)?;
+                if let HookOutcome::Redirect = self.flow_hook(FlowKind::Call, t, next)? {
+                    return Ok(self.cpu.rip);
+                }
+                self.push64(next)?;
+                return Ok(t);
+            }
+            K::Ret => {
+                let sp = self.cpu.regs[RSP];
+                let t = self.load(sp, 8)?;
+                if let HookOutcome::Redirect = self.flow_hook(FlowKind::Ret, t, next)? {
+                    return Ok(self.cpu.rip);
+                }
+                self.cpu.regs[RSP] = sp.wrapping_add(8).wrapping_add(p.t);
+                return Ok(t);
+            }
+            K::Jcc => {
+                let und = self.cpu.undef_flags & p.m;
+                if und != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                }
+                let taken = (cc_val(self.cpu.rflags, p.sub) ^ u64::from(p.n)) != 0;
+                let t = if taken { p.t } else { next };
+                return Ok(match self.flow_hook(FlowKind::Jcc { taken }, t, next)? {
+                    HookOutcome::Redirect => self.cpu.rip,
+                    HookOutcome::Continue => t,
+                });
+            }
+            K::Setcc => {
+                let und = self.cpu.undef_flags & p.m;
+                if und != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                }
+                let taken = cc_val(self.cpu.rflags, p.sub) ^ u64::from(p.n);
+                self.wr(&p.a, taken)?;
+            }
+            K::Cmov => {
+                let und = self.cpu.undef_flags & p.m;
+                if und != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                }
+                let taken = (cc_val(self.cpu.rflags, p.sub & 15) ^ u64::from(p.sub >> 4)) != 0;
+                let v = self.rd(&p.b)?;
+                if taken {
+                    self.wreg(&p.a, v);
+                }
+            }
+            K::Clc => self.apply(Flags { def: CF, val: 0, undef: 0 }),
+            K::Stc => self.apply(Flags { def: CF, val: CF, undef: 0 }),
+            K::Cmc => {
+                if self.cpu.undef_flags & CF == 0 {
+                    let v = if self.cpu.flag(CF) { 0 } else { CF };
+                    self.apply(Flags { def: CF, val: v, undef: 0 });
+                }
+            }
+            K::Cld => self.cpu.rflags &= !DF,
+            K::Std => self.cpu.rflags |= DF,
+            K::AdcSbbRR | K::AdcSbbRI => {
+                if self.cpu.undef_flags & CF != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                }
+                let a = self.rreg(&p.a);
+                let b = if p.kind == K::AdcSbbRR { self.rreg(&p.b) } else { p.b.v };
+                let carry = self.cpu.flag(CF);
+                let (r, fl) =
+                    if p.sub == 0 { alu::adc(a, b, carry, n) } else { alu::sbb(a, b, carry, n) };
+                self.wreg(&p.a, r);
+                self.apply(fl);
+            }
+            K::AdcSbb => {
+                if self.cpu.undef_flags & CF != 0 {
+                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                }
+                let a = self.rd(&p.a)?;
+                let b = self.rd(&p.b)?;
+                let carry = self.cpu.flag(CF);
+                let (r, fl) =
+                    if p.sub == 0 { alu::adc(a, b, carry, n) } else { alu::sbb(a, b, carry, n) };
+                self.wr(&p.a, r)?;
+                self.apply(fl);
+            }
+            K::Xadd => {
+                let dest = self.rd(&p.a)?;
+                let src = self.rd(&p.b)?;
+                let (sum, fl) = alu::arith(Alu::Add, dest, src, n);
+                self.wr(&p.a, sum)?;
+                self.wr(&p.b, dest)?;
+                self.apply(fl);
+            }
+            K::Bswap => {
+                let v = self.rreg(&p.a);
+                let r = if n == 4 { u64::from((v as u32).swap_bytes()) } else { v.swap_bytes() };
+                self.wreg(&p.a, r);
+            }
+            K::Cwde => self.cpu.regs[RAX] = alu_sext(self.cpu.regs[RAX], 2) & 0xffff_ffff,
+            K::Cdqe => self.cpu.regs[RAX] = alu_sext(self.cpu.regs[RAX], 4),
+            K::Cdq => {
+                self.cpu.regs[RDX] = if self.cpu.regs[RAX] & 0x8000_0000 != 0 { 0xffff_ffff } else { 0 };
+            }
+            K::Cqo => self.cpu.regs[RDX] = if self.cpu.regs[RAX] >> 63 != 0 { u64::MAX } else { 0 },
+            K::Pushfq => self.push64(self.cpu.rflags)?,
+        }
+        Ok(next)
     }
 
     fn exec(&mut self, ins: &Instruction, next: u64) -> Result<u64, Stop> {
@@ -938,6 +1549,7 @@ impl Emulator {
         self.steps * TSC_STRIDE
     }
 
+    #[inline(always)]
     fn push64(&mut self, v: u64) -> Result<(), Stop> {
         let sp = self.cpu.regs[RSP].wrapping_sub(8);
         self.store(sp, 8, v)?;
@@ -1102,6 +1714,31 @@ fn string_kind(code: Code) -> Option<(u32, StrOp)> {
     })
 }
 
+/// ALU operation selected by a const index (0..=4 = add/sub/and/or/xor).
+const fn alu_op(i: u8) -> Alu {
+    match i {
+        0 => Alu::Add,
+        1 => Alu::Sub,
+        2 => Alu::And,
+        3 => Alu::Or,
+        _ => Alu::Xor,
+    }
+}
+
+/// 1 when condition base `base` (o/b/e/be/s/p/l/le) holds in `rflags`, else 0.
+/// Branchless: every base is computed and one bit selected.
+#[inline(always)]
+fn cc_val(rflags: u64, base: u8) -> u64 {
+    let cf = rflags & 1;
+    let pf = (rflags >> 2) & 1;
+    let zf = (rflags >> 6) & 1;
+    let sf = (rflags >> 7) & 1;
+    let of = (rflags >> 11) & 1;
+    let lt = sf ^ of;
+    let bits = of | cf << 1 | zf << 2 | (cf | zf) << 3 | sf << 4 | pf << 5 | lt << 6 | (zf | lt) << 7;
+    (bits >> base) & 1
+}
+
 /// Sign-extend the low `bytes` of `v` to 64 bits (shared with alu's helper).
 fn alu_sext(v: u64, bytes: u32) -> u64 {
     if bytes >= 8 {
@@ -1159,9 +1796,160 @@ fn dx_reg(bytes: u32) -> Register {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::CF;
     use crate::memory::{PAGE_SIZE, Perm};
 
     const ADDR: u64 = 0x1000;
+
+    #[derive(Default)]
+    struct Log(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    impl Hook for Log {
+        fn on_mem(&mut self, ev: &MemEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.0.borrow_mut().push(format!("{ev:?}"));
+            HookAction::Continue
+        }
+        fn on_flow(&mut self, ev: &FlowEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.0.borrow_mut().push(format!("{ev:?}"));
+            HookAction::Continue
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const CODE: u64 = 0x10000;
+    const DATA: u64 = 0x20000;
+
+    /// A randomized emulator: random code bytes biased toward common opcodes,
+    /// registers that mostly point into mapped data/code, random flags.
+    fn fuzz_emu(seed: u64, log: &Log) -> Emulator {
+        const COMMON: &[u8] = &[
+            0x48, 0x49, 0x4c, 0x41, 0x66, 0x89, 0x8b, 0x01, 0x03, 0x83, 0x81, 0x0f, 0xb6, 0xb7,
+            0xbe, 0xbf, 0x63, 0x8d, 0xff, 0xc1, 0xd1, 0xd3, 0xf7, 0x85, 0x39, 0x3b, 0x29, 0x2b,
+            0x21, 0x23, 0x09, 0x0b, 0x31, 0x33, 0x90, 0xeb, 0x74, 0x75, 0x72, 0x7f, 0x0f, 0x84,
+            0x50, 0x51, 0x58, 0x59, 0xc3, 0xc7, 0xc6, 0x88, 0x8a, 0xf8, 0xf9, 0xf5, 0x9c, 0x98,
+            0x99, 0xa9, 0xa8, 0xc0, 0xd0, 0x87, 0x0f, 0xc1, 0xc8, 0xbc, 0xbd, 0xa3, 0xab, 0xba,
+            0x00, 0x04, 0x24, 0x44, 0x80, 0x84, 0x05, 0x15, 0x1d, 0xe8, 0xe9, 0x6a, 0x68, 0xb8,
+        ];
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut mem = Memory::new();
+        let code_perm = if r.below(2) == 0 { Perm::RWX } else { Perm::RX };
+        mem.map(CODE, PAGE_SIZE, code_perm).unwrap();
+        if r.below(2) == 0 {
+            mem.map(CODE + PAGE_SIZE, PAGE_SIZE, if r.below(2) == 0 { Perm::RX } else { Perm::RW }).unwrap();
+        }
+        mem.map(DATA, PAGE_SIZE * 2, Perm::RW).unwrap();
+        let bytes: Vec<u8> = (0..PAGE_SIZE * 2)
+            .map(|_| if r.below(4) < 3 { COMMON[r.below(COMMON.len() as u64) as usize] } else { r.next() as u8 })
+            .collect();
+        mem.poke(CODE, &bytes[..PAGE_SIZE as usize]).ok();
+        mem.poke(CODE + PAGE_SIZE, &bytes[PAGE_SIZE as usize..]).ok();
+        let data: Vec<u8> = (0..PAGE_SIZE * 2).map(|_| r.next() as u8).collect();
+        mem.poke(DATA, &data).unwrap();
+        let near_end = r.below(8) == 0;
+        let start = CODE + if near_end { PAGE_SIZE - 1 - r.below(20) } else { r.below(PAGE_SIZE - 8) };
+        let mut cpu = Cpu::new(start);
+        for reg in &mut cpu.regs {
+            *reg = match r.below(8) {
+                0 => r.next(),
+                1 => r.below(300),
+                2 => u64::MAX - r.below(300),
+                3 => CODE + r.below(PAGE_SIZE * 2),
+                _ => DATA + r.below(PAGE_SIZE * 2 - 16),
+            };
+        }
+        cpu.rflags = 2 | (r.next() & (CF | PF | AF | ZF | SF | OF | DF));
+        cpu.undef_flags = if r.below(4) == 0 { r.next() & (CF | PF | AF | ZF | SF | OF) } else { 0 };
+        cpu.gs_base = if r.below(4) == 0 { DATA } else { 0 };
+        let mut emu = Emulator::new(cpu, mem);
+        emu.resolve_undefined_flags = r.below(2) == 0;
+        emu.hook = Some(Box::new(Log(log.0.clone())));
+        emu
+    }
+
+    fn same_state(a: &Emulator, b: &Emulator) -> bool {
+        a.cpu == b.cpu
+            && a.steps == b.steps
+            && a.mem.pages().eq(b.mem.pages())
+    }
+
+    /// Fast path (pre-resolved ops via `step`, and blocks via `run`) must match
+    /// the original interpreter exactly: result, registers/flags, memory and the
+    /// hook event stream, including self-modifying and page-crossing code.
+    #[test]
+    fn fast_paths_match_reference_interpreter() {
+        let mut ran = 0u64;
+        let seeds: u64 = std::env::var("FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_500);
+        for seed in 1..seeds {
+            let (la, lb, lc) = (Log::default(), Log::default(), Log::default());
+            let mut a = fuzz_emu(seed, &la);
+            let mut b = fuzz_emu(seed, &lb);
+            let mut c = fuzz_emu(seed, &lc);
+            b.record_trace = seed % 2 == 0;
+            a.record_trace = b.record_trace;
+            c.record_trace = false;
+            let k = 1 + (seed % 24);
+            // `a` = reference, `b` = step(), `c` = run() (blocks).
+            let mut ra = Ok(());
+            let mut rb = Ok(());
+            let mut rips = vec![a.cpu.rip];
+            for i in 0..k {
+                ra = a.step_ref();
+                rips.push(a.cpu.rip);
+                rb = b.step();
+                assert_eq!(ra, rb, "seed {seed} step {i} result");
+                assert!(same_state(&a, &b), "seed {seed} step {i} state");
+                ran += 1;
+                if ra.is_err() {
+                    break;
+                }
+            }
+            assert_eq!(*la.0.borrow(), *lb.0.borrow(), "seed {seed} events");
+            assert_eq!(a.trace, b.trace, "seed {seed} trace");
+            let sc = c.run(a.steps);
+            if ra.is_err() {
+                // c may stop later than `a` only if budget remains; give it room.
+                let sc2 = if sc == Stop::StepLimit { c.run(1) } else { sc };
+                assert_eq!(Err(sc2), ra, "seed {seed} run stop");
+            } else {
+                assert_eq!(sc, Stop::StepLimit, "seed {seed} run limit");
+            }
+            assert!(same_state(&a, &c), "seed {seed} block state");
+            assert_eq!(*la.0.borrow(), *lc.0.borrow(), "seed {seed} block events");
+            let _ = rb;
+            // run_until: stop at a rip the reference visited (possibly mid-block).
+            let tgt = rips[(seed as usize) % rips.len()];
+            let (le, ld) = (Log::default(), Log::default());
+            let (mut e, mut d) = (fuzz_emu(seed, &le), fuzz_emu(seed, &ld));
+            e.record_trace = false;
+            d.record_trace = false;
+            let mut want = Stop::StepLimit;
+            for _ in 0..k {
+                if e.cpu.rip == tgt {
+                    want = Stop::Reached;
+                    break;
+                }
+                if let Err(s) = e.step_ref() {
+                    want = s;
+                    break;
+                }
+            }
+            assert_eq!(d.run_until(tgt, k), want, "seed {seed} run_until stop");
+            assert!(same_state(&e, &d), "seed {seed} run_until state");
+            assert_eq!(*le.0.borrow(), *ld.0.borrow(), "seed {seed} run_until events");
+        }
+        assert!(ran > seeds, "fuzz exercised too little: {ran}");
+    }
 
     /// The decode cache must not reuse a stale entry when the guest bytes at an
     /// address change underneath it (self-modifying / write-then-execute code).

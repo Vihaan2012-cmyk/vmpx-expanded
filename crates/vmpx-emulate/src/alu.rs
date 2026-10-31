@@ -51,18 +51,13 @@ fn bit(v: u64, n: u32) -> u64 {
     (v >> n) & 1
 }
 
+#[inline(always)]
 fn szp(res: u64, bits: u32) -> u64 {
-    let mut f = 0;
-    if res == 0 {
-        f |= ZF;
-    }
-    if bit(res, bits - 1) != 0 {
-        f |= SF;
-    }
-    if (res & 0xff).count_ones().is_multiple_of(2) {
-        f |= PF;
-    }
-    f
+    // Branchless; PF is the even parity of the low byte (nibble-fold + table).
+    let x = (res & 0xff) ^ ((res & 0xff) >> 4);
+    (u64::from(res == 0) << 6)
+        | (((res >> (bits - 1)) & 1) << 7)
+        | ((!(0x6996u64 >> (x & 15)) & 1) << 2)
 }
 
 fn pick(cond: bool, f: u64) -> u64 {
@@ -71,35 +66,36 @@ fn pick(cond: bool, f: u64) -> u64 {
 
 /// Two-operand ALU op over `bytes` (1/2/4/8) wide operands.
 #[must_use]
+#[inline(always)]
 pub fn arith(op: Alu, a: u64, b: u64, bytes: u32) -> (u64, Flags) {
-    let m = mask(bytes);
-    let bits = bytes * 8;
-    let (a, b) = (a & m, b & m);
-    let (res, extra) = match op {
+    let sh = 64 - bytes * 8;
+    // Operands left-aligned in 64 bits: the native carry/overflow of the wide
+    // add/sub is exactly the narrow operation's CF/OF.
+    let (xa, xb) = (a << sh, b << sh);
+    match op {
         Alu::Add => {
-            let r = a.wrapping_add(b) & m;
-            let cf = pick(r < a, CF);
-            let of = pick(bit((a ^ r) & (b ^ r), bits - 1) != 0, OF);
-            let af = pick((a ^ b ^ r) & 0x10 != 0, AF);
-            (r, cf | of | af)
+            let (x, cf) = xa.overflowing_add(xb);
+            let (_, of) = (xa as i64).overflowing_add(xb as i64);
+            let r = x >> sh;
+            let val = szp(r, bytes * 8) | u64::from(cf) | (u64::from(of) << 11) | ((a ^ b ^ r) & AF);
+            (r, Flags { def: ALL, val, undef: 0 })
         }
         Alu::Sub => {
-            let r = a.wrapping_sub(b) & m;
-            let cf = pick(a < b, CF);
-            let of = pick(bit((a ^ b) & (a ^ r), bits - 1) != 0, OF);
-            let af = pick((a ^ b ^ r) & 0x10 != 0, AF);
-            (r, cf | of | af)
+            let (x, cf) = xa.overflowing_sub(xb);
+            let (_, of) = (xa as i64).overflowing_sub(xb as i64);
+            let r = x >> sh;
+            let val = szp(r, bytes * 8) | u64::from(cf) | (u64::from(of) << 11) | ((a ^ b ^ r) & AF);
+            (r, Flags { def: ALL, val, undef: 0 })
         }
         Alu::And | Alu::Or | Alu::Xor => {
             let r = match op {
                 Alu::And => a & b,
                 Alu::Or => a | b,
                 _ => a ^ b,
-            };
-            return (r, Flags { def: CF | OF | SF | ZF | PF, val: szp(r, bits), undef: AF });
+            } & (u64::MAX >> sh);
+            (r, Flags { def: CF | OF | SF | ZF | PF, val: szp(r, bytes * 8), undef: AF })
         }
-    };
-    (res, Flags { def: ALL, val: szp(res, bits) | extra, undef: 0 })
+    }
 }
 
 /// `inc`/`dec`: like add/sub of 1 but CF is preserved.
@@ -171,30 +167,30 @@ pub fn shift(kind: Shift, a: u64, count: u64, bytes: u32) -> Option<(u64, Flags)
 
 /// `adc`: `a + b + carry`, exact flags (same model as `Alu::Add`).
 #[must_use]
+#[inline(always)]
 pub fn adc(a: u64, b: u64, carry: bool, bytes: u32) -> (u64, Flags) {
-    let m = mask(bytes);
     let bits = bytes * 8;
-    let (a, b) = (a & m, b & m);
-    let full = u128::from(a) + u128::from(b) + u128::from(carry);
-    let r = (full as u64) & m;
-    let cf = pick((full >> bits) & 1 != 0, CF);
-    let of = pick(bit((a ^ r) & (b ^ r), bits - 1) != 0, OF);
-    let af = pick((a ^ b ^ r) & 0x10 != 0, AF);
-    (r, Flags { def: ALL, val: szp(r, bits) | cf | of | af, undef: 0 })
+    let sh = 64 - bits;
+    let (x1, c1) = (a << sh).overflowing_add(b << sh);
+    let (x2, c2) = x1.overflowing_add(u64::from(carry) << sh);
+    let r = x2 >> sh;
+    let of = (((a ^ r) & (b ^ r)) >> (bits - 1)) & 1;
+    let val = szp(r, bits) | u64::from(c1 | c2) | (of << 11) | ((a ^ b ^ r) & AF);
+    (r, Flags { def: ALL, val, undef: 0 })
 }
 
 /// `sbb`: `a - b - borrow`, exact flags (same model as `Alu::Sub`).
 #[must_use]
+#[inline(always)]
 pub fn sbb(a: u64, b: u64, borrow: bool, bytes: u32) -> (u64, Flags) {
-    let m = mask(bytes);
     let bits = bytes * 8;
+    let m = u64::MAX >> (64 - bits);
     let (a, b) = (a & m, b & m);
-    let rhs = u128::from(b) + u128::from(borrow);
-    let r = (u128::from(a).wrapping_sub(rhs) as u64) & m;
-    let cf = pick(u128::from(a) < rhs, CF);
-    let of = pick(bit((a ^ b) & (a ^ r), bits - 1) != 0, OF);
-    let af = pick((a ^ b ^ r) & 0x10 != 0, AF);
-    (r, Flags { def: ALL, val: szp(r, bits) | cf | of | af, undef: 0 })
+    let r = a.wrapping_sub(b).wrapping_sub(u64::from(borrow)) & m;
+    let cf = u64::from(a < b || (a == b && borrow));
+    let of = (((a ^ b) & (a ^ r)) >> (bits - 1)) & 1;
+    let val = szp(r, bits) | cf | (of << 11) | ((a ^ b ^ r) & AF);
+    (r, Flags { def: ALL, val, undef: 0 })
 }
 
 // mul/imul leave SF, ZF, AF, PF architecturally undefined; only CF/OF are set.
@@ -518,5 +514,107 @@ mod tests {
         // Multi-bit rotate already carries its OF formula via `val` too.
         let (_, f) = rotate(Rotate::Rol, 0x80, 3, false, 1).unwrap();
         assert_eq!(f.undef, OF);
+    }
+
+    /// The straightforward (pre-optimization) `arith`, as the oracle.
+    fn arith_ref(op: Alu, a: u64, b: u64, bytes: u32) -> (u64, Flags) {
+        let m = mask(bytes);
+        let bits = bytes * 8;
+        let (a, b) = (a & m, b & m);
+        let szp_ref = |res: u64| {
+            let mut f = 0;
+            if res == 0 {
+                f |= ZF;
+            }
+            if (res >> (bits - 1)) & 1 != 0 {
+                f |= SF;
+            }
+            if (res & 0xff).count_ones().is_multiple_of(2) {
+                f |= PF;
+            }
+            f
+        };
+        let pk = |c: bool, f: u64| if c { f } else { 0 };
+        let (res, extra) = match op {
+            Alu::Add => {
+                let r = a.wrapping_add(b) & m;
+                (r, pk(r < a, CF) | pk(((a ^ r) & (b ^ r)) >> (bits - 1) & 1 != 0, OF) | pk((a ^ b ^ r) & 0x10 != 0, AF))
+            }
+            Alu::Sub => {
+                let r = a.wrapping_sub(b) & m;
+                (r, pk(a < b, CF) | pk(((a ^ b) & (a ^ r)) >> (bits - 1) & 1 != 0, OF) | pk((a ^ b ^ r) & 0x10 != 0, AF))
+            }
+            _ => {
+                let r = match op {
+                    Alu::And => a & b,
+                    Alu::Or => a | b,
+                    _ => a ^ b,
+                };
+                return (r, Flags { def: CF | OF | SF | ZF | PF, val: szp_ref(r), undef: AF });
+            }
+        };
+        (res, Flags { def: ALL, val: szp_ref(res) | extra, undef: 0 })
+    }
+
+    #[test]
+    fn arith_matches_reference() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let edge = [0u64, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x7fff_ffff, 0x8000_0000, u64::MAX, 1 << 63];
+        for op in [Alu::Add, Alu::Sub, Alu::And, Alu::Or, Alu::Xor] {
+            for bytes in [1u32, 2, 4, 8] {
+                for i in 0..20_000 {
+                    let (a, b) = if i < 144 { (edge[i % 12], edge[i / 12]) } else { (next(), next()) };
+                    assert_eq!(arith(op, a, b, bytes), arith_ref(op, a, b, bytes), "{op:?} {a:#x} {b:#x} {bytes}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adc_sbb_match_reference() {
+        let mut x = 0x0fed_cba9_8765_4321u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let edge = [0u64, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x7fff_ffff, 0x8000_0000, u64::MAX, 1 << 63];
+        for bytes in [1u32, 2, 4, 8] {
+            let bits = bytes * 8;
+            let m = mask(bytes);
+            for i in 0..20_000 {
+                let (a, b) = if i < 144 { (edge[i % 12], edge[i / 12]) } else { (next(), next()) };
+                for c in [false, true] {
+                    let (am, bm) = (a & m, b & m);
+                    let full = u128::from(am) + u128::from(bm) + u128::from(c);
+                    let r = (full as u64) & m;
+                    let exp_cf = (full >> bits) & 1 != 0;
+                    let (rr, f) = adc(a, b, c, bytes);
+                    assert_eq!(rr, r, "adc r {a:#x} {b:#x} {c} {bytes}");
+                    assert_eq!(f.val & CF != 0, exp_cf, "adc cf {a:#x} {b:#x} {c} {bytes}");
+                    assert_eq!(f.val & OF != 0, (((am ^ r) & (bm ^ r)) >> (bits - 1)) & 1 != 0);
+                    assert_eq!(f.val & AF != 0, (am ^ bm ^ r) & 0x10 != 0);
+                    assert_eq!((f.def, f.undef), (ALL, 0));
+                    let rhs = u128::from(bm) + u128::from(c);
+                    let r = (u128::from(am).wrapping_sub(rhs) as u64) & m;
+                    let (rr, f) = sbb(a, b, c, bytes);
+                    assert_eq!(rr, r, "sbb r {a:#x} {b:#x} {c} {bytes}");
+                    assert_eq!(f.val & CF != 0, u128::from(am) < rhs, "sbb cf {a:#x} {b:#x} {c} {bytes}");
+                    assert_eq!(f.val & OF != 0, (((am ^ bm) & (am ^ r)) >> (bits - 1)) & 1 != 0);
+                    assert_eq!(f.val & AF != 0, (am ^ bm ^ r) & 0x10 != 0);
+                    let szp_exp = (if r == 0 { ZF } else { 0 })
+                        | (if (r >> (bits - 1)) & 1 != 0 { SF } else { 0 })
+                        | (if (r & 0xff).count_ones().is_multiple_of(2) { PF } else { 0 });
+                    assert_eq!(f.val & (ZF | SF | PF), szp_exp);
+                }
+            }
+        }
     }
 }
