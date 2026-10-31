@@ -1,94 +1,111 @@
-Dynamic Assist: Emulation First
-===============================
+Dynamic Assist: Observe, Then Feed Back
+=======================================
 
 :doc:`static-frontier` lists what a purely static devirtualizer must refuse:
-unbounded input branches, environment reads, re-entrant continuations and packers
-whose unpacking is itself computed at run time. A recorded run supplies exactly
-those facts. This page describes the design (called SP7) for obtaining them
-without ever running a hostile sample on real hardware.
+unbounded input branches, environment reads, runtime-initialized globals,
+re-entrant continuations, import protection and packers whose unpacking is itself
+computed at run time. A recorded run supplies exactly those facts. This page
+describes the dynamic-assist engine (called SP7) that obtains them without ever
+running a hostile sample on real hardware, and states plainly how far it gets.
 
 .. note::
 
-    This is a design. Nothing on this page is implemented. It covers **user-mode**
-    malware only. Kernel-mode samples (drivers, boot code, anything that needs a
-    privileged device model) are out of the current scope.
+    The engine is implemented (crate ``vmpx-emulate`` and its bridges into the
+    static model) and covers **user-mode** samples only. Kernel-mode samples
+    (drivers, boot code, anything that needs a privileged device model) are out of
+    scope. Everything it produces lives on a labelled **experimental** tier. None of
+    it is written as the sound ``OUTPUT`` of ``clean``.
 
-The flow: unpack and observe
-----------------------------
+The flow: observe, then feed back
+---------------------------------
 
 .. code-block:: text
 
-    packed sample
-        |  detonate in a contained software emulator
+    packed or protected module
+        |  detonate in the contained software emulator
         v
-    observed execution: unpacked image, memory writes, API calls, branch inputs
-        |  dump the unpacked image
-        v
-    unpacked PE  ->  vmpx static devirtualizer  ->  hybrid or clean PE
+    observed facts: unpacked image, resolved imports, runtime globals,
+                    recursion depth, VM branch targets
+        |  dump the unpacked image          |  feed facts to the static side
+        v                                   v
+    unpacked PE  ->  vmpx static devirtualizer (seeded, labelled)  ->  experimental PE
 
-The emulator runs the sample until it has unpacked itself (or a step and time
+The emulator runs the module until it reaches its original entry point (or a step
 budget is spent) and the image is dumped from emulated memory. That image is the
-input to the existing static pipeline (:doc:`/tool/pipeline/unpacking` and the
-stages after it). The run also yields side facts the static model can use: the
-concrete values of environment reads, the real continuation of a protector exit,
-and inputs that exercise a branch that static analysis could not enumerate
-(:doc:`static-frontier`).
+input to the static pipeline (:doc:`/tool/pipeline/unpacking` and the stages after
+it). The same run yields side facts the static model can use. Dynamic assist does
+not replace static recovery: the devirtualizer still decodes, executes symbolically
+and lifts; the run only supplies what the binary does not contain.
 
-Dynamic assist does not replace static recovery. The devirtualizer still decodes,
-executes symbolically and lifts; the run only supplies what the binary does not
-contain.
+The engine
+----------
 
-Why emulation first
--------------------
+``vmpx-emulate`` is an in-process software interpreter for x86-64 user-mode code.
+Every instruction is decoded and applied to an in-process CPU and memory model.
+There is no host pointer the guest can reach, no syscall it can issue, no file,
+process or network path, and no foreign-function call.
 
-A sample run on real hardware, or in a conventional virtual machine, has an escape
-surface: the CPU, the firmware, the hypervisor and every emulated device are code
-the sample can attack. A software emulator that models only user-mode instruction
-execution and a thin operating-system API layer has no real hardware behind it.
-There is no device to exploit and no driver to load, so the surface reduces to the
-emulator's own implementation, which is small, memory-safe if written in Rust, and
-fully under the analyst's control.
+* **Exact or stop.** An instruction executes only with fully modelled semantics.
+  Flags the architecture leaves undefined are tracked, and reading one stops the run
+  (a deterministic undefined-flag mode exists for detonation). A faulting instruction
+  leaves state untouched. Unmodelled behaviour ends the run; it is never guessed.
+* **Loader and environment.** The module is mapped at its preferred base with
+  section permissions, TEB, PEB and loader-list stubs, a stack, and an import table
+  of sentinel thunks. Module export tables are modelled faithfully (with an offline
+  reference of system export names) so a protector that walks exports directly sees
+  consistent data. Time, ``rdtsc`` and ``cpuid`` are deterministic.
+* **Win32 surface.** The minimum API surface a protector startup needs is emulated
+  (memory, loader and heap APIs, ntdll syscall stubs),
+  and a ``GetProcAddress`` call records the binding it resolves.
+* **Network closed.** A denylist covering the Winsock, WinINet, WinHTTP, DNS and
+  URL-download surfaces is checked before any API is modelled, and a run that
+  resolves one stops. The workspace builds with cargo forced offline.
 
-Emulation also serves the analysis directly. Every memory access, branch and API
-call passes through the emulator, so observation is complete and does not depend on
-hooks the sample can detect or remove. Time, randomness and the environment are
-whatever the emulator says they are, which makes a run repeatable.
+Facts, and the bridges that use them
+------------------------------------
 
-Containment layers
-------------------
-
-No single layer is trusted. Each assumes the one inside it has failed.
+What a run records is an ``ObservedFacts`` bundle. Every entry carries an ``Observed``
+provenance tag so it cannot be mistaken for a proven fact.
 
 .. list-table::
    :header-rows: 1
-   :widths: 24 76
+   :widths: 24 34 42
 
-   * - Layer
-     - What it does
-   * - Minimal device model
-     - The emulator implements user-mode CPU semantics and the API surface the
-       sample touches, and nothing else: no disk or network devices, no
-       privileged instructions, no interrupt controller. Unimplemented behaviour
-       stops the run instead of being guessed.
-   * - Process sandbox
-     - The emulator itself runs under an OS sandbox with no ambient authority
-       (seccomp-style syscall filtering and a mandatory access control policy
-       where an operating system supports them). A compromised emulator can still
-       do almost nothing.
-   * - Virtual machine, when used
-     - If a full VM is needed for compatibility, it gets seccomp and mandatory
-       access control on the hypervisor process, no shared folders or clipboard,
-       and no device it does not need.
-   * - Fake network
-     - Network calls are answered by a simulated network that records requests and
-       replies with canned data. Nothing leaves the host.
-   * - Disposable
-     - Every run starts from a clean snapshot and is destroyed afterwards. Nothing
-       the sample writes persists, and runs share no state.
-   * - Air gap for the worst samples
-     - Samples judged most dangerous run on a machine with no network path to
-       anything, and only the unpacked image and the run log are carried out,
-       as inert data.
+   * - Observed fact
+     - Gap it addresses
+     - How the static side uses it (experimental only)
+   * - Unpacked image and OEP
+     - Packers and protector unpacking computed at run time
+     - Detected by write-then-execute; the memory image is dumped and rebuilt into a
+       loadable PE (``clean --dump-pe``, ``generic-unpack``)
+   * - Resolved imports
+     - Import protection: bindings exist only after the protector's loader runs
+     - ``GetProcAddress`` bindings feed experimental import reconstruction
+       (``clean --dynamic``)
+   * - Runtime-initialized globals
+     - A branch fed by a null-looking read of a pointer set during initialization
+     - Concrete values seed the symbolic state's reads, labelled, to resolve the stall
+   * - Recursion depth
+     - A recursive function that the lift cannot expand to a finite tree
+     - A concrete depth observed under one input bounds an unroll
+   * - VM branch targets
+     - Computed or data-dependent targets static analysis cannot enumerate
+     - Observed targets are offered to the CFG walker as a bridge for those branches
+
+Each bridge is opt-in, runs only on the experimental path, and names every observed
+fact it used in the report. The sound gate is never relaxed. The emulator also
+provides a differential harness that can run a lift and the original side by side
+for comparison.
+
+Packers other than VMProtect
+----------------------------
+
+The same engine backs ``generic-unpack`` (:doc:`/tool/cli/generic-unpack`).
+``detect`` classifies UPX, ASPack, PECompact, MPRESS and FSG; the named-section
+packers are routed to a bounded detonate, OEP, dump and rebuild path. A real UPX
+stub has been run to its original entry point end to end. The other routed packers
+have not been validated on real samples, and FSG, found by a low-confidence
+heuristic, is never routed.
 
 The trust tier: observed, not proven
 ------------------------------------
@@ -98,23 +115,67 @@ execution. vmpx therefore keeps a separate tier for it:
 
 * **proven** facts come from static analysis and pass verification. They are the
   only facts the sound path (``clean`` output) may rely on;
-* **observed** facts come from an emulated run. They may seed the static model (a
-  domain for an otherwise unbounded input, a resolved nested entry, the value of an
-  environment read) but are labelled as observed wherever they are used.
+* **observed** facts come from an emulated run. They may seed the static model but
+  are labelled as observed wherever they are used.
 
-Output that depends on an observed fact is quarantined in the same way
-``--experimental`` output is today: it is never written as the sound ``OUTPUT``, the
-report names each observed fact it used, and the blockers list stays honest. Where
-an observed value later contradicts a static result, the run wins for diagnosis and
-the static result is reported as blocked, not silently patched.
+Output that depends on an observed fact is quarantined the way ``--experimental``
+output is: never written as the sound ``OUTPUT``, with the report naming each
+observed fact used and the blockers list left honest. Where an observed value
+contradicts a static result, the run wins for diagnosis and the static result is
+reported as blocked, not silently patched.
 
 The honest limit
 ----------------
 
-No containment is 100%. Emulators have bugs, sandboxes have escapes, and a sample
-that detects emulation can refuse to unpack at all, so a clean-looking run is not
-evidence of a benign sample. The design does not rest on any layer being perfect.
-It aims at **zero blast radius**: assume the emulator will eventually be
-compromised and arrange that doing so gains the sample nothing: no credentials, no
-network, no persistent storage, no second target and no path back to the analyst's
-machine. A run that cannot be made safe on those terms is not run.
+Dynamic assist does not close the static gap. What stops it:
+
+* **A run needs a driver.** A virtualized function called by the host application is
+  reached only if something calls it with inputs. Observing host-called virtualized
+  functions needs a host-API driver that supplies the caller's side, and that is not
+  general.
+* **One run, one path.** Observed branch targets and depths come from the inputs the
+  run happened to use. Other inputs may take other branches, and an observed fact
+  says nothing about them.
+* **Irreducible dependence.** Some branches depend on the environment or on external
+  input (time, files, the network, user input). No emulation can decide them, and
+  vmpx does not invent an answer.
+* **Modelling gaps.** The ISA and the Win32 surface are modelled one case at a time. A
+  sample that needs an unmodelled instruction or API stops, and a sample that detects
+  emulation can refuse to unpack at all. A clean-looking run is therefore not
+  evidence that a sample is benign.
+* **No promotion.** Observed results never become sound results. The 313 of 814
+  functions recovered on the measured large module (:doc:`static-frontier`) are static
+  and proven; dynamic assist is not counted in that figure.
+
+Containment
+-----------
+
+No containment is 100%. Emulators have bugs, and the design does not rest on any one
+layer being perfect. The layers, and which of them are enforced by the code:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Layer
+     - Status
+   * - In-process interpreter
+     - Enforced by construction. No native execution, host syscall, file, process,
+       network or FFI path exists in the emulator crate
+   * - Minimal device model
+     - Enforced. Only user-mode CPU semantics and the API surface the sample
+       touches are modelled; unimplemented behaviour stops the run
+   * - Network denylist and offline build
+     - Enforced. Networking APIs stop a run before modelling; cargo is forced offline
+   * - Bounded runs
+     - Enforced. Every detonation has a step budget, and ``generic-unpack`` uses a
+       fixed modest bound so a hostile stub cannot run away
+   * - OS sandbox, disposable VM, air gap
+     - Operational practice, not enforced by the tool. Untrusted samples should still
+       be handled on a machine with no network path, with only inert output carried
+       out
+
+The aim is **zero blast radius**: assume the emulator will eventually be compromised
+and arrange that doing so gains the sample nothing, with no credentials, no network,
+no persistent storage and no path back to the analyst's machine. A run that cannot be
+made safe on those terms is not run.

@@ -23,14 +23,17 @@ Static by default
     self-unpacked OEP image, an on-demand import table, a PEB-dependent branch —
     is invisible to a purely static pass.
 
-    Dynamic assist (SP7) is a *separate, opt-in* architecture that closes that
-    gap: the sample is detonated inside a contained pure-Rust emulator, allowed
-    to self-unpack, and the resulting image is dumped and handed back to the
-    static pipeline. It deliberately reintroduces the anti-debug and containment
-    problem — which is exactly why it runs under emulation with a fail-closed
-    device model, not on the host. Its results carry an ``observed-not-proven``
-    trust tier, kept distinct from the proven static output; it never relaxes
-    the fail-closed rules above.
+    Dynamic assist (SP7) is a *separate, opt-in* engine that narrows that gap:
+    the sample is run inside a contained, offline, pure-Rust software
+    interpreter (no native execution, no network, no host syscall, filesystem
+    or FFI), allowed to self-unpack, and the resulting image and other observed
+    facts are handed back to the static pipeline. Its results carry an
+    ``observed-not-proven`` trust tier, kept distinct from the proven static
+    output, and are written only to labelled experimental paths; it never
+    relaxes the fail-closed rules above. It cannot observe everything: a
+    function the host never calls, or a branch that depends on the outside
+    environment, stays out of reach
+    (:doc:`/vmprotect/devirtualization/dynamic-assist`).
 
 Behaviour, not bytes
     "Reversible" means *behaviour-reversible*. Virtualization is lossy:
@@ -102,9 +105,11 @@ Blockers on a protected input
      - A successful OEP decision (:doc:`pipeline/oep-recovery`)
    * - ``application import set is not proven independently reconstructed``
      - Never, today. The import reduction is wired in, but the set of referenced
-       IAT slots it consumes is intentionally empty (there is no sound static way to
-       compute it yet), so this blocker always stays. The reconstruction is proven
-       incomplete by design, not unimplemented
+       IAT slots it consumes is intentionally empty: VMProtect 3.11 import protection
+       is resolved at run time, so there is no sound static way to compute it. The
+       reconstruction is proven incomplete by design, not unimplemented. Bindings
+       observed in the contained emulator (``clean --dynamic``) can build an
+       experimental import directory, but they never clear this blocker
    * - ``native code reintegration has not produced a devirtualized replacement image``
      - A reintegrated image was produced
    * - ``VMProtect sections remain referenced by unresolved paths``
@@ -174,7 +179,10 @@ There are two output paths, and they never mix.
      - Yes
 
 ``--experimental`` does **not** relax the gate. It is scaffolding so the pipeline
-can be exercised against real samples early, quarantined to its own path.
+can be exercised against real samples early, quarantined to its own path. The same
+tier carries anything observed in the contained emulator: ``--dynamic``,
+``--dump-pe`` and ``generic-unpack`` outputs are observed artifacts from one run,
+reported as such and never promoted to sound output.
 
 Known risks of experimental output:
 

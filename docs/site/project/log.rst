@@ -189,18 +189,127 @@ Result: linear and branching functions devirtualize; the output is a valid hybri
 with the lifted functions spliced in. The sound frontier and what is refused are written up in
 :doc:`/vmprotect/devirtualization/static-frontier`.
 
-SP7: dynamic assist (design)
-----------------------------
+Generalizing past the first sample
+----------------------------------
 
-An emulation-first design for going past the static frontier on user-mode samples:
-:doc:`/vmprotect/devirtualization/dynamic-assist`. Design only.
+The first sample was one build of one function family. Testing against freshly
+protected builds showed that the decoder was over-fitted to it, and that re-protecting
+the same input could swing results by tens of points. The work that followed was
+generalization, each step judged against several builds rather than one.
+
+Packer and layout (``b79bc9a``, ``27246b7``, ``1e39f41``)
+    Real VMProtect 3.11 packer layouts, including multi-section streams bound by
+    end-of-stream length and destinations that are uninitialized or not stream
+    backed, unpack and relayout correctly.
+Handlers and codecs (``f420459``, ``3e17e2e``, ``01c2214``)
+    Division, modulo and bit-permutation handler specifications; the dispatch and
+    keyed-operand codec of the bit-permutation family; two-candidate bootstrap role
+    assignment disambiguated by decode-coherence evidence.
+Branch resolution (``d3f80b2``, ``ec080cf``, ``8201b32``)
+    The CPUID processor-signature anti-analysis gate resolved by a sound both-target
+    over-approximation; read-only image loads concretized to resolve jump and
+    constant tables; stack and local stores proven non-aliasing so post-store
+    branches resolve.
+Lift coverage (``12597c3``, ``e048d64``, ``5dd7897``)
+    Remaining intrinsics and flag operations lowered; natural and reducible
+    multi-exit loops emitted; memory reads captured in order across CFG nodes.
+
+Mutation-mode deobfuscation (SP6)
+---------------------------------
+
+Mutated code is treated as a program, not a pattern (:doc:`/vmprotect/devirtualization/attacking-mutation`).
+The design is a solver tournament.
+
+Contract and solvers (``0844d0e``, ``7e8aaa4``, ``7531419``, ``19dc413``)
+    Shared problem and candidate types, then a portfolio of solvers: linear MBA,
+    algebraic MBA rewriting, opaque predicates, substitution canonicalization, and
+    later dictionary and synthesis solvers.
+Scoring and ELO (``8ac6607``, ``2215117``)
+    A differential input-testing scorer ranks candidates; a cost-aware ELO ladder
+    routes each problem class to the best-rated solvers.
+SMT gate (``ad2398c``, ``f2ae51d``)
+    An equivalence gate is the only route from the experimental tier to the sound
+    tier. A candidate that merely passes input testing is not promoted.
+Native CFG and end to end (``cea4ecc``, ``44ade88``, ``b35a8c0``)
+    Multi-block native CFG recovery, including decoding at control-flow-reached
+    offsets to resolve overlapping-instruction anti-disassembly, and an end-to-end
+    binary demutation pass. Measured against a synthetic benchmark with a ground
+    truth oracle (``09bc712``); coverage on real mutated binaries is partial.
+
+Protection removal and packers
+------------------------------
+
+Section stripping (``618a0f9``, ``14146f9``)
+    A stripping primitive that refuses when any reference would dangle, exposed as the
+    ``strip`` subcommand and an opt-in ``clean --experimental --strip`` stage.
+Packer front-end (``35bf859``)
+    Detection of UPX, ASPack, PECompact, MPRESS and FSG, reported by ``detect`` and
+    routed by ``generic-unpack`` (:doc:`/tool/cli/generic-unpack`).
+Real UPX end to end (``c0f5cfb``)
+    The emulator runs a real UPX unpack stub to its original entry point with a
+    faithful model of image-page writes. This is the one packer validated on a real
+    sample.
+
+SP7: contained dynamic assist
+-----------------------------
+
+Several gaps were confirmed to need runtime observation: import protection,
+runtime-initialized globals and recursion depth. The design
+(:doc:`/vmprotect/devirtualization/dynamic-assist`) was built as ``vmpx-emulate``,
+a pure in-process interpreter.
+
+Foundation (``222d972``, ``033022e``, ``9b35eb3``)
+    PE loader and minimal environment, mutable in-callback hooks and an
+    ``ObservedFacts`` hand-off format, then Win32 API stubs with import observation.
+Dump and OEP (``b3f5496``, ``fdbaa06``)
+    OEP detection by write-then-execute, image dump, runtime-global capture, VM
+    dispatcher observation and recursion-depth capture.
+ISA and environment (``6f4e629``, ``369b859``, ``3fb1b59``, ``b680e98``, ``0feb633``)
+    The modelled instruction set widened step by step, with exact flag semantics or a
+    stop; loader environment, module export tables and ntdll syscall stubs modelled
+    so protector startup reaches the OEP.
+Bridges into the static model (``d03c40f``, ``f448c7b``, ``28518aa``, ``cfce0e5``)
+    Observed imports for reconstruction, observed runtime globals to seed symbolic
+    reads, observed recursion depth for a bounded unroll, and observed branch targets
+    for computed targets. All are experimental and labelled.
+Containment (``d03e35f``)
+    Cargo is forced offline for the whole workspace (``net.offline = true``), and the
+    emulator's API layer checks a network-API denylist before any API is modelled.
+
+Cross-profile VM transitions and the measured ceiling
+------------------------------------------------------
+
+The largest late gain came from the walker. On a large real-world protected module,
+many functions stalled because a VM exit popped a target that begins a block in a
+*different* register-role and direction profile.
+
+Cross-profile walker (``e4395a1``, ``2d15f41``)
+    The CFG walker follows a proven popped-target VM transition and re-resolves
+    register roles per block. A per-entry node and instruction budget makes the
+    walk fail closed; the first version needed that bound because memory use grew
+    on large inputs.
+Dispatch residual and operand timing (``f35a48e``)
+    Further recovery of dispatch residuals, operand-timing and nested-profile
+    transitions.
+CPUID leaf-only variant (``3c569ba``)
+    Another handler variant modelled.
+
+Measured result: **313 of 814 (38.5%)** virtualized functions on that module are
+soundly recovered, under the all-paths-reach-exit oracle. The remaining 501 were
+examined and are documented as beyond sound static reach rather than left as
+open bugs: branch targets computed from runtime-pointer memory reads, nonlinear
+``SHLD``/``SHRD`` double-shift targets with no finite input domain, and handlers
+outside the file-backed image or behind import protection
+(:doc:`/vmprotect/devirtualization/static-frontier`). The emulator can observe some
+of these facts, but only on the experimental tier.
 
 Verification scope
 ------------------
 
 There is no protected corpus in CI. Correctness is verified by unit and synthetic tests plus
-out-of-band runs against locally protected samples. The goal remains behaviour-reversible
-output, not bit-reversible.
+out-of-band runs against locally protected samples, including multi-build corpora, where
+variance between builds of the same input is the main hazard. The goal remains
+behaviour-reversible output, not bit-reversible.
 
 Design documents
 ----------------

@@ -11,7 +11,8 @@ Synopsis
 
 .. code-block:: console
 
-    vmpx clean <INPUT> <OUTPUT> [--report <PATH>] [--reconstructed <PATH>] [--experimental <PATH>] [--decoded-lift]
+    vmpx clean <INPUT> <OUTPUT> [--report <PATH>] [--reconstructed <PATH>]
+               [--experimental <PATH> [--decoded-lift] [--dynamic [--dump-pe <PATH>]] [--strip]]
 
 Arguments
 ---------
@@ -52,6 +53,30 @@ Arguments
    the native body, producing a hybrid image: devirtualized functions are native,
    the rest still run through the original VM. Slow on large inputs (minutes), so
    it is off by default. See :doc:`/tool/pipeline/reintegration`.
+
+.. option:: --dynamic
+
+   Requires ``--experimental``. Runs the contained software-emulator detonation
+   (no native execution, no network) and feeds the dynamically resolved imports it
+   observes into the experimental import reconstruction. The facts are
+   Observed-tier; the proof-gated ``OUTPUT`` path and its blockers are never
+   affected. See :doc:`/vmprotect/devirtualization/dynamic-assist`.
+
+.. option:: --dump-pe PATH
+
+   Requires ``--dynamic``. Also rebuilds a conventional, loadable standalone PE
+   from the detonation memory dump and writes it to ``PATH``. It reflects one run's
+   memory state, is not loader-verified as sound, and does not affect the
+   proof-gated ``OUTPUT``.
+
+.. option:: --strip
+
+   Requires ``--experimental``. Attempts to strip protector (non-standard-named)
+   sections from the reintegrated image. They are removed only when the dangling
+   reference checker approves and the result validates; otherwise the step refuses
+   cleanly and the written experimental image is unchanged. The default
+   proof-gated ``OUTPUT`` path is never affected. The standalone form is
+   :doc:`strip`.
 
 What it does
 ------------

@@ -3,8 +3,12 @@ vmpx
 
 vmpx is a static-analysis and recovery framework for Windows x64 binaries
 protected with VMProtect. It is written in Rust, parses and analyses
-protected files without ever executing them, and is built around one rule:
-a result is reported as recovered only when it has passed verification.
+protected files without ever executing them natively, and is built around one
+rule: a result is reported as recovered only when it has passed verification.
+An optional, contained software emulator can observe facts static analysis
+cannot prove; those stay on a labelled experimental tier and never reach the
+sound output. See :doc:`tool/overview` for the current capabilities and their
+measured limits.
 
 The documentation is split in two. The first part documents the tool itself:
 how to build it, every command-line subcommand and the JSON it emits, the

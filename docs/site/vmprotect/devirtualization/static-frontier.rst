@@ -41,9 +41,10 @@ Unbounded or undecidable input branches
 Re-entrant and nested continuations
     A virtualized function that re-enters the VM cannot be modelled as a single
     closed path family. A VM exit that returns into another entry of the same VM
-    is followed in the CFG and lifted as a continuation exit, but in the sound
-    path a nested entry is counted and never counted as covered, and no redirect
-    is emitted for it. Loops within one function are refused for the same
+    is followed in the CFG and lifted as a continuation exit, and a popped-target
+    transition into a different register-role profile is followed by the
+    cross-profile walker. In the sound path a nested entry is still counted and
+    never counted as covered, and no redirect is emitted for it. Loops within one function are refused for the same
     reason: the lift expands paths into a tree, and a block that repeats on a path
     has no finite expansion.
 
@@ -68,8 +69,9 @@ Environment-dependent branches
     trust it rather than prove it, so it is marked as a boundary.
 
 Semantics without a verified lowering
-    ``TableChecksum``, wide multiply and divide and ``ReadTimestampCounter`` decode
-    but do not yet compile. Functions that use them are decoded, reported and not
+    Lowering has been added semantic by semantic (flag intrinsics, wide multiply and
+    several others now compile), but any semantic still without a verified lowering
+    decodes and does not compile. Functions that use one are decoded, reported and not
     lifted (:doc:`/tool/pipeline/function-lift`).
 
 Why refusal is the answer
@@ -81,14 +83,45 @@ machine. Producing output anyway would give code that is right for the cases the
 tool happened to consider. In the sound path it reports a blocker instead, with
 the stall reason in the CFG report, and the rest of the file is unaffected.
 
+Where the frontier sits on a real module
+----------------------------------------
+
+On a large real-world protected module with 814 virtualized functions, **313 (38.5%)**
+are soundly recovered, certified by the completeness oracle
+(``all_paths_reach_vm_exit``). That is the measured sound ceiling today. The
+cross-profile VM-transition walker (the walker switches the active register-role and
+direction profile at a proven popped-target transition and re-resolves roles per
+block, under a fail-closed per-entry budget) was the lever that moved it past the
+earlier figure.
+
+The other 501 are dynamic or runtime-dependent, and fall into three groups:
+
+Branch targets from runtime-pointer memory reads
+    The target is loaded through a pointer that is set during initialization. The
+    read is a free value to the static model, and the target depends on it through
+    arithmetic or a load rather than through a cover the model can enumerate.
+
+Nonlinear ``SHLD``/``SHRD`` double-shift targets
+    A target built by a double-shift of input-dependent words has no finite input
+    domain that can be proven exhaustive.
+
+Handlers outside the file-backed image, or import-protected
+    A handler or target that is not in the bytes on disk, or an import resolved by the
+    protector at run time, cannot be reached by a pass that never runs the sample.
+
+These are documented as beyond sound static reach, not as open defects. Results also
+vary a great deal between protections of the same input, so 38.5% is a measurement on
+one build, not a rate to expect elsewhere.
+
 Beyond the frontier: dynamic assist
 -----------------------------------
 
 The path past these limits is observation, not stronger static inference. A
 recorded run supplies what the binary does not: the concrete environment values,
-the real continuation of a protector exit, and the inputs that exercise a branch.
-Such facts can seed the static model (a domain for an otherwise unbounded input,
-a resolved nested entry), but they are evidence about one execution, not a proof.
-Any output that relies on them must be labelled as such and kept out of the sound
-path, in the same way ``--experimental`` is today. The design is in
-:doc:`dynamic-assist`; it is not implemented.
+runtime-initialized globals, the resolved imports, and the targets that a run took.
+Such facts can seed the static model, but they are evidence about one execution, not
+a proof. Any output that relies on them is labelled as such and kept out of the sound
+path, in the same way ``--experimental`` is. The engine is a contained, offline
+software interpreter and is implemented; it still cannot reach a function the host
+never calls, or a branch that depends on the outside environment. The design, the
+bridges and the honest limits are in :doc:`dynamic-assist`.
