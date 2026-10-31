@@ -6,6 +6,9 @@ use vmpx_vm::{
     discover_vm_entries, recover_entry_stream,
 };
 
+mod packer;
+pub use packer::{PackerKind, PackerReport, detect_packer};
+
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
@@ -100,6 +103,9 @@ pub struct ProtectionReport {
     pub executable_regions: Vec<ExecutableRegion>,
     pub evidence: Vec<DetectionEvidence>,
     pub protection_mode: ProtectionModeReport,
+    /// Common non-VMProtect packer signature, detected separately from and
+    /// independently of the VMProtect profile above.
+    pub packer: PackerReport,
     pub warnings: Vec<String>,
 }
 
@@ -515,7 +521,7 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
         );
     }
     ProtectionReport {
-        schema_version: 2,
+        schema_version: 3,
         verdict,
         confidence,
         image_layout,
@@ -526,6 +532,7 @@ pub fn detect_vmprotect(pe: &PeImage<'_>) -> ProtectionReport {
         executable_regions,
         evidence,
         protection_mode,
+        packer: detect_packer(pe),
         warnings,
     }
 }

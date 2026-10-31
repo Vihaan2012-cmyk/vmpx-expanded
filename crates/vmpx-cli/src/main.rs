@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use vmpx_detect::{ProtectionReport, detect_vmprotect};
+use vmpx_detect::{ProtectionReport, detect_packer, detect_vmprotect};
 use vmpx_disasm::{
     IpRelativeReference, find_ip_relative_references_resync,
     find_ip_relative_references_resync_in_ranges,
@@ -22,6 +22,7 @@ mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
+mod generic_unpack;
 mod input_closed_functions;
 mod strip_wiring;
 mod vm_inventory;
@@ -116,6 +117,15 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Recognize a common non-VMProtect packer (UPX/ASPack/PECompact/MPRESS/FSG)
+    /// and, for a supported named-section packer, attempt a bounded, contained
+    /// dynamic unpack to OEP, writing the rebuilt (OBSERVED) PE. Fails closed if
+    /// OEP is not reached within the step bound; never fabricates output for an
+    /// unsupported/heuristic detection. The sample is never executed natively.
+    GenericUnpack {
+        input: PathBuf,
+        output: PathBuf,
     },
     /// Discover evidence-scored VM entry stubs and mutated bootstrap profiles.
     VmList {
@@ -497,6 +507,15 @@ fn print_detection(report: &ProtectionReport) {
         mode.no_vm_entries
     );
     println!("[mode] signal: {}", mode.signal);
+    let packer = &report.packer;
+    println!(
+        "[packer] {} (confidence {})",
+        packer.kind.label(),
+        packer.confidence
+    );
+    for statement in &packer.evidence {
+        println!("  {statement}");
+    }
     for region in &report.executable_regions {
         println!(
             "[region] {:<8} rva={} size={:#X} entropy={} entry={}",
@@ -1175,6 +1194,84 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print_detection(&report);
+            }
+        }
+        Command::GenericUnpack { input, output } => {
+            if input == output {
+                bail!("refusing to overwrite the input file");
+            }
+            if output.exists() && fs::canonicalize(&input).ok() == fs::canonicalize(&output).ok() {
+                bail!("refusing to overwrite the input file through an alias");
+            }
+            if output.exists() {
+                bail!("refusing to overwrite existing output {}", output.display());
+            }
+            let data = read_file(&input)?;
+            let pe = PeImage::parse(&data).with_context(|| {
+                format!(
+                    "{} is not a supported, structurally parseable PE",
+                    input.display()
+                )
+            })?;
+            let detected = detect_packer(&pe);
+            println!(
+                "[packer] detected {} (confidence {})",
+                detected.kind.label(),
+                detected.confidence
+            );
+            for statement in &detected.evidence {
+                println!("  {statement}");
+            }
+            // Bounded, contained dynamic unpack-to-OEP. OBSERVED artifact; real
+            // packer samples are UNVALIDATED offline.
+            match generic_unpack::route_generic_unpack(&pe, generic_unpack::PACKER_UNPACK_MAX_STEPS)
+            {
+                generic_unpack::UnpackOutcome::NoPacker => {
+                    println!("[packer] no easy-packer signature detected; nothing to route");
+                }
+                generic_unpack::UnpackOutcome::Unsupported { kind, confidence } => {
+                    println!(
+                        "[packer] detected {} (confidence {confidence}); generic unpack is experimental/unsupported — refusing to fabricate output",
+                        kind.label()
+                    );
+                }
+                generic_unpack::UnpackOutcome::UnpackedToOep { kind, oep, steps, pe_bytes } => {
+                    fs::write(&output, &pe_bytes)
+                        .with_context(|| format!("failed to write {}", output.display()))?;
+                    let disk = read_file(&output)?;
+                    PeImage::parse(&disk).with_context(|| {
+                        format!("rebuilt output {} failed disk reparse", output.display())
+                    })?;
+                    println!(
+                        "[packer] detected {}; reached OEP {oep:#X} in {steps} steps (bound {})",
+                        kind.label(),
+                        generic_unpack::PACKER_UNPACK_MAX_STEPS
+                    );
+                    println!(
+                        "[packer] wrote {} bytes to {} — OBSERVED artifact from one contained run; UNVALIDATED on real samples offline",
+                        pe_bytes.len(),
+                        output.display()
+                    );
+                    println!("[verify] rebuilt output reparsed successfully from disk");
+                }
+                generic_unpack::UnpackOutcome::OepNotReached { kind, steps, stop } => {
+                    bail!(
+                        "detected {}; unpack did not reach OEP within bound ({steps} steps, stop={stop:?})",
+                        kind.label()
+                    );
+                }
+                generic_unpack::UnpackOutcome::NotStarted { kind, reason } => {
+                    bail!(
+                        "detected {}; contained detonation could not start: {reason}",
+                        kind.label()
+                    );
+                }
+                generic_unpack::UnpackOutcome::RebuildFailed { kind, reason } => {
+                    bail!(
+                        "detected {}; reached OEP but PE rebuild failed: {reason}",
+                        kind.label()
+                    );
+                }
             }
         }
         Command::VmList {
