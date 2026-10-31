@@ -628,17 +628,21 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 /// read (like loading the input); nothing here touches the network or the
 /// emulator's pure runtime path.
 ///
-/// Two complementary offline sources, both optional:
+/// Three complementary offline sources:
 ///
 /// * The UNPROTECTED original's import directory (its imports grouped by module
 ///   are the application functions the protected twin resolves). Located via
 ///   `VMPX_IMPORT_REFERENCE`, else a sibling `originals/<name without .vmp>`.
-/// * A bundled system-DLL export list (`VMPX_SYSDLL_REFERENCE`, comma-separated
-///   DLL paths): the protector's own runtime resolves functions from modules
-///   like `ntdll.dll`/`user32.dll` by walking THEIR export tables, so those
-///   modules' full export lists must be available for the walk to resolve. In
-///   production this is bundled static data; here a reference DLL stands in for
-///   it. Keyed by file name, so the walk of each resolved module finds it.
+/// * The local `System32` export DB ([`vmpx_emulate::SysDllDb`]): a protector
+///   resolves functions from loader/runtime modules like `ntdll.dll`/`user32.dll`
+///   by walking THEIR export tables, so those modules' REAL local export lists
+///   are auto-populated here (the default loader set, plus any system module the
+///   original already imported — upgraded to its full export list). This is an
+///   accurate, offline file read of the real DLLs; a module absent locally is
+///   simply skipped (fail-safe), leaving the original-import reference in place.
+/// * A manual system-DLL export list override (`VMPX_SYSDLL_REFERENCE`,
+///   comma-separated DLL paths), applied last so an explicit path wins. Keyed by
+///   file name, so the walk of each resolved module finds it.
 fn dynamic_export_reference(
     input_path: &str,
     warnings: &mut Vec<String>,
@@ -680,7 +684,32 @@ fn dynamic_export_reference(
         }
     }
 
-    // (2) Bundled offline system-DLL export lists.
+    // (2) Auto-populate real exports of local System32 loader/runtime DLLs so
+    // the protector's direct export-table walk resolves any real API in them,
+    // not just the subset the original imported. The default loader set, plus
+    // any system module already seen in the reference (upgraded to its full
+    // export list). Offline, accurate (real local DLLs); missing => skipped.
+    let db = vmpx_emulate::SysDllDb::new();
+    let mut system_modules: std::collections::BTreeSet<String> =
+        vmpx_emulate::DEFAULT_SYSTEM_MODULES.iter().map(|m| (*m).to_owned()).collect();
+    system_modules.extend(reference.keys().cloned());
+    let mut auto_modules = 0usize;
+    let mut auto_symbols = 0usize;
+    for module in system_modules {
+        if let Some(names) = db.exports(&module) {
+            auto_modules += 1;
+            auto_symbols += names.len();
+            reference.insert(module, names);
+        }
+    }
+    if auto_modules > 0 {
+        warnings.push(format!(
+            "[dynamic][experimental] export reference: {auto_symbols} real export(s) across {auto_modules} module(s) auto-populated from local System32 (root {})",
+            vmpx_emulate::system_root().display()
+        ));
+    }
+
+    // (3) Manual system-DLL export list override (wins over the auto set).
     if let Ok(list) = std::env::var("VMPX_SYSDLL_REFERENCE") {
         for path in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let key = std::path::Path::new(path)

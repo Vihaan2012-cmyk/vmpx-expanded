@@ -57,6 +57,7 @@ mod emu;
 mod loader;
 mod memory;
 mod observe;
+mod sysdll;
 mod vm_observe;
 mod winapi;
 
@@ -79,5 +80,6 @@ pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
 pub use observe::{
     Observed, ObservedFacts, ObservedGlobal, ObservedImport, ObservedLoopDepth, SymbolOrOrdinal,
 };
+pub use sysdll::{DEFAULT_SYSTEM_MODULES, SysDllDb, system_root};
 pub use vm_observe::{VmObservations, VmObserveHook};
 pub use winapi::WinApiHook;
