@@ -11,7 +11,9 @@ mod bvutil;
 pub mod cfg_recovery;
 pub mod dead_code;
 pub mod gate;
+pub mod general_mba;
 pub mod linear_mba;
+pub mod sampling;
 pub mod state_model;
 pub mod substitution;
 
@@ -21,6 +23,7 @@ pub use cfg_recovery::{
     recover_native_cfg_pe, recover_native_cfg_pe_with, recover_native_cfg_proven,
     recover_native_cfg_with,
 };
+pub use bvutil::{eval_concrete, registers};
 pub use vmpx_vm::{BitWidth, Expr};
 
 /// Which family of mutation obfuscation a [`Problem`] belongs to. Drives both
@@ -135,14 +138,8 @@ pub struct Candidate {
     pub cost: Cost,
 }
 
-/// WAVE3 (integration): wire DCE -> substitution -> MBA -> opaque-fold to a
-/// fixpoint, with the tournament selecting a player per sub-problem and the
-/// Gate tiering results sound/experimental. Stub returns the input unchanged.
-#[must_use]
-pub fn run_pipeline(problem: &Problem) -> Option<Candidate> {
-    let _ = problem;
-    None
-}
+// `run_pipeline` lives in `vmpx-tournament::run_pipeline`: it needs the solver
+// portfolio, the scorer and the ELO ladder, all of which depend on this crate.
 
 #[cfg(test)]
 mod tests {
@@ -162,15 +159,5 @@ mod tests {
         };
         assert!(full.is_eligible());
         assert!(!partial.is_eligible());
-    }
-
-    #[test]
-    fn pipeline_stub_is_a_noop() {
-        let p = Problem::new(
-            Expr::constant(BitWidth::W64, 7),
-            ProblemClass::Unknown,
-            Ctx::default(),
-        );
-        assert!(run_pipeline(&p).is_none());
     }
 }

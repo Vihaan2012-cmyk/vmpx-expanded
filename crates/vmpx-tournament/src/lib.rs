@@ -1,9 +1,13 @@
 //! SP6 tournament: the per-(player, class) ELO ladder that ranks solvers and
 //! routes each sub-problem to the top-rated player(s) for its class. Depends on
-//! `vmpx-mutation` only.
+//! `vmpx-mutation`, `vmpx-solvers` and `vmpx-verify`.
 //!
 //! Matchmaking (`run_round`) turns per-problem results into pairwise ELO
 //! outcomes; `rank_cost_aware` discounts ratings by observed solver cost.
+
+pub mod pipeline;
+
+pub use pipeline::{Gated, Tournament, run_pipeline};
 
 use std::cmp::Ordering;
 use std::collections::HashMap;

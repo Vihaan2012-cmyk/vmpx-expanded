@@ -2826,6 +2826,7 @@ name = "vmpx-solvers"
 version = "0.1.0"
 dependencies = [
  "vmpx-mutation",
+ "vmpx-verify",
  "vmpx-vm",
 ]
 
@@ -2834,6 +2835,9 @@ name = "vmpx-tournament"
 version = "0.1.0"
 dependencies = [
  "vmpx-mutation",
+ "vmpx-solvers",
+ "vmpx-verify",
+ "vmpx-vm",
 ]
 
 [[package]]
