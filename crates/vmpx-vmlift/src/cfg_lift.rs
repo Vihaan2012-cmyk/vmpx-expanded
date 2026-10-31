@@ -1036,12 +1036,23 @@ impl Builder<'_> {
                 block: key,
                 reason: format!("symbolic execution failed: {error}"),
             })?;
-            if !report.memory_havocs.is_empty()
-                || !report.native_calls.is_empty()
+            // Fail closed on unmodeled effects: a native call or fresh allocation
+            // in a straight-line body (native calls are bridged only at a
+            // `NativeCall` block boundary below), or a tainted store whose address
+            // could alias the VM operand stack so the VM state cannot survive it.
+            if !report.native_calls.is_empty()
                 || !report.fresh_allocations.is_empty()
                 || report.memory_tainted
             {
                 return refuse(key, "block body havocs memory, calls natively or allocates");
+            }
+            // An untainted havoc is the sound narrowing of an external store proven
+            // (or assumed) disjoint from the VM operand stack: only the non-vsp
+            // cells it could alias were discarded, the stack stays precise, and the
+            // store is still emitted from `external_writes` below. Record the
+            // assumption when the disjointness was assumed rather than proven.
+            if report.assumed_external_disjoint_from_vm_stack {
+                self.assume(LiftAssumption::ExternalStoresDisjointFromVmStack);
             }
 
             let entry_barrier = path.barrier;

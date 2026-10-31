@@ -116,6 +116,12 @@ pub enum LiftAssumption {
     /// relocation delta, 0 at the preferred base). Carried over from the CFG's
     /// `VmCfgAssumption::PreferredImageBase` when a guarded branch is reused.
     PreferredImageBase,
+    /// An external store whose address could not be placed in a tracked region
+    /// was narrowed under the assumption that it does not alias the VM's private
+    /// operand stack (caller/parameter pointers do not point into it). The store
+    /// is emitted; only the non-vsp-rooted cells it could alias were discarded.
+    /// Mirrors the CFG's `VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack`.
+    ExternalStoresDisjointFromVmStack,
 }
 
 #[derive(Debug, Error)]

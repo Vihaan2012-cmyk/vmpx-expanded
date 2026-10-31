@@ -992,6 +992,48 @@ fn a_loop_body_store_through_an_opaque_pointer_fails_closed() {
 }
 
 #[test]
+fn a_straight_line_disjoint_external_store_lifts_under_the_labeled_assumption() {
+    // A store through an opaque pointer (loaded from memory, so not placeable in
+    // a tracked region but proven not to carry `vsp_initial`) narrows to the
+    // sound assumed-disjoint havoc: it discards only the non-vsp cells it could
+    // alias and keeps the VM operand stack precise. The store itself stays in
+    // `external_writes`, so the straight-line walk must emit it and continue to
+    // the clean VM exit rather than refuse, recording the labeled assumption.
+    use VmHandlerSemantic as S;
+    let body = block(
+        0xA0,
+        Some(0x900),
+        vec![
+            ins(S::ConstantPush, Some(0x55), -8),
+            ins(S::VirtualRegisterWrite, Some(0x28), 8),
+            ins(S::ConstantPush, Some(0xAB), -8),
+            ins(S::ConstantPush, Some(0x4000), -8),
+            ins(S::MemoryLoad, None, 0),
+            ins(S::MemoryStore, None, 16),
+            ins(S::ConstantPush, Some(111), -8),
+        ],
+        BlockExit::VmExit,
+    );
+    let straight = cfg(vec![body], Vec::new(), 0xA0);
+    let lifted = lift(&straight, &constant_frame(), &BTreeMap::new())
+        .expect("a disjoint external store lifts instead of refusing");
+    assert!(
+        lifted
+            .assumptions
+            .contains(&LiftAssumption::ExternalStoresDisjointFromVmStack),
+        "the lifted function records the labeled disjointness assumption: {:?}",
+        lifted.assumptions
+    );
+    assert!(
+        count(&lifted.replacement.function.operations, |o| matches!(
+            o,
+            Operation::Store { .. }
+        )) >= 1,
+        "the external store is faithfully emitted"
+    );
+}
+
+#[test]
 fn a_pure_body_loop_emits_no_store() {
     // Regression: a loop whose body only transforms VM state carries no side
     // effects, so no native store is emitted.
