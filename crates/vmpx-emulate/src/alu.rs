@@ -51,13 +51,21 @@ fn bit(v: u64, n: u32) -> u64 {
     (v >> n) & 1
 }
 
+/// PF (bit 2) for each low result byte: set when it has an even number of 1 bits.
+const PARITY: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if (i as u32).count_ones() % 2 == 0 { 4 } else { 0 };
+        i += 1;
+    }
+    t
+};
+
 #[inline(always)]
 fn szp(res: u64, bits: u32) -> u64 {
     // Branchless; PF is the even parity of the low byte (nibble-fold + table).
-    let x = (res & 0xff) ^ ((res & 0xff) >> 4);
-    (u64::from(res == 0) << 6)
-        | (((res >> (bits - 1)) & 1) << 7)
-        | ((!(0x6996u64 >> (x & 15)) & 1) << 2)
+    (u64::from(res == 0) << 6) | (((res >> (bits - 1)) & 1) << 7) | u64::from(PARITY[(res & 0xff) as usize])
 }
 
 fn pick(cond: bool, f: u64) -> u64 {
@@ -113,6 +121,7 @@ pub fn neg(a: u64, bytes: u32) -> (u64, Flags) {
 /// Shift with x64 count masking. `None` when the masked count is zero (no
 /// register or flag change).
 #[must_use]
+#[inline(always)]
 pub fn shift(kind: Shift, a: u64, count: u64, bytes: u32) -> Option<(u64, Flags)> {
     let m = mask(bytes);
     let bits = bytes * 8;

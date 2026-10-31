@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::cpu::Cpu;
-use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, MemEvent};
+use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent};
 use crate::loader::LoadedImage;
 use crate::memory::{Access, MapError, Memory, Perm};
 use crate::ntdll::{NtDispatch, NtState};
@@ -1009,6 +1009,21 @@ fn span_of(keys: impl Iterator<Item = u64>) -> (u64, u64) {
 }
 
 impl Hook for WinApiHook {
+    fn interest(&self) -> Interest {
+        let kusd = if self.kusd_ready { (0, 0) } else { (KUSD_BASE, KUSD_BASE + PAGE) };
+        // Flow spans are inclusive in `on_flow`; widen to half-open (a span ending
+        // at u64::MAX cannot be, so fall back to every transfer).
+        let incl = |s: (u64, u64)| if s.0 > s.1 { (0, 0) } else { (s.0, s.1.saturating_add(1)) };
+        let (st, ex) = (incl(self.stub_span), incl(self.export_span));
+        Interest {
+            read: [kusd, self.watch_span],
+            write: [kusd, (0, 0)],
+            flow: [st, ex],
+            flow_all: st.1 == u64::MAX || ex.1 == u64::MAX,
+            ..Interest::NONE
+        }
+    }
+
     fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         // The fixed KUSER_SHARED_DATA page is provided by the OS at a constant
         // address; map it in-model on first touch (on_mem runs before the read,

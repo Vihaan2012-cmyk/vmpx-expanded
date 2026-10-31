@@ -34,7 +34,7 @@ use vmpx_pe::{PeError, PeImage};
 use vmpx_rebuild::{LayoutError, LoaderValidationError, relayout_conventional, validate_for_loader};
 
 use crate::cpu::Cpu;
-use crate::emu::{FlowEvent, Hook, HookAction, MemEvent};
+use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent};
 use crate::memory::{Access, MemFault, Memory, PAGE_SIZE, Perm};
 use crate::observe::ObservedFacts;
 
@@ -161,6 +161,15 @@ impl OepHook {
 }
 
 impl Hook for OepHook {
+    fn interest(&self) -> Interest {
+        let inner = self.inner.as_ref().map_or(Interest::NONE, |h| h.interest());
+        Interest {
+            write_pages: true,
+            flow_pages: self.facts.borrow().oep.is_none(),
+            ..inner
+        }
+    }
+
     fn on_mem(&mut self, ev: &MemEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         if ev.access == Access::Write {
             self.mark_written(ev.addr, ev.size);

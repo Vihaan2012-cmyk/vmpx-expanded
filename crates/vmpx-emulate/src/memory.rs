@@ -112,12 +112,12 @@ impl Memory {
         Some(idx as usize)
     }
 
-    #[inline]
+    #[inline(always)]
     fn page(&self, base: u64) -> Option<&Page> {
         self.slot(base).map(|i| &self.slab[i])
     }
 
-    #[inline]
+    #[inline(always)]
     fn page_mut(&mut self, base: u64) -> Option<&mut Page> {
         self.slot(base).map(|i| &mut self.slab[i])
     }
@@ -299,6 +299,22 @@ impl Memory {
     #[inline(always)]
     pub fn read_uint(&self, addr: u64, bytes: usize) -> Result<u64, MemFault> {
         let off = (addr & PAGE_MASK) as usize;
+        // Hit: one 8-byte load from a readable page, masked to `bytes`.
+        if off + 8 <= PAGE_SIZE as usize && matches!(bytes, 1 | 2 | 4 | 8) {
+            if let Some(p) = self.page(addr & !PAGE_MASK)
+                && p.perm.contains(Perm::R)
+                && let Some(w) = p.data.get(off..off + 8)
+            {
+                let v = u64::from_le_bytes(w.try_into().unwrap_or([0; 8]));
+                return Ok(v & (u64::MAX >> (64 - 8 * bytes)));
+            }
+        }
+        self.read_uint_slow(addr, bytes)
+    }
+
+    #[inline(never)]
+    fn read_uint_slow(&self, addr: u64, bytes: usize) -> Result<u64, MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
         if matches!(bytes, 1 | 2 | 4 | 8) && off + bytes <= PAGE_SIZE as usize {
             return match self.page(addr & !PAGE_MASK) {
                 Some(p) if p.perm.contains(Perm::R) => {
@@ -324,6 +340,27 @@ impl Memory {
     /// Faults like [`Memory::write`].
     #[inline(always)]
     pub fn write_uint(&mut self, addr: u64, bytes: usize, val: u64) -> Result<(), MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
+        // Hit: read-modify-write of one 8-byte window of a writable page.
+        if off + 8 <= PAGE_SIZE as usize && matches!(bytes, 1 | 2 | 4 | 8) {
+            if let Some(p) = self.page_mut(addr & !PAGE_MASK)
+                && p.perm.contains(Perm::W)
+                && let Some(w) = p.data.get_mut(off..off + 8)
+            {
+                let m = u64::MAX >> (64 - 8 * bytes);
+                let old = u64::from_le_bytes((&*w).try_into().unwrap_or([0; 8]));
+                w.copy_from_slice(&((old & !m) | (val & m)).to_le_bytes());
+                if p.code {
+                    self.xgen += 1;
+                }
+                return Ok(());
+            }
+        }
+        self.write_uint_slow(addr, bytes, val)
+    }
+
+    #[inline(never)]
+    fn write_uint_slow(&mut self, addr: u64, bytes: usize, val: u64) -> Result<(), MemFault> {
         let off = (addr & PAGE_MASK) as usize;
         if matches!(bytes, 1 | 2 | 4 | 8) && off + bytes <= PAGE_SIZE as usize {
             return match self.page_mut(addr & !PAGE_MASK) {

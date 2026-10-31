@@ -20,6 +20,15 @@ const DF: u64 = 1 << 10;
 /// The six status flags mul/div/string ops read or leave undefined.
 const STATUS: u64 = CF | PF | AF | ZF | SF | OF;
 
+/// A [`Stop`] on the hot paths: boxed so `Result<u64, Trap>` is two registers.
+type Trap = Box<Stop>;
+
+impl From<Trap> for Stop {
+    fn from(t: Trap) -> Stop {
+        *t
+    }
+}
+
 /// Why a `step`/`run` did not retire an instruction. On any `Stop` the
 /// architectural state is exactly as before the offending instruction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +121,212 @@ pub trait Hook {
     fn on_flow(&mut self, _ev: &FlowEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         HookAction::Continue
     }
+    /// Which events this hook can be affected by; `run`/`run_until` skip
+    /// building and delivering the rest. Re-queried after every delivered
+    /// callback and at the start of each `run`/`run_until`, so it may depend on
+    /// state the callbacks change. The default (every event) is always safe.
+    fn interest(&self) -> Interest {
+        Interest::ALL
+    }
+}
+
+/// Half-open address span `[lo, hi)`; empty when `lo >= hi`.
+pub type Span = (u64, u64);
+
+/// The events a [`Hook`] needs delivered. An event outside it must be a no-op
+/// for the hook (no state change, `Continue`).
+///
+/// Spans select by the access's start address (`MemEvent::addr`) or a
+/// transfer's target (`FlowEvent::to`). Two further promises make state-
+/// dependent interest cheap:
+/// - `write_pages`: writes outside `write` are interesting only until a write
+///   covering their page(s) has been delivered; after that, later writes
+///   wholly inside such pages are no-ops.
+/// - `flow_pages`: only a transfer into a different page than it came from is
+///   interesting, and only while no `Continue`-answered transfer into that
+///   target page has been delivered (a `Continue`-answered one leaves the hook
+///   unchanged; any other delivered callback restarts this).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interest {
+    pub read: [Span; 2],
+    pub write: [Span; 2],
+    pub flow: [Span; 2],
+    pub read_all: bool,
+    pub write_all: bool,
+    pub flow_all: bool,
+    pub write_pages: bool,
+    pub flow_pages: bool,
+}
+
+const NO_SPAN: [Span; 2] = [(0, 0); 2];
+
+impl Interest {
+    /// Nothing is interesting.
+    pub const NONE: Interest = Interest {
+        read: NO_SPAN,
+        write: NO_SPAN,
+        flow: NO_SPAN,
+        read_all: false,
+        write_all: false,
+        flow_all: false,
+        write_pages: false,
+        flow_pages: false,
+    };
+    /// Every event is interesting.
+    pub const ALL: Interest =
+        Interest { read_all: true, write_all: true, flow_all: true, ..Interest::NONE };
+
+    /// Interest of two hooks run back to back (spans merged conservatively).
+    #[must_use]
+    pub fn union(self, o: Interest) -> Interest {
+        Interest {
+            read: merge_spans(self.read, o.read),
+            write: merge_spans(self.write, o.write),
+            flow: merge_spans(self.flow, o.flow),
+            read_all: self.read_all | o.read_all,
+            write_all: self.write_all | o.write_all,
+            flow_all: self.flow_all | o.flow_all,
+            write_pages: self.write_pages | o.write_pages,
+            flow_pages: self.flow_pages | o.flow_pages,
+        }
+    }
+}
+
+/// Cover up to four spans with two, merging the closest pair until it fits.
+fn merge_spans(a: [Span; 2], b: [Span; 2]) -> [Span; 2] {
+    let mut v = [(0u64, 0u64); 4];
+    let mut n = 0;
+    for s in a.into_iter().chain(b) {
+        if s.0 < s.1 {
+            v[n] = s;
+            n += 1;
+        }
+    }
+    v[..n].sort_unstable();
+    while n > 2 {
+        let gap = |i: usize| v[i + 1].0.saturating_sub(v[i].1);
+        let i = (0..n - 1).min_by_key(|&i| gap(i)).unwrap_or(0);
+        v[i] = (v[i].0.min(v[i + 1].0), v[i].1.max(v[i + 1].1));
+        v.copy_within(i + 2..n, i + 1);
+        n -= 1;
+    }
+    [v[0], v[1]]
+}
+
+const GATE_SLOTS: usize = 32;
+const PAGE_SHIFT: u32 = 12;
+const PAGE_BYTES: u64 = 1 << PAGE_SHIFT;
+const _: () = assert!(crate::memory::PAGE_SIZE == 1 << PAGE_SHIFT);
+
+/// [`Interest`] in the form the hot loop tests: spans as `(lo, len)`.
+#[derive(Clone, Copy)]
+struct Gate {
+    read: [Span; 2],
+    write: [Span; 2],
+    flow: [Span; 2],
+    read_all: bool,
+    write_all: bool,
+    flow_all: bool,
+    write_pages: bool,
+    flow_pages: bool,
+    /// Whether `read_all` / any read span is set (else reads are never wanted).
+    rd_any: bool,
+    /// Likewise for `write_all` / the write spans.
+    wr_any: bool,
+    /// Set while a `run`/`run_until` is eliding; outside one every event is
+    /// delivered and nothing is memoized.
+    active: bool,
+    /// Pages already vouched quiet (direct-mapped by page number).
+    wq: [u64; GATE_SLOTS],
+    fq: [u64; GATE_SLOTS],
+}
+
+const EMPTY_PAGE: u64 = u64::MAX;
+
+impl Gate {
+    const ALL: Gate = Gate {
+        read: NO_SPAN,
+        write: NO_SPAN,
+        flow: NO_SPAN,
+        read_all: true,
+        write_all: true,
+        flow_all: true,
+        write_pages: false,
+        flow_pages: false,
+        rd_any: true,
+        wr_any: true,
+        active: false,
+        wq: [EMPTY_PAGE; GATE_SLOTS],
+        fq: [EMPTY_PAGE; GATE_SLOTS],
+    };
+
+    fn set(&mut self, i: &Interest) {
+        let len = |s: [Span; 2]| s.map(|(lo, hi)| (lo, hi.saturating_sub(lo)));
+        self.read = len(i.read);
+        self.write = len(i.write);
+        self.flow = len(i.flow);
+        self.read_all = i.read_all;
+        self.write_all = i.write_all;
+        self.flow_all = i.flow_all;
+        self.write_pages = i.write_pages;
+        self.flow_pages = i.flow_pages;
+        let any = |s: &[Span; 2]| s.iter().any(|&(_, len)| len != 0);
+        self.rd_any = i.read_all || any(&self.read);
+        self.wr_any = i.write_all || any(&self.write);
+    }
+
+    #[inline(always)]
+    fn hit(s: &[Span; 2], a: u64) -> bool {
+        (a.wrapping_sub(s[0].0) < s[0].1) | (a.wrapping_sub(s[1].0) < s[1].1)
+    }
+
+    #[inline(always)]
+    fn wants_read(&self, addr: u64) -> bool {
+        self.rd_any && (self.read_all | Self::hit(&self.read, addr))
+    }
+
+    #[inline(always)]
+    fn wants_write(&self, addr: u64, size: u32) -> bool {
+        if self.wr_any && (self.write_all | Self::hit(&self.write, addr)) {
+            return true;
+        }
+        if !self.write_pages {
+            return false;
+        }
+        let p0 = addr >> PAGE_SHIFT;
+        if (addr & (PAGE_BYTES - 1)) + u64::from(size) <= PAGE_BYTES {
+            return self.wq[p0 as usize % GATE_SLOTS] != p0;
+        }
+        match Self::pages(addr, size) {
+            Some((p0, p1)) => {
+                self.wq[p0 as usize % GATE_SLOTS] != p0 || self.wq[p1 as usize % GATE_SLOTS] != p1
+            }
+            None => true,
+        }
+    }
+
+    /// First and last page number touched; `None` if the access wraps the address space.
+    #[inline(always)]
+    fn pages(addr: u64, size: u32) -> Option<(u64, u64)> {
+        let last = addr.checked_add(u64::from(size.max(1)) - 1)?;
+        Some((addr >> PAGE_SHIFT, last >> PAGE_SHIFT))
+    }
+
+    #[inline(always)]
+    fn wants_flow(&self, from: u64, to: u64) -> bool {
+        if self.flow_all | Self::hit(&self.flow, to) {
+            return true;
+        }
+        let p = to >> PAGE_SHIFT;
+        self.flow_pages && (from >> PAGE_SHIFT) != p && self.fq[p as usize % GATE_SLOTS] != p
+    }
+
+    fn note_write(&mut self, addr: u64, size: u32) {
+        if let Some((p0, p1)) = Self::pages(addr, size) {
+            self.wq[p0 as usize % GATE_SLOTS] = p0;
+            self.wq[p1 as usize % GATE_SLOTS] = p1;
+        }
+    }
 }
 
 /// Internal resolution of a hook callback (a `Stop` is surfaced as `Err`).
@@ -150,6 +365,8 @@ pub struct Emulator {
     /// by start RIP (see [`Block`]); used by `run`/`run_until` when no trace is
     /// being recorded.
     bcache: Vec<Option<Box<Block>>>,
+    /// Which hook events `run`/`run_until` still need to deliver (see [`Interest`]).
+    gate: Gate,
 }
 
 /// A straight-line run of pre-resolved instructions starting at `start`,
@@ -173,6 +390,9 @@ struct Block {
     ops: Vec<Pre>,
     /// Generic-path instructions for `K::Slow` ops (indexed by `Pre::t`).
     slow: Vec<Instruction>,
+    /// One bit per `bloom_bit(op rip)`: a `run_until` target absent from it is
+    /// not any op's address.
+    bloom: u64,
 }
 
 /// A contiguous run of guest code inside a [`Block`].
@@ -183,6 +403,11 @@ struct Seg {
 }
 
 const BLOCK_MAX: usize = 64;
+
+#[inline(always)]
+fn bloom_bit(rip: u64) -> u32 {
+    ((rip ^ (rip >> 6)) & 63) as u32
+}
 const BCACHE_SIZE: usize = 1 << 13;
 
 #[inline]
@@ -226,6 +451,58 @@ fn dslot(rip: u64) -> usize {
     ((rip ^ (rip >> 15)) as usize) & (DCACHE_SIZE - 1)
 }
 
+impl Block {
+    /// Whether `target` is the address of any op after the first.
+    #[inline]
+    fn has(&self, target: Option<u64>) -> bool {
+        target.is_some_and(|t| {
+            self.bloom >> bloom_bit(t) & 1 != 0 && self.ops[1..].iter().any(|p| p.rip == t)
+        })
+    }
+}
+
+/// Flag bits an op defines when it can neither fault, stop, call a hook nor
+/// read the flags; `None` for anything else.
+fn flag_def(k: K) -> Option<u64> {
+    Some(match k {
+        K::AddRR | K::AddRI | K::SubRR | K::SubRI | K::AndRR | K::AndRI | K::OrRR | K::OrRI
+        | K::XorRR | K::XorRI | K::CmpRR | K::CmpRI | K::TestRR | K::TestRI | K::NegR => STATUS,
+        K::IncR | K::DecR => STATUS & !CF,
+        K::Clc | K::Stc => CF,
+        K::Nop | K::MovRR | K::MovRI | K::ZxRR | K::SxRR | K::Lea | K::ShR | K::NotR | K::Cdq
+        | K::Cqo | K::Cdqe | K::Cwde | K::Cld | K::Std | K::Bswap => 0,
+        _ => return None,
+    })
+}
+
+/// Flag bits a producer that honours `Pre::nf` may change.
+fn flag_prod(k: K) -> Option<u64> {
+    Some(match k {
+        K::AddRR | K::AddRI | K::SubRR | K::SubRI | K::AndRR | K::AndRI | K::OrRR | K::OrRI
+        | K::XorRR | K::XorRI | K::CmpRR | K::CmpRI | K::TestRR | K::TestRI | K::AdcSbbRR
+        | K::AdcSbbRI | K::ShR => STATUS,
+        K::Stc | K::Clc | K::Cmc => CF,
+        _ => return None,
+    })
+}
+
+/// Mark producers whose flags a later straight-line op fully overwrites before
+/// anything (a fault, a hook, a flag reader, the block end) can observe them.
+fn mark_dead_flags(ops: &mut [Pre]) {
+    for i in 0..ops.len() {
+        let Some(prod) = flag_prod(ops[i].kind) else { continue };
+        let mut over = 0;
+        for j in &ops[i + 1..] {
+            let Some(def) = flag_def(j.kind) else { break };
+            over |= def;
+            if over & prod == prod {
+                ops[i].nf = true;
+                break;
+            }
+        }
+    }
+}
+
 impl Emulator {
     #[must_use]
     pub fn new(cpu: Cpu, mem: Memory) -> Self {
@@ -246,6 +523,7 @@ impl Emulator {
             ]
             .into_boxed_slice(),
             bcache: (0..BCACHE_SIZE).map(|_| None).collect(),
+            gate: Gate::ALL,
         }
     }
 
@@ -338,8 +616,18 @@ impl Emulator {
         self.run_to(Some(addr), max_steps)
     }
 
-    #[allow(clippy::collapsible_if)]
     fn run_to(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
+        self.gate.wq = [EMPTY_PAGE; GATE_SLOTS];
+        self.gate.fq = [EMPTY_PAGE; GATE_SLOTS];
+        self.gate.active = true;
+        self.refresh_gate();
+        let stop = self.run_loop(target, max_steps);
+        self.gate = Gate::ALL;
+        stop
+    }
+
+    #[allow(clippy::collapsible_if)]
+    fn run_loop(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
         let mut left = max_steps;
         // Per-step trace/detail capture needs the single-step path.
         let blocks = !self.record_trace && !self.observe.detail;
@@ -353,8 +641,8 @@ impl Emulator {
                     // Run whole only if it fits the budget (it may still exit
                     // early at a taken branch, a redirect, the target or a
                     // code write).
-                    if b.ops.len() as u64 <= left {
-                        let (done, stop) = self.exec_block(&b, target);
+                    if b.ops.len() as u64 <= left && !b.has(target) {
+                        let (done, stop) = self.exec_block(&b);
                         self.bcache[slot] = Some(b);
                         left -= done;
                         if let Some(s) = stop {
@@ -410,6 +698,7 @@ impl Emulator {
             segs: Vec::new(),
             ops: Vec::new(),
             slow: Vec::new(),
+            bloom: 0,
         };
         let mut seg_ip = rip;
         'segments: while let Some(page) = self.mem.code_bytes(seg_ip) {
@@ -423,6 +712,7 @@ impl Emulator {
                 let len = ins.len();
                 let mut pre = predecode::resolve(&ins);
                 pre.rip = ip;
+                pre.flow = matches!(pre.kind, K::Slow | K::Jmp | K::JmpD | K::Call | K::CallD | K::Ret | K::Jcc);
                 // `stop`: nothing after this op is statically known.
                 let mut stop = false;
                 match pre.kind {
@@ -455,7 +745,20 @@ impl Emulator {
         if b.ops.is_empty() {
             return None;
         }
+        for i in 0..b.ops.len().saturating_sub(2) {
+            let (p, j, t) = (&b.ops[i], &b.ops[i + 1], &b.ops[i + 2]);
+            let fuse = !p.flow
+                && j.kind == K::JmpD
+                && j.rip == p.rip.wrapping_add(u64::from(p.len))
+                && t.rip == j.a.v;
+            b.ops[i].fj = fuse;
+        }
+        mark_dead_flags(&mut b.ops);
+        for p in &mut b.ops {
+            p.chk = !(flag_def(p.kind).is_some() || matches!(p.kind, K::AdcSbbRR | K::AdcSbbRI | K::Cmc));
+        }
         b.epoch = self.mem.code_gen();
+        b.bloom = b.ops.iter().fold(0, |m, p| m | 1 << bloom_bit(p.rip));
         Some(Box::new(b))
     }
 
@@ -464,39 +767,71 @@ impl Emulator {
     /// block is left as soon as control does not reach the next op in the block
     /// (taken branch, hook redirect), reaches `target`, or the guest code was
     /// written.
-    fn exec_block(&mut self, b: &Block, target: Option<u64>) -> (u64, Option<Stop>) {
+    fn exec_block(&mut self, b: &Block) -> (u64, Option<Stop>) {
         let base = self.steps;
         let epoch = b.epoch;
-        let n = b.ops.len();
+        let ops = &b.ops[..];
+        let n = ops.len();
         let mut i = 0usize;
         let end = loop {
-            let p = &b.ops[i];
+            let p = &ops[i];
             let rip = p.rip;
             self.cur.0 = rip;
-            self.cpu.rip = rip;
             let next = rip.wrapping_add(u64::from(p.len));
             let r = if p.kind == K::Slow {
+                self.cpu.rip = rip;
                 self.cur.1 = p.mn;
                 self.steps = base + i as u64;
                 let ins = b.slow[p.t as usize];
-                self.exec(&ins, next)
+                self.exec(&ins, next).map_err(Box::new)
             } else {
                 self.exec_fast(p, next)
             };
             let nr = match r {
                 Ok(nr) => nr,
                 Err(s) => {
+                    self.cpu.rip = rip;
                     self.steps = base + i as u64;
-                    return (i as u64, Some(s));
+                    return (i as u64, Some(*s));
                 }
             };
             i += 1;
-            if i == n
-                || nr != b.ops[i].rip
-                || self.mem.code_gen() != epoch
-                || target == Some(nr)
-            {
-                break nr;
+            if p.flow {
+                if i == n || nr != ops[i].rip || self.mem.code_gen() != epoch {
+                    break nr;
+                }
+            } else {
+                if i == n || (p.chk && self.mem.code_gen() != epoch) {
+                    break next;
+                }
+                if p.fj {
+                    // Direct `jmp` right after this op, run without a dispatch.
+                    let j = &ops[i];
+                    let to = j.a.v;
+                    let jnext = next.wrapping_add(u64::from(j.len));
+                    if self.gate.wants_flow(next, to) {
+                        self.cur.0 = next;
+                        match self.flow_hook_slow(FlowKind::Jmp, to, jnext) {
+                            Err(s) => {
+                                self.cpu.rip = next;
+                                self.steps = base + i as u64;
+                                return (i as u64, Some(*s));
+                            }
+                            Ok(out) => {
+                                i += 1;
+                                let nr = if let HookOutcome::Redirect = out { self.cpu.rip } else { to };
+                                if i == n || nr != ops[i].rip || self.mem.code_gen() != epoch {
+                                    break nr;
+                                }
+                            }
+                        }
+                    } else {
+                        i += 1;
+                        if i == n {
+                            break to;
+                        }
+                    }
+                }
             }
         };
         self.cpu.rip = end;
@@ -544,32 +879,77 @@ impl Emulator {
     }
 
     #[cold]
-    fn fault(&self, addr: u64, access: Access) -> Stop {
-        Stop::Fault { rip: self.cur.0, addr, access }
+    fn fault(&self, addr: u64, access: Access) -> Trap {
+        Box::new(Stop::Fault { rip: self.cur.0, addr, access })
     }
 
-    fn mem_hook(&mut self, ev: MemEvent) -> Result<(), Stop> {
+    /// Re-read the hook's interest (it may have changed in a callback).
+    #[cold]
+    #[inline(never)]
+    fn refresh_gate(&mut self) {
+        let ix = self.hook.as_ref().map_or(Interest::NONE, |h| h.interest());
+        self.gate.set(&ix);
+    }
+
+    /// Deliver a memory event the gate let through.
+    #[cold]
+    #[inline(never)]
+    fn mem_hook(&mut self, ev: MemEvent) -> Result<(), Trap> {
         // Disjoint field borrows: the hook mutates cpu/mem while it fires.
+        self.cpu.rip = self.cur.0;
         let Self { hook, cpu, mem, .. } = self;
-        match hook.as_mut().map(|h| h.on_mem(&ev, cpu, mem)) {
-            Some(HookAction::Stop) => Err(Stop::Hook),
+        let act = hook.as_mut().map(|h| h.on_mem(&ev, cpu, mem));
+        if self.gate.active {
+            self.gate.fq = [EMPTY_PAGE; GATE_SLOTS];
+            if ev.access == Access::Write && act != Some(HookAction::Stop) {
+                self.gate.note_write(ev.addr, ev.size);
+            }
+            self.refresh_gate();
+        }
+        match act {
+            Some(HookAction::Stop) => Err(Box::new(Stop::Hook)),
             _ => Ok(()),
         }
     }
 
-    fn flow_hook(&mut self, kind: FlowKind, to: u64, next: u64) -> Result<HookOutcome, Stop> {
+    /// Deliver a flow event the gate let through.
+    #[cold]
+    #[inline(never)]
+    fn flow_hook_slow(&mut self, kind: FlowKind, to: u64, next: u64) -> Result<HookOutcome, Trap> {
         let ev = FlowEvent { kind, from: self.cur.0, to, next };
+        self.cpu.rip = self.cur.0;
         let Self { hook, cpu, mem, .. } = self;
-        match hook.as_mut().map(|h| h.on_flow(&ev, cpu, mem)) {
-            Some(HookAction::Stop) => Err(Stop::Hook),
+        let act = hook.as_mut().map(|h| h.on_flow(&ev, cpu, mem));
+        if self.gate.active {
+            let routed = !self.gate.flow_all && !Gate::hit(&self.gate.flow, to);
+            if routed && matches!(act, None | Some(HookAction::Continue)) {
+                let p = to >> PAGE_SHIFT;
+                self.gate.fq[p as usize % GATE_SLOTS] = p;
+            } else {
+                self.gate.fq = [EMPTY_PAGE; GATE_SLOTS];
+                self.refresh_gate();
+            }
+        }
+        match act {
+            Some(HookAction::Stop) => Err(Box::new(Stop::Hook)),
             Some(HookAction::Redirect) => Ok(HookOutcome::Redirect),
             _ => Ok(HookOutcome::Continue),
         }
     }
 
-    #[inline]
-    fn load(&mut self, addr: u64, size: u32) -> Result<u64, Stop> {
-        self.mem_hook(MemEvent { addr, size, access: Access::Read, value: None })?;
+    #[inline(always)]
+    fn flow_hook(&mut self, kind: FlowKind, to: u64, next: u64) -> Result<HookOutcome, Trap> {
+        if self.gate.wants_flow(self.cur.0, to) {
+            return self.flow_hook_slow(kind, to, next);
+        }
+        Ok(HookOutcome::Continue)
+    }
+
+    #[inline(always)]
+    fn load(&mut self, addr: u64, size: u32) -> Result<u64, Trap> {
+        if self.gate.wants_read(addr) {
+            self.mem_hook(MemEvent { addr, size, access: Access::Read, value: None })?;
+        }
         let v = self.mem.read_uint(addr, size as usize).map_err(|f| self.fault(f.addr, f.access))?;
         if self.observe.detail {
             self.det = (Some(addr), Some(v));
@@ -577,10 +957,12 @@ impl Emulator {
         Ok(v)
     }
 
-    #[inline]
-    fn store(&mut self, addr: u64, size: u32, val: u64) -> Result<(), Stop> {
+    #[inline(always)]
+    fn store(&mut self, addr: u64, size: u32, val: u64) -> Result<(), Trap> {
         let value = val & mask(size);
-        self.mem_hook(MemEvent { addr, size, access: Access::Write, value: Some(value) })?;
+        if self.gate.wants_write(addr, size) {
+            self.mem_hook(MemEvent { addr, size, access: Access::Write, value: Some(value) })?;
+        }
         self.mem.write_uint(addr, size as usize, val).map_err(|f| self.fault(f.addr, f.access))?;
         if self.observe.detail {
             self.det = (Some(addr), Some(value));
@@ -654,7 +1036,7 @@ impl Emulator {
             OpKind::Register => self.cpu.reg(ins.op_register(i)).ok_or_else(|| self.unsup()),
             OpKind::Memory => {
                 let a = self.ea(ins)?;
-                self.load(a, bytes)
+                Ok(self.load(a, bytes)?)
             }
             OpKind::Immediate8
             | OpKind::Immediate16
@@ -679,7 +1061,7 @@ impl Emulator {
             }
             OpKind::Memory => {
                 let a = self.ea(ins)?;
-                self.store(a, bytes, val)
+                Ok(self.store(a, bytes, val)?)
             }
             _ => Err(self.unsup()),
         }
@@ -731,7 +1113,7 @@ impl Emulator {
             }
             OpKind::Memory if ins.memory_size().size() == 8 => {
                 let a = self.ea(ins)?;
-                self.load(a, 8)
+                Ok(self.load(a, 8)?)
             }
             _ => Err(self.unsup()),
         }
@@ -762,7 +1144,7 @@ impl Emulator {
     }
 
     #[inline(always)]
-    fn rd(&mut self, o: &Opnd) -> Result<u64, Stop> {
+    fn rd(&mut self, o: &Opnd) -> Result<u64, Trap> {
         match o.tag {
             T_REG => Ok(self.rreg(o)),
             T_MEM => {
@@ -774,7 +1156,7 @@ impl Emulator {
     }
 
     #[inline(always)]
-    fn wr(&mut self, o: &Opnd, v: u64) -> Result<(), Stop> {
+    fn wr(&mut self, o: &Opnd, v: u64) -> Result<(), Trap> {
         if o.tag == T_REG {
             self.wreg(o, v);
             Ok(())
@@ -784,29 +1166,109 @@ impl Emulator {
         }
     }
 
+    /// Low-`N`-byte register read / write with x64 partial-write rules. Only for
+    /// operands without a high-byte shift (those resolve to the generic path).
+    #[inline(always)]
+    fn rn<const N: u32>(&self, o: &Opnd) -> u64 {
+        self.cpu.regs[usize::from(o.r & 15)] & mask(N)
+    }
+
+    #[inline(always)]
+    fn wn<const N: u32>(&mut self, o: &Opnd, v: u64) {
+        let r = &mut self.cpu.regs[usize::from(o.r & 15)];
+        *r = if N >= 4 { v & mask(N) } else { (*r & !mask(N)) | (v & mask(N)) };
+    }
+
+    /// `wn` with the width picked at run time (`n` is 1, 2, 4 or 8).
+    #[inline(always)]
+    fn wdst(&mut self, o: &Opnd, n: u8, v: u64) {
+        match n {
+            8 => self.wn::<8>(o, v),
+            4 => self.wn::<4>(o, v),
+            2 => self.wn::<2>(o, v),
+            _ => self.wn::<1>(o, v),
+        }
+    }
+
+    /// Register `shl`/`shr`/`sar` (`KIND` 0/1/2) at width `N`.
+    #[inline(always)]
+    fn shift_r<const KIND: u8, const N: u32>(&mut self, p: &Pre) -> Result<(), Trap> {
+        let a = self.rn::<N>(&p.a);
+        let c = self.rd(&p.b)?;
+        let kind = match KIND {
+            0 => Shift::Shl,
+            1 => Shift::Shr,
+            _ => Shift::Sar,
+        };
+        if let Some((r, fl)) = alu::shift(kind, a, c, N) {
+            self.wn::<N>(&p.a, r);
+            if !p.nf {
+                self.apply(fl);
+            }
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     fn alu_rr<const OP: u8, const W: bool>(&mut self, p: &Pre) {
-        let a = self.rreg(&p.a);
-        let b = self.rreg(&p.b);
-        let (r, fl) = alu::arith(alu_op(OP), a, b, u32::from(p.n));
-        if W {
-            self.wreg(&p.a, r);
+        match p.n {
+            8 => self.alu_rr_n::<OP, W, 8>(p),
+            4 => self.alu_rr_n::<OP, W, 4>(p),
+            2 => self.alu_rr_n::<OP, W, 2>(p),
+            _ => self.alu_rr_n::<OP, W, 1>(p),
         }
-        self.apply(fl);
+    }
+
+    #[inline(always)]
+    fn alu_rr_n<const OP: u8, const W: bool, const N: u32>(&mut self, p: &Pre) {
+        let a = self.rn::<N>(&p.a);
+        let b = self.rn::<N>(&p.b);
+        let (r, fl) = alu::arith(alu_op(OP), a, b, N);
+        if W {
+            self.wn::<N>(&p.a, r);
+        }
+        if !p.nf {
+            self.apply(fl);
+        }
     }
 
     #[inline(always)]
     fn alu_ri<const OP: u8, const W: bool>(&mut self, p: &Pre) {
-        let a = self.rreg(&p.a);
-        let (r, fl) = alu::arith(alu_op(OP), a, p.b.v, u32::from(p.n));
-        if W {
-            self.wreg(&p.a, r);
+        match p.n {
+            8 => self.alu_ri_n::<OP, W, 8>(p),
+            4 => self.alu_ri_n::<OP, W, 4>(p),
+            2 => self.alu_ri_n::<OP, W, 2>(p),
+            _ => self.alu_ri_n::<OP, W, 1>(p),
         }
-        self.apply(fl);
     }
 
     #[inline(always)]
-    fn alu_rm<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Stop> {
+    fn alu_ri_n<const OP: u8, const W: bool, const N: u32>(&mut self, p: &Pre) {
+        let a = self.rn::<N>(&p.a);
+        let (r, fl) = alu::arith(alu_op(OP), a, p.b.v, N);
+        if W {
+            self.wn::<N>(&p.a, r);
+        }
+        if !p.nf {
+            self.apply(fl);
+        }
+    }
+
+    /// `adc`/`sbb` with a register destination and register/immediate source.
+    #[inline(always)]
+    fn adc_sbb_r<const RR: bool, const N: u32>(&mut self, p: &Pre) {
+        let a = self.rn::<N>(&p.a);
+        let b = if RR { self.rn::<N>(&p.b) } else { p.b.v };
+        let carry = self.cpu.flag(CF);
+        let (r, fl) = if p.sub == 0 { alu::adc(a, b, carry, N) } else { alu::sbb(a, b, carry, N) };
+        self.wn::<N>(&p.a, r);
+        if !p.nf {
+            self.apply(fl);
+        }
+    }
+
+    #[inline(always)]
+    fn alu_rm<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Trap> {
         let a = self.rreg(&p.a);
         let ea = self.ea_of(&p.b);
         let b = self.load(ea, u32::from(p.n))?;
@@ -820,7 +1282,7 @@ impl Emulator {
 
     /// Memory-destination ALU op; `src` is a register or an immediate.
     #[inline(always)]
-    fn alu_m<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Stop> {
+    fn alu_m<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Trap> {
         let ea = self.ea_of(&p.a);
         let a = self.load(ea, u32::from(p.n))?;
         let b = if p.b.tag == T_REG { self.rreg(&p.b) } else { p.b.v };
@@ -835,7 +1297,7 @@ impl Emulator {
 
     /// Unary r/m op (`inc`/`dec`/`neg`/`not` = 0/1/2/3); flags unchanged for `not`.
     #[inline(always)]
-    fn unary(&mut self, p: &Pre, kind: u8) -> Result<(), Stop> {
+    fn unary(&mut self, p: &Pre, kind: u8) -> Result<(), Trap> {
         let n = u32::from(p.n);
         let a = self.rd(&p.a)?;
         let (r, fl) = match kind {
@@ -852,20 +1314,40 @@ impl Emulator {
     }
 
     #[inline(always)]
-    fn exec_fast(&mut self, p: &Pre, next: u64) -> Result<u64, Stop> {
+    fn exec_fast(&mut self, p: &Pre, next: u64) -> Result<u64, Trap> {
         let n = u32::from(p.n);
         match p.kind {
             K::Nop => {}
-            K::Slow => return Err(self.unsup()),
-            K::MovRR | K::ZxRR => {
+            K::Slow => return Err(self.unsup().into()),
+            K::MovRR => match p.n {
+                8 => self.cpu.regs[usize::from(p.a.r & 15)] = self.cpu.regs[usize::from(p.b.r & 15)],
+                4 => {
+                    let v = self.rn::<4>(&p.b);
+                    self.wn::<4>(&p.a, v);
+                }
+                2 => {
+                    let v = self.rn::<2>(&p.b);
+                    self.wn::<2>(&p.a, v);
+                }
+                _ => {
+                    let v = self.rn::<1>(&p.b);
+                    self.wn::<1>(&p.a, v);
+                }
+            },
+            K::ZxRR => {
                 let v = self.rreg(&p.b);
-                self.wreg(&p.a, v);
+                self.wdst(&p.a, p.n, v);
             }
-            K::MovRI => self.wreg(&p.a, p.b.v),
+            K::MovRI => match p.n {
+                8 => self.cpu.regs[usize::from(p.a.r & 15)] = p.b.v,
+                4 => self.wn::<4>(&p.a, p.b.v),
+                2 => self.wn::<2>(&p.a, p.b.v),
+                _ => self.wn::<1>(&p.a, p.b.v),
+            },
             K::MovRM => {
                 let ea = self.ea_of(&p.b);
                 let v = self.load(ea, n)?;
-                self.wreg(&p.a, v);
+                self.wdst(&p.a, p.n, v);
             }
             K::MovMR => {
                 let v = self.rreg(&p.b);
@@ -879,20 +1361,20 @@ impl Emulator {
             K::ZxRM => {
                 let ea = self.ea_of(&p.b);
                 let v = self.load(ea, u32::from(p.b.bytes))?;
-                self.wreg(&p.a, v);
+                self.wdst(&p.a, p.n, v);
             }
             K::SxRR => {
                 let v = self.rreg(&p.b);
-                self.wreg(&p.a, (((v << p.sub) as i64) >> p.sub) as u64);
+                self.wdst(&p.a, p.n, (((v << p.sub) as i64) >> p.sub) as u64);
             }
             K::SxRM => {
                 let ea = self.ea_of(&p.b);
                 let v = self.load(ea, u32::from(p.b.bytes))?;
-                self.wreg(&p.a, (((v << p.sub) as i64) >> p.sub) as u64);
+                self.wdst(&p.a, p.n, (((v << p.sub) as i64) >> p.sub) as u64);
             }
             K::Lea => {
                 let a = self.ea_of(&p.b);
-                self.wreg(&p.a, a);
+                self.wdst(&p.a, p.n, a);
             }
             K::AddRR => self.alu_rr::<0, true>(p),
             K::AddRI => self.alu_ri::<0, true>(p),
@@ -926,7 +1408,21 @@ impl Emulator {
             K::DecR | K::DecM => self.unary(p, 1)?,
             K::NegR | K::NegM => self.unary(p, 2)?,
             K::NotR | K::NotM => self.unary(p, 3)?,
-            K::ShR | K::ShM => {
+            K::ShR => match (p.sub, p.n) {
+                (0, 8) => self.shift_r::<0, 8>(p)?,
+                (0, 4) => self.shift_r::<0, 4>(p)?,
+                (0, 2) => self.shift_r::<0, 2>(p)?,
+                (0, _) => self.shift_r::<0, 1>(p)?,
+                (1, 8) => self.shift_r::<1, 8>(p)?,
+                (1, 4) => self.shift_r::<1, 4>(p)?,
+                (1, 2) => self.shift_r::<1, 2>(p)?,
+                (1, _) => self.shift_r::<1, 1>(p)?,
+                (_, 8) => self.shift_r::<2, 8>(p)?,
+                (_, 4) => self.shift_r::<2, 4>(p)?,
+                (_, 2) => self.shift_r::<2, 2>(p)?,
+                (_, _) => self.shift_r::<2, 1>(p)?,
+            },
+            K::ShM => {
                 let a = self.rd(&p.a)?;
                 let c = self.rd(&p.b)?;
                 let kind = match p.sub {
@@ -949,7 +1445,7 @@ impl Emulator {
                     _ => Rotate::Rcr,
                 };
                 if p.sub >= 2 && self.cpu.undef_flags & CF != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: CF }));
                 }
                 let cf_in = self.cpu.flag(CF);
                 if let Some((r, fl)) = alu::rotate(kind, a, c, cf_in, n) {
@@ -1008,9 +1504,9 @@ impl Emulator {
                 return Ok(t);
             }
             K::Jcc => {
-                let und = self.cpu.undef_flags & p.m;
+                let und = self.cpu.undef_flags & u64::from(p.m);
                 if und != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: und }));
                 }
                 let taken = (cc_val(self.cpu.rflags, p.sub) ^ u64::from(p.n)) != 0;
                 let t = if taken { p.t } else { next };
@@ -1020,17 +1516,17 @@ impl Emulator {
                 });
             }
             K::Setcc => {
-                let und = self.cpu.undef_flags & p.m;
+                let und = self.cpu.undef_flags & u64::from(p.m);
                 if und != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: und }));
                 }
                 let taken = cc_val(self.cpu.rflags, p.sub) ^ u64::from(p.n);
                 self.wr(&p.a, taken)?;
             }
             K::Cmov => {
-                let und = self.cpu.undef_flags & p.m;
+                let und = self.cpu.undef_flags & u64::from(p.m);
                 if und != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: und });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: und }));
                 }
                 let taken = (cc_val(self.cpu.rflags, p.sub & 15) ^ u64::from(p.sub >> 4)) != 0;
                 let v = self.rd(&p.b)?;
@@ -1038,10 +1534,18 @@ impl Emulator {
                     self.wreg(&p.a, v);
                 }
             }
-            K::Clc => self.apply(Flags { def: CF, val: 0, undef: 0 }),
-            K::Stc => self.apply(Flags { def: CF, val: CF, undef: 0 }),
+            K::Clc => {
+                if !p.nf {
+                    self.apply(Flags { def: CF, val: 0, undef: 0 });
+                }
+            }
+            K::Stc => {
+                if !p.nf {
+                    self.apply(Flags { def: CF, val: CF, undef: 0 });
+                }
+            }
             K::Cmc => {
-                if self.cpu.undef_flags & CF == 0 {
+                if !p.nf && self.cpu.undef_flags & CF == 0 {
                     let v = if self.cpu.flag(CF) { 0 } else { CF };
                     self.apply(Flags { def: CF, val: v, undef: 0 });
                 }
@@ -1050,19 +1554,22 @@ impl Emulator {
             K::Std => self.cpu.rflags |= DF,
             K::AdcSbbRR | K::AdcSbbRI => {
                 if self.cpu.undef_flags & CF != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: CF }));
                 }
-                let a = self.rreg(&p.a);
-                let b = if p.kind == K::AdcSbbRR { self.rreg(&p.b) } else { p.b.v };
-                let carry = self.cpu.flag(CF);
-                let (r, fl) =
-                    if p.sub == 0 { alu::adc(a, b, carry, n) } else { alu::sbb(a, b, carry, n) };
-                self.wreg(&p.a, r);
-                self.apply(fl);
+                match (p.kind == K::AdcSbbRR, p.n) {
+                    (true, 8) => self.adc_sbb_r::<true, 8>(p),
+                    (true, 4) => self.adc_sbb_r::<true, 4>(p),
+                    (true, 2) => self.adc_sbb_r::<true, 2>(p),
+                    (true, _) => self.adc_sbb_r::<true, 1>(p),
+                    (false, 8) => self.adc_sbb_r::<false, 8>(p),
+                    (false, 4) => self.adc_sbb_r::<false, 4>(p),
+                    (false, 2) => self.adc_sbb_r::<false, 2>(p),
+                    (false, _) => self.adc_sbb_r::<false, 1>(p),
+                }
             }
             K::AdcSbb => {
                 if self.cpu.undef_flags & CF != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                    return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: CF }));
                 }
                 let a = self.rd(&p.a)?;
                 let b = self.rd(&p.b)?;
@@ -1550,7 +2057,7 @@ impl Emulator {
     }
 
     #[inline(always)]
-    fn push64(&mut self, v: u64) -> Result<(), Stop> {
+    fn push64(&mut self, v: u64) -> Result<(), Trap> {
         let sp = self.cpu.regs[RSP].wrapping_sub(8);
         self.store(sp, 8, v)?;
         self.cpu.regs[RSP] = sp;
@@ -1801,16 +2308,89 @@ mod tests {
 
     const ADDR: u64 = 0x1000;
 
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// Records every event it is given (default interest: all). `.1` counts deliveries.
     #[derive(Default)]
-    struct Log(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    struct Log(Rc<RefCell<Vec<String>>>, Rc<Cell<u64>>);
     impl Hook for Log {
         fn on_mem(&mut self, ev: &MemEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.1.set(self.1.get() + 1);
             self.0.borrow_mut().push(format!("{ev:?}"));
             HookAction::Continue
         }
         fn on_flow(&mut self, ev: &FlowEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.1.set(self.1.get() + 1);
             self.0.borrow_mut().push(format!("{ev:?}"));
             HookAction::Continue
+        }
+    }
+
+    /// A state-dependent hook shaped like `OepHook` + `WinApiHook`: logs events in
+    /// its spans, tracks written pages, and notices a cross-page transfer into
+    /// one (optionally stopping). Declares exactly that interest, so eliding
+    /// anything else must leave its log (and the run) unchanged.
+    struct Smart {
+        log: Rc<RefCell<Vec<String>>>,
+        delivered: Rc<Cell<u64>>,
+        spans: [Span; 3],
+        written: std::collections::BTreeSet<u64>,
+        stop: bool,
+        seen: bool,
+    }
+    impl Hook for Smart {
+        fn on_mem(&mut self, ev: &MemEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.delivered.set(self.delivered.get() + 1);
+            let inside = |s: Span| ev.addr >= s.0 && ev.addr < s.1;
+            if ev.access == Access::Read {
+                if inside(self.spans[0]) {
+                    self.log.borrow_mut().push(format!("{ev:?}"));
+                }
+                return HookAction::Continue;
+            }
+            if inside(self.spans[1]) {
+                self.log.borrow_mut().push(format!("{ev:?}"));
+            }
+            let end = ev.addr.saturating_add(u64::from(ev.size.max(1)));
+            let mut p = ev.addr & !0xfff;
+            while p < end {
+                if self.written.insert(p) {
+                    self.log.borrow_mut().push(format!("new page {p:#x}"));
+                }
+                match p.checked_add(0x1000) {
+                    Some(n) => p = n,
+                    None => break,
+                }
+            }
+            HookAction::Continue
+        }
+        fn on_flow(&mut self, ev: &FlowEvent, _c: &mut Cpu, _m: &mut Memory) -> HookAction {
+            self.delivered.set(self.delivered.get() + 1);
+            if ev.to >= self.spans[2].0 && ev.to < self.spans[2].1 {
+                self.log.borrow_mut().push(format!("{ev:?}"));
+            }
+            if !self.seen
+                && (ev.from & !0xfff) != (ev.to & !0xfff)
+                && self.written.contains(&(ev.to & !0xfff))
+            {
+                self.seen = true;
+                self.log.borrow_mut().push(format!("hit {ev:?}"));
+                if self.stop {
+                    return HookAction::Stop;
+                }
+            }
+            HookAction::Continue
+        }
+        fn interest(&self) -> Interest {
+            Interest {
+                read: [self.spans[0], (0, 0)],
+                write: [self.spans[1], (0, 0)],
+                flow: [self.spans[2], (0, 0)],
+                write_pages: true,
+                flow_pages: !self.seen,
+                ..Interest::NONE
+            }
         }
     }
 
@@ -1873,7 +2453,22 @@ mod tests {
         cpu.gs_base = if r.below(4) == 0 { DATA } else { 0 };
         let mut emu = Emulator::new(cpu, mem);
         emu.resolve_undefined_flags = r.below(2) == 0;
-        emu.hook = Some(Box::new(Log(log.0.clone())));
+        emu.hook = Some(if seed % 3 == 0 {
+            Box::new(Log(log.0.clone(), log.1.clone()))
+        } else {
+            let mut span = |base: u64| {
+                let lo = base + r.below(PAGE_SIZE * 2);
+                (lo, lo + r.below(600))
+            };
+            Box::new(Smart {
+                log: log.0.clone(),
+                delivered: log.1.clone(),
+                spans: [span(DATA), span(DATA), span(CODE)],
+                written: std::collections::BTreeSet::new(),
+                stop: r.below(2) == 0,
+                seen: false,
+            })
+        });
         emu
     }
 
@@ -1889,6 +2484,7 @@ mod tests {
     #[test]
     fn fast_paths_match_reference_interpreter() {
         let mut ran = 0u64;
+        let (mut full, mut elided) = (0u64, 0u64);
         let seeds: u64 = std::env::var("FUZZ_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_500);
         for seed in 1..seeds {
             let (la, lb, lc) = (Log::default(), Log::default(), Log::default());
@@ -1926,6 +2522,15 @@ mod tests {
             }
             assert!(same_state(&a, &c), "seed {seed} block state");
             assert_eq!(*la.0.borrow(), *lc.0.borrow(), "seed {seed} block events");
+            // Same run on the per-step (trace recording) path.
+            let lg = Log::default();
+            let mut g = fuzz_emu(seed, &lg);
+            let sg = g.run(a.steps);
+            let sg = if ra.is_err() && sg == Stop::StepLimit { g.run(1) } else { sg };
+            assert_eq!(sg, if ra.is_err() { ra.clone().unwrap_err() } else { Stop::StepLimit }, "seed {seed} traced run stop");
+            assert!(same_state(&a, &g), "seed {seed} traced run state");
+            assert_eq!(*la.0.borrow(), *lg.0.borrow(), "seed {seed} traced run events");
+            (full, elided) = (full + la.1.get(), elided + lc.1.get());
             let _ = rb;
             // run_until: stop at a rip the reference visited (possibly mid-block).
             let tgt = rips[(seed as usize) % rips.len()];
@@ -1949,6 +2554,47 @@ mod tests {
             assert_eq!(*le.0.borrow(), *ld.0.borrow(), "seed {seed} run_until events");
         }
         assert!(ran > seeds, "fuzz exercised too little: {ran}");
+        assert!(elided < full, "interest elision never kicked in: {elided} vs {full}");
+    }
+
+    /// A transfer into a page that was quiet (memoized) must be delivered again
+    /// once that page has been written.
+    #[test]
+    fn elided_transfer_is_delivered_after_the_page_is_written() {
+        const X: u64 = 0x31000;
+        let build = |log: &Log| {
+            let mut mem = Memory::new();
+            mem.map(CODE, PAGE_SIZE, Perm::RWX).unwrap();
+            mem.map(X, PAGE_SIZE, Perm::RWX).unwrap();
+            let mut main = vec![0x48, 0xBB];
+            main.extend_from_slice(&X.to_le_bytes());
+            main.extend_from_slice(&[0xFF, 0xE3]); // mov rbx, X; jmp rbx
+            mem.poke(CODE, &main).unwrap();
+            let mut jb = vec![0xE9];
+            jb.extend_from_slice(&((CODE + 0x20).wrapping_sub(X + 5) as u32).to_le_bytes());
+            mem.poke(X, &jb).unwrap(); // jmp CODE+0x20
+            mem.poke(CODE + 0x20, &[0x48, 0x89, 0x9B, 0, 8, 0, 0, 0xFF, 0xE3]).unwrap(); // mov [rbx+0x800], rbx; jmp rbx
+            let mut emu = Emulator::new(Cpu::new(CODE), mem);
+            emu.record_trace = false;
+            emu.hook = Some(Box::new(Smart {
+                log: log.0.clone(),
+                delivered: log.1.clone(),
+                spans: [(0, 0); 3],
+                written: std::collections::BTreeSet::new(),
+                stop: false,
+                seen: false,
+            }));
+            emu
+        };
+        let (lr, lf) = (Log::default(), Log::default());
+        let (mut r, mut f) = (build(&lr), build(&lf));
+        for _ in 0..8 {
+            r.step_ref().unwrap();
+        }
+        assert_eq!(f.run(8), Stop::StepLimit);
+        assert!(lr.0.borrow().iter().any(|e| e.starts_with("hit")), "scenario never transferred into the written page");
+        assert_eq!(*lr.0.borrow(), *lf.0.borrow());
+        assert!(same_state(&r, &f));
     }
 
     /// The decode cache must not reuse a stale entry when the guest bytes at an

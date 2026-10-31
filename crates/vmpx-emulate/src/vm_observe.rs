@@ -36,7 +36,7 @@ use std::rc::Rc;
 use iced_x86::Register;
 
 use crate::cpu::Cpu;
-use crate::emu::{FlowEvent, FlowKind, Hook, HookAction};
+use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, Interest};
 use crate::memory::Memory;
 use crate::observe::ObservedFacts;
 
@@ -121,6 +121,10 @@ impl VmObserveHook {
 }
 
 impl Hook for VmObserveHook {
+    fn interest(&self) -> Interest {
+        Interest { flow_all: true, ..Interest::NONE }
+    }
+
     fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         let mut o = self.obs.borrow_mut();
 

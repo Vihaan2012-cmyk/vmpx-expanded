@@ -142,12 +142,21 @@ pub(crate) struct Pre {
     pub n: u8,
     /// Per-kind selector (shift/rotate kind, sign-extend shift, condition base).
     pub sub: u8,
+    /// May leave the straight-line path (set when placed in a block).
+    pub flow: bool,
+    /// The next op in its block is a direct `jmp` run inline after this one.
+    pub fj: bool,
+    /// The flags this op produces are overwritten, unobserved, by a later op in
+    /// its block (set when placed in a block).
+    pub nf: bool,
+    /// May write memory or run a hook (so guest code may have changed after it).
+    pub chk: bool,
     pub a: Opnd,
     pub b: Opnd,
     /// Branch target / `ret` pop extra.
     pub t: u64,
     /// Flag bits a `Jcc`/`Setcc`/`Cmov` reads (undefined-flag guard).
-    pub m: u64,
+    pub m: u16,
 }
 
 impl Pre {
@@ -158,6 +167,10 @@ impl Pre {
         rip: 0,
         n: 0,
         sub: 0,
+        flow: false,
+        fj: false,
+        nf: false,
+        chk: true,
         a: NONE,
         b: NONE,
         t: 0,
@@ -313,6 +326,36 @@ pub(crate) fn resolve(ins: &Instruction) -> Pre {
     }
     if let Some(k) = resolve_kind(ins, &mut p) {
         p.kind = k;
+        // Register-form ops are specialized per width and assume no high-byte
+        // (AH..BH) operand; those take the generic path.
+        let reg_form = matches!(
+            k,
+            K::MovRR
+                | K::MovRI
+                | K::AddRR
+                | K::AddRI
+                | K::SubRR
+                | K::SubRI
+                | K::AndRR
+                | K::AndRI
+                | K::OrRR
+                | K::OrRI
+                | K::XorRR
+                | K::XorRI
+                | K::CmpRR
+                | K::CmpRI
+                | K::TestRR
+                | K::TestRI
+                | K::AdcSbbRR
+                | K::AdcSbbRI
+        );
+        let dst_form = matches!(
+            k,
+            K::MovRM | K::ZxRR | K::ZxRM | K::SxRR | K::SxRM | K::Lea | K::ShR
+        );
+        if (reg_form && (p.a.sh != 0 || p.b.sh != 0)) || (dst_form && p.a.sh != 0) {
+            p.kind = K::Slow;
+        }
     }
     p
 }
@@ -528,7 +571,7 @@ fn resolve_kind(ins: &Instruction, p: &mut Pre) -> Option<K> {
 fn resolve_cc(ins: &Instruction, p: &mut Pre) -> Option<K> {
     let (base, inv) = cc_parts(ins.condition_code())?;
     p.sub = base;
-    p.m = cc_need(base);
+    p.m = cc_need(base) as u16;
     if ins.flow_control() == FlowControl::Next {
         if ins.op_count() == 1 {
             let a = opnd(ins, 0, 1)?;

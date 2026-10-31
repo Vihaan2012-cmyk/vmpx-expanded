@@ -22,7 +22,7 @@ use vmpx_pe::PeImage;
 
 use crate::cpu::Cpu;
 use crate::dump::{DumpImage, OepHook, capture_globals, dump_image};
-use crate::emu::{FlowEvent, Hook, HookAction, MemEvent, Stop};
+use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
 use crate::loader::{LoadError, LoadOptions, load};
 use crate::memory::Memory;
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
@@ -174,6 +174,10 @@ fn combine(acc: HookAction, next: HookAction) -> HookAction {
 }
 
 impl Hook for MultiHook {
+    fn interest(&self) -> Interest {
+        self.hooks.iter().fold(Interest::NONE, |acc, h| acc.union(h.interest()))
+    }
+
     fn on_mem(&mut self, ev: &MemEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         let mut acc = HookAction::Continue;
         for h in &mut self.hooks {
