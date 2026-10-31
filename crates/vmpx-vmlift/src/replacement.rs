@@ -333,8 +333,14 @@ pub fn build_replacement_popping(
             PhysicalRegister::R8,
             PhysicalRegister::R9,
         ];
-        let mut lowered_arguments: Vec<VirtualRegister> = Vec::new();
-        for (argument_index, argument) in arguments.iter().enumerate() {
+        // Every argument is evaluated through the same scratch registers (and
+        // `RCX` for variable shifts), so each result is parked in a private slot
+        // and the ABI registers are loaded together once all are evaluated.
+        if arguments.len() > ARGUMENT_REGISTERS.len() {
+            return Err(ReplacementError::TooManyCallArguments);
+        }
+        let mut argument_slots: Vec<SpillSlot> = Vec::new();
+        for argument in &arguments {
             let (argument_operations, argument_result) = lower_fragment(
                 argument,
                 &inputs,
@@ -348,23 +354,28 @@ pub fn build_replacement_popping(
                 &mut trust,
             )?;
             effects_operations.extend(argument_operations);
-            // The call ABI requires each argument in its own register, so move
-            // the lowered value there once the expression has been evaluated.
-            let abi_register = *ARGUMENT_REGISTERS
-                .get(argument_index)
-                .ok_or(ReplacementError::TooManyCallArguments)?;
+            let slot = SpillSlot(window_base);
+            window_base = window_base
+                .checked_add(1)
+                .ok_or(ReplacementError::TooManyInputs)?;
+            effects_operations.push(Operation::SpillStore {
+                slot,
+                source: argument_result,
+            });
+            argument_slots.push(slot);
+        }
+        let mut lowered_arguments: Vec<VirtualRegister> = Vec::new();
+        for (abi_register, slot) in ARGUMENT_REGISTERS.iter().zip(&argument_slots) {
             let destination = canonical_register(
-                abi_register,
+                *abi_register,
                 &mut canonical,
                 &mut assignments,
                 &mut next_register,
             );
-            if destination.id != argument_result.id {
-                effects_operations.push(Operation::Move {
-                    destination,
-                    source: argument_result,
-                });
-            }
+            effects_operations.push(Operation::SpillLoad {
+                destination,
+                slot: *slot,
+            });
             lowered_arguments.push(destination);
         }
         // The slot was registered with the shared frame above; the call writes
@@ -1851,5 +1862,125 @@ mod tests {
             Some(result_base + 3),
             "the carrier holds the flag slot at restore"
         );
+    }
+
+    fn shifted(left: &str, count: &str) -> Expr {
+        Expr::binary(
+            vmpx_vm::BinaryOp::Shl,
+            input(left),
+            input(count),
+        )
+        .expect("shift")
+    }
+
+    #[test]
+    fn effect_call_arguments_are_placed_after_all_are_evaluated() {
+        let config = ReplacementConfig {
+            inputs: full_inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: vec![EffectCall {
+                result_intrinsic: "alloc".to_owned(),
+                call: crate::ImportCall {
+                    iat_address: 0x1_4000_2000,
+                    argument_count: 3,
+                },
+                arguments: vec![
+                    shifted("native_rax_initial", "native_rcx_initial"),
+                    shifted("native_rdx_initial", "native_rcx_initial"),
+                    shifted("native_rax_initial", "native_rdx_initial"),
+                ],
+            }],
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 1))]);
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        let operations = &replacement.function.operations;
+        let vreg = |physical: PhysicalRegister| {
+            replacement
+                .function
+                .assignments
+                .iter()
+                .find(|assignment| assignment.physical_register == physical)
+                .expect("assigned")
+                .virtual_register
+                .id
+        };
+        let call = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Call { .. }))
+            .expect("call emitted");
+        let Operation::Call { arguments, .. } = &operations[call] else {
+            unreachable!()
+        };
+        let abi = [
+            PhysicalRegister::Rcx,
+            PhysicalRegister::Rdx,
+            PhysicalRegister::R8,
+        ];
+        assert_eq!(
+            arguments.iter().map(|a| a.id).collect::<Vec<_>>(),
+            abi.iter().map(|r| vreg(*r)).collect::<Vec<_>>()
+        );
+
+        let first_abi_load = operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, Operation::SpillLoad { destination, .. }
+                    if abi.iter().any(|r| vreg(*r) == destination.id))
+            })
+            .expect("abi registers are loaded");
+        let rcx = vreg(PhysicalRegister::Rcx);
+        assert!(
+            operations[..first_abi_load].iter().any(|operation| matches!(
+                operation,
+                Operation::Move { destination, .. } | Operation::SpillLoad { destination, .. }
+                    if destination.id == rcx
+            )),
+            "the scenario must exercise RCX during argument lowering"
+        );
+
+        // Nothing but loads sits between the first ABI load and the call, so no
+        // lowering can clobber an already-placed argument register.
+        assert!(
+            operations[first_abi_load..call]
+                .iter()
+                .all(|operation| matches!(operation, Operation::SpillLoad { .. })),
+            "{:?}",
+            &operations[first_abi_load..call]
+        );
+
+        // The final write to each ABI register loads that argument's own slot,
+        // which holds exactly one store (its result).
+        let mut seen_slots = BTreeSet::new();
+        for (ordinal, register) in abi.iter().enumerate() {
+            let id = vreg(*register);
+            let (write, slot) = operations[..call]
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, operation)| match operation {
+                    Operation::SpillLoad { destination, slot } if destination.id == id => {
+                        Some((index, *slot))
+                    }
+                    _ => None,
+                })
+                .expect("abi register is loaded from a slot");
+            assert!(write >= first_abi_load, "argument {ordinal} written late");
+            assert!(seen_slots.insert(slot), "argument slots must be distinct");
+            let stores = operations[..first_abi_load]
+                .iter()
+                .filter(|operation| {
+                    matches!(operation, Operation::SpillStore { slot: s, .. } if *s == slot)
+                })
+                .count();
+            assert_eq!(stores, 1, "argument {ordinal} slot has one store");
+        }
     }
 }
