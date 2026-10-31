@@ -179,25 +179,25 @@ fn a_dropped_store_is_never_proven() {
     assert_ne!(report.verdict, EquivVerdict::Proven);
 }
 
-/// Two real miscompiles in the closed-path `build_replacement` that the gate
-/// found: the effect store's address and value are lowered into the same
-/// scratch register (it stores `[value] <- value`), and the flag value is
-/// materialised in a scratch register after the exit registers were loaded
-/// (clobbering r10). Flip this test when that lowering is fixed.
+/// Regression guard for two real miscompiles the gate once found in the
+/// closed-path `build_replacement`: the effect store lowered its address and
+/// value into the same scratch register (storing `[value] <- value`), and the
+/// flag value was materialised in a scratch register after the exit registers
+/// were loaded (clobbering r10). Both are now fixed (distinct scratch/frame
+/// slots), so the gate proves this lowering; it must never refute these cells again.
 #[test]
-fn gate_refutes_known_closed_path_lowering_bugs() {
+fn gate_proves_fixed_closed_path_lowering() {
     let vm = with_store(recovered(0x1234));
     let p = pair_with(&vm, false, true);
     let mut o = Obligation::from_exits(&p.vm, &p.recompiled);
     o.cells.retain(|c| c.id != CellId::ReturnAddress);
     let report = Verifier::default().check_function(&[o], true);
-    assert_eq!(report.verdict, EquivVerdict::Refuted);
+    assert_eq!(report.verdict, EquivVerdict::Proven);
     let refuted: Vec<&CellId> = report.paths[0]
         .cells
         .iter()
         .filter(|(_, v)| matches!(v, CellVerdict::Refuted(_)))
         .map(|(id, _)| id)
         .collect();
-    assert!(refuted.contains(&&CellId::StoreAddress(0)), "{refuted:?}");
-    assert!(refuted.contains(&&CellId::Register(R::R10)), "{refuted:?}");
+    assert!(refuted.is_empty(), "no cell should refute now: {refuted:?}");
 }

@@ -284,9 +284,16 @@ pub fn build_replacement_popping(
     // Every fragment gets a private window of frame slots starting here, above
     // the shared input frame, the value results, and the effect results.
     let mut inputs = inputs;
-    let mut window_base = result_base
+    // The flag word is materialised ahead of the epilogue into its own shared
+    // slot, placed after the effect results.
+    let flag_slot = result_base
         .checked_add(u16::try_from(ordered.len()).map_err(|_| ReplacementError::TooManyInputs)?)
         .and_then(|base| base.checked_add(effect_slot_count))
+        .map(SpillSlot)
+        .ok_or(ReplacementError::TooManyInputs)?;
+    let mut window_base = flag_slot
+        .0
+        .checked_add(u16::from(config.rflags.is_some()))
         .ok_or(ReplacementError::TooManyInputs)?;
     // The shared region ends where the first fragment window begins.
     let shared_end = window_base;
@@ -418,6 +425,16 @@ pub fn build_replacement_popping(
             &mut trust,
         )?;
         effects_operations.extend(address_operations);
+        // Both fragments leave their result in the same scratch register, so the
+        // address is parked in a private slot while the value is computed.
+        let address_slot = SpillSlot(window_base);
+        window_base = window_base
+            .checked_add(1)
+            .ok_or(ReplacementError::TooManyInputs)?;
+        effects_operations.push(Operation::SpillStore {
+            slot: address_slot,
+            source: address,
+        });
         let (value_operations, value) = lower_fragment(
             &value_expression,
             &inputs,
@@ -431,8 +448,26 @@ pub fn build_replacement_popping(
             &mut trust,
         )?;
         effects_operations.extend(value_operations);
+        let address_register = [PhysicalRegister::R11, PhysicalRegister::R10]
+            .into_iter()
+            .map(|physical| {
+                canonical_register(
+                    physical,
+                    &mut canonical,
+                    &mut assignments,
+                    &mut next_register,
+                )
+            })
+            .find(|candidate| candidate.id != value.id)
+            .ok_or(ReplacementError::NoScratch {
+                register: X64NativeRegister::R10,
+            })?;
+        effects_operations.push(Operation::SpillLoad {
+            destination: address_register,
+            slot: address_slot,
+        });
         effects_operations.push(Operation::Store {
-            address: Address::new(address, 0),
+            address: Address::new(address_register, 0),
             source: value,
         });
     }
@@ -444,6 +479,44 @@ pub fn build_replacement_popping(
         if !inputs.iter().any(|existing| existing.name == input.name) {
             inputs.push(input.clone());
         }
+    }
+
+    // 1c. Materialise the flag word into its slot now. Doing it after the
+    // epilogue would compute it in scratch registers that already hold exit
+    // values.
+    if let Some(rflags) = &config.rflags {
+        // A condition state is a small set of bits. An expression that depends on
+        // the stack root is an address, not a flag word: the exit state read a
+        // pointer where the flags belong. Restoring it would hand the continuation
+        // a garbage condition state, so the body is refused instead.
+        if rflags
+            .dependencies()
+            .iter()
+            .any(|name| name == "vsp_initial")
+        {
+            return Err(ReplacementError::FlagsAreNotAConditionState);
+        }
+        let bound = substitute_effect_bindings(
+            &rewrite_symbols(rflags, &config.symbol_rewrites)?,
+            &effect_bindings,
+        )?;
+        let (flag_operations, flag_value) = lower_fragment(
+            &bound,
+            &inputs,
+            &extra_inputs,
+            config,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+            &mut window_base,
+            &shared_end,
+            &mut trust,
+        )?;
+        operations.extend(flag_operations);
+        operations.push(Operation::SpillStore {
+            slot: flag_slot,
+            source: flag_value,
+        });
     }
 
     // 2. One body per exit register. Each body reads its inputs from the shared
@@ -569,60 +642,82 @@ pub fn build_replacement_popping(
     }
 
     // 3. Epilogue: load each result slot into its architectural register.
-    for (index, (register, _)) in ordered.iter().enumerate() {
-        let physical = physical_for(register);
+    //
+    // The flag restore needs a register to read the flag word from, and every
+    // register may hold an exit value. One exit register is therefore loaded
+    // last: it carries the flag word through the restore and only then receives
+    // its own value. `POPFQ` touches no other register.
+    let flag_carrier = if config.rflags.is_some() {
+        ordered.len().checked_sub(1)
+    } else {
+        None
+    };
+    let load_result = |index: usize,
+                       register: &X64NativeRegister,
+                       canonical: &mut BTreeMap<PhysicalRegister, VirtualRegister>,
+                       assignments: &mut Vec<RegisterAssignment>,
+                       next_register: &mut u32|
+     -> Result<Operation, ReplacementError> {
         let destination = canonical_register(
-            physical,
-            &mut canonical,
-            &mut assignments,
-            &mut next_register,
+            physical_for(register),
+            canonical,
+            assignments,
+            next_register,
         );
         let result_slot = result_base
             .checked_add(u16::try_from(index).map_err(|_| ReplacementError::TooManyInputs)?)
             .ok_or(ReplacementError::TooManyInputs)?;
-        operations.push(Operation::SpillLoad {
+        Ok(Operation::SpillLoad {
             destination,
             slot: SpillSlot(result_slot),
-        });
+        })
+    };
+    for (index, (register, _)) in ordered.iter().enumerate() {
+        if Some(index) == flag_carrier {
+            continue;
+        }
+        operations.push(load_result(
+            index,
+            register,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+        )?);
     }
     // End by transferring to the recovered continuation, which restores its own
     // frame and returns to the original caller. Without one the function simply
     // returns, which is only correct when the exit already targets the caller.
     // The jump must be a real tail transfer: nothing is pushed, so the
     // continuation sees exactly the stack the VM exit would have produced.
-    // Restore the condition state before the frame goes away. The value is
-    // materialised while the frame is still addressable, and `POPFQ` does not
-    // touch the stack pointer beyond the one qword it consumes.
-    if let Some(rflags) = &config.rflags {
-        // A condition state is a small set of bits. An expression that depends on
-        // the stack root is an address, not a flag word: the exit state read a
-        // pointer where the flags belong. Restoring it would hand the continuation
-        // a garbage condition state, so the body is refused instead.
-        if rflags
-            .dependencies()
-            .iter()
-            .any(|name| name == "vsp_initial")
-        {
-            return Err(ReplacementError::FlagsAreNotAConditionState);
+    if config.rflags.is_some() {
+        let carrier = match flag_carrier {
+            Some(index) => canonical_register(
+                physical_for(ordered[index].0),
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            ),
+            None => canonical_register(
+                PhysicalRegister::R10,
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            ),
+        };
+        operations.push(Operation::SpillLoad {
+            destination: carrier,
+            slot: flag_slot,
+        });
+        operations.push(Operation::RestoreFlags { value: carrier });
+        if let Some(index) = flag_carrier {
+            operations.push(load_result(
+                index,
+                ordered[index].0,
+                &mut canonical,
+                &mut assignments,
+                &mut next_register,
+            )?);
         }
-        let bound = substitute_effect_bindings(
-            &rewrite_symbols(rflags, &config.symbol_rewrites)?,
-            &effect_bindings,
-        )?;
-        let (flag_operations, flag_value) = lower_fragment(
-            &bound,
-            &inputs,
-            &extra_inputs,
-            config,
-            &mut canonical,
-            &mut assignments,
-            &mut next_register,
-            &mut window_base,
-            &shared_end,
-            &mut trust,
-        )?;
-        operations.extend(flag_operations);
-        operations.push(Operation::RestoreFlags { value: flag_value });
     }
 
     // A tail jump tears the frame down itself, so it replaces the return rather
@@ -972,7 +1067,8 @@ pub(crate) struct Trust {
 
 impl Trust {
     fn absorb(&mut self, lowered: &crate::LoweredExpression) {
-        self.passthroughs.extend(lowered.passthroughs.iter().cloned());
+        self.passthroughs
+            .extend(lowered.passthroughs.iter().cloned());
         self.environment_boundaries
             .extend(lowered.environment_boundaries.iter().cloned());
     }
@@ -1585,5 +1681,175 @@ mod tests {
         let error = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
             .expect_err("intrinsic must not be emitted");
         assert!(matches!(error, ReplacementError::Lowering { .. }));
+    }
+
+    fn full_inputs() -> Vec<(String, PhysicalRegister)> {
+        [
+            X64NativeRegister::Rax,
+            X64NativeRegister::Rcx,
+            X64NativeRegister::Rdx,
+            X64NativeRegister::R10,
+            X64NativeRegister::R11,
+        ]
+        .iter()
+        .map(|register| (register.symbolic_name().to_owned(), physical_for(register)))
+        .collect()
+    }
+
+    fn input(name: &str) -> Expr {
+        Expr::register(BitWidth::W64, name)
+    }
+
+    #[test]
+    fn an_effect_store_keeps_address_and_value_in_distinct_registers() {
+        let address = Expr::binary(
+            vmpx_vm::BinaryOp::Add,
+            input("native_rax_initial"),
+            Expr::constant(BitWidth::W64, 8),
+        )
+        .expect("address");
+        let value = Expr::binary(
+            vmpx_vm::BinaryOp::Xor,
+            input("native_rcx_initial"),
+            Expr::constant(BitWidth::W64, 0x55),
+        )
+        .expect("value");
+        let config = ReplacementConfig {
+            inputs: full_inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: vec![EffectStore {
+                address,
+                value,
+                width: BitWidth::W64,
+            }],
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 1))]);
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        let operations = &replacement.function.operations;
+        let store = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Store { .. }))
+            .expect("the effect store is emitted");
+        let Operation::Store { address, source } = &operations[store] else {
+            unreachable!()
+        };
+        assert_ne!(
+            address.base.id, source.id,
+            "address and value must not share a register"
+        );
+        let Operation::SpillLoad { destination, slot } = &operations[store - 1] else {
+            panic!("the address must be reloaded just before the store");
+        };
+        assert_eq!(destination.id, address.base.id);
+        let parked = operations[..store].iter().any(
+            |operation| matches!(operation, Operation::SpillStore { slot: s, .. } if s == slot),
+        );
+        assert!(parked, "the address must have been parked in {slot:?}");
+    }
+
+    #[test]
+    fn the_flag_word_survives_to_the_restore_without_clobbering_exit_registers() {
+        let flags = Expr::binary(
+            vmpx_vm::BinaryOp::Or,
+            input("native_rax_initial"),
+            Expr::constant(BitWidth::W64, 0x2),
+        )
+        .expect("flags");
+        let registers = BTreeMap::from([
+            (X64NativeRegister::R10, Expr::constant(BitWidth::W64, 0x10)),
+            (X64NativeRegister::R11, Expr::constant(BitWidth::W64, 0x11)),
+            (X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 0x1)),
+        ]);
+        let config = ReplacementConfig {
+            inputs: full_inputs(),
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: Some(flags),
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement =
+            build_replacement(&registers, &config, CodeAddress(0x1_4000_1000)).expect("build");
+        let operations = &replacement.function.operations;
+        let restore = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::RestoreFlags { .. }))
+            .expect("flags are restored");
+        let result_base = u16::try_from(full_inputs().len()).expect("fits");
+        let first_load = operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, Operation::SpillLoad { slot, .. } if (result_base..result_base + 4).contains(&slot.0))
+            })
+            .expect("epilogue loads");
+        let epilogue = &operations[first_load..];
+        assert!(
+            epilogue.iter().all(|operation| matches!(
+                operation,
+                Operation::SpillLoad { .. } | Operation::RestoreFlags { .. } | Operation::Return
+            )),
+            "no computation may follow the first epilogue load: {epilogue:?}"
+        );
+        let mut sorted = [
+            X64NativeRegister::R10,
+            X64NativeRegister::R11,
+            X64NativeRegister::Rax,
+        ];
+        sorted.sort_by_key(|register| format!("{register:?}"));
+        for (index, register) in sorted.iter().enumerate() {
+            let physical = physical_for(register);
+            let id = replacement
+                .function
+                .assignments
+                .iter()
+                .find(|assignment| assignment.physical_register == physical)
+                .expect("assigned")
+                .virtual_register
+                .id;
+            let last = operations
+                .iter()
+                .rev()
+                .find_map(|operation| match operation {
+                    Operation::SpillLoad { destination, slot } if destination.id == id => {
+                        Some(slot.0)
+                    }
+                    _ => None,
+                })
+                .expect("loaded");
+            assert_eq!(
+                last,
+                result_base + u16::try_from(index).expect("fits"),
+                "{register:?}"
+            );
+        }
+        let Operation::RestoreFlags { value } = &operations[restore] else {
+            unreachable!()
+        };
+        let carrier_slot =
+            operations[..restore]
+                .iter()
+                .rev()
+                .find_map(|operation| match operation {
+                    Operation::SpillLoad { destination, slot } if destination.id == value.id => {
+                        Some(slot.0)
+                    }
+                    _ => None,
+                });
+        assert_eq!(
+            carrier_slot,
+            Some(result_base + 3),
+            "the carrier holds the flag slot at restore"
+        );
     }
 }
