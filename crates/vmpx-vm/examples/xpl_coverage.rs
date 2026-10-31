@@ -536,6 +536,127 @@ fn main() {
     for (h, n) in hv.iter().take(8) {
         println!("    {n:>5}  high32={h:#x}");
     }
+    // ---------------- cause-B typed flag-fork refusal split (M2) ----------------
+    {
+        // Per B function: the refusal label of each of its B stalls.
+        let mut b_fns: Vec<(u32, BTreeSet<char>, Vec<String>)> = Vec::new();
+        for (rva, set) in &fn_sets {
+            if !set.contains(&'B') {
+                continue;
+            }
+            let mut labels = Vec::new();
+            for r in results.iter().filter(|r| r.rva == *rva) {
+                if let Outcome::Incomplete { raw, .. } = &r.outcome {
+                    for x in raw.iter().filter(|x| categorize(x) == 'B') {
+                        let label = x
+                            .split_once("[flagfork=")
+                            .and_then(|(_, rest)| rest.rsplit_once(']').map(|(l, _)| l.to_owned()))
+                            .unwrap_or_else(|| "NoTag".to_owned());
+                        labels.push(label);
+                    }
+                }
+            }
+            labels.sort();
+            labels.dedup();
+            b_fns.push((*rva, set.clone(), labels));
+        }
+        let family = |l: &str| l.split('(').next().unwrap_or(l).to_owned();
+        let too_many = |l: &str| -> Option<usize> {
+            l.strip_prefix("TooManyFlags(")?.strip_suffix(')')?.parse().ok()
+        };
+        let tunable_at = |l: &str, cap: usize| {
+            l.split('+').all(|c| match family(c).as_str() {
+                "MultiBitMask" | "ConstantCountShift" => true,
+                "TooManyFlags" => too_many(c).is_some_and(|n| n <= cap),
+                _ => false,
+            })
+        };
+        // Function class under the CURRENT cap (2): TUNABLE only if every B stall is.
+        let class_of = |labels: &[String], cap: usize| -> &'static str {
+            if !labels.is_empty() && labels.iter().all(|l| tunable_at(l, cap)) {
+                "TUNABLE"
+            } else if labels.iter().any(|l| l.split('+').any(|c| family(c) == "ResidualFullWidth")) {
+                "CLOSED(ResidualFullWidth)"
+            } else {
+                "OTHER/MIXED"
+            }
+        };
+        println!("\n==================== CAUSE-B FLAG-FORK REFUSAL SPLIT (M2) ====================");
+        println!("cause-B functions (any B stall): {}", b_fns.len());
+        let mut per_label: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, _, labels) in &b_fns {
+            for l in labels {
+                *per_label.entry(l.clone()).or_insert(0) += 1;
+            }
+        }
+        println!("\n-- B functions per distinct refusal label (a function counts once per label) --");
+        let mut pl: Vec<_> = per_label.iter().collect();
+        pl.sort_by_key(|(k, n)| (std::cmp::Reverse(**n), (*k).clone()));
+        for (l, n) in pl {
+            println!("  {n:>4}  {l}");
+        }
+        let groups: [(&str, Box<dyn Fn(&BTreeSet<char>) -> bool>); 4] = [
+            ("all B functions", Box::new(|_| true)),
+            ("pure {B}", Box::new(|s| s.len() == 1)),
+            ("{B,D}", Box::new(|s| s.len() == 2 && s.contains(&'D'))),
+            ("{B,E}", Box::new(|s| s.len() == 2 && s.contains(&'E'))),
+        ];
+        println!("\n-- function class at current MAX_FLAGS=2 (TUNABLE = every B stall is TooManyFlags/MultiBitMask/ConstantCountShift) --");
+        for (name, pred) in &groups {
+            let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut n = 0;
+            for (_, s, labels) in b_fns.iter().filter(|(_, s, _)| pred(s)) {
+                let _ = s;
+                n += 1;
+                *tally.entry(class_of(labels, 2)).or_insert(0) += 1;
+            }
+            println!("  {name}: {n}  {tally:?}");
+        }
+        println!("\n-- function-level first-label family (pure {{B}} / all B) --");
+        for (name, pred) in &groups[..2] {
+            let mut fam: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, _, labels) in b_fns.iter().filter(|(_, s, _)| pred(s)) {
+                let mut fams: Vec<String> =
+                    labels.iter().flat_map(|l| l.split('+')).map(|c| family(c)).collect();
+                fams.sort();
+                fams.dedup();
+                *fam.entry(fams.join("+")).or_insert(0) += 1;
+            }
+            println!("  {name}: {fam:?}");
+        }
+        println!("\n-- TooManyFlags frontier-size histogram: functions by max n (all B / pure {{B}}) --");
+        let max_n = |labels: &[String]| labels.iter().filter_map(|l| too_many(l)).max();
+        let mut hist_all: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut hist_pure: BTreeMap<usize, usize> = BTreeMap::new();
+        for (_, s, labels) in &b_fns {
+            if let Some(n) = max_n(labels) {
+                *hist_all.entry(n).or_insert(0) += 1;
+                if s.len() == 1 {
+                    *hist_pure.entry(n).or_insert(0) += 1;
+                }
+            }
+        }
+        println!("  all : {hist_all:?}");
+        println!("  pure: {hist_pure:?}");
+        println!("\n-- functions TUNABLE if MAX_FLAGS were raised to cap (upper bound: enumeration may still fail) --");
+        for cap in 2..=8usize {
+            let all = b_fns.iter().filter(|(_, _, l)| class_of(l, cap) == "TUNABLE").count();
+            let pure = b_fns
+                .iter()
+                .filter(|(_, s, l)| s.len() == 1 && class_of(l, cap) == "TUNABLE")
+                .count();
+            let bd = b_fns
+                .iter()
+                .filter(|(_, s, l)| s.len() == 2 && s.contains(&'D') && class_of(l, cap) == "TUNABLE")
+                .count();
+            let be = b_fns
+                .iter()
+                .filter(|(_, s, l)| s.len() == 2 && s.contains(&'E') && class_of(l, cap) == "TUNABLE")
+                .count();
+            println!("  cap {cap}: all {all}, pure-B {pure}, {{B,D}} {bd}, {{B,E}} {be}");
+        }
+    }
+
     if let Some(path) = args.get(5) {
         let mut out = String::new();
         for (rva, set) in &fn_sets {

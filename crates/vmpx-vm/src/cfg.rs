@@ -1254,10 +1254,12 @@ fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u6
             // of flag bits the affine-domain path cannot characterize still
             // forks exactly when every input reaches the target through a
             // boolean, by enumerating that boolean over {0, 1}.
-            if let Some(targets) = flag_fork_targets(simplified, limits) {
-                return Ok((targets, true));
-            }
-            return Err(format!("target depends on unproven input: {refusal}"));
+            return match flag_fork_analysis(simplified, limits) {
+                Ok(targets) => Ok((targets, true)),
+                Err(why) => Err(format!(
+                    "target depends on unproven input: {refusal} [flagfork={why}]"
+                )),
+            };
         }
     };
     let domain = SymbolicDomainLimits {
@@ -1276,10 +1278,10 @@ fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u6
             // real target set is tiny. Enumerate those flags over {0, 1} instead.
             // Sound: each substituted flag is proven single-bit, and any residual
             // input dependence fails the branch closed rather than guessing.
-            if let Some(targets) = flag_fork_targets(simplified, limits) {
-                return Ok((targets, true));
-            }
-            return Err(format!("target enumeration failed: {error}"));
+            return match flag_fork_analysis(simplified, limits) {
+                Ok(targets) => Ok((targets, true)),
+                Err(why) => Err(format!("target enumeration failed: {error} [flagfork={why}]")),
+            };
         }
     };
     if !report.complete || report.unique_values.is_empty() {
@@ -1380,6 +1382,14 @@ fn resolve_environment_gate(
     Some((targets, guarded, bound_registers))
 }
 
+/// An input reaching the target outside a single-bit flag: the leaf, and the
+/// narrowest bit-width through which the path to it observes it (`u32::MAX`
+/// when observed at full width).
+struct FrontierLeaf {
+    expr: Expr,
+    observed_bits: u32,
+}
+
 /// Largest subexpressions, in `out`, that `target` depends on its inputs only
 /// through: each is proven to lie in {0, 1}. `Err` when an input reaches the
 /// target outside of such a boolean (a bare register, memory, or an opaque
@@ -1388,7 +1398,8 @@ fn collect_flag_frontier(
     expr: &Expr,
     out: &mut Vec<Expr>,
     seen: &mut std::collections::HashSet<*const Expr>,
-) -> Result<(), ()> {
+    observed_bits: u32,
+) -> Result<(), Vec<FrontierLeaf>> {
     if !seen.insert(std::ptr::from_ref(expr)) {
         return Ok(());
     }
@@ -1402,20 +1413,123 @@ fn collect_flag_frontier(
         return Ok(());
     }
     match &expr.kind {
-        ExprKind::Unary { value, .. }
-        | ExprKind::Extract { value, .. }
-        | ExprKind::Resize { value, .. } => collect_flag_frontier(value, out, seen),
-        ExprKind::Binary { left, right, .. }
-        | ExprKind::Concat {
+        ExprKind::Extract { value, .. } => {
+            collect_flag_frontier(value, out, seen, observed_bits.min(expr.width.bits()))
+        }
+        ExprKind::Resize { value, .. } => {
+            let narrowed = if expr.width.bits() < value.width.bits() {
+                observed_bits.min(expr.width.bits())
+            } else {
+                observed_bits
+            };
+            collect_flag_frontier(value, out, seen, narrowed)
+        }
+        ExprKind::Unary { value, .. } => collect_flag_frontier(value, out, seen, observed_bits),
+        ExprKind::Binary { op, left, right } => {
+            let mask_bits = |side: &Expr| match side.kind {
+                ExprKind::Const { value } if *op == BinaryOp::And => Some(64 - value.leading_zeros()),
+                _ => None,
+            };
+            let left_bits = mask_bits(right).map_or(observed_bits, |m| observed_bits.min(m));
+            let right_bits = mask_bits(left).map_or(observed_bits, |m| observed_bits.min(m));
+            let first = collect_flag_frontier(left, out, seen, left_bits);
+            merge_leaves(first, collect_flag_frontier(right, out, seen, right_bits))
+        }
+        ExprKind::Concat {
             high: left,
             low: right,
         } => {
-            collect_flag_frontier(left, out, seen)?;
-            collect_flag_frontier(right, out, seen)
+            let first = collect_flag_frontier(left, out, seen, observed_bits);
+            merge_leaves(first, collect_flag_frontier(right, out, seen, observed_bits))
         }
         // Input reaches the target as a full value, not through a bit.
-        ExprKind::Register { .. } | ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => Err(()),
+        ExprKind::Register { .. } | ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => {
+            Err(vec![FrontierLeaf {
+                expr: expr.clone(),
+                observed_bits,
+            }])
+        }
         ExprKind::Const { .. } => Ok(()),
+    }
+}
+
+fn merge_leaves(
+    first: Result<(), Vec<FrontierLeaf>>,
+    second: Result<(), Vec<FrontierLeaf>>,
+) -> Result<(), Vec<FrontierLeaf>> {
+    match (first, second) {
+        (Ok(()), other) | (other, Ok(())) => other,
+        (Err(mut a), Err(b)) => {
+            a.extend(b);
+            Err(a)
+        }
+    }
+}
+
+/// Typed reason `flag_fork_analysis` refused. Diagnostic only: rendered into the
+/// stall text, never branched on.
+enum FlagForkRefusal {
+    /// Every offending leaf, classified, as `+`-joined labels.
+    Leaves(String),
+    /// The target depends on `n` > `MAX_FLAGS` distinct single-bit flags.
+    TooManyFlags(usize),
+    /// An input is observed through a mask/extract of `bits` bits, not a flag.
+    MultiBitMask { bits: u32, leaf: String },
+    /// A double shift with an input-independent count (a bit permutation).
+    ConstantCountShift(String),
+    /// A variable-count double shift consumed at full width.
+    ResidualFullWidth(String),
+    /// Some other full-width register/memory/intrinsic leaf.
+    OtherLeaf(String),
+    NoFlags,
+    /// Size cap, substitution failure, residual non-constant, or target cap.
+    Other(&'static str),
+}
+
+impl std::fmt::Display for FlagForkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Leaves(labels) => write!(f, "{labels}"),
+            Self::TooManyFlags(n) => write!(f, "TooManyFlags({n})"),
+            Self::MultiBitMask { bits, leaf } => write!(f, "MultiBitMask({bits},{leaf})"),
+            Self::ConstantCountShift(leaf) => write!(f, "ConstantCountShift({leaf})"),
+            Self::ResidualFullWidth(leaf) => write!(f, "ResidualFullWidth({leaf})"),
+            Self::OtherLeaf(leaf) => write!(f, "OtherLeaf({leaf})"),
+            Self::NoFlags => write!(f, "NoFlags"),
+            Self::Other(why) => write!(f, "Other({why})"),
+        }
+    }
+}
+
+fn classify_frontier_leaf(leaf: &FrontierLeaf) -> FlagForkRefusal {
+    let family = match &leaf.expr.kind {
+        ExprKind::Intrinsic { name, .. } => name
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end_matches('_')
+            .to_owned(),
+        ExprKind::Register { .. } => "register".to_owned(),
+        ExprKind::Load { .. } => "load".to_owned(),
+        _ => "other".to_owned(),
+    };
+    let full_width = leaf.observed_bits >= leaf.expr.width.bits();
+    if let ExprKind::Intrinsic { name, arguments } = &leaf.expr.kind
+        && (name.starts_with("x86_double_shift_") || name.starts_with("vm_flags_double_shift_"))
+    {
+        let constant_count = arguments
+            .get(2)
+            .is_some_and(|c| c.dependencies().is_empty() && c.intrinsic_dependencies().is_empty());
+        if constant_count {
+            return FlagForkRefusal::ConstantCountShift(family);
+        }
+        if full_width {
+            return FlagForkRefusal::ResidualFullWidth(family);
+        }
+    } else if full_width {
+        return FlagForkRefusal::OtherLeaf(family);
+    }
+    FlagForkRefusal::MultiBitMask {
+        bits: leaf.observed_bits,
+        leaf: family,
     }
 }
 
@@ -1465,22 +1579,45 @@ fn substitute_flags(
 /// collapse to a constant: any residual input dependence fails the branch
 /// closed rather than emitting a guessed target. Over-approximation can only add
 /// a target, never drop one.
+#[cfg(test)]
 fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
+    flag_fork_analysis(target, limits).ok()
+}
+
+/// `flag_fork_targets` with the refusal reason retained.
+fn flag_fork_analysis(target: &Expr, limits: VmCfgLimits) -> Result<Vec<u64>, FlagForkRefusal> {
     const MAX_NODES: usize = 4_096;
     const MAX_FLAGS: usize = 2;
     if target.node_count_bounded(MAX_NODES) > MAX_NODES {
-        return None;
+        return Err(FlagForkRefusal::Other("node_cap"));
     }
     let mut frontier = Vec::new();
-    collect_flag_frontier(target, &mut frontier, &mut std::collections::HashSet::new()).ok()?;
+    collect_flag_frontier(
+        target,
+        &mut frontier,
+        &mut std::collections::HashSet::new(),
+        u32::MAX,
+    )
+    .map_err(|leaves| {
+        let mut labels: Vec<String> = leaves
+            .iter()
+            .map(|leaf| classify_frontier_leaf(leaf).to_string())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        FlagForkRefusal::Leaves(labels.join("+"))
+    })?;
     let mut flags: Vec<Expr> = Vec::new();
     for flag in frontier {
         if !flags.contains(&flag) {
             flags.push(flag);
         }
     }
-    if flags.is_empty() || flags.len() > MAX_FLAGS {
-        return None;
+    if flags.is_empty() {
+        return Err(FlagForkRefusal::NoFlags);
+    }
+    if flags.len() > MAX_FLAGS {
+        return Err(FlagForkRefusal::TooManyFlags(flags.len()));
     }
     let mut targets = BTreeSet::new();
     for combination in 0_u32..(1_u32 << flags.len()) {
@@ -1490,18 +1627,21 @@ fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
             .map(|(index, flag)| (flag, u64::from((combination >> index) & 1)))
             .collect();
         let resolved = substitute_flags(target, &assignment, &mut std::collections::HashMap::new())
-            .ok()?
+            .map_err(|_| FlagForkRefusal::Other("substitute"))?
             .simplify();
         match resolved.kind {
             ExprKind::Const { value } => {
                 targets.insert(value);
             }
             // Residual input dependence beyond the flags: fail closed.
-            _ => return None,
+            _ => return Err(FlagForkRefusal::Other("residual_nonconst")),
         }
     }
-    (!targets.is_empty() && targets.len() <= limits.max_targets)
-        .then(|| targets.into_iter().collect())
+    if !targets.is_empty() && targets.len() <= limits.max_targets {
+        Ok(targets.into_iter().collect())
+    } else {
+        Err(FlagForkRefusal::Other("target_cap"))
+    }
 }
 
 impl Walker<'_, '_> {
