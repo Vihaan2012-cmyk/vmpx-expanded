@@ -100,6 +100,13 @@ pub struct SymbolicVmExecutionReport {
     /// labeled `AssumesExternalStoresDisjointFromVmStack` assumption instead of
     /// the broad havoc. Surfaced so the CFG can record the assumption.
     pub assumed_external_disjoint_from_vm_stack: bool,
+    /// True when a value derived from `vsp_initial` was stored to an address that
+    /// is not a tracked VM-stack cell, or passed to a native call as target or
+    /// argument: the frame address may then be reachable from outside the VM.
+    pub vm_stack_address_escapes: bool,
+    /// Highest end offset above `vsp_initial` of any VM-stack cell written by
+    /// this block, or `None` if it wrote none.
+    pub vm_stack_store_hi: Option<i64>,
     pub external_writes: Vec<SymbolicMemoryWrite>,
     pub memory_havocs: Vec<SymbolicMemoryHavoc>,
     pub native_calls: Vec<SymbolicNativeCall>,
@@ -400,6 +407,8 @@ struct SymbolicMachine<'a> {
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
+    vm_stack_address_escapes: bool,
+    vm_stack_store_hi: Option<i64>,
     checksum_byte_limit: usize,
 }
 
@@ -481,6 +490,8 @@ impl<'a> SymbolicMachine<'a> {
             memory_tainted: initial.memory_tainted,
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
+            vm_stack_address_escapes: false,
+            vm_stack_store_hi: None,
             checksum_byte_limit: limits.max_memory_bytes,
         };
         for (offset, value) in &initial.context_values {
@@ -614,6 +625,10 @@ impl<'a> SymbolicMachine<'a> {
 
     fn store_memory(&mut self, address: &Expr, value: &Expr) -> Result<(), String> {
         let address = canonicalize_pointer(address.clone());
+        if let Some(offset) = pointer_offset(&address) {
+            let end = offset.saturating_add(i64::from(value.width.bytes()));
+            self.vm_stack_store_hi = self.vm_stack_store_hi.max(Some(end));
+        }
         self.advance_memory_epoch()?;
         self.write_memory_bytes(&address, value)
     }
@@ -710,6 +725,9 @@ impl<'a> SymbolicMachine<'a> {
         value: Expr,
     ) -> Result<(), String> {
         let address = canonicalize_pointer(address);
+        if pointer_offset(&address).is_none() && depends_on_vsp_root(&value) {
+            self.vm_stack_address_escapes = true;
+        }
         if is_proven_region_pointer(&address) {
             // The address provably lies in a tracked region (VM stack / proven
             // allocation / concrete). Update tracked memory precisely.
@@ -744,6 +762,9 @@ impl<'a> SymbolicMachine<'a> {
         outcome: &NativeCallSelectorOutcome,
     ) -> Result<(), String> {
         let target = self.load_stack(i64::from(outcome.target_stack_offset), BitWidth::W64)?;
+        if depends_on_vsp_root(&target) {
+            self.vm_stack_address_escapes = true;
+        }
         let argument_capacity = outcome
             .register_argument_offsets
             .len()
@@ -752,6 +773,9 @@ impl<'a> SymbolicMachine<'a> {
         let mut descriptors = Vec::with_capacity(argument_capacity);
         for (index, offset) in outcome.register_argument_offsets.iter().enumerate() {
             let value = self.load_stack(i64::from(*offset), BitWidth::W64)?;
+            if depends_on_vsp_root(&value) {
+                self.vm_stack_address_escapes = true;
+            }
             let ordinal = u16::try_from(index)
                 .map_err(|_| "native-call register argument ordinal overflows".to_owned())?;
             let name = WIN64_ARGUMENT_REGISTERS.get(index).ok_or_else(|| {
@@ -777,6 +801,9 @@ impl<'a> SymbolicMachine<'a> {
         }
         for (stack_index, offset) in outcome.stack_argument_offsets.iter().enumerate() {
             let value = self.load_stack(i64::from(*offset), BitWidth::W64)?;
+            if depends_on_vsp_root(&value) {
+                self.vm_stack_address_escapes = true;
+            }
             let logical_index = outcome
                 .register_argument_offsets
                 .len()
@@ -1123,6 +1150,10 @@ fn canonicalize_pointer(expression: Expr) -> Expr {
 #[must_use]
 pub fn canonicalize_symbolic_pointer(expression: &Expr) -> Expr {
     canonicalize_pointer(expression.clone())
+}
+
+fn depends_on_vsp_root(expression: &Expr) -> bool {
+    expression.dependencies().contains("vsp_initial")
 }
 
 fn pointer_offset(expression: &Expr) -> Option<i64> {
@@ -2301,6 +2332,8 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        vm_stack_address_escapes: machine.vm_stack_address_escapes,
+        vm_stack_store_hi: machine.vm_stack_store_hi,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -2395,6 +2428,8 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        vm_stack_address_escapes: machine.vm_stack_address_escapes,
+        vm_stack_store_hi: machine.vm_stack_store_hi,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -3170,6 +3205,34 @@ mod tests {
             is_free_read(&reloaded),
             "stale pre-store value must not survive the havoc: {reloaded:?}"
         );
+    }
+
+    // The frame address is non-escaping while it only flows into VM-stack cells
+    // and the native register file; storing it to a non-frame address or handing
+    // it to a native call marks it escaped, and in-frame writes report their top.
+    #[test]
+    fn vm_stack_address_escape_is_tracked_per_store() {
+        let mut machine = default_machine();
+        machine
+            .store_stack(-8, &stack_address(24))
+            .expect("frame pointer kept inside the frame");
+        machine
+            .store_external(
+                0,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("benign external store");
+        assert!(!machine.vm_stack_address_escapes);
+        assert_eq!(machine.vm_stack_store_hi, Some(0));
+        machine
+            .store_external(
+                1,
+                Expr::constant(BitWidth::W64, 0x1_4000_2000),
+                stack_address(24),
+            )
+            .expect("store of the frame pointer to a global");
+        assert!(machine.vm_stack_address_escapes);
     }
 
     #[test]

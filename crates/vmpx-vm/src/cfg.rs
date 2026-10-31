@@ -453,17 +453,33 @@ fn vsp_capture_top_offset(instruction: &iced_x86::Instruction, vsp: Register) ->
     None
 }
 
+/// True when `instruction` copies the stack pointer (or an address derived from
+/// it) into a register or the stack: a register operand naming RSP, or an `lea`
+/// based on it. Plain loads and stores through RSP do not expose the address.
+fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
+    let is_rsp = |register: Register| register.full_register() == Register::RSP;
+    (0..instruction.op_count()).any(|operand| match instruction.op_kind(operand) {
+        OpKind::Register => is_rsp(instruction.op_register(operand)),
+        OpKind::Memory => {
+            instruction.mnemonic() == Mnemonic::Lea
+                && (is_rsp(instruction.memory_base()) || is_rsp(instruction.memory_index()))
+        }
+        _ => false,
+    })
+}
+
 /// Proven contents of the VM stack at VM start, top first, recovered by
-/// stepping the native entry up to the VSP capture. Returns the cells and the
+/// stepping the native entry up to the VSP capture. Returns the cells, the
 /// byte offset from VSP to the top cell (nonzero when a `lea` capture places VSP
-/// off the frame top). Fails closed on anything it cannot model (nested calls,
-/// unknown stack writes, stack-pointer arithmetic).
+/// off the frame top), and whether any pre-capture instruction exposed the
+/// stack pointer to a register or memory. Fails closed on anything it cannot
+/// model (nested calls, unknown stack writes, stack-pointer arithmetic).
 fn recover_entry_frame(
     pe: &PeImage<'_>,
     entry: &VmEntryCandidate,
     vsp: Register,
     limits: DirectJumpTraceLimits,
-) -> Result<(Vec<NativeFrameSource>, u64), String> {
+) -> Result<(Vec<NativeFrameSource>, u64, bool), String> {
     let caller = trace_direct_jump_fragments(pe, entry.rva, limits).map_err(|e| e.to_string())?;
     let caller_instructions = caller.instructions().collect::<Vec<_>>();
     let (call_index, call) = caller_instructions
@@ -476,8 +492,10 @@ fn recover_entry_frame(
         .ok_or("entry call has no direct target")?;
     // Bottom-first model of the native stack.
     let mut stack: Vec<NativeFrameSource> = Vec::new();
+    let mut exposed = false;
     for decoded in caller_instructions.iter().copied().take(call_index) {
         let instruction = &decoded.instruction;
+        exposed |= exposes_stack_pointer(instruction);
         if instruction.mnemonic() == Mnemonic::Push {
             let ordinal = u32::try_from(stack.len()).unwrap_or(u32::MAX);
             stack.push(caller_push_source(decoded, ordinal));
@@ -501,8 +519,9 @@ fn recover_entry_frame(
         let instruction = &decoded.instruction;
         if let Some(top_offset) = vsp_capture_top_offset(instruction, vsp) {
             stack.reverse();
-            return Ok((stack, top_offset));
+            return Ok((stack, top_offset, exposed));
         }
+        exposed |= exposes_stack_pointer(instruction);
         match instruction.flow_control() {
             FlowControl::Next | FlowControl::UnconditionalBranch => {}
             _ => return Err(format!("unsupported control flow at {}", decoded.rva)),
@@ -1196,6 +1215,12 @@ struct Walker<'a, 'p> {
     /// path). Consulted only at a branch that otherwise fails closed, and only
     /// for targets that still validate as real in-image bytecode.
     observed_branch_targets: &'a crate::ObservedBranchTargets,
+    /// End offset above `vsp_initial` of the entry frame when it is recovered
+    /// and its address provably never leaves the entry stub; `None` otherwise.
+    private_frame_hi: Option<i64>,
+    /// Set once a report may leak the frame address or write outside the frame,
+    /// or a loop widening may have hidden such a pointer.
+    frame_not_private: bool,
 }
 
 /// Builds the memory source for a symbolic call: the sound read-only image
@@ -1931,7 +1956,10 @@ impl Walker<'_, '_> {
                 None
             }
             LoopStep::Unroll => Some(item.symbolic.clone()),
-            LoopStep::Widen(widened) => Some(widened),
+            LoopStep::Widen(widened) => {
+                self.frame_not_private = true;
+                Some(widened)
+            }
             LoopStep::Refuse(reason) => {
                 self.stall(key, key, format!("loop cannot be closed: {reason}"));
                 None
@@ -2043,7 +2071,10 @@ impl Walker<'_, '_> {
                     self.stall(key, key, "symbolic state keeps changing at this block");
                     return;
                 }
-                GeneralizeAcross::Continue(widened) => symbolic_in = widened,
+                GeneralizeAcross::Continue(widened) => {
+                    self.frame_not_private = true;
+                    symbolic_in = widened;
+                }
             }
             if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
                 return;
@@ -2140,6 +2171,7 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        self.note_frame_use(&symbolic);
         if symbolic.assumed_external_disjoint_from_vm_stack {
             self.cfg
                 .assumptions
@@ -2552,7 +2584,7 @@ impl Walker<'_, '_> {
                 section: nested_section,
             }))
         };
-        let (cells, top_offset) = match recover_entry_frame(
+        let (cells, top_offset, _) = match recover_entry_frame(
             self.pe,
             &candidate,
             setup.profile.effect_roles.vsp,
@@ -2607,6 +2639,26 @@ impl Walker<'_, '_> {
         });
     }
 
+    /// Every store the assumption narrowed targets a native-rooted or opaque
+    /// address. It cannot alias the tracked VM-stack cells when the frame is the
+    /// entry stub's fresh allocation (no pointer to it existed before the VM),
+    /// every cell lies inside it, and the VM never exported a pointer into it.
+    fn discharge_vm_stack_assumption(&mut self) {
+        if self.private_frame_hi.is_some() && !self.frame_not_private && self.nested_followed == 0 {
+            self.cfg
+                .assumptions
+                .remove(&VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+    }
+
+    fn note_frame_use(&mut self, report: &SymbolicVmExecutionReport) {
+        let past_frame = self
+            .private_frame_hi
+            .zip(report.vm_stack_store_hi)
+            .is_some_and(|(frame_hi, written)| written > frame_hi);
+        self.frame_not_private |= report.vm_stack_address_escapes || past_frame;
+    }
+
     fn follow_native_call(
         &mut self,
         key: Va,
@@ -2653,6 +2705,7 @@ impl Walker<'_, '_> {
                 return;
             }
         };
+        self.note_frame_use(&call);
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
@@ -2817,6 +2870,8 @@ impl Walker<'_, '_> {
             global_table: None,
             section: bytecode_section(self.pe, Va(target)),
         });
+        self.note_frame_use(&symbolic);
+        self.note_frame_use(&pop);
         if symbolic.assumed_external_disjoint_from_vm_stack
             || pop.assumed_external_disjoint_from_vm_stack
         {
@@ -2922,17 +2977,20 @@ pub fn recover_vm_cfg_with_observed(
     observed: &ObservedRun,
 ) -> Result<VmCfg, CfgError> {
     let setup = prepare_entry_stream(pe, entry, limits.entry)?;
+    let mut private_frame_hi = None;
     let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
         pe,
         entry,
         setup.profile.effect_roles.vsp,
         limits.entry.trace,
     ) {
-        Ok((cells, top_offset)) => {
+        Ok((cells, top_offset, exposed)) => {
             let (initial, known) = frame_initial_state(&cells, top_offset);
-            DIAG_FRAME_HI.with(|hi| {
-                hi.set(Some(top_offset.wrapping_add((cells.len() as u64).wrapping_mul(8))));
-            });
+            let frame_hi = top_offset.wrapping_add((cells.len() as u64).wrapping_mul(8));
+            DIAG_FRAME_HI.with(|hi| hi.set(Some(frame_hi)));
+            if !exposed {
+                private_frame_hi = Some(frame_hi.cast_signed());
+            }
             (initial, known, None)
         }
         Err(note) => {
@@ -2976,6 +3034,8 @@ pub fn recover_vm_cfg_with_observed(
         seeded: &seeded,
         observed_depths: &observed.loop_depths,
         observed_branch_targets: &observed.branch_targets,
+        private_frame_hi,
+        frame_not_private: false,
     };
     let mut pending = vec![Item {
         bytes: 0,
@@ -2998,6 +3058,7 @@ pub fn recover_vm_cfg_with_observed(
             break;
         }
     }
+    walker.discharge_vm_stack_assumption();
     Ok(walker.cfg)
 }
 
@@ -3169,7 +3230,70 @@ mod tests {
             seeded,
             observed_depths: &observed.loop_depths,
             observed_branch_targets: &observed.branch_targets,
+            private_frame_hi: None,
+            frame_not_private: false,
         }
+    }
+
+    #[test]
+    fn stack_pointer_exposure_is_detected_only_for_copies_of_rsp() {
+        let exposes = |bytes: &[u8]| exposes_stack_pointer(&decode_one(bytes));
+        assert!(exposes(&[0x48, 0x89, 0xE5])); // mov rbp,rsp
+        assert!(exposes(&[0x48, 0x8D, 0x6C, 0x24, 0x28])); // lea rbp,[rsp+0x28]
+        assert!(exposes(&[0x54])); // push rsp
+        assert!(!exposes(&[0x48, 0x89, 0x04, 0x24])); // mov [rsp],rax
+        assert!(!exposes(&[0x48, 0x8B, 0x44, 0x24, 0x08])); // mov rax,[rsp+8]
+        assert!(!exposes(&[0x53])); // push rbx
+    }
+
+    /// The assumption is discharged only for a private, un-leaked, in-frame,
+    /// non-nested, non-widened walk; every other case keeps it.
+    #[test]
+    fn vm_stack_assumption_discharges_only_when_the_frame_is_provably_private() {
+        use crate::immutable_image::tests::two_section_pe64;
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let report = |escapes: bool, store_hi: Option<i64>| {
+            let mut report = execute_symbolic_linear_block_with_initial_state(
+                &[],
+                None,
+                crate::SymbolicExecutionLimits::default(),
+                &SymbolicVmInitialState::default(),
+                None,
+            )
+            .expect("empty block executes");
+            report.vm_stack_address_escapes = escapes;
+            report.vm_stack_store_hi = store_hi;
+            report
+        };
+        let outcome = |frame_hi: Option<i64>, reports: &[SymbolicVmExecutionReport], nested: usize| {
+            let mut walker = test_walker(&pe, base, &observed, &seeded);
+            walker.private_frame_hi = frame_hi;
+            walker.nested_followed = nested;
+            walker
+                .cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+            for report in reports {
+                walker.note_frame_use(report);
+            }
+            walker.discharge_vm_stack_assumption();
+            walker.cfg.assumptions.is_empty()
+        };
+        let quiet = report(false, Some(0x30));
+        assert!(outcome(Some(0x30), &[quiet.clone()], 0));
+        assert!(outcome(Some(0x30), &[], 0));
+        assert!(!outcome(None, &[quiet.clone()], 0), "frame unproven or exposed");
+        assert!(!outcome(Some(0x30), &[report(true, None)], 0), "pointer leaked");
+        assert!(!outcome(Some(0x30), &[report(false, Some(0x38))], 0), "write past the frame");
+        assert!(!outcome(Some(0x30), &[quiet], 1), "nested entry");
     }
 
     /// SOUND-PATH INVARIANCE: with no transition active, every profile accessor
