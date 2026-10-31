@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use crate::iat_fill::{AddressBook, ImportSource, KnownImport};
 use crate::cpu::Cpu;
 use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent};
 use crate::loader::LoadedImage;
@@ -159,6 +160,8 @@ pub struct WinApiHook {
     nt: NtState,
     /// Recording host-SDK model; XPLM/XPWidgets imports route here (never forwarded).
     xplm: Option<Rc<RefCell<Xplm>>>,
+    /// Every import address this hook has handed out (see [`AddressBook`]).
+    addr_book: AddressBook,
 }
 
 /// A read-watch over one module's `AddressOfFunctions` array. When the protector
@@ -197,6 +200,19 @@ impl WinApiHook {
     #[must_use]
     pub fn new(stubs: BTreeMap<u64, (String, String)>) -> Self {
         let stub_span = span_of(stubs.keys().copied());
+        let addr_book: AddressBook = Rc::new(RefCell::new(
+            stubs
+                .iter()
+                .map(|(&va, (m, f))| {
+                    let known = KnownImport {
+                        module: m.to_lowercase(),
+                        name: f.clone(),
+                        source: ImportSource::LoaderStub,
+                    };
+                    (va, known)
+                })
+                .collect(),
+        ));
         Self {
             stubs,
             stub_span,
@@ -227,6 +243,7 @@ impl WinApiHook {
             export_stub_addrs: BTreeMap::new(),
             nt: NtState::new(),
             xplm: None,
+            addr_book,
         }
     }
 
@@ -266,6 +283,13 @@ impl WinApiHook {
     #[must_use]
     pub fn facts(&self) -> Rc<RefCell<ObservedFacts>> {
         Rc::clone(&self.facts)
+    }
+
+    /// Shared handle to every import address handed out so far (loader stubs,
+    /// export-table addresses, `GetProcAddress` results).
+    #[must_use]
+    pub fn address_book(&self) -> AddressBook {
+        Rc::clone(&self.addr_book)
     }
 
     fn arg(cpu: &Cpu, i: usize) -> u64 {
@@ -403,6 +427,14 @@ impl WinApiHook {
                     self.export_span.1 = self.export_span.1.max(export.va);
                     self.export_stub_addrs
                         .insert(export.va, (key.clone(), symbol_key(&export.symbol)));
+                    self.addr_book.borrow_mut().insert(
+                        export.va,
+                        KnownImport {
+                            module: key.clone(),
+                            name: symbol_key(&export.symbol),
+                            source: ImportSource::ExportTable,
+                        },
+                    );
                 }
                 let wlo = layout.functions_va;
                 let whi = wlo.saturating_add(4 * layout.slots.len() as u64);
@@ -450,7 +482,18 @@ impl WinApiHook {
     fn proc_addr(&mut self, module: &str, symbol: &str) -> u64 {
         let key = (module.to_string(), symbol.to_string());
         let n = self.procs.len() as u64;
-        *self.procs.entry(key).or_insert(PROC_BASE + n * 8)
+        let va = *self.procs.entry(key).or_insert(PROC_BASE + n * 8);
+        if module != "<unknown>" {
+            self.addr_book.borrow_mut().insert(
+                va,
+                KnownImport {
+                    module: module.to_owned(),
+                    name: symbol.to_owned(),
+                    source: ImportSource::GetProcAddress,
+                },
+            );
+        }
+        va
     }
 
     /// Read 0-based argument `i`: the first four from registers, `i >= 4` from

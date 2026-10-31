@@ -23,6 +23,7 @@ use vmpx_pe::PeImage;
 use crate::cpu::Cpu;
 use crate::dump::{DumpImage, OepHook, capture_globals, dump_image};
 use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
+use crate::iat_fill::{self, IatFill, IatFillHook};
 use crate::loader::{LoadError, LoadOptions, load};
 use crate::memory::Memory;
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
@@ -38,6 +39,18 @@ const DEFAULT_MAX_STEPS: u64 = 2_000_000;
 const IMAGE_FILE_DLL: u16 = 0x2000;
 // DllMain reason code for process attach.
 const DLL_PROCESS_ATTACH: u64 = 1;
+
+/// Which guest region to watch for the loader filling import slots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IatRegion {
+    /// The `.idata` section, else the section holding the import directory.
+    #[default]
+    Auto,
+    /// An explicit `(rva, len)`.
+    Rva { rva: u64, len: u64 },
+    /// No IAT-fill observation.
+    Off,
+}
 
 /// Knobs for one detonation. `Default` runs the entry point to OEP with a dump.
 #[derive(Clone, Debug)]
@@ -77,6 +90,8 @@ pub struct DetonateOptions {
     /// rather than stopping. Observed/quarantined tier — never sound static
     /// output. Set `false` to reproduce the sound fail-closed stop.
     pub resolve_undefined_flags: bool,
+    /// Region watched for import-slot fills (see [`DetonationResult::iat_fill`]).
+    pub iat_region: IatRegion,
 }
 
 impl Default for DetonateOptions {
@@ -94,6 +109,7 @@ impl Default for DetonateOptions {
             export_reference: BTreeMap::new(),
             dump: true,
             resolve_undefined_flags: true,
+            iat_region: IatRegion::Auto,
         }
     }
 }
@@ -177,6 +193,9 @@ pub struct DetonationResult {
     pub xplm: Option<XplmSummary>,
     /// VMs found by the structural survey, when `opts.vm_discover` was set.
     pub discovered: Vec<DiscoveredVm>,
+    /// Import-slot fills observed in `opts.iat_region`, mapped to `module!name`
+    /// only on an exact known-address match.
+    pub iat_fill: IatFill,
 }
 
 /// What the recording host-SDK model captured during the run.
@@ -188,6 +207,34 @@ pub struct XplmSummary {
     pub call_counts: BTreeMap<String, u64>,
     /// XPLM imports hit with no stub: `(dll, func, count)`.
     pub unlisted: Vec<(String, String, u64)>,
+}
+
+/// Absolute `[lo, hi)` VA range to watch, per `region`.
+fn iat_range(pe: &PeImage, image_base: u64, region: IatRegion) -> Option<(u64, u64)> {
+    let report = pe.report();
+    let (rva, len) = match region {
+        IatRegion::Off => return None,
+        IatRegion::Rva { rva, len } => (rva, len),
+        IatRegion::Auto => {
+            let import_rva = report
+                .directories
+                .iter()
+                .find(|d| d.index == 1 && d.size != 0)
+                .map(|d| d.address);
+            let sec = report
+                .sections
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(".idata"))
+                .or_else(|| {
+                    import_rva.and_then(|r| {
+                        report.sections.iter().find(|s| s.contains_mapped_rva(vmpx_pe::Rva(r)))
+                    })
+                })?;
+            (u64::from(sec.virtual_address.0), u64::from(sec.mapped_span()))
+        }
+    };
+    let len = len & !7;
+    (len != 0 && len <= iat_fill::MAX_REGION).then(|| (image_base + rva, image_base + rva + len))
 }
 
 /// A hook that fans every event out to several inner hooks. `Stop` from any
@@ -303,6 +350,7 @@ fn detonate_with(
         winapi = winapi.with_xplm(Rc::clone(x));
     }
     let facts = winapi.facts();
+    let book = winapi.address_book();
     let oep = OepHook::wrapping(winapi, Rc::clone(&facts));
 
     // Fold in VM observation only when a dispatcher/loop-head is configured.
@@ -328,6 +376,18 @@ fn detonate_with(
             (Box::new(oep), None)
         };
 
+    // IAT-fill observer: fold into the hook set when a slot region is derived.
+    let iat_range = iat_range(pe, image_base, opts.iat_region);
+    let mut iat_watch = None;
+    let hook: Box<dyn Hook> = match iat_range {
+        Some((lo, hi)) => {
+            let (watcher, log) = IatFillHook::new(lo, hi);
+            iat_watch = Some(log);
+            Box::new(MultiHook { hooks: vec![hook, Box::new(watcher)] })
+        }
+        None => hook,
+    };
+
     // Stop cleanly when the entry returns to the synthetic sentinel: for a DLL
     // whose DllMain simply returns (no write-then-execute OEP handoff), this is
     // a legitimate terminus (`Stop::Reached`) rather than an exec fault on the
@@ -335,6 +395,7 @@ fn detonate_with(
     // via `OepHook` (`Stop::Hook`, with `observed.oep` set).
     let sentinel = img.return_sentinel();
     let mut emu = img.prepare(entry, &args)?;
+    let iat_initial = iat_range.map(|(lo, hi)| iat_fill::snapshot(&emu.mem, lo, hi));
     emu.hook = Some(hook);
     // Detonation is a concrete CPU run: by default resolve architecturally-
     // undefined flags to their deterministic hardware value instead of
@@ -375,7 +436,24 @@ fn detonate_with(
     let dump = opts.dump.then(|| dump_image(&emu.mem, image_base));
 
     let rip = emu.cpu.rip;
-    Ok(DetonationResult { observed, dump, stop, steps, rip, vm, xplm, discovered: Vec::new() })
+    let iat_fill = match (iat_range, iat_watch, iat_initial) {
+        (Some(range), Some(log), Some(initial)) => {
+            iat_fill::resolve(&emu.mem, image_base, range, &initial, &log, &book)
+        }
+        _ => IatFill::default(),
+    };
+
+    Ok(DetonationResult {
+        observed,
+        dump,
+        stop,
+        steps,
+        rip,
+        vm,
+        xplm,
+        discovered: Vec::new(),
+        iat_fill,
+    })
 }
 
 #[cfg(test)]
@@ -592,6 +670,22 @@ mod tests {
             eprintln!("[probe] merged {} exports for {key}", names.len());
             export_reference.insert(key.clone(), names);
         }
+        // VMPX_IAT_SYSDB=1 (or a comma list of extra modules): offline System32
+        // export DB for the default loader set, so a manual export walk resolves.
+        if let Ok(extra) = std::env::var("VMPX_IAT_SYSDB") {
+            let db = crate::SysDllDb::new();
+            let imported = pe.report().imports;
+            let mods = crate::DEFAULT_SYSTEM_MODULES
+                .iter()
+                .map(|m| (*m).to_owned())
+                .chain(extra.split(',').filter(|m| m.ends_with(".dll")).map(str::to_owned))
+                .chain(imported.iter().map(|m| m.name.to_lowercase()));
+            for m in mods {
+                if let Some(names) = db.exports(&m) {
+                    export_reference.insert(m, names);
+                }
+            }
+        }
         let ref_syms: usize = export_reference.values().map(Vec::len).sum();
         let max_steps = std::env::var("VMPX_DETONATE_MAXSTEPS")
             .ok()
@@ -629,6 +723,7 @@ mod tests {
             resolve_undefined_flags,
             xplm: std::env::var("VMPX_XPLM").is_ok_and(|v| v == "1"),
             vm_discover: std::env::var("VMPX_VM_DISCOVER").is_ok_and(|v| v == "1"),
+            dump: true,
             ..DetonateOptions::default()
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
@@ -704,6 +799,88 @@ mod tests {
         for imp in res.observed.imports.iter().take(30) {
             eprintln!("    {} :: {:?}", imp.module, imp.symbol);
         }
+        for sec in &pe.report().sections {
+            eprintln!("  sec {:8} rva={:#x} vsize={:#x}", sec.name, sec.virtual_address.0, sec.virtual_size);
+        }
+        eprintln!("  image_base={:#x} import modules={:?}", pe.report().optional.image_base.0, pe.report().imports.iter().map(|m| (m.name.clone(), m.entries.len())).collect::<Vec<_>>());
+        report_iat_fill(&pe, &res.iat_fill, res.dump.as_ref());
+    }
+
+    /// Print the IAT-fill mapping, plus how many of the slots `.text` actually
+    /// calls/jumps through (`call/jmp [rip+disp]`, linear decode) resolved.
+    fn report_iat_fill(pe: &PeImage, fill: &IatFill, dump: Option<&DumpImage>) {
+        use crate::memory::Perm;
+        use iced_x86::{Decoder, DecoderOptions, FlowControl};
+        let report = pe.report();
+        let base = report.optional.image_base.0;
+        let size = u64::from(report.optional.size_of_image);
+        let Some((r_rva, r_len)) = fill.region else {
+            eprintln!("  iat_fill: no region");
+            return;
+        };
+        let mut referenced = std::collections::BTreeSet::new();
+        // Scan the POST-RUN image: the on-disk code is packed.
+        let image_end = base + size;
+        for reg in dump.iter().flat_map(|d| &d.regions) {
+            if !reg.perm.contains(Perm::X) || reg.va < base || reg.va >= image_end {
+                continue;
+            }
+            let mut dec = Decoder::with_ip(64, &reg.bytes, reg.va, DecoderOptions::NONE);
+            while dec.can_decode() {
+                let i = dec.decode();
+                if matches!(i.flow_control(), FlowControl::IndirectCall | FlowControl::IndirectBranch)
+                    && i.is_ip_rel_memory_operand()
+                {
+                    let rva = i.ip_rel_memory_address().wrapping_sub(base);
+                    if (r_rva..r_rva + r_len).contains(&rva) {
+                        referenced.insert(rva & !7);
+                    }
+                }
+            }
+        }
+        let learned = fill.resolved.iter().filter(|s| s.changed).count();
+        eprintln!("  resolved: value-changed-by-guest={learned} rewritten-same-as-loader={}", fill.resolved.len() - learned);
+        let resolved: std::collections::BTreeSet<u64> =
+            fill.resolved.iter().map(|s| s.slot_rva).collect();
+        let unresolved: std::collections::BTreeSet<u64> =
+            fill.unresolved.iter().map(|s| s.slot_rva).collect();
+        eprintln!(
+            "  iat_fill region rva={r_rva:#x} len={r_len:#x}: resolved={} unresolved={} untouched={}",
+            fill.resolved.len(),
+            fill.unresolved.len(),
+            fill.untouched
+        );
+        eprintln!(
+            "  text-referenced slots={} -> resolved={} unresolved={} never-filled={}",
+            referenced.len(),
+            referenced.intersection(&resolved).count(),
+            referenced.intersection(&unresolved).count(),
+            referenced.difference(&resolved).count() - referenced.intersection(&unresolved).count(),
+        );
+        let (mut zero, mut in_image, mut in_model, mut other) = (0, 0, 0, 0);
+        for u in &fill.unresolved {
+            if u.value == 0 {
+                zero += 1;
+            } else if u.value.wrapping_sub(base) < size {
+                in_image += 1;
+            } else if (0x20_0000_0000..0x80_0000_0000).contains(&u.value) {
+                in_model += 1;
+            } else {
+                other += 1;
+            }
+        }
+        eprintln!("  unresolved values: zero={zero} in-image={in_image} in-model-region(not exact)={in_model} other={other}");
+        let mut by_module: BTreeMap<&str, usize> = BTreeMap::new();
+        for s in &fill.resolved {
+            *by_module.entry(s.module.as_str()).or_default() += 1;
+        }
+        eprintln!("  resolved by module: {by_module:?}");
+        for s in fill.resolved.iter().take(15) {
+            eprintln!("    {:#x} -> {}!{} ({:?}, writes={})", s.slot_rva, s.module, s.name, s.source, s.writes);
+        }
+        for u in fill.unresolved.iter().take(15) {
+            eprintln!("    {:#x} = {:#x} unresolved {:?} (writes={})", u.slot_rva, u.value, u.reason, u.writes);
+        }
     }
 
     #[test]
@@ -727,6 +904,66 @@ mod tests {
         };
         assert_eq!(read(IMAGE_BASE + 0x20E0), IMAGE_BASE, "hinstDLL == image base");
         assert_eq!(read(IMAGE_BASE + 0x20E8), 1, "fdwReason == DLL_PROCESS_ATTACH");
+    }
+
+    const FILL_A: u64 = IMAGE_BASE + 0x2110;
+
+    /// Resolve LoadLibraryA("u") + GetProcAddress(.., "F"), then "fill" three
+    /// `.idata` slots: the GetProcAddress result, a loader import stub, and a
+    /// value that is no known address; then transfer to the OEP.
+    fn fill_code() -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(rcx, NAME_U).unwrap();
+        a.mov(rax, IAT_LOADLIB).unwrap();
+        a.mov(rax, qword_ptr(rax)).unwrap();
+        a.call(rax).unwrap();
+        a.mov(rcx, rax).unwrap();
+        a.mov(rdx, NAME_F).unwrap();
+        a.mov(rax, IAT_GETPROC).unwrap();
+        a.mov(rax, qword_ptr(rax)).unwrap();
+        a.call(rax).unwrap();
+        a.mov(rdi, FILL_A).unwrap();
+        a.mov(qword_ptr(rdi), rax).unwrap();
+        a.mov(rsi, IAT_LOADLIB).unwrap();
+        a.mov(rsi, qword_ptr(rsi)).unwrap();
+        a.mov(qword_ptr(rdi + 8), rsi).unwrap();
+        a.mov(rdx, 0x1234u64).unwrap();
+        a.mov(qword_ptr(rdi + 16), rdx).unwrap();
+        a.mov(rbx, OEP_TARGET).unwrap();
+        a.mov(qword_ptr(rbx), rbx).unwrap();
+        a.jmp(rbx).unwrap();
+        a.assemble(IMAGE_BASE + ENTRY_RVA).unwrap()
+    }
+
+    #[test]
+    fn iat_fill_resolves_only_exact_known_addresses() {
+        let data = synth_pe_with_entry(&fill_code());
+        let pe = PeImage::parse(&data).unwrap();
+        let res = detonate(&pe, &DetonateOptions::default()).expect("detonation starts");
+        let fill = &res.iat_fill;
+        assert_eq!(fill.region, Some((0x2000, 0x200)), "derived from the .idata section");
+
+        let rva = |va: u64| va - IMAGE_BASE;
+        let by_rva = |r: u64| fill.resolved.iter().find(|s| s.slot_rva == r);
+
+        let gpa = by_rva(rva(FILL_A)).expect("GetProcAddress result resolves");
+        assert_eq!((gpa.module.as_str(), gpa.name.as_str()), ("u", "F"));
+        assert!(gpa.changed && gpa.writes == 1);
+        assert_eq!(gpa.source, crate::ImportSource::GetProcAddress);
+
+        let stub = by_rva(rva(FILL_A) + 8).expect("loader stub resolves");
+        assert_eq!((stub.module.as_str(), stub.name.as_str()), ("kernel32.dll", "LoadLibraryA"));
+        assert_eq!(stub.source, crate::ImportSource::LoaderStub);
+
+        // A non-export value stays unresolved, with the reason recorded.
+        let bad = fill.unresolved.iter().find(|s| s.slot_rva == rva(FILL_A) + 16).unwrap();
+        assert_eq!((bad.value, bad.reason), (0x1234, crate::UnresolvedReason::NotKnownExport));
+        assert!(by_rva(rva(FILL_A) + 16).is_none());
+        assert!(fill.untouched > 0, "unwritten slots are not reported as filled");
+
+        let off = detonate(&pe, &DetonateOptions { iat_region: IatRegion::Off, ..Default::default() })
+            .unwrap();
+        assert_eq!(off.iat_fill, IatFill::default());
     }
 
     #[test]
