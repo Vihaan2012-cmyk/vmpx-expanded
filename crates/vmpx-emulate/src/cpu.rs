@@ -9,6 +9,9 @@ pub const OF: u64 = 1 << 11;
 
 pub const RSP: usize = 4;
 
+/// Power-on MXCSR: all exceptions masked, round-to-nearest.
+pub const MXCSR_DEFAULT: u32 = 0x1f80;
+
 #[must_use]
 pub fn mask(bytes: u32) -> u64 {
     if bytes >= 8 { u64::MAX } else { (1u64 << (bytes * 8)) - 1 }
@@ -25,6 +28,9 @@ pub struct Cpu {
     pub rflags: u64,
     pub undef_flags: u64,
     pub gs_base: u64,
+    /// Low 128 bits of xmm0-15 (see `sse.rs` for the modeled subset).
+    pub xmm: [u128; 16],
+    pub mxcsr: u32,
 }
 
 enum Loc {
@@ -58,7 +64,7 @@ pub(crate) fn locate_reg(r: Register) -> Option<(u8, u8, u8)> {
 impl Cpu {
     #[must_use]
     pub fn new(rip: u64) -> Self {
-        Self { regs: [0; 16], rip, rflags: 2, undef_flags: 0, gs_base: 0 }
+        Self { regs: [0; 16], rip, rflags: 2, undef_flags: 0, gs_base: 0, xmm: [0; 16], mxcsr: MXCSR_DEFAULT }
     }
 
     /// Read a general-purpose register; `None` for non-GPRs.

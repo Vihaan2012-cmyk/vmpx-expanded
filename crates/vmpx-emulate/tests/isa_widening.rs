@@ -412,12 +412,12 @@ fn undefined_flag_consumer_still_stops() {
 
 #[test]
 fn xmm_move_fails_closed() {
-    // movaps xmm0, xmm1 (0F 28 C1): XMM state is deferred, so it must stop
-    // cleanly as unsupported rather than guess.
-    let mut e = emu_bytes(&[0x0f, 0x28, 0xc1]);
+    // addss xmm0, xmm1 (F3 0F 58 C1): scalar float is unmodeled, so it must
+    // stop cleanly rather than guess.
+    let mut e = emu_bytes(&[0xf3, 0x0f, 0x58, 0xc1]);
     let before = e.cpu.clone();
     let s = e.step().unwrap_err();
-    assert!(matches!(s, Stop::Unsupported { .. }), "{s:?}");
+    assert!(matches!(s, Stop::UnmodeledSse { .. }), "{s:?}");
     assert_eq!(e.cpu, before); // rolled back
     assert!(e.trace.is_empty());
 }
