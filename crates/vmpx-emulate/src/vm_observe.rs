@@ -37,7 +37,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use iced_x86::Register;
@@ -47,15 +47,59 @@ use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, Interest};
 use crate::memory::Memory;
 use crate::observe::ObservedFacts;
 
+/// Where an instance keeps its VIP at dispatch time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VipLoc {
+    Reg(Register),
+    /// Qword at `base + disp`: a VIP spilled to memory (e.g. a stack slot).
+    Mem { base: Register, disp: i64 },
+}
+
+impl From<Register> for VipLoc {
+    fn from(r: Register) -> Self {
+        VipLoc::Reg(r)
+    }
+}
+
+impl VipLoc {
+    /// The VIP, or `None` if a register/slot is unreadable. `rsp_bias` is
+    /// added to an RSP base (a transfer sited after the stub's `push`).
+    fn read(self, cpu: &Cpu, mem: &Memory, rsp_bias: u64) -> Option<u64> {
+        match self {
+            VipLoc::Reg(r) => cpu.reg(r),
+            VipLoc::Mem { base, disp } => {
+                let b = cpu.reg(base)?;
+                let b = if base == Register::RSP { b.wrapping_add(rsp_bias) } else { b };
+                mem.read_uint(b.wrapping_add(disp as u64), 8).ok()
+            }
+        }
+    }
+}
+
 /// One interpreter instance behind a dispatcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmInstance {
+    /// Specs sharing an id are one instance (one walk) across their dispatchers.
     pub id: u32,
-    /// Register holding this instance's VIP at dispatcher entry.
-    pub vip_reg: Register,
+    /// Where this instance's VIP lives at dispatcher entry.
+    pub vip: VipLoc,
     /// Proven bytecode region as a half-open RVA span. `None` = unconstrained,
     /// accepted only when the instance is alone on its dispatch slice.
     pub bytecode_region: Option<(u64, u64)>,
+}
+
+/// How a spec's `dispatcher_rva` is recognised at run time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DispatchAt {
+    /// Control arrives at the dispatcher; its first `jmp`/`ret` out is the
+    /// handler transfer and the VIP is read on arrival.
+    #[default]
+    Arrival,
+    /// The address IS the dispatching `jmp reg` / `ret` itself, seen by its
+    /// source (so a stub entered by fall-through is not missed). The VIP is
+    /// read at the transfer; `rsp_bias` is added to an RSP-based VIP slot
+    /// (8 when the transfer is the `ret` of a `push reg; ret` stub).
+    Transfer { rsp_bias: u64 },
 }
 
 /// A statically discovered dispatcher (by RVA) and the instance it serves.
@@ -63,6 +107,7 @@ pub struct VmInstance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmInstanceSpec {
     pub dispatcher_rva: u64,
+    pub at: DispatchAt,
     pub instance: VmInstance,
 }
 
@@ -105,6 +150,8 @@ pub struct VmObservations {
     pub edges: Vec<ObservedVmEdge>,
     /// Dispatcher entries whose live VIP matched no candidate instance.
     pub unattributed: u64,
+    /// New edges not recorded because the edge table hit its cap.
+    pub edges_dropped: u64,
 }
 
 impl VmObservations {
@@ -130,11 +177,20 @@ impl VmObservations {
     }
 }
 
+/// Cap on recorded handler entries / distinct edges (memory backstop).
+const MAX_RECORDS: usize = 1 << 21;
+
 /// An instance with its region resolved to absolute VAs, plus run state.
 struct Live {
     id: u32,
-    vip_reg: Register,
+    vip: VipLoc,
     region: Option<(u64, u64)>,
+    rsp_bias: u64,
+}
+
+/// Per-instance walk state, shared by every dispatcher serving the instance.
+#[derive(Default)]
+struct Walk {
     last_vip: Option<u64>,
     last_handler: u64,
 }
@@ -149,13 +205,18 @@ struct Live {
 /// `jmp` after entry — the `VMProtect` central-dispatch shape.
 pub struct VmObserveHook {
     obs: Rc<RefCell<VmObservations>>,
-    /// Dispatcher VA -> candidate indices into `live`.
+    /// Arrival-dispatcher VA -> candidate indices into `live`.
     dispatchers: BTreeMap<u64, Vec<usize>>,
+    /// Transfer-site VA (a `jmp`/`ret` source) -> candidate indices into `live`.
+    tails: HashMap<u64, Vec<usize>>,
     live: Vec<Live>,
+    walks: HashMap<u32, Walk>,
     /// Instance entered at the last dispatcher arrival, awaiting its jmp-out.
     armed: Option<usize>,
     /// `(instance, from, to, handler)` -> index into `obs.edges`.
     edge_ix: HashMap<(u32, u64, u64, u64), usize>,
+    /// De-dupe set mirroring `obs.branch_targets`.
+    bt_seen: HashSet<(u64, u64)>,
     /// Flow spans covering every dispatcher and the loop head.
     spans: [(u64, u64); 2],
 }
@@ -183,7 +244,8 @@ impl VmObserveHook {
     pub fn new(dispatcher: Option<u64>, loop_head: Option<u64>) -> Self {
         let spec = dispatcher.map(|d| VmInstanceSpec {
             dispatcher_rva: d,
-            instance: VmInstance { id: 0, vip_reg: Register::RSI, bytecode_region: None },
+            at: DispatchAt::Arrival,
+            instance: VmInstance { id: 0, vip: Register::RSI.into(), bytecode_region: None },
         });
         Self::with_instances(0, spec, loop_head)
     }
@@ -200,18 +262,28 @@ impl VmObserveHook {
         loop_head: Option<u64>,
     ) -> Self {
         let mut dispatchers: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut tails: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut live = Vec::new();
         for s in specs {
-            dispatchers.entry(base.wrapping_add(s.dispatcher_rva)).or_default().push(live.len());
+            let va = base.wrapping_add(s.dispatcher_rva);
+            let rsp_bias = match s.at {
+                DispatchAt::Arrival => {
+                    dispatchers.entry(va).or_default().push(live.len());
+                    0
+                }
+                DispatchAt::Transfer { rsp_bias } => {
+                    tails.entry(va).or_default().push(live.len());
+                    rsp_bias
+                }
+            };
             live.push(Live {
+                rsp_bias,
                 id: s.instance.id,
-                vip_reg: s.instance.vip_reg,
+                vip: s.instance.vip,
                 region: s
                     .instance
                     .bytecode_region
                     .map(|(lo, hi)| (base.wrapping_add(lo), base.wrapping_add(hi))),
-                last_vip: None,
-                last_handler: 0,
             });
         }
         let mut pts: Vec<u64> = dispatchers.keys().copied().collect();
@@ -223,9 +295,12 @@ impl VmObserveHook {
                 ..VmObservations::default()
             })),
             dispatchers,
+            tails,
             live,
+            walks: HashMap::new(),
             armed: None,
             edge_ix: HashMap::new(),
+            bt_seen: HashSet::new(),
             spans: cover(pts),
         }
     }
@@ -236,13 +311,12 @@ impl VmObserveHook {
         Rc::clone(&self.obs)
     }
 
-    /// Instance served by the dispatcher at `d` and its live VIP, chosen by
-    /// matching the VIP against each candidate's bytecode region.
-    fn resolve(&self, d: u64, cpu: &Cpu) -> Option<(usize, u64)> {
-        let cands = self.dispatchers.get(&d)?;
+    /// Instance among `cands` and its live VIP, chosen by matching the VIP
+    /// against each candidate's bytecode region.
+    fn resolve(&self, cands: &[usize], cpu: &Cpu, mem: &Memory) -> Option<(usize, u64)> {
         cands.iter().find_map(|&i| {
             let l = &self.live[i];
-            let vip = cpu.reg(l.vip_reg).unwrap_or_default();
+            let vip = l.vip.read(cpu, mem, l.rsp_bias)?;
             let ok = match l.region {
                 Some((lo, hi)) => (lo..hi).contains(&vip),
                 None => cands.len() == 1,
@@ -252,58 +326,92 @@ impl VmObserveHook {
     }
 }
 
+impl VmObserveHook {
+    /// Record the edge from the instance's previous dispatch VIP to `vip`.
+    fn note_dispatch(&mut self, o: &mut VmObservations, i: usize, vip: u64) {
+        let id = self.live[i].id;
+        let w = self.walks.entry(id).or_default();
+        let handler = w.last_handler;
+        let Some(site) = w.last_vip.replace(vip) else { return };
+        if o.branch_targets.len() < MAX_RECORDS && self.bt_seen.insert((site, vip)) {
+            o.branch_targets.push((site, vip));
+        }
+        let edges = &mut o.edges;
+        let key = (id, site, vip, handler);
+        let ix = match self.edge_ix.get(&key) {
+            Some(&ix) => Some(ix),
+            None if edges.len() < MAX_RECORDS => {
+                edges.push(ObservedVmEdge {
+                    instance: id,
+                    from_vip: site,
+                    to_vip: vip,
+                    handler_va: handler,
+                    dispatch_count: 0,
+                });
+                self.edge_ix.insert(key, edges.len() - 1);
+                Some(edges.len() - 1)
+            }
+            None => None,
+        };
+        match ix {
+            Some(ix) => edges[ix].dispatch_count += 1,
+            None => o.edges_dropped += 1,
+        }
+    }
+}
+
 impl Hook for VmObserveHook {
     fn interest(&self) -> Interest {
+        // Transfer sites are matched by source, which spans cannot select.
         // Once inside a dispatcher the next jmp (target unknown) is the handler.
-        if self.armed.is_some() {
+        if self.armed.is_some() || !self.tails.is_empty() {
             return Interest { flow_all: true, ..Interest::NONE };
         }
         Interest { flow: self.spans, ..Interest::NONE }
     }
 
-    fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
-        let mut o = self.obs.borrow_mut();
+    fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+        let obs = Rc::clone(&self.obs);
+        let mut o = obs.borrow_mut();
 
         // Concolic depth: every arrival at the loop head is a back-edge visit.
         if o.loop_head == Some(ev.to) {
             o.back_edges += 1;
         }
 
-        // Handler trace: record the dispatcher's first jmp-out as a handler
-        // entry, then re-arm when control returns to a dispatcher.
-        if let (Some(i), FlowKind::Jmp) = (self.armed, ev.kind) {
-            o.handlers.push(ev.to);
-            self.live[i].last_handler = ev.to;
+        // Handler trace: record the dispatcher's first jmp/ret-out (`jmp reg`
+        // or the threaded `push reg; ret`) as a handler entry, then re-arm when
+        // control returns to a dispatcher.
+        if let (Some(i), FlowKind::Jmp | FlowKind::Ret) = (self.armed, ev.kind) {
+            if o.handlers.len() < MAX_RECORDS {
+                o.handlers.push(ev.to);
+            }
+            self.walks.entry(self.live[i].id).or_default().last_handler = ev.to;
             self.armed = None;
         }
-        if self.dispatchers.contains_key(&ev.to) {
-            let Some((i, vip)) = self.resolve(ev.to, cpu) else {
+        if let Some(cands) = self.dispatchers.get(&ev.to) {
+            let Some((i, vip)) = self.resolve(cands, cpu, mem) else {
                 o.unattributed += 1;
                 return HookAction::Continue;
             };
             self.armed = Some(i);
-
             // At dispatcher entry the VIP is the bytecode site about to be
             // decoded; the previous dispatch VIP -> this one is the edge.
-            let l = &mut self.live[i];
-            let (id, handler) = (l.id, l.last_handler);
-            if let Some(site) = l.last_vip.replace(vip) {
-                let o = &mut *o;
-                if !o.branch_targets.contains(&(site, vip)) {
-                    o.branch_targets.push((site, vip));
+            self.note_dispatch(&mut o, i, vip);
+        }
+
+        // Transfer-sited dispatch: VIP and handler are both known right here.
+        if matches!(ev.kind, FlowKind::Jmp | FlowKind::Ret) {
+            if let Some(cands) = self.tails.get(&ev.from) {
+                let Some((i, vip)) = self.resolve(cands, cpu, mem) else {
+                    o.unattributed += 1;
+                    return HookAction::Continue;
+                };
+                self.note_dispatch(&mut o, i, vip);
+                if o.handlers.len() < MAX_RECORDS {
+                    o.handlers.push(ev.to);
                 }
-                let edges = &mut o.edges;
-                let ix = *self.edge_ix.entry((id, site, vip, handler)).or_insert_with(|| {
-                    edges.push(ObservedVmEdge {
-                        instance: id,
-                        from_vip: site,
-                        to_vip: vip,
-                        handler_va: handler,
-                        dispatch_count: 0,
-                    });
-                    edges.len() - 1
-                });
-                edges[ix].dispatch_count += 1;
+                self.walks.entry(self.live[i].id).or_default().last_handler = ev.to;
             }
         }
 
@@ -355,11 +463,11 @@ mod tests {
     const BASE: u64 = 0x1_4000_0000;
 
     fn inst(id: u32, vip_reg: Register, region: Option<(u64, u64)>) -> VmInstance {
-        VmInstance { id, vip_reg, bytecode_region: region }
+        VmInstance { id, vip: vip_reg.into(), bytecode_region: region }
     }
 
     fn spec(dispatcher_rva: u64, instance: VmInstance) -> VmInstanceSpec {
-        VmInstanceSpec { dispatcher_rva, instance }
+        VmInstanceSpec { dispatcher_rva, at: DispatchAt::Arrival, instance }
     }
 
     /// Enter the dispatcher at `d` with `vip` in `reg`, then jmp out to `handler`.
@@ -519,6 +627,78 @@ mod tests {
         h.on_flow(&FlowEvent { kind: FlowKind::Jmp, from: 0, to: BASE + 0x9000, next: 0 }, &mut c, &mut m);
         assert!(!h.interest().flow_all);
         assert_eq!(h.observations().borrow().handlers, vec![BASE + 0x9000]);
+    }
+
+    /// Arrive at a threaded `push reg; ret` dispatcher, then `ret` to a handler.
+    fn ret_step(h: &mut VmObserveHook, c: &mut Cpu, m: &mut Memory, d: u64, handler: u64) {
+        h.on_flow(&FlowEvent { kind: FlowKind::Jmp, from: 0, to: d, next: 0 }, c, m);
+        h.on_flow(&FlowEvent { kind: FlowKind::Ret, from: d + 1, to: handler, next: 0 }, c, m);
+    }
+
+    #[test]
+    fn one_instance_spanning_several_dispatch_stubs_walks_as_one() {
+        // Threaded VMs replicate the dispatch stub: the instance id, not the
+        // stub, owns the walk, so edges chain across stubs.
+        let specs = [0x5000, 0x6000, 0x7000].map(|d| spec(d, inst(9, Register::RSI, None)));
+        let mut h = VmObserveHook::with_instances(BASE, specs, None);
+        let obs = h.observations();
+        let (mut c, mut m) = (Cpu::new(0), Memory::new());
+        let hd = BASE + 0x9000;
+        for (d, vip) in [(0x5000, 0x100), (0x6000, 0x104), (0x7000, 0x108), (0x5000, 0x10c)] {
+            step(&mut h, &mut c, &mut m, BASE + d, Register::RSI, vip, hd);
+        }
+        let o = obs.borrow();
+        let chain: Vec<_> = o.edges.iter().map(|e| (e.from_vip, e.to_vip)).collect();
+        assert_eq!(chain, vec![(0x100, 0x104), (0x104, 0x108), (0x108, 0x10c)]);
+    }
+
+    #[test]
+    fn memory_resident_vip_is_read_at_each_dispatch() {
+        // VIP spilled to a stack slot [rsp+0x20], threaded `push rbp; ret` dispatch.
+        const STACK: u64 = 0x20_0000;
+        let vip = VipLoc::Mem { base: Register::RSP, disp: 0x20 };
+        let mut h = VmObserveHook::with_instances(
+            BASE,
+            [spec(0x5000, VmInstance { id: 3, vip, bytecode_region: None })],
+            None,
+        );
+        let obs = h.observations();
+        let (mut c, mut m) = (Cpu::new(0), Memory::new());
+        m.map(STACK, 0x1000, crate::memory::Perm::RW).unwrap();
+        c.set_reg(Register::RSP, STACK);
+        let (d, hd) = (BASE + 0x5000, BASE + 0x9000);
+        // The slot walks down the bytecode; a register-only observer sees nothing.
+        for v in [0x4000_u64, 0x3ffc, 0x3ff4, 0x3000] {
+            m.write_uint(STACK + 0x20, 8, v).unwrap();
+            ret_step(&mut h, &mut c, &mut m, d, hd);
+        }
+        let o = obs.borrow();
+        assert_eq!(o.unattributed, 0);
+        assert_eq!(o.handlers, vec![hd; 4], "ret-out recorded as the handler");
+        assert_eq!(
+            o.edges,
+            vec![
+                edge(3, 0x4000, 0x3ffc, hd, 1),
+                edge(3, 0x3ffc, 0x3ff4, hd, 1),
+                edge(3, 0x3ff4, 0x3000, hd, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_memory_vip_is_unattributed_not_a_junk_edge() {
+        let vip = VipLoc::Mem { base: Register::RSP, disp: 0 };
+        let mut h = VmObserveHook::with_instances(
+            BASE,
+            [spec(0x5000, VmInstance { id: 1, vip, bytecode_region: None })],
+            None,
+        );
+        let (mut c, mut m) = (Cpu::new(0), Memory::new());
+        c.set_reg(Register::RSP, 0xdead_0000);
+        ret_step(&mut h, &mut c, &mut m, BASE + 0x5000, BASE + 0x9000);
+        let obs = h.observations();
+        let o = obs.borrow();
+        assert_eq!((o.unattributed, o.edges.len()), (1, 0));
     }
 
     #[test]

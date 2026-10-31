@@ -50,6 +50,19 @@ fn section_permissions_are_enforced() {
 }
 
 #[test]
+fn return_address_is_readable_but_not_executable_and_not_a_breakpoint() {
+    // A protected entry probes the byte at its return address (int3 detection).
+    let pe = PeImage::parse(UNITOPS).expect("parse PE");
+    let mut img = load(&pe, &vmpx_emulate::LoadOptions::default()).expect("load");
+    let sentinel = img.return_sentinel();
+    let rip = img.export("op_add32").expect("export");
+    let emu = img.prepare(rip, &[1, 2]).expect("prepare");
+    let byte = emu.mem.read_uint(sentinel, 1).expect("return address is readable");
+    assert_ne!(byte, 0xCC, "the caller is not breakpointed");
+    assert_eq!(emu.mem.fetch(sentinel, &mut [0u8; 1]).unwrap_err().access, Access::Exec);
+}
+
+#[test]
 fn iat_slots_point_at_resolvable_stubs() {
     let pe = PeImage::parse(COREDLL).expect("parse coredll");
     let img = load(&pe, &vmpx_emulate::LoadOptions::default()).expect("load coredll");
