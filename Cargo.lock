@@ -2862,6 +2862,7 @@ version = "0.1.0"
 dependencies = [
  "vmpx-mutation",
  "vmpx-vm",
+ "vmpx-vmlift",
  "z3",
 ]
 
