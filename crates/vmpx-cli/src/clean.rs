@@ -911,6 +911,11 @@ pub fn analyze_clean_with_image(
     // `ObservedLoopDepths` seed (never the `vmpx-emulate` type). Feeds the
     // experimental bounded-recursion unroll; `None` on the sound path.
     let mut dynamic_loop_depths: Vec<(u64, u64)> = Vec::new();
+    // Observed concrete VM branch targets, grouped branch-site VIP -> target
+    // VIPs, converted into the plain vmpx-vm `ObservedBranchTargets` seed (never
+    // the `vmpx-emulate` type). Feeds the experimental observed-branch-target
+    // bridge; empty on the sound path, which stays unchanged.
+    let mut dynamic_branch_targets: Vec<(u64, Vec<u64>)> = Vec::new();
     let observed_imports: Vec<vmpx_emulate::ObservedImport> = if dynamic {
         let export_reference = dynamic_export_reference(input_path, &mut warnings);
         let ref_symbols: usize = export_reference.values().map(Vec::len).sum();
@@ -935,6 +940,10 @@ pub fn analyze_clean_with_image(
                     result.observed.globals.len(),
                     result.observed.loop_depths.len(),
                 ));
+                warnings.push(format!(
+                    "[dynamic][experimental] observed branch-target edges={}",
+                    result.observed.branch_targets.len(),
+                ));
                 dynamic_stop = Some(format!("{:?}", result.stop));
                 dynamic_steps = result.steps;
                 dynamic_oep = result.observed.oep;
@@ -950,6 +959,16 @@ pub fn analyze_clean_with_image(
                     .iter()
                     .map(|loop_depth| (loop_depth.loop_head, loop_depth.depth))
                     .collect();
+                // Group the flat observed (site, target) edges by branch site;
+                // `from_sites` keys on the site, so one entry per site.
+                let mut grouped: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+                for bt in &result.observed.branch_targets {
+                    let targets = grouped.entry(bt.site_vip).or_default();
+                    if !targets.contains(&bt.target_vip) {
+                        targets.push(bt.target_vip);
+                    }
+                }
+                dynamic_branch_targets = grouped.into_iter().collect();
                 result.observed.imports
             }
             Err(error) => {
@@ -961,23 +980,12 @@ pub fn analyze_clean_with_image(
     } else {
         Vec::new()
     };
-    // Observed concrete VM branch targets per branch site, converted into the
-    // plain vmpx-vm `ObservedBranchTargets` seed (never the `vmpx-emulate` type).
-    // Feeds the experimental observed-branch-target bridge, which resolves a
+    // `dynamic_branch_targets` (built above in the detonation arm) resolves a
     // branch that otherwise fails closed (CASE-C data target, or an
     // untracked-memory-epoch target) only when the observed target re-validates
-    // as real in-image bytecode. OBSERVE-SIDE CONTRACT (follow-on, in
-    // vmpx-emulate's `VmObserveHook` / `ObservedFacts`): for each VM branch taken
-    // during the detonation, record `(branch_site_vip, target_vip)` where
-    // `branch_site_vip` is the VM branch instruction's bytecode VIP (the same
-    // identity cfg.rs stalls on) and `target_vip` is the concrete next VIP the
-    // branch jumped to. Emit it as e.g. `ObservedFacts.branch_targets:
-    // Vec<ObservedBranchTarget { provenance, site_vip, target_vip }>`, then map
-    // it here exactly like `dynamic_globals`/`dynamic_loop_depths`. Until that
-    // field exists the seed is empty, so this bridge is a no-op on every path
-    // (the static seam is proven by the synthetic unit tests, like the globals
-    // bridge was). Grouped site -> targets for `ObservedBranchTargets`.
-    let dynamic_branch_targets: Vec<(u64, Vec<u64>)> = Vec::new();
+    // as real in-image bytecode. It is empty unless the detonation configured a
+    // VM dispatcher to observe against, so this bridge stays a no-op on every
+    // current path (the static seam is proven by the synthetic unit tests).
     // Observed-tier seed for the experimental decoded-lift path only (concrete
     // globals + recursion depths + branch targets). `None` keeps the sound
     // path's recovery seedless and unchanged.

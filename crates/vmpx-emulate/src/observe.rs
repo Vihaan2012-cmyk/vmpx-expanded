@@ -42,6 +42,16 @@ pub struct ObservedLoopDepth {
     pub depth: u64,
 }
 
+/// A concrete VM branch edge seen on the observed path: at bytecode VIP
+/// `site_vip` (the branch SITE the static `cfg` stalls on) the VM reached
+/// `target_vip` next. One run/input only — never a proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedBranchTarget {
+    pub provenance: Observed,
+    pub site_vip: u64,
+    pub target_vip: u64,
+}
+
 /// Accumulated facts from one run. Collector methods stamp [`Observed`] so a
 /// caller cannot record an un-provenanced fact; later WPs fill this from hooks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,6 +59,7 @@ pub struct ObservedFacts {
     pub imports: Vec<ObservedImport>,
     pub globals: Vec<ObservedGlobal>,
     pub loop_depths: Vec<ObservedLoopDepth>,
+    pub branch_targets: Vec<ObservedBranchTarget>,
     pub oep: Option<u64>,
 }
 
@@ -78,6 +89,10 @@ impl ObservedFacts {
 
     pub fn record_loop_depth(&mut self, loop_head: u64, depth: u64) {
         self.loop_depths.push(ObservedLoopDepth { provenance: Observed, loop_head, depth });
+    }
+
+    pub fn record_branch_target(&mut self, site_vip: u64, target_vip: u64) {
+        self.branch_targets.push(ObservedBranchTarget { provenance: Observed, site_vip, target_vip });
     }
 
     pub fn set_oep(&mut self, oep: u64) {

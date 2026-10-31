@@ -33,6 +33,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use iced_x86::Register;
+
 use crate::cpu::Cpu;
 use crate::emu::{FlowEvent, FlowKind, Hook, HookAction};
 use crate::memory::Memory;
@@ -52,6 +54,14 @@ pub struct VmObservations {
     /// Count of control-flow transfers that landed on `loop_head` — the
     /// observed recursion depth for this concrete input.
     pub back_edges: u64,
+    /// Observed VM VIP edges `(site_vip, target_vip)`: at each dispatcher
+    /// re-entry the VIP register (RSI, VMProtect 3.11 Compact) holds the
+    /// bytecode VIP about to be decoded, so consecutive dispatch VIPs form the
+    /// edge from one bytecode site to the next the VM reached. De-duped. The
+    /// branch SITEs the static `cfg` stalls on are the subset it queries;
+    /// straight-line edges are inert (the static side keys by site and
+    /// independently re-validates every target as real in-image bytecode).
+    pub branch_targets: Vec<(u64, u64)>,
 }
 
 impl VmObservations {
@@ -60,6 +70,14 @@ impl VmObservations {
     pub fn seed_loop_depth(&self, facts: &mut ObservedFacts) {
         if let Some(h) = self.loop_head {
             facts.record_loop_depth(h, self.back_edges);
+        }
+    }
+
+    /// Flush the observed VM VIP edges into `facts` as [`crate::Observed`]-
+    /// stamped branch targets. The static side groups them by site.
+    pub fn seed_branch_targets(&self, facts: &mut ObservedFacts) {
+        for &(site, target) in &self.branch_targets {
+            facts.record_branch_target(site, target);
         }
     }
 }
@@ -74,6 +92,9 @@ impl VmObservations {
 pub struct VmObserveHook {
     obs: Rc<RefCell<VmObservations>>,
     in_dispatcher: bool,
+    /// VIP (RSI) seen at the previous dispatcher re-entry — the site whose
+    /// bytecode led to the next dispatch VIP.
+    last_vip: Option<u64>,
 }
 
 impl VmObserveHook {
@@ -85,8 +106,10 @@ impl VmObserveHook {
                 loop_head,
                 handlers: Vec::new(),
                 back_edges: 0,
+                branch_targets: Vec::new(),
             })),
             in_dispatcher: false,
+            last_vip: None,
         }
     }
 
@@ -98,7 +121,7 @@ impl VmObserveHook {
 }
 
 impl Hook for VmObserveHook {
-    fn on_flow(&mut self, ev: &FlowEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
+    fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         let mut o = self.obs.borrow_mut();
 
         // Concolic depth: every arrival at the loop head is a back-edge visit.
@@ -115,9 +138,64 @@ impl Hook for VmObserveHook {
             }
             if ev.to == d {
                 self.in_dispatcher = true;
+
+                // Branch targets: at dispatcher re-entry the VIP (RSI) is the
+                // bytecode site about to be decoded. The edge from the previous
+                // dispatch VIP to this one is the (site, target) the branch
+                // bridge consumes. De-dupe to the observed VIP-edge set.
+                let vip = cpu.reg(Register::RSI).unwrap_or_default();
+                if let Some(site) = self.last_vip {
+                    let edge = (site, vip);
+                    if !o.branch_targets.contains(&edge) {
+                        o.branch_targets.push(edge);
+                    }
+                }
+                self.last_vip = Some(vip);
             }
         }
 
         HookAction::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DISPATCHER: u64 = 0x1_4000_5000;
+
+    /// Drive one dispatcher re-entry with `vip` in RSI (the VMProtect 3.11
+    /// Compact VIP register).
+    fn dispatch(hook: &mut VmObserveHook, cpu: &mut Cpu, mem: &mut Memory, vip: u64) {
+        cpu.set_reg(Register::RSI, vip);
+        let ev = FlowEvent { kind: FlowKind::Jmp, from: 0, to: DISPATCHER, next: 0 };
+        hook.on_flow(&ev, cpu, mem);
+    }
+
+    #[test]
+    fn records_vm_branch_target_edge_at_dispatch() {
+        let mut hook = VmObserveHook::new(Some(DISPATCHER), None);
+        let obs = hook.observations();
+        let mut cpu = Cpu::new(0);
+        let mut mem = Memory::new();
+
+        // VIP walks two straight-line sites, then branches to 0x2000; the loop
+        // back-edge re-takes the same branch so the edge is seen twice.
+        for vip in [0x1000_u64, 0x1004, 0x2000, 0x1004, 0x2000] {
+            dispatch(&mut hook, &mut cpu, &mut mem, vip);
+        }
+
+        let edges = &obs.borrow().branch_targets;
+        assert!(edges.contains(&(0x1004, 0x2000)), "observed the branch edge: {edges:?}");
+        // De-duped: the re-taken branch edge appears once.
+        assert_eq!(edges.iter().filter(|&&e| e == (0x1004, 0x2000)).count(), 1);
+
+        // Seeds into ObservedFacts as Observed-stamped branch targets.
+        let mut facts = ObservedFacts::new();
+        obs.borrow().seed_branch_targets(&mut facts);
+        assert!(
+            facts.branch_targets.iter().any(|b| b.site_vip == 0x1004 && b.target_vip == 0x2000),
+            "seeded branch target recorded",
+        );
     }
 }

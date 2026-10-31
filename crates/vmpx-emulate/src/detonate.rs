@@ -267,6 +267,7 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     }
     let vm = vm_handle.map(|h| {
         h.borrow().seed_loop_depth(&mut observed);
+        h.borrow().seed_branch_targets(&mut observed);
         h.borrow().clone()
     });
 
