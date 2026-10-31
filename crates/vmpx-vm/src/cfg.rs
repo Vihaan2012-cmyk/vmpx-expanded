@@ -491,23 +491,75 @@ fn has_havoc(expr: &Expr) -> bool {
         .any(|name| name.starts_with(HAVOC_PREFIX))
 }
 
-/// `a` holds every value `r` can take at this location. A generalized cell
-/// covers anything; any other cell covers only an identical expression free of
-/// generalized variables, whose meaning differs between iterations.
-fn covers(a: Option<&Expr>, r: Option<&Expr>) -> bool {
-    match (a, r) {
-        (None, None) => true,
-        (Some(a), _) if is_havoc(a) => true,
-        (Some(a), Some(r)) => a == r && !has_havoc(a),
-        _ => false,
+/// The bits a loop-carried generalized unknown may set: the full width for a
+/// bare havoc register (TOP), or the mask for a havoc register narrowed to a
+/// proven set of bits (`loop_havoc_… & m`). `None` for anything that is not a
+/// generalized unknown. The masked form carries a PROVEN-narrower domain for a
+/// loop-carried value through the widening so a dependent table index resolves.
+fn havoc_active_mask(expr: &Expr) -> Option<u64> {
+    if is_havoc(expr) {
+        return Some(expr.width.mask());
+    }
+    match &expr.kind {
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => match (&left.kind, &right.kind) {
+            (ExprKind::Register { name }, ExprKind::Const { value })
+            | (ExprKind::Const { value }, ExprKind::Register { name })
+                if name.starts_with(HAVOC_PREFIX) =>
+            {
+                Some(*value & expr.width.mask())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-/// Widens a differing loop-carried cell to a single canonical unknown named for
-/// its `(block, cell)` site — never a fresh name per pass. Idempotent: once a
-/// site is TOP it stays that exact name, so a re-widened state equals the prior
-/// one and the loop closes (abstract-interpretation widening to a fixpoint).
-/// Distinct sites get distinct names, so independent unknowns are never aliased.
+/// The bits `expr` can provably set within its width (its reachable one-bits),
+/// from static value-range analysis with no path facts. A sound
+/// over-approximation: every reachable value is a submask of this. Masks,
+/// shifts, extracts and small intervals prove bits zero; an opaque register or
+/// memory read proves nothing and returns the full width.
+fn reachable_ones(expr: &Expr) -> u64 {
+    expr.width.mask() & !value_range(expr).known_zero()
+}
+
+/// `a` holds every value `r` can take at this location. A generalized unknown
+/// covers any value whose reachable bits are a subset of the unknown's proven
+/// bits (a bare-TOP unknown covers everything); any other cell covers only an
+/// identical expression free of generalized variables, whose meaning differs
+/// between iterations.
+fn covers(a: Option<&Expr>, r: Option<&Expr>) -> bool {
+    match a {
+        None => r.is_none(),
+        Some(a) => match havoc_active_mask(a) {
+            Some(mask) => match r {
+                None => true,
+                Some(r) => a.width == r.width && reachable_ones(r) & !mask == 0,
+            },
+            None => matches!(r, Some(r) if a == r && !has_havoc(a)),
+        },
+    }
+}
+
+/// Widens a differing loop-carried cell to a canonical unknown named for its
+/// `(block, cell)` site — never a fresh name per pass. When both sides are
+/// provably confined to fewer bits than the full width (a value masked by a
+/// constant, a byte assigned only from a small set, a bounded accumulator), the
+/// unknown carries that proven bit-mask (`loop_havoc_… & m`) instead of going to
+/// full-range TOP, so a dependent multi-byte table index enumerates instead of
+/// blowing its domain cross-product. The mask is the union of each side's
+/// reachable bits, so it over-approximates every iteration (sound); when it
+/// cannot be proven narrower it stays the full-range bare register (fail-safe).
+///
+/// Idempotent: the mask grows monotonically toward the full width and the
+/// register name is fixed by site, so a re-widened state whose re-entry stays
+/// within the carried mask equals the prior one and the loop closes (abstract-
+/// interpretation widening to a fixpoint). Distinct sites get distinct names, so
+/// independent unknowns are never aliased.
 fn generalize(
     a: Option<&Expr>,
     r: Option<&Expr>,
@@ -526,10 +578,26 @@ fn generalize(
         (None, None) => return Ok(None),
     };
     *changed = true;
-    Ok(Some(Expr::register(
-        width,
-        format!("{HAVOC_PREFIX}{:x}_{cell}", key.0),
-    )))
+    let register = Expr::register(width, format!("{HAVOC_PREFIX}{:x}_{cell}", key.0));
+    // A cell already carrying a mask that failed to cover the re-entry: the mask
+    // is not an invariant, so go straight to full-range TOP rather than growing
+    // it a bit per revisit (which would exhaust the visit budget before closing).
+    if a.is_some_and(|a| havoc_active_mask(a).is_some()) {
+        return Ok(Some(register));
+    }
+    // Otherwise carry the proven mask (union of both sides' reachable bits) only
+    // when it is a narrow (<=16-bit) cell confined to 1..=4 live bits — a <=16
+    // value domain, the index-byte case that shrinks the table cross-product.
+    // Wider or all-zero masks barely narrow the byte yet make every loop state
+    // distinct from bare TOP, only churning visits, so they keep full-range TOP
+    // (fail-safe, and preserves the closing behaviour of converging loops).
+    let active = a.map_or(0, reachable_ones) | r.map_or(0, reachable_ones);
+    if width.bits() > 16 || !(1..=4).contains(&active.count_ones()) {
+        return Ok(Some(register));
+    }
+    Expr::binary(BinaryOp::And, register, Expr::constant(width, active))
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// A short, stable token for a memory site (its address), used only to name the
@@ -2594,5 +2662,71 @@ mod tests {
         let states = [loop_state(0, w64(0))];
         let incoming = loop_state(8, w64(0));
         assert!(fold_states(Va(0x1000), &states, &incoming).is_err());
+    }
+
+    fn byte_cell_state(cell: Expr) -> SymbolicVmInitialState {
+        SymbolicVmInitialState {
+            context_values: BTreeMap::from([(8, cell)]),
+            ..SymbolicVmInitialState::default()
+        }
+    }
+
+    #[test]
+    fn provably_masked_loop_byte_keeps_a_narrow_domain_through_widening() {
+        // A loop-carried byte re-masked to its low bits each iteration
+        // (`x & 0x0f`) is provably confined to [0, 15]. Widening must carry that
+        // proven mask instead of widening to the full [0, 0xffff] TOP, so a table
+        // index built from it enumerates instead of overflowing its domain.
+        let w = BitWidth::W16;
+        let masked = |name: &str| {
+            Expr::binary(BinaryOp::And, Expr::register(w, name), Expr::constant(w, 0x0f))
+                .expect("same width")
+        };
+        let widened = widen_state(
+            Va(0x2000),
+            &byte_cell_state(masked("a")),
+            &byte_cell_state(masked("b")),
+        )
+        .expect("widens")
+        .expect("the byte differs between iterations");
+        let cell = widened.context_values[&8].clone();
+        // The generalized unknown carries the proven 4-bit mask, not full width.
+        assert_eq!(havoc_active_mask(&cell), Some(0x0f));
+        // A third value within the mask is covered: the narrow unknown is a
+        // fixpoint, so the loop closes without widening to full range.
+        assert!(matches!(
+            widen_state(Va(0x2000), &widened, &byte_cell_state(masked("c"))),
+            Ok(None)
+        ));
+        // The dependent index now has a 16-value domain (the submasks of 0x0f),
+        // small enough to enumerate, rather than the full 256-value byte.
+        let index =
+            Expr::binary(BinaryOp::Mul, cell, Expr::constant(w, 0x10)).expect("same width");
+        let inferred = infer_branch_input_domains(&index, InputDomainLimits::default())
+            .expect("a masked byte is a bounded input domain");
+        assert!(
+            inferred.domains.values().all(|values| values.len() <= 16),
+            "a 4-bit-masked index byte must not enumerate the full 256-value range"
+        );
+    }
+
+    #[test]
+    fn unprovable_loop_byte_widens_to_full_range_fail_safe() {
+        // A loop-carried byte with no provable bound (an opaque value that is not
+        // masked) must keep the full-range bare-TOP widening: narrowing it would
+        // drop reachable values and miss real branch targets (unsound). A branch
+        // over the full-range unknown fails closed.
+        let w = BitWidth::W16;
+        let widened = widen_state(
+            Va(0x3000),
+            &byte_cell_state(Expr::register(w, "p")),
+            &byte_cell_state(Expr::register(w, "q")),
+        )
+        .expect("widens")
+        .expect("the byte differs between iterations");
+        let cell = &widened.context_values[&8];
+        // No mask could be proven, so the cell stays a bare full-width unknown.
+        assert!(is_havoc(cell));
+        assert_eq!(havoc_active_mask(cell), Some(w.mask()));
     }
 }
