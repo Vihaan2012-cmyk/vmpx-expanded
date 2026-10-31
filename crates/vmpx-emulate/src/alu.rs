@@ -125,13 +125,15 @@ pub fn shift(kind: Shift, a: u64, count: u64, bytes: u32) -> Option<(u64, Flags)
     if c == 0 {
         return None;
     }
-    // Per Intel SDM, CF is undefined for SHL/SHR when the count reaches the
-    // operand width; for SAR the last bit shifted out is always the sign bit,
-    // so CF stays defined for every nonzero count.
-    let in_range = c <= bits;
+    // Intel marks CF "undefined" for SHL/SHR once the count reaches the operand
+    // width, but the hardware result is deterministic (and VMProtect's mutator
+    // relies on it): a shift register that has pushed out every original bit
+    // carries a 0, so CF == 0 for a count past the width. We model that exact
+    // value. SAR shifts in the sign bit, so its CF is the sign bit for any
+    // count at/over the width.
     let (res, cf) = match kind {
-        Shift::Shl => ((a << c) & m, in_range.then(|| bit(a, bits - c))),
-        Shift::Shr => (a >> c, in_range.then(|| bit(a, c - 1))),
+        Shift::Shl => ((a << c) & m, Some(if c <= bits { bit(a, bits - c) } else { 0 })),
+        Shift::Shr => (a >> c, Some(if c <= bits { bit(a, c - 1) } else { 0 })),
         Shift::Sar => {
             let sa = ((a << (64 - bits)) as i64) >> (64 - bits);
             (((sa >> c.min(63)) as u64) & m, Some(bit(sa as u64, (c - 1).min(63))))
@@ -387,6 +389,15 @@ mod tests {
         assert_eq!(f.undef, AF);
         let (_, f) = shift(Shift::Shr, 5, 3, 4).unwrap();
         assert_eq!(f.undef, AF | OF);
+        // Count past the operand width: result shifted fully out, CF a defined 0
+        // (exact silicon behaviour), only OF/AF left undefined.
+        let (r, f) = shift(Shift::Shl, 0xFF, 9, 1).unwrap();
+        assert_eq!(r, 0);
+        assert_eq!(f.val & CF, 0);
+        assert_eq!(f.undef, AF | OF);
+        let (r, f) = shift(Shift::Shr, 0xFF, 12, 1).unwrap();
+        assert_eq!(r, 0);
+        assert_eq!(f.undef & CF, 0, "CF defined past width");
     }
 
     #[test]

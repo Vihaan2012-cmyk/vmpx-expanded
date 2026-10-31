@@ -106,10 +106,11 @@ fn partial_register_writes() {
 
 #[test]
 fn unsupported_stops_cleanly() {
-    let mut e = emu(&[0x0f, 0xa2]);
+    // movaps xmm0, xmm1 (0F 28 C1): XMM state is unmodeled, so it stops cleanly.
+    let mut e = emu(&[0x0f, 0x28, 0xc1]);
     e.cpu.regs[0] = 7;
     let before = e.cpu.clone();
-    assert_eq!(e.step(), Err(Stop::Unsupported { rip: CODE, mnemonic: M::Cpuid }));
+    assert_eq!(e.step(), Err(Stop::Unsupported { rip: CODE, mnemonic: M::Movaps }));
     assert_eq!(e.cpu, before);
     assert!(e.trace.is_empty());
 }

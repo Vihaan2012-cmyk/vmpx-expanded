@@ -432,3 +432,127 @@ fn carry_flag_controls() {
     }));
     assert!(!e.cpu.flag(CF));
 }
+
+#[test]
+fn rdtsc_is_monotonic_and_deterministic() {
+    // Two reads with work between them: the second tick is strictly larger
+    // (EAX low dword; EDX stays 0 within the budget). Capture the first in R8D.
+    let code = asm(|a| {
+        a.rdtsc().unwrap();
+        a.mov(r8d, eax).unwrap();
+        a.nop().unwrap();
+        a.nop().unwrap();
+        a.rdtsc().unwrap();
+        a.nop().unwrap();
+    });
+    let e1 = run(&code);
+    let first = e1.cpu.regs[8] & 0xffff_ffff;
+    let second = e1.cpu.regs[0] & 0xffff_ffff;
+    assert!(second > first, "tsc monotonic: {second} > {first}");
+    assert_eq!(e1.cpu.regs[2] & 0xffff_ffff, 0, "EDX high dword 0 in-budget");
+    // Deterministic: an independent run yields identical ticks (no host clock).
+    let e2 = run(&code);
+    assert_eq!(e2.cpu.regs[8] & 0xffff_ffff, first);
+    assert_eq!(e2.cpu.regs[0] & 0xffff_ffff, second);
+}
+
+#[test]
+fn cpuid_fixed_signature() {
+    // Leaf 0: "GenuineIntel" vendor string in EBX/EDX/ECX, max leaf in EAX.
+    let e = run(&asm(|a| {
+        a.mov(eax, 0).unwrap();
+        a.cpuid().unwrap();
+        a.nop().unwrap();
+    }));
+    assert_eq!(e.cpu.regs[3] & 0xffff_ffff, 0x756e_6547); // EBX "Genu"
+    assert_eq!(e.cpu.regs[1] & 0xffff_ffff, 0x6c65_746e); // ECX "ntel"
+    assert_eq!(e.cpu.regs[2] & 0xffff_ffff, 0x4965_6e69); // EDX "ineI"
+    assert_eq!(e.cpu.regs[0] & 0xffff_ffff, 0x16); // EAX max standard leaf
+    // Leaf 1: SSE2 advertised (EDX bit 26), no AVX/SSE4 (ECX == 0).
+    let e = run(&asm(|a| {
+        a.mov(eax, 1).unwrap();
+        a.cpuid().unwrap();
+        a.nop().unwrap();
+    }));
+    assert_ne!(e.cpu.regs[2] & (1 << 26), 0, "SSE2 feature bit set");
+    assert_eq!(e.cpu.regs[1] & 0xffff_ffff, 0, "ECX feature set empty (no AVX)");
+}
+
+#[test]
+fn shrd_16bit_overwidth_is_undefined_not_unsupported() {
+    // `shrd dx, cx, 30` (66 0f ac ca 1e): the imm masks (mod 32) to 30 >= 16, a
+    // 16-bit count past the operand width. The matching VMProtect form used to
+    // fail closed as Unsupported; now it retires with the destination unchanged
+    // and the status flags left undefined (bsf/bsr convention).
+    let mut e = emu_bytes(&[0x66, 0x0f, 0xac, 0xca, 0x1e, 0x90]);
+    e.cpu.regs[2] = 0x1234; // DX
+    e.cpu.regs[1] = 0xFFFF; // CX
+    assert_eq!(e.run_until(CODE + 5, 10), Stop::Reached, "retired, not Unsupported");
+    assert_eq!(e.cpu.regs[2] & 0xffff, 0x1234, "destination preserved");
+    // A consumer of a status flag it left undefined must then stop.
+    let mut e = emu_bytes(&[0x66, 0x0f, 0xac, 0xca, 0x1e, 0x70, 0x00]); // + jo
+    assert!(matches!(e.run(10), Stop::UndefinedFlags { .. }));
+}
+
+#[test]
+fn bswap_16bit_is_undefined_not_unsupported() {
+    // `bswap ax` (66 0f c8) is architecturally undefined; model it as a no-op
+    // (destination unchanged) rather than stopping. 32-bit bswap still swaps.
+    let mut e = emu_bytes(&[0x66, 0x0f, 0xc8, 0x90]);
+    e.cpu.regs[0] = 0x1234; // AX
+    assert_eq!(e.run_until(CODE + 3, 10), Stop::Reached);
+    assert_eq!(e.cpu.regs[0] & 0xffff, 0x1234, "16-bit bswap leaves dest unchanged");
+    let e = run(&asm(|a| {
+        a.mov(eax, 0x1122_3344u32).unwrap();
+        a.bswap(eax).unwrap();
+        a.nop().unwrap();
+    }));
+    assert_eq!(e.cpu.regs[0] & 0xffff_ffff, 0x4433_2211);
+}
+
+#[test]
+fn shift_past_width_defines_carry_as_zero() {
+    // `shl al, cl` with CL=9 (> 8-bit width): result 0 and CF is a defined 0 on
+    // real silicon, so a CF consumer (adc) must NOT stop on an undefined flag.
+    let e = run(&asm(|a| {
+        a.mov(al, 0xFFu32).unwrap();
+        a.mov(cl, 9u32).unwrap();
+        a.shl(al, cl).unwrap();
+        a.mov(bl, 5u32).unwrap();
+        a.adc(bl, 0u32).unwrap(); // bl = 5 + CF; stops if CF were undefined
+        a.nop().unwrap();
+    }));
+    assert_eq!(e.cpu.regs[0] & 0xff, 0, "shifted fully out");
+    assert!(!e.cpu.flag(CF), "CF defined as 0");
+    assert_eq!(e.cpu.regs[3] & 0xff, 5, "adc saw CF=0");
+}
+
+#[test]
+fn cmc_propagates_undefined_carry() {
+    // `bsf` leaves CF undefined; `cmc` is a pure CF->!CF transform, so it must
+    // propagate the undefinedness (not invent a value) and not stop. A later
+    // real consumer (jc) still stops.
+    let code = asm(|a| {
+        a.mov(eax, 1u32).unwrap();
+        a.bsf(ebx, eax).unwrap(); // CF undefined
+        a.cmc().unwrap(); // propagates: no stop
+        a.stc().unwrap(); // redefines CF
+        a.nop().unwrap();
+    });
+    // Runs to completion: cmc did not fail closed, stc re-defined CF.
+    let mut e = emu_bytes(&code);
+    assert_eq!(e.run_until(CODE + code.len() as u64 - 1, 50), Stop::Reached);
+    assert!(e.cpu.flag(CF));
+    // But a consumer reading CF straight after the propagating cmc stops.
+    let code = asm(|a| {
+        let mut l = a.create_label();
+        a.mov(eax, 1u32).unwrap();
+        a.bsf(ebx, eax).unwrap();
+        a.cmc().unwrap();
+        a.jc(l).unwrap(); // reads the still-undefined CF
+        a.set_label(&mut l).unwrap();
+        a.nop().unwrap();
+    });
+    let mut e = emu_bytes(&code);
+    assert!(matches!(e.run(50), Stop::UndefinedFlags { mask, .. } if mask == CF));
+}

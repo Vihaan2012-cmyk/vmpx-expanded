@@ -607,11 +607,13 @@ impl Emulator {
                 let src = self.read_op(ins, 1, n)?;
                 let cnt = (self.read_op(ins, 2, 1)? & if n == 8 { 63 } else { 31 }) as u32;
                 if cnt >= bits {
-                    // Count beyond the operand width (only reachable for 16-bit)
-                    // is architecturally undefined — fail closed.
-                    return Err(self.unsup());
-                }
-                if cnt != 0 {
+                    // Count beyond the operand width (only reachable for 16-bit,
+                    // whose count still masks mod 32) leaves both the result and
+                    // the status flags architecturally undefined; VMProtect emits
+                    // these as junk. Match the bsf/bsr convention: destination
+                    // unchanged, status group flagged undefined.
+                    self.apply(Flags { def: 0, val: 0, undef: STATUS });
+                } else if cnt != 0 {
                     let (r, fl) = alu::dshift(mn == Mnemonic::Shld, dest, src, cnt, n);
                     self.write_op(ins, 0, n, r)?;
                     self.apply(fl);
@@ -676,14 +678,45 @@ impl Emulator {
                 self.cpu.regs[RSP] = bp.wrapping_add(8);
                 self.cpu.regs[RBP] = v;
             }
+            // Deterministic offline environment layer: no host clock or real
+            // CPU is consulted, so detonation is repeatable. See `tsc`/`cpuid`.
+            Mnemonic::Rdtsc => {
+                let t = self.tsc();
+                self.cpu.set_reg(Register::EAX, t & 0xffff_ffff);
+                self.cpu.set_reg(Register::EDX, t >> 32);
+            }
+            Mnemonic::Rdtscp => {
+                let t = self.tsc();
+                self.cpu.set_reg(Register::EAX, t & 0xffff_ffff);
+                self.cpu.set_reg(Register::EDX, t >> 32);
+                self.cpu.set_reg(Register::ECX, TSC_AUX);
+            }
+            Mnemonic::Cpuid => {
+                let leaf = self.cpu.regs[RAX] & 0xffff_ffff;
+                let sub = self.cpu.regs[RCX] & 0xffff_ffff;
+                let (a, b, c, d) = cpuid(leaf, sub);
+                self.cpu.set_reg(Register::EAX, a);
+                self.cpu.set_reg(Register::EBX, b);
+                self.cpu.set_reg(Register::ECX, c);
+                self.cpu.set_reg(Register::EDX, d);
+            }
             Mnemonic::Bswap => {
                 let n = self.op_bytes(ins, 0)?;
-                if n != 4 && n != 8 {
-                    return Err(self.unsup());
+                match n {
+                    4 => {
+                        let v = self.read_op(ins, 0, n)?;
+                        self.write_op(ins, 0, n, u64::from((v as u32).swap_bytes()))?;
+                    }
+                    8 => {
+                        let v = self.read_op(ins, 0, n)?;
+                        self.write_op(ins, 0, n, v.swap_bytes())?;
+                    }
+                    // bswap r16 is architecturally undefined (it does not touch
+                    // flags); VMProtect emits it as junk. Destination left
+                    // unchanged, matching the bsf/bsr undefined-result convention.
+                    2 => {}
+                    _ => return Err(self.unsup()),
                 }
-                let v = self.read_op(ins, 0, n)?;
-                let r = if n == 4 { u64::from((v as u32).swap_bytes()) } else { v.swap_bytes() };
-                self.write_op(ins, 0, n, r)?;
             }
             // Bulk flag save/restore: pushfq copies the concrete flag image (as
             // hardware does); it does not stop on an undefined bit. Only a
@@ -720,11 +753,16 @@ impl Emulator {
             Mnemonic::Clc => self.apply(Flags { def: CF, val: 0, undef: 0 }),
             Mnemonic::Stc => self.apply(Flags { def: CF, val: CF, undef: 0 }),
             Mnemonic::Cmc => {
-                if self.cpu.undef_flags & CF != 0 {
-                    return Err(Stop::UndefinedFlags { rip: self.cur.0, mask: CF });
+                // Pure CF -> !CF. When CF is architecturally undefined (e.g. a
+                // VMProtect junk `bsf`/over-width shift feeds it), complementing
+                // it yields an equally-undefined CF, so propagate that undefined
+                // state rather than inventing a value: a later real consumer
+                // (jcc/adc/sbb/setcc/cmovcc) still stops on it, but a sequence
+                // that overwrites CF first sails through as on hardware.
+                if self.cpu.undef_flags & CF == 0 {
+                    let v = if self.cpu.flag(CF) { 0 } else { CF };
+                    self.apply(Flags { def: CF, val: v, undef: 0 });
                 }
-                let v = if self.cpu.flag(CF) { 0 } else { CF };
-                self.apply(Flags { def: CF, val: v, undef: 0 });
             }
             Mnemonic::Cld => self.cpu.rflags &= !DF,
             Mnemonic::Std => self.cpu.rflags |= DF,
@@ -773,6 +811,16 @@ impl Emulator {
             _ => return Err(self.unsup()),
         }
         Ok(next)
+    }
+
+    /// Deterministic, monotonic timestamp counter: the retired-instruction
+    /// index scaled by a fixed stride. No host clock is read, so a given run
+    /// always yields the same sequence; because each read is its own retired
+    /// step, two reads are strictly increasing (a positive delta for code that
+    /// times itself). The value fits comfortably in EAX across the step budget,
+    /// so EDX reads back 0.
+    fn tsc(&self) -> u64 {
+        self.trace.len() as u64 * TSC_STRIDE
     }
 
     fn push64(&mut self, v: u64) -> Result<(), Stop> {
@@ -946,6 +994,31 @@ fn alu_sext(v: u64, bytes: u32) -> u64 {
     } else {
         let sh = 64 - bytes * 8;
         (((v << sh) as i64) >> sh) as u64
+    }
+}
+
+/// `rdtsc` tick per retired instruction (see [`Emulator::tsc`]).
+const TSC_STRIDE: u64 = 64;
+/// Fixed `rdtscp` processor id written to ECX (single generic core).
+const TSC_AUX: u64 = 0;
+
+/// Fixed, deterministic `cpuid` signature: a generic `GenuineIntel` family-6
+/// processor advertising only the x87/TSC/CMOV/MMX/SSE/SSE2 baseline (no
+/// AVX/SSE4), so the protector's `cpuid` gate takes one definite path and no
+/// feature we cannot model is claimed. Returns `(EAX, EBX, ECX, EDX)`.
+///
+/// - leaf 0: max standard leaf + vendor string `GenuineIntel`.
+/// - leaf 1: version `0x000606A7`; EDX = FPU|TSC|MSR|CMOV|MMX|FXSR|SSE|SSE2.
+/// - leaf `0x8000_0000`: max extended leaf.
+/// - leaf `0x8000_0001`: EDX = SYSCALL | Long-Mode (64-bit capable).
+/// - any other leaf/subleaf: all zero.
+fn cpuid(leaf: u64, _sub: u64) -> (u64, u64, u64, u64) {
+    match leaf {
+        0x0 => (0x16, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+        0x1 => (0x0006_06a7, 0, 0, 0x0780_8031),
+        0x8000_0000 => (0x8000_0001, 0, 0, 0),
+        0x8000_0001 => (0, 0, 0, 0x2000_0800),
+        _ => (0, 0, 0, 0),
     }
 }
 
