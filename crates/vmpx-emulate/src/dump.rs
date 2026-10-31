@@ -25,7 +25,7 @@
 //! [`Observed`](crate::Observed) by the collector methods, so the static side
 //! always treats them as one observed path, never as sound output.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -46,6 +46,12 @@ const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+const MEMO_SIZE: usize = 256;
+
+fn memo_slot(page: u64) -> usize {
+    (page >> 12) as usize & (MEMO_SIZE - 1)
+}
+
 fn page_base(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
 }
@@ -60,6 +66,10 @@ pub struct OepHook {
     facts: Rc<RefCell<ObservedFacts>>,
     /// Page bases written at least once this run.
     written: Rc<RefCell<BTreeSet<u64>>>,
+    /// Direct-mapped memo of `written` membership: `(page base, is written)`.
+    /// `mark_written` overwrites the slot of every page it inserts, so a cached
+    /// verdict is never stale (pages are only ever added, never removed).
+    memo: [Cell<(u64, bool)>; MEMO_SIZE],
     inner: Option<Box<dyn Hook>>,
     /// Stop the run the moment the OEP is detected (default); otherwise keep
     /// running so later behaviour can still be observed.
@@ -82,7 +92,13 @@ impl OepHook {
     /// Record OEP into an existing (possibly shared) [`ObservedFacts`].
     #[must_use]
     pub fn with_facts(facts: Rc<RefCell<ObservedFacts>>) -> Self {
-        Self { facts, written: Rc::new(RefCell::new(BTreeSet::new())), inner: None, stop_on_oep: true }
+        Self {
+            facts,
+            written: Rc::new(RefCell::new(BTreeSet::new())),
+            memo: std::array::from_fn(|_| Cell::new((u64::MAX, false))),
+            inner: None,
+            stop_on_oep: true,
+        }
     }
 
     /// Wrap an inner hook (e.g. [`WinApiHook`](crate::WinApiHook)) so both run
@@ -112,12 +128,30 @@ impl OepHook {
         self.facts.borrow().oep
     }
 
+    fn is_written(&self, page: u64) -> bool {
+        let slot = &self.memo[memo_slot(page)];
+        let (tag, hit) = slot.get();
+        if tag == page {
+            return hit;
+        }
+        let hit = self.written.borrow().contains(&page);
+        slot.set((page, hit));
+        hit
+    }
+
     fn mark_written(&self, addr: u64, size: u32) {
-        let mut w = self.written.borrow_mut();
         let end = addr.saturating_add(u64::from(size.max(1)));
+        // Entirely inside a page already known written: nothing new to insert.
+        if self.memo[memo_slot(page_base(addr))].get() == (page_base(addr), true)
+            && end <= page_base(addr).saturating_add(PAGE_SIZE)
+        {
+            return;
+        }
+        let mut w = self.written.borrow_mut();
         let mut p = page_base(addr);
         while p < end {
             w.insert(p);
+            self.memo[memo_slot(p)].set((p, true));
             match p.checked_add(PAGE_SIZE) {
                 Some(n) => p = n,
                 None => break,
@@ -145,9 +179,9 @@ impl Hook for OepHook {
         // UPX writes a `cld` into its TLS-dispatch stub) and then branches
         // within it, which would otherwise read as a spurious OEP inside the
         // packer stub rather than in the decompressed image.
-        if self.facts.borrow().oep.is_none()
-            && page_base(ev.from) != page_base(ev.to)
-            && self.written.borrow().contains(&page_base(ev.to))
+        if page_base(ev.from) != page_base(ev.to)
+            && self.facts.borrow().oep.is_none()
+            && self.is_written(page_base(ev.to))
         {
             self.facts.borrow_mut().set_oep(ev.to);
             if self.stop_on_oep {
@@ -506,5 +540,43 @@ mod rebuild_tests {
         dump.regions.retain(|r| r.va != BASE); // drop the headers
         let err = rebuild_module_pe(&dump, SIZE_OF_IMAGE).expect_err("no headers => error");
         assert!(matches!(err, RebuildModuleError::MissingHeaders { image_base } if image_base == BASE));
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use crate::emu::FlowKind;
+
+    const A: u64 = 0x10_000;
+    const B: u64 = 0x20_000;
+
+    fn flow(from: u64, to: u64) -> FlowEvent {
+        FlowEvent { kind: FlowKind::Jmp, from, to, next: 0 }
+    }
+
+    /// A page first queried as unwritten (negative verdict memoized) must be
+    /// seen as written once a write lands on it.
+    #[test]
+    fn write_after_cached_negative_is_detected() {
+        let mut hook = OepHook::new();
+        let (mut cpu, mut mem) = (Cpu::new(0), Memory::new());
+        assert_eq!(hook.on_flow(&flow(A, B), &mut cpu, &mut mem), HookAction::Continue);
+        let w = MemEvent { addr: B + 8, size: 8, access: Access::Write, value: Some(0) };
+        hook.on_mem(&w, &mut cpu, &mut mem);
+        assert_eq!(hook.on_flow(&flow(A, B), &mut cpu, &mut mem), HookAction::Stop);
+        assert_eq!(hook.oep(), Some(B));
+    }
+
+    /// A write spilling into the next page marks both, even when the first page
+    /// was already memoized as written.
+    #[test]
+    fn straddling_write_marks_second_page() {
+        let mut hook = OepHook::new();
+        let (mut cpu, mut mem) = (Cpu::new(0), Memory::new());
+        let w = |addr| MemEvent { addr, size: 8, access: Access::Write, value: Some(0) };
+        hook.on_mem(&w(B), &mut cpu, &mut mem);
+        hook.on_mem(&w(B + PAGE_SIZE - 4), &mut cpu, &mut mem);
+        assert_eq!(hook.on_flow(&flow(A, B + PAGE_SIZE), &mut cpu, &mut mem), HookAction::Stop);
     }
 }

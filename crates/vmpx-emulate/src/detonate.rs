@@ -257,8 +257,10 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     // is an observed/quarantined-tier concretization confined to this contained,
     // in-model run; it never affects sound static output.
     emu.resolve_undefined_flags = opts.resolve_undefined_flags;
+    // Only the retired count is consumed; skip the per-step trace allocation.
+    emu.record_trace = false;
     let stop = emu.run_until(sentinel, opts.max_steps);
-    let steps = emu.trace.len();
+    let steps = emu.steps() as usize;
 
     let mut observed = facts.borrow().clone();
     if !opts.capture_globals.is_empty() {

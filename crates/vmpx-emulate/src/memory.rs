@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -56,16 +57,59 @@ struct Page {
     perm: Perm,
 }
 
+/// Direct-mapped page lookup cache size (entries).
+const TLB_SIZE: usize = 256;
+/// Tag that matches no page base (bases are page aligned, so never all-ones).
+const TLB_EMPTY: u64 = u64::MAX;
+
 /// Sparse paged guest memory; unmapped addresses fault.
-#[derive(Default)]
+///
+/// Pages live in an append-only slab (`slab`); `index` maps base -> slab slot
+/// in address order. Pages are never unmapped, so a cached `(base, slot)` in
+/// `tlb` can never go stale; permissions are read from the slab on each
+/// access, so a reprotect is seen immediately.
 pub struct Memory {
-    pages: BTreeMap<u64, Page>,
+    index: BTreeMap<u64, u32>,
+    slab: Vec<Page>,
+    tlb: [Cell<(u64, u32)>; TLB_SIZE],
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            index: BTreeMap::new(),
+            slab: Vec::new(),
+            tlb: std::array::from_fn(|_| Cell::new((TLB_EMPTY, 0))),
+        }
+    }
 }
 
 impl Memory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    fn slot(&self, base: u64) -> Option<usize> {
+        let e = &self.tlb[(base >> 12) as usize & (TLB_SIZE - 1)];
+        let (tag, idx) = e.get();
+        if tag == base {
+            return Some(idx as usize);
+        }
+        let idx = *self.index.get(&base)?;
+        e.set((base, idx));
+        Some(idx as usize)
+    }
+
+    #[inline]
+    fn page(&self, base: u64) -> Option<&Page> {
+        self.slot(base).map(|i| &self.slab[i])
+    }
+
+    #[inline]
+    fn page_mut(&mut self, base: u64) -> Option<&mut Page> {
+        self.slot(base).map(|i| &mut self.slab[i])
     }
 
     /// Map zeroed pages over `[addr, addr+len)`; both must be page aligned.
@@ -80,13 +124,14 @@ impl Memory {
             return Err(MapError::Empty);
         }
         let end = addr.checked_add(len).ok_or(MapError::Overflow)?;
-        if self.pages.range(addr..end).next().is_some() {
+        if self.index.range(addr..end).next().is_some() {
             return Err(MapError::Overlap);
         }
         let mut a = addr;
         while a < end {
             let data = vec![0u8; PAGE_SIZE as usize].into_boxed_slice();
-            self.pages.insert(a, Page { data, perm });
+            self.index.insert(a, self.slab.len() as u32);
+            self.slab.push(Page { data, perm });
             a += PAGE_SIZE;
         }
         Ok(())
@@ -99,7 +144,7 @@ impl Memory {
         let mut a = addr;
         while a < end {
             let base = a & !PAGE_MASK;
-            match self.pages.get(&base) {
+            match self.page(base) {
                 Some(p) if p.perm.contains(need) => {}
                 _ => return Err(fault(a)),
             }
@@ -118,7 +163,7 @@ impl Memory {
             let base = a & !PAGE_MASK;
             let off = (a - base) as usize;
             let n = (PAGE_SIZE as usize - off).min(buf.len() - done);
-            let page = &self.pages[&base];
+            let page = self.page(base).expect("checked");
             buf[done..done + n].copy_from_slice(&page.data[off..off + n]);
             done += n;
             a = a.wrapping_add(n as u64);
@@ -132,7 +177,7 @@ impl Memory {
             let base = a & !PAGE_MASK;
             let off = (a - base) as usize;
             let n = (PAGE_SIZE as usize - off).min(data.len() - done);
-            let page = self.pages.get_mut(&base).expect("checked");
+            let page = self.page_mut(base).expect("checked");
             page.data[off..off + n].copy_from_slice(&data[done..done + n]);
             done += n;
             a = a.wrapping_add(n as u64);
@@ -142,6 +187,16 @@ impl Memory {
     /// # Errors
     /// Faults if any byte is unmapped or not readable.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
+        if !buf.is_empty() && off + buf.len() <= PAGE_SIZE as usize {
+            return match self.page(addr & !PAGE_MASK) {
+                Some(p) if p.perm.contains(Perm::R) => {
+                    buf.copy_from_slice(&p.data[off..off + buf.len()]);
+                    Ok(())
+                }
+                _ => Err(MemFault { addr, access: Access::Read }),
+            };
+        }
         self.check(addr, buf.len(), Access::Read)?;
         self.copy_out(addr, buf);
         Ok(())
@@ -152,6 +207,16 @@ impl Memory {
     /// # Errors
     /// Faults if any byte is unmapped or not writable; nothing is written then.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), MemFault> {
+        let off = (addr & PAGE_MASK) as usize;
+        if !data.is_empty() && off + data.len() <= PAGE_SIZE as usize {
+            return match self.page_mut(addr & !PAGE_MASK) {
+                Some(p) if p.perm.contains(Perm::W) => {
+                    p.data[off..off + data.len()].copy_from_slice(data);
+                    Ok(())
+                }
+                _ => Err(MemFault { addr, access: Access::Write }),
+            };
+        }
         self.check(addr, data.len(), Access::Write)?;
         self.copy_in(addr, data);
         Ok(())
@@ -167,7 +232,7 @@ impl Memory {
         let mut a = addr;
         while a < end {
             let base = a & !PAGE_MASK;
-            if !self.pages.contains_key(&base) {
+            if !self.index.contains_key(&base) {
                 return Err(fault(a));
             }
             match base.checked_add(PAGE_SIZE) {
@@ -195,6 +260,21 @@ impl Memory {
         Err(MemFault { addr, access: Access::Exec })
     }
 
+    /// The 15 bytes at `addr` straight from the page, when they lie within one
+    /// executable page (the common instruction-fetch case). `None` otherwise;
+    /// the caller then uses [`Memory::fetch`], which handles page crossings and
+    /// short executable prefixes identically.
+    #[inline]
+    #[must_use]
+    pub fn fetch15(&self, addr: u64) -> Option<&[u8]> {
+        let off = (addr & PAGE_MASK) as usize;
+        if off + 15 > PAGE_SIZE as usize {
+            return None;
+        }
+        let p = self.page(addr & !PAGE_MASK)?;
+        p.perm.contains(Perm::X).then(|| &p.data[off..off + 15])
+    }
+
     /// Little-endian read of 1, 2, 4 or 8 bytes.
     ///
     /// # Errors
@@ -216,13 +296,16 @@ impl Memory {
     /// Enumerate mapped pages in ascending address order as `(base, perm,
     /// bytes)`. Read-only view used to snapshot the guest image.
     pub fn pages(&self) -> impl Iterator<Item = (u64, Perm, &[u8])> {
-        self.pages.iter().map(|(&base, p)| (base, p.perm, &p.data[..]))
+        self.index.iter().map(|(&base, &i)| {
+            let p = &self.slab[i as usize];
+            (base, p.perm, &p.data[..])
+        })
     }
 
     /// Permission of the page containing `addr`, or `None` if unmapped.
     #[must_use]
     pub fn perm_at(&self, addr: u64) -> Option<Perm> {
-        self.pages.get(&(addr & !PAGE_MASK)).map(|p| p.perm)
+        self.page(addr & !PAGE_MASK).map(|p| p.perm)
     }
 
     /// Change the permission of every page overlapping `[addr, addr+len)` to
@@ -240,7 +323,7 @@ impl Memory {
         let end = addr.checked_add(len).ok_or_else(|| fault(addr))?;
         let mut a = base;
         while a < end {
-            match self.pages.get_mut(&a) {
+            match self.page_mut(a) {
                 Some(p) => p.perm = perm,
                 None => return Err(fault(a)),
             }
@@ -250,5 +333,59 @@ impl Memory {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: u64 = 0x4000;
+
+    /// Reprotecting a page the lookup cache already holds takes effect at once.
+    #[test]
+    fn protect_is_seen_through_the_page_cache() {
+        let mut m = Memory::new();
+        m.map(A, PAGE_SIZE, Perm::RW).unwrap();
+        m.write_uint(A, 8, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(m.read_uint(A, 8).unwrap(), 0x1122_3344_5566_7788);
+        m.protect(A, PAGE_SIZE, Perm::R).unwrap();
+        assert_eq!(m.write_uint(A, 8, 0).unwrap_err(), MemFault { addr: A, access: Access::Write });
+        assert_eq!(m.fetch15(A), None, "not executable");
+        m.protect(A, PAGE_SIZE, Perm::RX).unwrap();
+        assert_eq!(m.fetch15(A).map(<[u8]>::len), Some(15));
+    }
+
+    /// A page-crossing access faults on the first bad byte, and only commits
+    /// when every page allows it; in-page and slow paths agree.
+    #[test]
+    fn page_crossing_access_is_all_or_nothing() {
+        let mut m = Memory::new();
+        m.map(A, PAGE_SIZE, Perm::RW).unwrap();
+        m.map(A + PAGE_SIZE * 2, PAGE_SIZE, Perm::RW).unwrap();
+        let edge = A + PAGE_SIZE - 4;
+        assert_eq!(m.write_uint(edge, 8, u64::MAX).unwrap_err().addr, A + PAGE_SIZE);
+        assert_eq!(m.read_uint(edge, 4).unwrap(), 0, "nothing was written");
+        m.map(A + PAGE_SIZE, PAGE_SIZE, Perm::RW).unwrap();
+        m.write_uint(edge, 8, 0x0807_0605_0403_0201).unwrap();
+        assert_eq!(m.read_uint(edge, 8).unwrap(), 0x0807_0605_0403_0201);
+        assert_eq!(m.read_uint(A + PAGE_SIZE, 4).unwrap(), 0x0807_0605);
+        assert_eq!(m.read_uint(0x9000, 1).unwrap_err(), MemFault { addr: 0x9000, access: Access::Read });
+        assert!(m.read(0x9000, &mut []).is_ok(), "empty read never faults");
+    }
+
+    /// Executable bytes within a page match the page-crossing `fetch` result.
+    #[test]
+    fn fetch15_agrees_with_fetch() {
+        let mut m = Memory::new();
+        m.map(A, PAGE_SIZE, Perm::RX).unwrap();
+        let pat: Vec<u8> = (0..=255u8).cycle().take(PAGE_SIZE as usize).collect();
+        m.poke(A, &pat).unwrap();
+        for off in [0u64, 1, 100, PAGE_SIZE - 15] {
+            let mut buf = [0u8; 15];
+            assert_eq!(m.fetch(A + off, &mut buf).unwrap(), 15);
+            assert_eq!(m.fetch15(A + off).unwrap(), &buf);
+        }
+        assert_eq!(m.fetch15(A + PAGE_SIZE - 14), None, "crossing the page end");
     }
 }

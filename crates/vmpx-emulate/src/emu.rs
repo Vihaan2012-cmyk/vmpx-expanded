@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use iced_x86::{
     Code, ConditionCode, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
     Register,
@@ -125,6 +123,9 @@ pub struct Emulator {
     pub cpu: Cpu,
     pub mem: Memory,
     pub trace: Vec<TraceEntry>,
+    /// Record a [`TraceEntry`] per retired instruction (default). Long runs
+    /// that only need the count turn this off and read [`Emulator::steps`].
+    pub record_trace: bool,
     pub hook: Option<Box<dyn Hook>>,
     pub observe: ObserveConfig,
     /// DETONATION-only concretization. When `false` (the default), a read of an
@@ -137,15 +138,48 @@ pub struct Emulator {
     pub resolve_undefined_flags: bool,
     cur: (u64, Mnemonic),
     det: (Option<u64>, Option<u64>),
-    /// Decode cache keyed by RIP: (decoded bytes, byte len, instruction). A hit
-    /// is only honoured when the current guest bytes still match the stored
-    /// ones, so self-modifying/unpacking code re-decodes instead of reusing a
-    /// stale entry. Cleared wholesale when it reaches [`DCACHE_CAP`].
-    dcache: HashMap<u64, ([u8; 15], usize, Instruction)>,
+    /// Retired-instruction count (always maintained, independent of `trace`).
+    steps: u64,
+    /// Direct-mapped decode cache indexed by RIP. A hit is only honoured when
+    /// the current guest bytes still match the stored ones, so self-modifying/
+    /// unpacking code re-decodes instead of reusing a stale entry. A colliding
+    /// RIP simply evicts; a miss always re-decodes, so results are unchanged.
+    dcache: Box<[DEntry]>,
 }
 
-/// Entry cap for `dcache`; cleared on overflow to stay bounded over long runs.
-const DCACHE_CAP: usize = 1 << 16;
+#[derive(Clone, Copy)]
+struct DEntry {
+    rip: u64,
+    /// Instruction byte length; 0 marks an empty slot.
+    len: u8,
+    bytes: [u8; 15],
+    ins: Instruction,
+}
+
+/// Decode-cache slots (power of two).
+const DCACHE_SIZE: usize = 1 << 15;
+
+/// `code[..len] == stored[..len]`, with `len <= code.len()`. A full 15-byte
+/// fetch (the common case) compares via two 8-byte loads instead of a memcmp.
+#[inline]
+fn same_bytes(code: &[u8], stored: &[u8; 15], len: usize) -> bool {
+    if code.len() < 15 {
+        return code[..len] == stored[..len];
+    }
+    let ld = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let lo = |n: usize| if n >= 8 { u64::MAX } else { (1u64 << (n * 8)) - 1 };
+    if len <= 8 {
+        (ld(code, 0) ^ ld(stored, 0)) & lo(len) == 0
+    } else {
+        // Bytes 0..8 via the first load, 8..len via a load starting at byte 7.
+        ld(code, 0) == ld(stored, 0) && (ld(code, 7) ^ ld(stored, 7)) & lo(len - 7) == 0
+    }
+}
+
+#[inline]
+fn dslot(rip: u64) -> usize {
+    ((rip ^ (rip >> 15)) as usize) & (DCACHE_SIZE - 1)
+}
 
 impl Emulator {
     #[must_use]
@@ -154,13 +188,25 @@ impl Emulator {
             cpu,
             mem,
             trace: Vec::new(),
+            record_trace: true,
             hook: None,
             observe: ObserveConfig::default(),
             resolve_undefined_flags: false,
             cur: (0, Mnemonic::INVALID),
             det: (None, None),
-            dcache: HashMap::new(),
+            steps: 0,
+            dcache: vec![
+                DEntry { rip: 0, len: 0, bytes: [0; 15], ins: Instruction::default() };
+                DCACHE_SIZE
+            ]
+            .into_boxed_slice(),
         }
+    }
+
+    /// Instructions retired so far (equals `trace.len()` while recording).
+    #[must_use]
+    pub fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// Execute one instruction.
@@ -171,9 +217,13 @@ impl Emulator {
         let rip = self.cpu.rip;
         self.cur = (rip, Mnemonic::INVALID);
         self.det = (None, None);
-        let mut buf = [0u8; 15];
-        let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
-        let ins = self.decode(rip, &buf, n);
+        let ins = if let Some(code) = self.mem.fetch15(rip) {
+            Self::decode(&mut self.dcache, rip, code)
+        } else {
+            let mut buf = [0u8; 15];
+            let n = self.mem.fetch(rip, &mut buf).map_err(|f| self.fault(f.addr, f.access))?;
+            Self::decode(&mut self.dcache, rip, &buf[..n])
+        };
         if ins.is_invalid() {
             return Err(Stop::DecodeError { rip });
         }
@@ -181,12 +231,15 @@ impl Emulator {
         let next = rip.wrapping_add(ins.len() as u64);
         let new_rip = self.exec(&ins, next)?;
         self.cpu.rip = new_rip;
-        let (ea, value, vsp) = if self.observe.detail {
-            (self.det.0, self.det.1, self.observe.vsp.and_then(|r| self.cpu.reg(r)))
-        } else {
-            (None, None, None)
-        };
-        self.trace.push(TraceEntry { rip, mnemonic: ins.mnemonic(), ea, value, vsp });
+        self.steps += 1;
+        if self.record_trace {
+            let (ea, value, vsp) = if self.observe.detail {
+                (self.det.0, self.det.1, self.observe.vsp.and_then(|r| self.cpu.reg(r)))
+            } else {
+                (None, None, None)
+            };
+            self.trace.push(TraceEntry { rip, mnemonic: ins.mnemonic(), ea, value, vsp });
+        }
         Ok(())
     }
 
@@ -214,26 +267,26 @@ impl Emulator {
         Stop::StepLimit
     }
 
-    /// Decode the instruction at `rip`, reusing a cached decode when the guest
-    /// bytes are unchanged. On a byte mismatch (self-modifying/unpacking code)
-    /// or a miss, decode afresh and store the result. Invalid decodes are not
-    /// cached; the caller surfaces them as [`Stop::DecodeError`].
-    fn decode(&mut self, rip: u64, buf: &[u8; 15], n: usize) -> Instruction {
-        if let Some((bytes, len, ins)) = self.dcache.get(&rip) {
-            let len = *len;
-            if len <= n && buf[..len] == bytes[..len] {
-                return *ins;
-            }
+    /// Decode the instruction at `rip` from `code` (the executable prefix, up
+    /// to 15 bytes), reusing a cached decode when the guest bytes are
+    /// unchanged. On a byte mismatch (self-modifying/unpacking code) or a miss,
+    /// decode afresh and store the result. Invalid decodes are not cached; the
+    /// caller surfaces them as [`Stop::DecodeError`].
+    #[inline]
+    fn decode(dcache: &mut [DEntry], rip: u64, code: &[u8]) -> Instruction {
+        let n = code.len();
+        let e = &mut dcache[dslot(rip)];
+        let len = usize::from(e.len);
+        if e.rip == rip && len != 0 && len <= n && same_bytes(code, &e.bytes, len) {
+            return e.ins;
         }
-        let ins = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE).decode();
+        let ins = Decoder::with_ip(64, code, rip, DecoderOptions::NONE).decode();
         let len = ins.len();
         if !ins.is_invalid() && len <= n {
-            if self.dcache.len() >= DCACHE_CAP {
-                self.dcache.clear();
-            }
-            let mut stored = [0u8; 15];
-            stored[..len].copy_from_slice(&buf[..len]);
-            self.dcache.insert(rip, (stored, len, ins));
+            e.rip = rip;
+            e.len = len as u8;
+            e.bytes[..len].copy_from_slice(&code[..len]);
+            e.ins = ins;
         }
         ins
     }
@@ -882,7 +935,7 @@ impl Emulator {
     /// times itself). The value fits comfortably in EAX across the step budget,
     /// so EDX reads back 0.
     fn tsc(&self) -> u64 {
-        self.trace.len() as u64 * TSC_STRIDE
+        self.steps * TSC_STRIDE
     }
 
     fn push64(&mut self, v: u64) -> Result<(), Stop> {
@@ -1128,5 +1181,44 @@ mod tests {
         emu.cpu.rip = ADDR;
         emu.step().unwrap();
         assert_eq!(emu.cpu.reg(Register::RAX), Some(2), "cache served stale decode");
+    }
+
+    /// The 8-byte-load fast compare must agree with a plain slice compare for
+    /// every length and every single differing byte position.
+    #[test]
+    fn same_bytes_matches_slice_compare() {
+        let base: [u8; 15] = std::array::from_fn(|i| i as u8 + 1);
+        for len in 1..=15usize {
+            assert!(same_bytes(&base, &base, len));
+            for pos in 0..15 {
+                let mut other = base;
+                other[pos] ^= 0x80;
+                assert_eq!(same_bytes(&other, &base, len), pos >= len, "len {len} pos {pos}");
+                // Shorter fetch (page-crossing slow path) uses the slice compare.
+                assert_eq!(same_bytes(&other[..len], &base, len), pos >= len);
+            }
+        }
+    }
+
+    /// Without trace recording the retired count and TSC are unchanged.
+    #[test]
+    fn untraced_run_keeps_step_count_and_tsc() {
+        let code = [0x0F, 0x31, 0x0F, 0x31, 0x90]; // rdtsc; rdtsc; nop
+        let run = |record: bool| {
+            let mut mem = Memory::new();
+            mem.map(ADDR, PAGE_SIZE, Perm::RWX).unwrap();
+            mem.poke(ADDR, &code).unwrap();
+            let mut emu = Emulator::new(Cpu::new(ADDR), mem);
+            emu.record_trace = record;
+            for _ in 0..3 {
+                emu.step().unwrap();
+            }
+            (emu.steps(), emu.cpu.regs[RAX], emu.trace.len())
+        };
+        let (traced, untraced) = (run(true), run(false));
+        assert_eq!(traced.0, 3);
+        assert_eq!(traced.0, untraced.0);
+        assert_eq!(traced.1, untraced.1, "rdtsc value depends only on the step count");
+        assert_eq!((traced.2, untraced.2), (3, 0));
     }
 }

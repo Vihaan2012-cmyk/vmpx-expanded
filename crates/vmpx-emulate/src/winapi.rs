@@ -147,6 +147,13 @@ pub struct WinApiHook {
     /// these VAs is the protector invoking a directly-walked export (notably the
     /// ntdll `Zw*` syscall stubs it uses to unpack). Dispatched like an IAT thunk.
     export_stub_addrs: BTreeMap<u64, (String, String)>,
+    /// Inclusive `[lo, hi]` key span of `stubs` / `export_stub_addrs`; a flow
+    /// target outside both is provably not a thunk, skipping the map lookups.
+    stub_span: (u64, u64),
+    export_span: (u64, u64),
+    /// Half-open `[lo, hi)` union of the watched `AddressOfFunctions` slot
+    /// ranges; a read outside it cannot hit any watch.
+    watch_span: (u64, u64),
     /// In-model NT object + memory state for the emulated ntdll syscall stubs.
     nt: NtState,
 }
@@ -186,8 +193,12 @@ fn symbol_key(symbol: &SymbolOrOrdinal) -> String {
 impl WinApiHook {
     #[must_use]
     pub fn new(stubs: BTreeMap<u64, (String, String)>) -> Self {
+        let stub_span = span_of(stubs.keys().copied());
         Self {
             stubs,
+            stub_span,
+            export_span: EMPTY_SPAN,
+            watch_span: (u64::MAX, 0),
             facts: Rc::new(RefCell::new(ObservedFacts::new())),
             alloc_next: ALLOC_BASE,
             hmodule_next: HMODULE_BASE,
@@ -377,9 +388,14 @@ impl WinApiHook {
         match map_module_image(mem, h, &key, &exports) {
             Ok(Some(layout)) => {
                 for export in layout.slots.iter().flatten() {
+                    self.export_span.0 = self.export_span.0.min(export.va);
+                    self.export_span.1 = self.export_span.1.max(export.va);
                     self.export_stub_addrs
                         .insert(export.va, (key.clone(), symbol_key(&export.symbol)));
                 }
+                let wlo = layout.functions_va;
+                let whi = wlo.saturating_add(4 * layout.slots.len() as u64);
+                self.watch_span = (self.watch_span.0.min(wlo), self.watch_span.1.max(whi));
                 self.export_watches.push(ExportWatch {
                     module: key.clone(),
                     functions_va: layout.functions_va,
@@ -985,6 +1001,13 @@ impl WinApiHook {
     }
 }
 
+/// Empty span: `lo > hi`, so no address is inside it.
+const EMPTY_SPAN: (u64, u64) = (u64::MAX, 0);
+
+fn span_of(keys: impl Iterator<Item = u64>) -> (u64, u64) {
+    keys.fold(EMPTY_SPAN, |(lo, hi), k| (lo.min(k), hi.max(k)))
+}
+
 impl Hook for WinApiHook {
     fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         // The fixed KUSER_SHARED_DATA page is provided by the OS at a constant
@@ -996,7 +1019,10 @@ impl Hook for WinApiHook {
         {
             return HookAction::Stop;
         }
-        if ev.access == Access::Read && !self.export_watches.is_empty() {
+        if ev.access == Access::Read
+            && ev.addr >= self.watch_span.0
+            && ev.addr < self.watch_span.1
+        {
             self.note_export_read(ev.addr);
         }
         HookAction::Continue
@@ -1006,6 +1032,11 @@ impl Hook for WinApiHook {
         // A protector reaches a stub by `call`/`jmp` or the `push addr; ret`
         // idiom (the popped target is the stub); all three are dispatched.
         if !matches!(ev.kind, FlowKind::Call | FlowKind::Jmp | FlowKind::Ret) {
+            return HookAction::Continue;
+        }
+        let to = ev.to;
+        let in_span = |s: (u64, u64)| to >= s.0 && to <= s.1;
+        if !in_span(self.stub_span) && !in_span(self.export_span) {
             return HookAction::Continue;
         }
         // An IAT import thunk (the loader's STUB_REGION sentinels).
