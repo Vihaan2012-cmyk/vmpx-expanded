@@ -686,16 +686,21 @@ pub fn analyze_clean_with_image(
     // experimental decoded-lift recovery past provably-null image reads; it is
     // `None` on the default sound path, so that path is unchanged.
     let mut dynamic_globals: Vec<(u64, Vec<u8>)> = Vec::new();
+    // Observed recursion depths per loop head, converted into the plain vmpx-vm
+    // `ObservedLoopDepths` seed (never the `vmpx-emulate` type). Feeds the
+    // experimental bounded-recursion unroll; `None` on the sound path.
+    let mut dynamic_loop_depths: Vec<(u64, u64)> = Vec::new();
     let observed_imports: Vec<vmpx_emulate::ObservedImport> = if dynamic {
         match vmpx_emulate::detonate(&input_pe, &vmpx_emulate::DetonateOptions::default()) {
             Ok(result) => {
                 warnings.push(format!(
-                    "[dynamic][experimental] detonation ran {} instr(s), stop={:?}, observed oep={:?}, GetProcAddress imports={}, observed globals={}",
+                    "[dynamic][experimental] detonation ran {} instr(s), stop={:?}, observed oep={:?}, GetProcAddress imports={}, observed globals={}, observed loop depths={}",
                     result.steps,
                     result.stop,
                     result.observed.oep,
                     result.observed.imports.len(),
                     result.observed.globals.len(),
+                    result.observed.loop_depths.len(),
                 ));
                 dynamic_stop = Some(format!("{:?}", result.stop));
                 dynamic_steps = result.steps;
@@ -705,6 +710,12 @@ pub fn analyze_clean_with_image(
                     .globals
                     .iter()
                     .map(|global| (global.va, global.bytes.clone()))
+                    .collect();
+                dynamic_loop_depths = result
+                    .observed
+                    .loop_depths
+                    .iter()
+                    .map(|loop_depth| (loop_depth.loop_head, loop_depth.depth))
                     .collect();
                 result.observed.imports
             }
@@ -717,10 +728,14 @@ pub fn analyze_clean_with_image(
     } else {
         Vec::new()
     };
-    // Observed-tier seed for the experimental decoded-lift path only. `None`
-    // keeps the sound path's recovery seedless and unchanged.
-    let observed_memory: Option<vmpx_vm::ObservedMemory> = if dynamic {
-        Some(vmpx_vm::ObservedMemory::from_slots(dynamic_globals))
+    // Observed-tier seed for the experimental decoded-lift path only (concrete
+    // globals + recursion depths). `None` keeps the sound path's recovery
+    // seedless and unchanged.
+    let observed_run: Option<vmpx_vm::ObservedRun> = if dynamic {
+        Some(vmpx_vm::ObservedRun::new(
+            vmpx_vm::ObservedMemory::from_slots(dynamic_globals),
+            vmpx_vm::ObservedLoopDepths::from_depths(dynamic_loop_depths),
+        ))
     } else {
         None
     };
@@ -1471,7 +1486,7 @@ pub fn analyze_clean_with_image(
                     &pe,
                     entry.rva,
                     va + u64::from(layout_cursor),
-                    observed_memory.as_ref(),
+                    observed_run.as_ref(),
                 ) {
                     Ok(body) => {
                         let len = u64::try_from(body.bytes.len()).unwrap_or(0);

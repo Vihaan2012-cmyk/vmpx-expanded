@@ -58,8 +58,9 @@ pub use call_effects::{
     opaque_call_return_intrinsic_name, resolve_native_call_import,
 };
 pub use cfg::{
-    BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, VmBasicBlock, VmCfg,
-    VmCfgAssumption, VmCfgLimits, recover_vm_cfg, recover_vm_cfg_with_observed_memory,
+    BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
+    ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, recover_vm_cfg,
+    recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
 };
 pub use checksum::{
     ChecksumAccumulatorSource, ChecksumCombine, ChecksumShift, ChecksumTableIndex,

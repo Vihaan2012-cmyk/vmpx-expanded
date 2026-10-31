@@ -22,7 +22,7 @@ use crate::{
     InputDomainLimits,
     LinearDecodeCache, LinearDecodeStop, ModuloImageTargetLimits, NativeCallSelectorOutcome,
     NativeFrameSource, RecoveryStatus, RelativeDispatchState, SymbolicDomainLimits,
-    SymbolicVmExecutionReport, SymbolicVmInitialState, VmDiscoveryLimits, VmEntryCandidate,
+    SymbolicVmExecutionReport, SymbolicVmInitialState, UnaryOp, VmDiscoveryLimits, VmEntryCandidate,
     VmExitReport, VmHandlerSemantic, analyze_vm_entry_at,
     dispatch_extract::canonical,
     entry_profile::{bootstrap_global_table, entry_stream_config, prepare_entry_stream},
@@ -172,6 +172,73 @@ pub enum VmCfgAssumption {
     /// observed-tier: valid for that run/environment only, never sound output.
     /// Present only when recovery was driven with an observed-memory seed.
     ObservedGlobal,
+    /// A recursion inlined as a VSP-changing bytecode loop (a push-down stack on
+    /// the VM stack) was lifted as a BOUNDED UNROLL of exactly the depth observed
+    /// on ONE detonation, instead of the non-converging fixpoint widening that
+    /// otherwise fails closed at "loop changes the VM stack pointer". Engaged
+    /// only when the per-iteration VSP delta is a PROVEN CONSTANT and an observed
+    /// depth is present for the loop head. EXPERIMENTAL and observed-tier: valid
+    /// for that run/input only, never sound output.
+    ObservedRecursionDepth,
+}
+
+/// Observed back-edge trip counts per loop head, captured on ONE detonation: a
+/// plain, crate-owned map from loop-head virtual address to recursion depth.
+/// This is NOT a proof — it reflects a single run/input. The CLI builds it from
+/// a detonation's `ObservedFacts.loop_depths`; vmpx-vm never produces it and
+/// never trusts it on the sound path.
+///
+/// Kept deliberately free of any `vmpx-emulate` type (the crate owns this plain
+/// structure, mirroring [`ObservedMemory`](crate::ObservedMemory)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedLoopDepths {
+    depths: BTreeMap<u64, u64>,
+}
+
+impl ObservedLoopDepths {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds the seed from `(loop_head, depth)` pairs, e.g. a detonation's
+    /// observed loop depths.
+    pub fn from_depths(depths: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        Self {
+            depths: depths.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.depths.is_empty()
+    }
+
+    /// Observed recursion depth for `loop_head`, if any was recorded.
+    #[must_use]
+    pub fn depth_for(&self, loop_head: u64) -> Option<u64> {
+        self.depths.get(&loop_head).copied()
+    }
+}
+
+/// The observed-runtime seed for one experimental recovery: concrete memory and
+/// loop depths captured on ONE detonation, bundled so the CLI threads a single
+/// value. Both halves are empty on the sound path (so recovery is unchanged),
+/// mirroring D6b's seedless default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedRun {
+    pub memory: crate::ObservedMemory,
+    pub loop_depths: ObservedLoopDepths,
+}
+
+impl ObservedRun {
+    #[must_use]
+    pub fn new(memory: crate::ObservedMemory, loop_depths: ObservedLoopDepths) -> Self {
+        Self {
+            memory,
+            loop_depths,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -701,6 +768,99 @@ fn widen_state(
     }))
 }
 
+/// Flattens an affine VSP expression into its non-constant terms (keyed by
+/// stable debug text, carrying a signed coefficient) and the summed constant
+/// offset. Add/Sub/Neg are walked with sign so the `((base + a) - b) + c`
+/// nesting `VMProtect` emits for a push-down frame reduces to `{base: +1}` with a
+/// single constant — the reduction `simplify` alone does not perform on `Sub`.
+/// Any other node (a multiply, a load, a flag intrinsic) stays an opaque term,
+/// so a non-affine VSP step cannot be mistaken for a constant adjustment.
+fn affine_vsp_parts(expr: &Expr) -> (BTreeMap<String, i64>, u64) {
+    fn collect(expr: &Expr, positive: bool, terms: &mut BTreeMap<String, i64>, constant: &mut u64) {
+        match &expr.kind {
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                left,
+                right,
+            } => {
+                collect(left, positive, terms, constant);
+                collect(right, positive, terms, constant);
+            }
+            ExprKind::Binary {
+                op: BinaryOp::Sub,
+                left,
+                right,
+            } => {
+                collect(left, positive, terms, constant);
+                collect(right, !positive, terms, constant);
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                value,
+            } => collect(value, !positive, terms, constant),
+            // Wrapping two's-complement sum, so the constant offset is exact
+            // whether the frame grows up or down.
+            ExprKind::Const { value } => {
+                *constant = if positive {
+                    constant.wrapping_add(*value)
+                } else {
+                    constant.wrapping_sub(*value)
+                };
+            }
+            _ => {
+                let coefficient = terms.entry(format!("{expr:?}")).or_insert(0);
+                *coefficient += if positive { 1 } else { -1 };
+            }
+        }
+    }
+    let mut terms = BTreeMap::new();
+    let mut constant = 0_u64;
+    collect(&expr.simplify(), true, &mut terms, &mut constant);
+    terms.retain(|_, coefficient| *coefficient != 0);
+    (terms, constant)
+}
+
+/// The proven constant byte delta `b - a` between two VSP expressions, or `None`
+/// when their non-constant parts differ (so the step is not a pure constant
+/// adjustment of the same base). Width mismatch is also rejected.
+fn constant_vsp_delta(a: &Expr, b: &Expr) -> Option<u64> {
+    if a.width != b.width {
+        return None;
+    }
+    let (a_terms, a_const) = affine_vsp_parts(a);
+    let (b_terms, b_const) = affine_vsp_parts(b);
+    (a_terms == b_terms).then(|| b_const.wrapping_sub(a_const))
+}
+
+/// The single PROVEN-CONSTANT per-iteration VSP delta of a recursion-as-loop, or
+/// `None` when the delta is not a constant that is identical across every
+/// observed iteration (ancestors nearest-first, then the re-entry). A zero delta
+/// is rejected: the VSP is then loop-invariant, which is not this stall. This is
+/// the soundness guard for the bounded unroll — without a proven constant delta
+/// the loop is never unrolled, even with an observed depth.
+fn proven_constant_vsp_delta(
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+) -> Option<u64> {
+    // Oldest -> newest: reverse the nearest-first ancestors, then the re-entry.
+    let chain: Vec<&Expr> = ancestors
+        .iter()
+        .rev()
+        .map(|state| &state.vsp)
+        .chain(std::iter::once(&reentry.vsp))
+        .collect();
+    let mut delta: Option<u64> = None;
+    for pair in chain.windows(2) {
+        let step = constant_vsp_delta(pair[0], pair[1])?;
+        match delta {
+            None => delta = Some(step),
+            Some(previous) if previous != step => return None,
+            Some(_) => {}
+        }
+    }
+    delta.filter(|value| *value != 0)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum LoopStep {
     /// An enclosing entry state covers the re-entry state: a back edge.
@@ -710,6 +870,13 @@ enum LoopStep {
     /// Continue from this generalization of every enclosing entry at once.
     Widen(SymbolicVmInitialState),
     Refuse(String),
+    /// Bounded recursion unroll (experimental, observed-tier): the loop changes
+    /// the VM stack pointer by a PROVEN CONSTANT delta and an observed depth
+    /// bounds it, so this iteration is exact-unrolled past the normal budget
+    /// rather than widened to a non-converging fixpoint.
+    UnrollObserved,
+    /// The observed recursion depth has been reached: the bounded unroll closes.
+    CloseObserved,
 }
 
 /// Generalizes the nearest enclosing entry against every other enclosing entry
@@ -778,11 +945,14 @@ enum GeneralizeAcross {
 
 /// Decides how a block re-entered while already on the path proceeds.
 /// `ancestors` are the entry states of the enclosing visits, nearest first.
+/// `observed_depth` is the recursion depth observed for this loop head on ONE
+/// detonation, if any; it gates the experimental bounded-unroll bridge.
 fn loop_step(
     key: Va,
     ancestors: &[&SymbolicVmInitialState],
     reentry: &SymbolicVmInitialState,
     unrolls: usize,
+    observed_depth: Option<u64>,
 ) -> LoopStep {
     if ancestors
         .iter()
@@ -796,7 +966,35 @@ fn loop_step(
     match widen_to_fixpoint(key, ancestors, reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
-        Err(reason) => LoopStep::Refuse(reason),
+        Err(reason) => bounded_unroll_or_refuse(ancestors, reentry, observed_depth, reason),
+    }
+}
+
+/// The experimental bounded-unroll bridge, reached only when the fixpoint widen
+/// fails (e.g. "loop changes the VM stack pointer"). A VSP-changing recursion
+/// whose per-iteration VSP delta is a PROVEN CONSTANT, bounded by an observed
+/// recursion depth, unrolls exactly `depth` iterations instead of failing
+/// closed. Without an observed depth, or when the delta is not a proven
+/// constant, it stays the existing fail-closed refusal — no depth is ever
+/// guessed, and the sound path (no observed depth) is never reached here.
+fn bounded_unroll_or_refuse(
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+    observed_depth: Option<u64>,
+    reason: String,
+) -> LoopStep {
+    let Some(depth) = observed_depth else {
+        return LoopStep::Refuse(reason);
+    };
+    if proven_constant_vsp_delta(ancestors, reentry).is_none() {
+        return LoopStep::Refuse(reason);
+    }
+    // `ancestors.len()` counts the enclosing iterations already on the path; one
+    // more exact unroll per remaining level up to the observed depth.
+    if (ancestors.len() as u64) < depth {
+        LoopStep::UnrollObserved
+    } else {
+        LoopStep::CloseObserved
     }
 }
 
@@ -828,6 +1026,10 @@ struct Walker<'a, 'p> {
     /// actually consumed an observed seed; read after each symbolic call so the
     /// recovery records the `ObservedGlobal` assumption.
     seeded: &'a Cell<bool>,
+    /// Observed recursion depths per loop head (empty on the sound path).
+    /// Consulted only to bound a VSP-changing recursion whose per-iteration VSP
+    /// delta is a proven constant.
+    observed_depths: &'a ObservedLoopDepths,
 }
 
 /// Builds the memory source for a symbolic call: the sound read-only image
@@ -1308,15 +1510,16 @@ impl Walker<'_, '_> {
         }
         let states: Vec<&SymbolicVmInitialState> =
             ancestors.iter().map(|node| &node.state).collect();
-        match loop_step(key, &states, &item.symbolic, self.limits.max_loop_unrolls) {
+        let observed_depth = self.observed_depths.depth_for(key.get());
+        match loop_step(
+            key,
+            &states,
+            &item.symbolic,
+            self.limits.max_loop_unrolls,
+            observed_depth,
+        ) {
             LoopStep::Close => {
-                if let Some(parent) = &item.path {
-                    self.add_edge(CfgEdge {
-                        from: parent.key,
-                        to: key,
-                        kind: CfgEdgeKind::LoopBack,
-                    });
-                }
+                self.record_loop_back(item, key);
                 None
             }
             LoopStep::Unroll => Some(item.symbolic.clone()),
@@ -1325,6 +1528,33 @@ impl Walker<'_, '_> {
                 self.stall(key, key, format!("loop cannot be closed: {reason}"));
                 None
             }
+            // Experimental, observed-tier: a bounded recursion unroll keyed by an
+            // observed depth. Each iteration applies the proven constant VSP
+            // delta exactly; the whole bridge is labeled so the CFG never passes
+            // as sound.
+            LoopStep::UnrollObserved => {
+                self.cfg
+                    .assumptions
+                    .insert(VmCfgAssumption::ObservedRecursionDepth);
+                Some(item.symbolic.clone())
+            }
+            LoopStep::CloseObserved => {
+                self.cfg
+                    .assumptions
+                    .insert(VmCfgAssumption::ObservedRecursionDepth);
+                self.record_loop_back(item, key);
+                None
+            }
+        }
+    }
+
+    fn record_loop_back(&mut self, item: &Item, key: Va) {
+        if let Some(parent) = &item.path {
+            self.add_edge(CfgEdge {
+                from: parent.key,
+                to: key,
+                kind: CfgEdgeKind::LoopBack,
+            });
         }
     }
 
@@ -1886,20 +2116,16 @@ pub fn recover_vm_cfg(
     entry: &VmEntryCandidate,
     limits: VmCfgLimits,
 ) -> Result<VmCfg, CfgError> {
-    // Sound path: no observed seed. The empty seed makes the overlay memory
-    // source behaviourally identical to a bare read-only image.
-    recover_vm_cfg_with_observed_memory(pe, entry, limits, &crate::ObservedMemory::new())
+    // Sound path: no observed seed. The empty run makes the overlay memory
+    // source behaviourally identical to a bare read-only image and leaves every
+    // VSP-changing recursion failing closed.
+    recover_vm_cfg_with_observed(pe, entry, limits, &ObservedRun::default())
 }
 
 /// Like [`recover_vm_cfg`], but seeds provably-null image reads from concrete
-/// runtime memory observed on ONE detonation.
-///
-/// This is the EXPERIMENTAL, observed tier: where a global pointer slot is zero
-/// in the static image but runtime-initialized, the matching observed slot lets
-/// recovery continue past the null-read stall instead of failing closed. Any
-/// block that consumes such a seed makes the returned CFG carry
-/// [`VmCfgAssumption::ObservedGlobal`]. Pass an empty [`ObservedMemory`] for the
-/// sound path (equivalent to [`recover_vm_cfg`]).
+/// runtime memory observed on ONE detonation. A thin wrapper over
+/// [`recover_vm_cfg_with_observed`] carrying only the memory seed (no observed
+/// loop depths).
 ///
 /// # Errors
 ///
@@ -1910,6 +2136,36 @@ pub fn recover_vm_cfg_with_observed_memory(
     entry: &VmEntryCandidate,
     limits: VmCfgLimits,
     observed: &crate::ObservedMemory,
+) -> Result<VmCfg, CfgError> {
+    let run = ObservedRun::new(observed.clone(), ObservedLoopDepths::new());
+    recover_vm_cfg_with_observed(pe, entry, limits, &run)
+}
+
+/// Like [`recover_vm_cfg`], but driven by the EXPERIMENTAL observed-runtime seed
+/// captured on ONE detonation (concrete memory + recursion depths).
+///
+/// Two observed-tier bridges may engage, each labeled on the returned CFG and
+/// never the sound path:
+/// - A global pointer slot that is zero in the static image but runtime-
+///   initialized is resolved from [`ObservedRun::memory`], past the null-read
+///   stall ([`VmCfgAssumption::ObservedGlobal`]).
+/// - A recursion inlined as a VSP-changing loop, whose per-iteration VSP delta
+///   is a PROVEN CONSTANT, is lifted as a BOUNDED UNROLL of exactly the depth in
+///   [`ObservedRun::loop_depths`], past the "loop changes the VM stack pointer"
+///   stall ([`VmCfgAssumption::ObservedRecursionDepth`]).
+///
+/// Pass [`ObservedRun::default`] (both empty) for the sound path, which recovers
+/// exactly as [`recover_vm_cfg`].
+///
+/// # Errors
+///
+/// Fails if the entry bootstrap cannot be recovered; everything after is a stall
+/// or hit limit in the returned [`VmCfg`].
+pub fn recover_vm_cfg_with_observed(
+    pe: &PeImage<'_>,
+    entry: &VmEntryCandidate,
+    limits: VmCfgLimits,
+    observed: &ObservedRun,
 ) -> Result<VmCfg, CfgError> {
     let setup = prepare_entry_stream(pe, entry, limits.entry)?;
     let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
@@ -1952,8 +2208,9 @@ pub fn recover_vm_cfg_with_observed_memory(
             assumptions: BTreeSet::new(),
         },
         total_instructions: 0,
-        observed,
+        observed: &observed.memory,
         seeded: &seeded,
+        observed_depths: &observed.loop_depths,
     };
     let mut pending = vec![Item {
         start: setup.first_state,
@@ -2553,30 +2810,73 @@ mod tests {
         Expr::binary(BinaryOp::Add, expr.clone(), w64(1)).expect("add")
     }
 
-    /// Walks one loop whose body runs `step` on the state; returns the steps
-    /// taken until the back edge closes, or the refusal.
-    fn walk_loop(
+    /// Outcome of [`walk_loop_observed`]: how the walk closed plus bookkeeping.
+    #[derive(Debug, Eq, PartialEq)]
+    struct LoopWalk {
+        /// `loop_step` calls made until the walk closed (the closing call
+        /// included).
+        iterations: usize,
+        /// Times the state was generalized (sound widening).
+        widened: usize,
+        /// Exact iterations taken through the observed bounded-unroll bridge.
+        observed_unrolls: usize,
+        /// The bounded unroll's observed-depth close fired.
+        closed_observed: bool,
+    }
+
+    /// Walks one loop whose body runs `step` on the state; returns how it closed,
+    /// or the refusal. `observed_depth` gates the experimental bounded unroll.
+    fn walk_loop_observed(
         entry: SymbolicVmInitialState,
         step: impl Fn(&SymbolicVmInitialState) -> SymbolicVmInitialState,
         unrolls: usize,
-    ) -> Result<(usize, usize), String> {
+        observed_depth: Option<u64>,
+    ) -> Result<LoopWalk, String> {
         let key = Va(0x1000);
         let mut ancestors = vec![entry];
-        let mut widened = 0;
-        for iteration in 1..=32 {
+        let mut walk = LoopWalk {
+            iterations: 0,
+            widened: 0,
+            observed_unrolls: 0,
+            closed_observed: false,
+        };
+        for iteration in 1..=64 {
             let reentry = step(ancestors.last().expect("entry"));
             let nearest_first: Vec<_> = ancestors.iter().rev().collect();
-            match loop_step(key, &nearest_first, &reentry, unrolls) {
-                LoopStep::Close => return Ok((iteration, widened)),
+            match loop_step(key, &nearest_first, &reentry, unrolls, observed_depth) {
+                LoopStep::Close => {
+                    walk.iterations = iteration;
+                    return Ok(walk);
+                }
+                LoopStep::CloseObserved => {
+                    walk.iterations = iteration;
+                    walk.closed_observed = true;
+                    return Ok(walk);
+                }
                 LoopStep::Unroll => ancestors.push(reentry),
+                LoopStep::UnrollObserved => {
+                    walk.observed_unrolls += 1;
+                    ancestors.push(reentry);
+                }
                 LoopStep::Widen(state) => {
-                    widened += 1;
+                    walk.widened += 1;
                     ancestors.push(state);
                 }
                 LoopStep::Refuse(reason) => return Err(reason),
             }
         }
         Err("did not terminate".to_owned())
+    }
+
+    /// Walks one loop whose body runs `step` on the state; returns the steps
+    /// taken until the back edge closes, or the refusal. Sound path: no observed
+    /// depth.
+    fn walk_loop(
+        entry: SymbolicVmInitialState,
+        step: impl Fn(&SymbolicVmInitialState) -> SymbolicVmInitialState,
+        unrolls: usize,
+    ) -> Result<(usize, usize), String> {
+        walk_loop_observed(entry, step, unrolls, None).map(|walk| (walk.iterations, walk.widened))
     }
 
     #[test]
@@ -2634,6 +2934,83 @@ mod tests {
         };
         let reason = walk_loop(entry, step, 2).expect_err("never converges");
         assert!(reason.contains("stack pointer"), "{reason}");
+    }
+
+    /// A step that decrements VSP by a proven constant `delta` bytes each
+    /// iteration (the recursion-as-loop push-down frame), like rmath_fib's −64.
+    fn constant_vsp_shift(delta: u64) -> impl Fn(&SymbolicVmInitialState) -> SymbolicVmInitialState {
+        move |state| {
+            let mut next = state.clone();
+            next.vsp = Expr::binary(BinaryOp::Add, state.vsp.clone(), w64(delta)).expect("add");
+            next
+        }
+    }
+
+    #[test]
+    fn bounded_unroll_from_observed_depth_unrolls_exactly_and_closes() {
+        // A VSP-changing loop with a proven constant −64 delta: with an observed
+        // depth of 5 it unrolls exactly 5 iterations and the back edge closes via
+        // the observed bridge instead of stalling.
+        let entry = SymbolicVmInitialState::default();
+        let minus_64 = (-64_i64) as u64;
+        let walk = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, Some(5))
+            .expect("bounded unroll closes");
+        assert!(walk.closed_observed, "closed through the observed bridge");
+        assert_eq!(walk.iterations, 5, "exactly the observed depth of iterations");
+        assert_eq!(walk.widened, 0, "a bounded unroll never widens");
+    }
+
+    #[test]
+    fn vsp_loop_without_observed_depth_still_fails_closed() {
+        // The same constant-delta VSP loop, but no observed depth: the sound path
+        // keeps the fail-closed stall. No depth is guessed.
+        let entry = SymbolicVmInitialState::default();
+        let minus_64 = (-64_i64) as u64;
+        let reason = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, None)
+            .expect_err("no depth means fail closed");
+        assert!(reason.contains("stack pointer"), "{reason}");
+    }
+
+    #[test]
+    fn non_constant_vsp_delta_is_never_unrolled_even_with_depth() {
+        // VSP that changes non-constantly (doubles each iteration): the
+        // proven-constant-delta guard refuses to bounded-unroll even when an
+        // observed depth is present.
+        let entry = SymbolicVmInitialState::default();
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.vsp = Expr::binary(BinaryOp::Mul, state.vsp.clone(), w64(2)).expect("mul");
+            next
+        };
+        let reason = walk_loop_observed(entry, step, 2, Some(5))
+            .expect_err("non-constant delta is not liftable");
+        assert!(reason.contains("stack pointer"), "{reason}");
+    }
+
+    #[test]
+    fn proven_constant_vsp_delta_detects_constant_and_rejects_drift() {
+        let s = |vsp: Expr| SymbolicVmInitialState {
+            vsp,
+            ..SymbolicVmInitialState::default()
+        };
+        let base = Expr::register(BitWidth::W64, "vsp_initial");
+        let shifted = |k: u64| {
+            Expr::binary(BinaryOp::Add, base.clone(), w64(k))
+                .expect("add")
+        };
+        // vsp_initial, -64, -128: a proven constant −64 per iteration.
+        let a = s(base.clone());
+        let r1 = s(shifted((-64_i64) as u64));
+        let reentry = s(shifted((-128_i64) as u64));
+        assert_eq!(
+            proven_constant_vsp_delta(&[&r1, &a], &reentry),
+            Some((-64_i64) as u64)
+        );
+        // A non-constant step (doubling) has no proven constant delta.
+        let doubled = s(Expr::binary(BinaryOp::Mul, base.clone(), w64(2)).expect("mul"));
+        assert_eq!(proven_constant_vsp_delta(&[&a], &doubled), None);
+        // An invariant VSP (zero delta) is not this stall.
+        assert_eq!(proven_constant_vsp_delta(&[&a], &s(base.clone())), None);
     }
 
     #[test]

@@ -8,12 +8,12 @@ use vmpx_pe::{PeImage, Rva, Va};
 use vmpx_recompile::CodeAddress;
 use vmpx_vm::{
     BlockExit, CfgEdgeKind, EntryProfileRecoveryLimits, Expr, NativeCallImportResolution,
-    NativeCallMemoryDecision, NativeFrameSource, ObservedImage, ObservedMemory, ReadOnlyImage,
+    NativeCallMemoryDecision, NativeFrameSource, ObservedImage, ObservedRun, ReadOnlyImage,
     SymbolicExecutionLimits, SymbolicMemorySource, SymbolicVmExecutionReport,
     SymbolicVmInitialState, VmCfg, VmCfgLimits, VmDiscoveryLimits, VmHandlerSemantic,
     analyze_vm_entry_at, execute_symbolic_linear_block_with_initial_state,
     execute_symbolic_native_call_boundary_with_initial_state, recover_entry_stream,
-    recover_vm_cfg_with_observed_memory, symbolic_pointer_offset,
+    recover_vm_cfg_with_observed, symbolic_pointer_offset,
 };
 use vmpx_vmlift::{
     DecodedCfgInput, DecodedLinearInput, frame_initial_state, lift_decoded_cfg,
@@ -155,15 +155,16 @@ fn resolved_imports(
 
 /// Lifts the VM entry at `rva` to a callee-style native body placed at `address`.
 ///
-/// `observed` is the EXPERIMENTAL observed-runtime seed (from a detonation's
-/// globals). When present it lets recovery resolve provably-null image reads of
-/// runtime-initialized global slots; pass `None` for the sound path, which then
-/// recovers exactly as before.
+/// `observed` is the EXPERIMENTAL observed-runtime seed (from a detonation):
+/// concrete globals let recovery resolve provably-null image reads, and observed
+/// recursion depths let a VSP-changing recursion with a proven constant delta
+/// lift as a bounded unroll. Pass `None` for the sound path, which then recovers
+/// exactly as before.
 pub(crate) fn lift_entry(
     pe: &PeImage<'_>,
     rva: Rva,
     address: u64,
-    observed: Option<&ObservedMemory>,
+    observed: Option<&ObservedRun>,
 ) -> Result<SplicedBody, String> {
     let candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
         .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
@@ -183,13 +184,14 @@ pub(crate) fn lift_entry(
     let decode = &stream.decode.decode;
     let address = CodeAddress(address);
     // The symbolic memory source is the sound read-only image overlaid with the
-    // observed seed (empty on the sound path, so the overlay is then identical
-    // to a bare read-only image). `seeded` is flipped if an observed value is
-    // ever consumed, but the labeling the recovery surfaces lives on the CFG's
-    // `VmCfgAssumption::ObservedGlobal`.
+    // observed memory seed (empty on the sound path, so the overlay is then
+    // identical to a bare read-only image). `seeded` is flipped if an observed
+    // value is ever consumed, but the labeling the recovery surfaces lives on the
+    // CFG's `VmCfgAssumption::ObservedGlobal`. The observed loop depths ride
+    // along in the same run and feed the bounded-recursion unroll.
     let observed = observed.cloned().unwrap_or_default();
     let seeded = Cell::new(false);
-    let overlay = ObservedImage::new(ReadOnlyImage(pe), &observed, &seeded);
+    let overlay = ObservedImage::new(ReadOnlyImage(pe), &observed.memory, &seeded);
     let image = &overlay;
 
     let linear_error = match stream
@@ -225,7 +227,7 @@ pub(crate) fn lift_entry(
         entry: entry_limits,
         ..VmCfgLimits::default()
     };
-    let cfg = recover_vm_cfg_with_observed_memory(pe, &candidate, limits, &observed)
+    let cfg = recover_vm_cfg_with_observed(pe, &candidate, limits, &observed)
         .map_err(|error| format!("linear: {linear_error}; cfg recovery failed: {error}"))?;
     if !cfg
         .blocks
