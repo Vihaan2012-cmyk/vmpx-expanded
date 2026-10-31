@@ -212,4 +212,10 @@ impl Memory {
     pub fn write_uint(&mut self, addr: u64, bytes: usize, val: u64) -> Result<(), MemFault> {
         self.write(addr, &val.to_le_bytes()[..bytes])
     }
+
+    /// Enumerate mapped pages in ascending address order as `(base, perm,
+    /// bytes)`. Read-only view used to snapshot the guest image.
+    pub fn pages(&self) -> impl Iterator<Item = (u64, Perm, &[u8])> {
+        self.pages.iter().map(|(&base, p)| (base, p.perm, &p.data[..]))
+    }
 }

@@ -51,6 +51,7 @@
 mod alu;
 mod cpu;
 mod differential;
+mod dump;
 mod emu;
 mod loader;
 mod memory;
@@ -58,6 +59,7 @@ mod observe;
 mod winapi;
 
 pub use alu::{Alu, Flags, Shift};
+pub use dump::{DumpImage, DumpRegion, OepHook, capture_globals, dump_image};
 pub use cpu::{AF, CF, Cpu, OF, PF, SF, ZF};
 pub use differential::{
     DiffRecord, DiffReport, Divergence, Incomplete, Limits, Outcome, OutputRegion, RunError,
