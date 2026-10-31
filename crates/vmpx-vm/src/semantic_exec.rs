@@ -923,6 +923,51 @@ impl<'a> SymbolicMachine<'a> {
     }
 }
 
+/// Total rendered bytes allowed for the address sort keys of one block.
+const MAX_SORT_KEY_BYTES: usize = 64 * 1024 * 1024;
+
+struct BoundedKey {
+    text: String,
+    remaining: usize,
+}
+
+impl std::fmt::Write for BoundedKey {
+    fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
+        self.remaining = self.remaining.checked_sub(chunk.len()).ok_or(std::fmt::Error)?;
+        self.text.push_str(chunk);
+        Ok(())
+    }
+}
+
+/// Orders tracked memory by the rendered address. `Debug` prints a shared DAG
+/// as a tree, so a heavily shared address can render exponentially large; the
+/// rendering is bounded and the block fails closed rather than exhausting RAM.
+fn sorted_memory_values(
+    memory: HashMap<Expr, Expr>,
+) -> Result<Vec<(Expr, Expr)>, String> {
+    use std::fmt::Write;
+    let mut remaining = MAX_SORT_KEY_BYTES;
+    let mut keyed = Vec::with_capacity(memory.len());
+    for (address, value) in memory {
+        let mut key = BoundedKey {
+            text: String::new(),
+            remaining,
+        };
+        if write!(key, "{address:?}").is_err() {
+            return Err(format!(
+                "tracked memory addresses exceed {MAX_SORT_KEY_BYTES} rendered bytes"
+            ));
+        }
+        remaining = key.remaining;
+        keyed.push((key.text, address, value));
+    }
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(keyed
+        .into_iter()
+        .map(|(_, address, value)| (address, value))
+        .collect())
+}
+
 fn combine_little_endian(bytes: &[Expr]) -> Result<Expr, ExprError> {
     if let [byte] = bytes {
         Ok(byte.clone())
@@ -2226,8 +2271,16 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         .len()
         .saturating_add(machine.context.bytes.len());
     let next_native_call_epoch = machine.native_call_epochs.next();
-    let mut memory_values = machine.memory.into_iter().collect::<Vec<_>>();
-    memory_values.sort_by_cached_key(|(address, _)| format!("{address:?}"));
+    let memory_values = sorted_memory_values(machine.memory).map_err(|message| {
+        SymbolicExecutionError {
+            instruction_index: instructions.len(),
+            vip: instructions
+                .last()
+                .map_or(Va(0), |instruction| instruction.state_after.vip),
+            semantic: boundary.unwrap_or(VmHandlerSemantic::Unknown),
+            message,
+        }
+    })?;
     Ok(SymbolicVmExecutionReport {
         schema_version: 4,
         executed_instructions: instructions.len(),
@@ -2319,8 +2372,13 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         .len()
         .saturating_add(machine.context.bytes.len());
     let next_native_call_epoch = machine.native_call_epochs.next();
-    let mut memory_values = machine.memory.into_iter().collect::<Vec<_>>();
-    memory_values.sort_by_cached_key(|(address, _)| format!("{address:?}"));
+    let memory_values =
+        sorted_memory_values(machine.memory).map_err(|message| SymbolicExecutionError {
+            instruction_index: 0,
+            vip: boundary_vip,
+            semantic: VmHandlerSemantic::NativeCall,
+            message,
+        })?;
     Ok(SymbolicVmExecutionReport {
         schema_version: 4,
         executed_instructions: 1,
@@ -2350,6 +2408,34 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
 
 #[cfg(test)]
 mod tests {
+    /// A heavily shared DAG has few distinct nodes but renders as an
+    /// exponentially large tree; sorting its address must fail closed instead of
+    /// allocating the tree.
+    #[test]
+    fn shared_dag_address_sort_key_fails_closed() {
+        let mut address = Expr::register(BitWidth::W64, "native_rax_initial");
+        for round in 0..48_u64 {
+            let mixed = Expr::binary(
+                BinaryOp::Xor,
+                address.clone(),
+                Expr::constant(BitWidth::W64, round + 1),
+            )
+            .unwrap();
+            address = Expr::binary(BinaryOp::Add, address, mixed).unwrap();
+        }
+        assert!(address.node_count_bounded(1_000_000) < 10_000, "DAG stays small");
+        let mut memory = HashMap::new();
+        memory.insert(address, Expr::constant(BitWidth::W8, 0));
+        assert!(sorted_memory_values(memory).is_err());
+
+        let mut small = HashMap::new();
+        small.insert(Expr::constant(BitWidth::W64, 2), Expr::constant(BitWidth::W8, 0));
+        small.insert(Expr::constant(BitWidth::W64, 1), Expr::constant(BitWidth::W8, 0));
+        let sorted = sorted_memory_values(small).unwrap();
+        assert_eq!(sorted.len(), 2);
+        assert!(format!("{:?}", sorted[0].0) < format!("{:?}", sorted[1].0));
+    }
+
     use crate::{EffectKnowledge, RelativeDispatchState};
 
     use super::*;
