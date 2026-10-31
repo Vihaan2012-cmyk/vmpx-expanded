@@ -765,6 +765,7 @@ mod tests {
             memory_tainted: true,
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
+            served_read_only_image: false,
             external_writes: vec![SymbolicMemoryWrite {
                 instruction_index: 2,
                 address: address.clone(),

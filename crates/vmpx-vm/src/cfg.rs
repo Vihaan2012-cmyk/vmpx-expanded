@@ -247,6 +247,13 @@ pub enum VmCfgAssumption {
     /// it). Image-source reads remain withheld, so the narrowing only recovers
     /// the VM-stack-rooted VIP; it does not otherwise trust the store.
     AssumesExternalStoresDisjointFromVmStack,
+    /// A constant read of a read-only, file-backed image page was served from
+    /// the file after an external store suppressed image reads, assuming the
+    /// page protection never changes at runtime (the binary imports
+    /// `VirtualProtect`, so this is not provable). EXPERIMENTAL tier: present
+    /// only when `SymbolicExecutionLimits::serve_read_only_when_suppressed`
+    /// is enabled.
+    AssumesImageProtectionStable,
     /// A branch gated on a pure host-environment intrinsic (a VMProtect CPUID
     /// processor-signature / timestamp-counter anti-analysis gate) was resolved
     /// by a sound both-target over-approximation: the environment value is an
@@ -2145,6 +2152,11 @@ impl Walker<'_, '_> {
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
         }
+        if symbolic.served_read_only_image {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesImageProtectionStable);
+        }
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
@@ -2823,6 +2835,11 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if symbolic.served_read_only_image || pop.served_read_only_image {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesImageProtectionStable);
         }
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);

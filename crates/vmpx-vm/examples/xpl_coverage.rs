@@ -125,6 +125,10 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_
             // and symbolic state can't balloon memory (post-transition, a long
             // linear stream can decode before a clean boundary).
             instruction_limit,
+            symbolic: vmpx_vm::SymbolicExecutionLimits {
+                serve_read_only_when_suppressed: std::env::var_os("XPL_SERVE_RO").is_some(),
+                ..vmpx_vm::SymbolicExecutionLimits::default()
+            },
             ..EntryProfileRecoveryLimits::default()
         },
         ..VmCfgLimits::default()
@@ -681,7 +685,8 @@ fn main() {
                     VmCfgAssumption::ObservedGlobal
                     | VmCfgAssumption::ObservedRecursionDepth
                     | VmCfgAssumption::ObservedBranchTarget => "OBSERVED",
-                    VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack => "UNPROVEN-ASSUMPTION",
+                    VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
+                    | VmCfgAssumption::AssumesImageProtectionStable => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase
                     | VmCfgAssumption::OverApproximatedEnvironmentGate => "BENIGN-LABELED",
                 };
