@@ -55,6 +55,7 @@ mod detonate;
 mod differential;
 mod dump;
 mod emu;
+mod iat_fill;
 mod loader;
 mod memory;
 mod ntdll;
@@ -68,7 +69,7 @@ mod xplm;
 
 pub use alu::{Alu, Flags, Shift};
 pub use detonate::{
-    DetonateError, DetonateOptions, DetonationResult, XplmSummary, detonate, export_reference_from_exports,
+    DetonateError, DetonateOptions, DetonationResult, XplmSummary, IatRegion, detonate, export_reference_from_exports,
     export_reference_from_imports,
 };
 pub use dump::{
@@ -83,6 +84,10 @@ pub use differential::{
 pub use emu::{
     Emulator, FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent, ObserveConfig, Span, Stop,
     TraceEntry,
+};
+pub use iat_fill::{
+    AddressBook, IatFill, IatSlotImport, IatSlotUnresolved, ImportSource, KnownImport,
+    UnresolvedReason,
 };
 pub use loader::{LoadError, LoadOptions, LoadedImage, load};
 pub use memory::{Access, MapError, MemFault, Memory, PAGE_SIZE, Perm};
