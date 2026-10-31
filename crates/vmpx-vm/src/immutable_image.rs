@@ -127,6 +127,10 @@ impl SymbolicMemorySource for ObservedImage<'_, '_> {
         self.image.read_byte(address)
     }
 
+    fn read_only_byte(&self, address: Va) -> Option<u8> {
+        self.image.read_only_byte(address)
+    }
+
     fn observed_byte(&self, address: Va) -> Option<u8> {
         let byte = self.observed.read_byte(address.get())?;
         self.seeded.set(true);
@@ -147,6 +151,10 @@ const SCN_MEM_WRITE: u32 = 0x8000_0000;
 pub struct ReadOnlyImage<'a, 'data>(pub &'a PeImage<'data>);
 
 impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
+    fn read_only_byte(&self, address: Va) -> Option<u8> {
+        self.read_byte(address)
+    }
+
     fn read_byte(&self, address: Va) -> Option<u8> {
         let pe = self.0;
         let rva = pe.optional.image_base.checked_rva_of(address)?;

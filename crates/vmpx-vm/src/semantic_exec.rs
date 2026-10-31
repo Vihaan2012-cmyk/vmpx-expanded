@@ -22,6 +22,11 @@ pub struct SymbolicExecutionLimits {
     pub max_instructions: usize,
     pub max_memory_bytes: usize,
     pub max_expression_nodes: usize,
+    /// EXPERIMENTAL: serve constant reads of read-only file-backed image bytes
+    /// even after an external store suppressed image reads. Unsound if the
+    /// page is re-protected writable at runtime; the block is labeled
+    /// `AssumesImageProtectionStable`.
+    pub serve_read_only_when_suppressed: bool,
 }
 
 impl Default for SymbolicExecutionLimits {
@@ -30,6 +35,7 @@ impl Default for SymbolicExecutionLimits {
             max_instructions: 4_096,
             max_memory_bytes: 1_048_576,
             max_expression_nodes: 200_000,
+            serve_read_only_when_suppressed: false,
         }
     }
 }
@@ -100,6 +106,9 @@ pub struct SymbolicVmExecutionReport {
     /// labeled `AssumesExternalStoresDisjointFromVmStack` assumption instead of
     /// the broad havoc. Surfaced so the CFG can record the assumption.
     pub assumed_external_disjoint_from_vm_stack: bool,
+    /// True when a suppressed constant read was served from a read-only
+    /// file-backed page; the CFG records `AssumesImageProtectionStable`.
+    pub served_read_only_image: bool,
     pub external_writes: Vec<SymbolicMemoryWrite>,
     pub memory_havocs: Vec<SymbolicMemoryHavoc>,
     pub native_calls: Vec<SymbolicNativeCall>,
@@ -266,6 +275,12 @@ pub trait SymbolicMemorySource {
         None
     }
 
+    /// Byte of a read-only, file-backed page: determinate in the file and
+    /// immune to stores, provided the page protection never changes.
+    fn read_only_byte(&self, _address: Va) -> Option<u8> {
+        None
+    }
+
     fn resolve_native_call_import(&self, _target: u64) -> Option<NativeCallImportResolution> {
         None
     }
@@ -400,6 +415,8 @@ struct SymbolicMachine<'a> {
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
+    serve_read_only_when_suppressed: bool,
+    served_read_only_image: bool,
     checksum_byte_limit: usize,
 }
 
@@ -481,6 +498,8 @@ impl<'a> SymbolicMachine<'a> {
             memory_tainted: initial.memory_tainted,
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
+            serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
+            served_read_only_image: false,
             checksum_byte_limit: limits.max_memory_bytes,
         };
         for (offset, value) in &initial.context_values {
@@ -573,6 +592,17 @@ impl<'a> SymbolicMachine<'a> {
                         vec![byte_address],
                     ));
                 }
+            } else if let ExprKind::Const { value } = byte_address.kind
+                && self.serve_read_only_when_suppressed
+                && !self.memory_tainted
+                && let Some(byte) = self
+                    .memory_source
+                    .and_then(|source| source.read_only_byte(Va(value)))
+            {
+                all_unknown = false;
+                self.served_read_only_image = true;
+                self.resolved_image_addresses.insert(Va(value));
+                bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else {
                 bytes.push(Expr::intrinsic(
                     BitWidth::W8,
@@ -2301,6 +2331,7 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        served_read_only_image: machine.served_read_only_image,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -2395,6 +2426,7 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        served_read_only_image: machine.served_read_only_image,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
         native_calls: machine.native_calls,
@@ -3835,6 +3867,44 @@ mod tests {
                     .any(|name| name.starts_with("memory_load_epoch_"))
             );
         }
+    }
+
+    #[test]
+    fn suppressed_read_only_page_is_served_only_when_enabled() {
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = crate::ReadOnlyImage(&pe);
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let data = Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA);
+        let suppressed = SymbolicVmInitialState {
+            image_reads_suppressed: true,
+            ..SymbolicVmInitialState::default()
+        };
+        let mut off = SymbolicMachine::new(
+            &suppressed,
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        let value = off.load_memory(rdata.clone(), BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }));
+        assert!(!off.served_read_only_image);
+
+        let limits = SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let mut on =
+            SymbolicMachine::new(&suppressed, Some(&source), limits).expect("state");
+        let value = on.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(on.served_read_only_image);
+
+        let mut writable =
+            SymbolicMachine::new(&suppressed, Some(&source), limits).expect("state");
+        let value = writable.load_memory(data, BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }));
+        assert!(!writable.served_read_only_image);
     }
 
     #[test]
