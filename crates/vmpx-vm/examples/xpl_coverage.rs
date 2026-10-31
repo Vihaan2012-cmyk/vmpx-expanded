@@ -70,7 +70,7 @@ fn normalize(reason: &str) -> String {
     out
 }
 
-fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate) -> Outcome {
+fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate, instruction_limit: usize) -> Outcome {
     // Mirror cfgdiag's recovery budget: default CFG limits (which bound blocks,
     // visits, decoded instructions, and cross-profile transitions per entry),
     // with a bumped per-block instruction budget. Every entry is hard-bounded,
@@ -81,7 +81,7 @@ fn recover_one(pe: &PeImage<'_>, entry: &vmpx_vm::VmEntryCandidate) -> Outcome {
             // block but small enough that one block's decoded-instruction vector
             // and symbolic state can't balloon memory (post-transition, a long
             // linear stream can decode before a clean boundary).
-            instruction_limit: 512,
+            instruction_limit,
             ..EntryProfileRecoveryLimits::default()
         },
         ..VmCfgLimits::default()
@@ -135,6 +135,9 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(2);
+    // Per-block decode budget (4th arg). Default 512 keeps a naive run memory-safe;
+    // raise it deliberately (with memory headroom) to reclaim InstructionLimit stalls.
+    let instruction_limit: usize = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(512);
 
     let t0 = Instant::now();
     let bytes = std::fs::read(image_path).unwrap_or_else(|e| panic!("read {image_path}: {e}"));
@@ -215,7 +218,7 @@ fn main() {
                         .iter()
                         .map(|entry| EntryResult {
                             rva: entry.rva.0,
-                            outcome: recover_one(pe_ref, entry),
+                            outcome: recover_one(pe_ref, entry, instruction_limit),
                         })
                         .collect::<Vec<_>>()
                 })
