@@ -24,6 +24,7 @@ mod coverage_gate;
 mod decoded_splice;
 mod generic_unpack;
 mod input_closed_functions;
+mod report_cmd;
 mod strip_wiring;
 mod vm_inventory;
 
@@ -79,6 +80,27 @@ enum Command {
         /// default proof-gated `output` path is never affected.
         #[arg(long, requires = "experimental")]
         strip: bool,
+    },
+    /// Run the static analysis chain and print an honest tiered report: N1
+    /// CFG-complete, N2 PROVEN (no assumptions), N3 proven-equivalent, and the
+    /// experimental tiers, each labeled with its assumption. Writes nothing.
+    Report {
+        input: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Entries to sweep (default 50; a bounded, memory-safe sample).
+        #[arg(long, conflicts_with = "all")]
+        sample: Option<usize>,
+        /// Sweep every discovered VM entry (can be slow and memory-heavy).
+        #[arg(long)]
+        all: bool,
+        /// Worker threads for the CFG sweep.
+        #[arg(long, default_value_t = 2)]
+        threads: usize,
+        /// Also run the contained emulator detonation and an OBSERVED-tier
+        /// re-sweep of the incomplete entries (can take very long).
+        #[arg(long)]
+        dynamic: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -1032,6 +1054,23 @@ fn main() -> Result<()> {
                 fs::write(&report_path, serde_json::to_vec_pretty(&clean)?)
                     .with_context(|| format!("failed to write report {}", report_path.display()))?;
                 println!("[report] {}", report_path.display());
+            }
+        }
+        Command::Report {
+            input,
+            json,
+            sample,
+            all,
+            threads,
+            dynamic,
+        } => {
+            let data = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+            let opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
+            let report = report_cmd::build_report(&input.display().to_string(), &data, &opts)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", report_cmd::render(&report));
             }
         }
         Command::Info { input, json } => {

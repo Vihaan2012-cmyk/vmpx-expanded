@@ -643,7 +643,7 @@ fn completed_stage(diagnostic: impl Into<String>) -> CleanStageReport {
 /// * A manual system-DLL export list override (`VMPX_SYSDLL_REFERENCE`,
 ///   comma-separated DLL paths), applied last so an explicit path wins. Keyed by
 ///   file name, so the walk of each resolved module finds it.
-fn dynamic_export_reference(
+pub(crate) fn dynamic_export_reference(
     input_path: &str,
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, Vec<vmpx_emulate::SymbolOrOrdinal>> {
