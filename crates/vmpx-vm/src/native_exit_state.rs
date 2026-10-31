@@ -181,6 +181,8 @@ mod tests {
             assumed_external_disjoint_from_vm_stack: false,
             served_read_only_image: false,
             vm_stack_address_escapes: false,
+            vm_stack_derived_escapes: false,
+            vm_stack_pointer_lost: false,
             vm_stack_store_hi: None,
             external_writes: Vec::new(),
             memory_havocs: Vec::new(),

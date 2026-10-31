@@ -113,6 +113,14 @@ pub struct SymbolicVmExecutionReport {
     /// is not a tracked VM-stack cell, or passed to a native call as target or
     /// argument: the frame address may then be reachable from outside the VM.
     pub vm_stack_address_escapes: bool,
+    /// Superset of `vm_stack_address_escapes`: also set when a value merely
+    /// derived from `vsp_initial` (e.g. data loaded from an untracked frame
+    /// cell) leaves the frame. Only trusted to be benign when no frame pointer
+    /// was discarded from tracked memory (`vm_stack_pointer_lost`).
+    pub vm_stack_derived_escapes: bool,
+    /// True when tracked memory holding a frame-pointer value was discarded, so a
+    /// later untracked load from the frame could return that pointer.
+    pub vm_stack_pointer_lost: bool,
     /// Highest end offset above `vsp_initial` of any VM-stack cell written by
     /// this block, or `None` if it wrote none.
     pub vm_stack_store_hi: Option<i64>,
@@ -425,6 +433,9 @@ struct SymbolicMachine<'a> {
     serve_read_only_when_suppressed: bool,
     served_read_only_image: bool,
     vm_stack_address_escapes: bool,
+    vm_stack_derived_escapes: bool,
+    vm_stack_pointer_lost: bool,
+    frame_pointer_in_memory: bool,
     vm_stack_store_hi: Option<i64>,
     checksum_byte_limit: usize,
 }
@@ -510,6 +521,12 @@ impl<'a> SymbolicMachine<'a> {
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
             served_read_only_image: false,
             vm_stack_address_escapes: false,
+            vm_stack_derived_escapes: false,
+            vm_stack_pointer_lost: false,
+            frame_pointer_in_memory: initial
+                .memory_values
+                .iter()
+                .any(|(_, value)| is_frame_pointer_value(value)),
             vm_stack_store_hi: None,
             checksum_byte_limit: limits.max_memory_bytes,
         };
@@ -653,7 +670,34 @@ impl<'a> SymbolicMachine<'a> {
         Ok(())
     }
 
+    /// A value leaving the frame exposes a frame pointer only if it IS one;
+    /// data merely read from the frame does not. Anything not provably
+    /// pointer-free counts as a pointer.
+    fn note_value_leaves_frame(&mut self, value: &Expr) {
+        if depends_on_vsp_root(value) {
+            self.vm_stack_derived_escapes = true;
+            if is_frame_pointer_value(value) {
+                self.vm_stack_address_escapes = true;
+            }
+        }
+    }
+
+    /// Discards tracked cells not satisfying `keep`, recording whether a
+    /// frame-pointer value was among them.
+    fn retain_memory(&mut self, keep: impl Fn(&Expr) -> bool) {
+        if self.frame_pointer_in_memory {
+            self.vm_stack_pointer_lost |= self
+                .memory
+                .iter()
+                .any(|(address, value)| !keep(address) && is_frame_pointer_value(value));
+        }
+        self.memory.retain(|address, _| keep(address));
+    }
+
     fn store_memory(&mut self, address: &Expr, value: &Expr) -> Result<(), String> {
+        if is_frame_pointer_value(value) {
+            self.frame_pointer_in_memory = true;
+        }
         let address = canonicalize_pointer(address.clone());
         if let Some(offset) = pointer_offset(&address) {
             let end = offset.saturating_add(i64::from(value.width.bytes()));
@@ -698,8 +742,9 @@ impl<'a> SymbolicMachine<'a> {
         // vsp-rooted state below/above an array-store window thus stays precise
         // and the post-store branch resolves.
         if let Some((root, slo, shi)) = proven_store_byte_range(address, width) {
-            self.memory
-                .retain(|cell_address, _| store_range_disjoint_from_cell(&root, slo, shi, cell_address));
+            self.retain_memory(|cell_address| {
+                store_range_disjoint_from_cell(&root, slo, shi, cell_address)
+            });
             // The store base is a symbolic region pointer; it cannot be proven
             // disjoint from concrete in-image addresses, so image-source reads
             // stay withheld (this does not block branch resolution or resume).
@@ -715,7 +760,7 @@ impl<'a> SymbolicMachine<'a> {
         if address.dependencies().contains("vsp_initial") {
             // The address may alias the VM operand stack itself; keep the broad,
             // assumption-free havoc.
-            self.memory.clear();
+            self.retain_memory(|_| false);
             self.memory_tainted = true;
             self.memory_havocs.push(SymbolicMemoryHavoc {
                 instruction_index,
@@ -724,8 +769,7 @@ impl<'a> SymbolicMachine<'a> {
             return Ok(());
         }
         // Preserve the provably vsp-rooted cells, discard the rest.
-        self.memory
-            .retain(|cell_address, _| pointer_offset(cell_address).is_some());
+        self.retain_memory(|cell_address| pointer_offset(cell_address).is_some());
         self.image_reads_suppressed = true;
         self.assumed_external_disjoint_from_vm_stack = true;
         self.memory_havocs.push(SymbolicMemoryHavoc {
@@ -755,8 +799,8 @@ impl<'a> SymbolicMachine<'a> {
         value: Expr,
     ) -> Result<(), String> {
         let address = canonicalize_pointer(address);
-        if pointer_offset(&address).is_none() && depends_on_vsp_root(&value) {
-            self.vm_stack_address_escapes = true;
+        if pointer_offset(&address).is_none() {
+            self.note_value_leaves_frame(&value);
         }
         if is_proven_region_pointer(&address) {
             // The address provably lies in a tracked region (VM stack / proven
@@ -792,9 +836,7 @@ impl<'a> SymbolicMachine<'a> {
         outcome: &NativeCallSelectorOutcome,
     ) -> Result<(), String> {
         let target = self.load_stack(i64::from(outcome.target_stack_offset), BitWidth::W64)?;
-        if depends_on_vsp_root(&target) {
-            self.vm_stack_address_escapes = true;
-        }
+        self.note_value_leaves_frame(&target);
         let argument_capacity = outcome
             .register_argument_offsets
             .len()
@@ -803,9 +845,7 @@ impl<'a> SymbolicMachine<'a> {
         let mut descriptors = Vec::with_capacity(argument_capacity);
         for (index, offset) in outcome.register_argument_offsets.iter().enumerate() {
             let value = self.load_stack(i64::from(*offset), BitWidth::W64)?;
-            if depends_on_vsp_root(&value) {
-                self.vm_stack_address_escapes = true;
-            }
+            self.note_value_leaves_frame(&value);
             let ordinal = u16::try_from(index)
                 .map_err(|_| "native-call register argument ordinal overflows".to_owned())?;
             let name = WIN64_ARGUMENT_REGISTERS.get(index).ok_or_else(|| {
@@ -831,9 +871,7 @@ impl<'a> SymbolicMachine<'a> {
         }
         for (stack_index, offset) in outcome.stack_argument_offsets.iter().enumerate() {
             let value = self.load_stack(i64::from(*offset), BitWidth::W64)?;
-            if depends_on_vsp_root(&value) {
-                self.vm_stack_address_escapes = true;
-            }
+            self.note_value_leaves_frame(&value);
             let logical_index = outcome
                 .register_argument_offsets
                 .len()
@@ -902,7 +940,7 @@ impl<'a> SymbolicMachine<'a> {
         match &applied.memory {
             NativeCallMemoryDecision::HavocTracked { reason } => {
                 self.advance_memory_epoch()?;
-                self.memory.clear();
+                self.retain_memory(|_| false);
                 self.memory_tainted = false;
                 let touched_context = self.context.touched_cells.clone();
                 self.context = SymbolicByteMemory::new(format!(
@@ -1184,6 +1222,14 @@ pub fn canonicalize_symbolic_pointer(expression: &Expr) -> Expr {
 
 fn depends_on_vsp_root(expression: &Expr) -> bool {
     expression.dependencies().contains("vsp_initial")
+}
+
+/// True unless `vsp_initial` occurs only as (part of) the address of an untracked
+/// memory read, i.e. the value is data read from the frame, not a frame pointer.
+fn is_frame_pointer_value(expression: &Expr) -> bool {
+    expression.register_outside_intrinsic_args("vsp_initial", |name| {
+        name.starts_with("memory_load_epoch_")
+    })
 }
 
 fn pointer_offset(expression: &Expr) -> Option<i64> {
@@ -2364,6 +2410,8 @@ pub fn execute_symbolic_linear_block_with_initial_state(
             .assumed_external_disjoint_from_vm_stack,
         served_read_only_image: machine.served_read_only_image,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
+        vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
+        vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
         vm_stack_store_hi: machine.vm_stack_store_hi,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
@@ -2461,6 +2509,8 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
             .assumed_external_disjoint_from_vm_stack,
         served_read_only_image: machine.served_read_only_image,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
+        vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
+        vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
         vm_stack_store_hi: machine.vm_stack_store_hi,
         external_writes: machine.external_writes,
         memory_havocs: machine.memory_havocs,
@@ -3264,6 +3314,51 @@ mod tests {
                 stack_address(24),
             )
             .expect("store of the frame pointer to a global");
+        assert!(machine.vm_stack_address_escapes);
+    }
+
+    // Data read from the frame is not a frame pointer: re-storing it in the
+    // frame or handing it out does not escape, while the frame pointer itself
+    // (even after a round trip through a tracked cell) still does.
+    #[test]
+    fn frame_data_is_not_a_frame_pointer_but_the_pointer_still_escapes() {
+        let global = || Expr::constant(BitWidth::W64, 0x1_4000_2000);
+        let mut machine = default_machine();
+        let data = machine.load_stack(16, BitWidth::W64).expect("untracked frame read");
+        assert!(depends_on_vsp_root(&data));
+        assert!(!is_frame_pointer_value(&data));
+        machine.store_stack(-8, &data).expect("data re-stored in-frame");
+        machine.store_external(0, global(), data.clone()).expect("data stored out");
+        assert!(!machine.vm_stack_address_escapes);
+        assert!(!machine.vm_stack_pointer_lost);
+        assert!(machine.vm_stack_derived_escapes);
+
+        let mut machine = default_machine();
+        machine.store_stack(-8, &stack_address(24)).expect("pointer in-frame");
+        assert!(machine.frame_pointer_in_memory && !machine.vm_stack_pointer_lost);
+        let reloaded = machine.load_stack(-8, BitWidth::W64).expect("tracked reload");
+        machine.store_external(0, global(), reloaded).expect("pointer stored out");
+        assert!(machine.vm_stack_address_escapes);
+
+        // Discarding a tracked cell that held a frame pointer is recorded, since
+        // an untracked reload could then return that pointer as "data".
+        let mut machine = default_machine();
+        machine.store_stack(-8, &stack_address(24)).expect("pointer in-frame");
+        machine
+            .store_external(
+                0,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                Expr::constant(BitWidth::W64, 1),
+            )
+            .expect("external store drops non-vsp cells only");
+        assert!(!machine.vm_stack_pointer_lost);
+        machine.retain_memory(|_| false);
+        assert!(machine.vm_stack_pointer_lost);
+
+        let mut machine = default_machine();
+        let mixed = Expr::binary(BinaryOp::Add, data, stack_address(8)).expect("data + pointer");
+        assert!(is_frame_pointer_value(&mixed), "uncertain values count as pointers");
+        machine.store_external(0, global(), mixed).expect("store");
         assert!(machine.vm_stack_address_escapes);
     }
 

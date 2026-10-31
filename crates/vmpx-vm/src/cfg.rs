@@ -1228,6 +1228,10 @@ struct Walker<'a, 'p> {
     /// Set once a report may leak the frame address or write outside the frame,
     /// or a loop widening may have hidden such a pointer.
     frame_not_private: bool,
+    /// Some report let a value derived from the frame (possibly mere data) leave it.
+    frame_derived_escape: bool,
+    /// Some report discarded tracked memory holding a frame-pointer value.
+    frame_pointer_lost: bool,
 }
 
 /// Builds the memory source for a symbolic call: the sound read-only image
@@ -2656,7 +2660,14 @@ impl Walker<'_, '_> {
     /// entry stub's fresh allocation (no pointer to it existed before the VM),
     /// every cell lies inside it, and the VM never exported a pointer into it.
     fn discharge_vm_stack_assumption(&mut self) {
-        if self.private_frame_hi.is_some() && !self.frame_not_private && self.nested_followed == 0 {
+        // Data read from the frame is benign only if no cell holding a frame
+        // pointer was discarded (an untracked load could otherwise return it).
+        let derived_leak = self.frame_pointer_lost && self.frame_derived_escape;
+        if self.private_frame_hi.is_some()
+            && !self.frame_not_private
+            && !derived_leak
+            && self.nested_followed == 0
+        {
             self.cfg
                 .assumptions
                 .remove(&VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
@@ -2669,6 +2680,8 @@ impl Walker<'_, '_> {
             .zip(report.vm_stack_store_hi)
             .is_some_and(|(frame_hi, written)| written > frame_hi);
         self.frame_not_private |= report.vm_stack_address_escapes || past_frame;
+        self.frame_derived_escape |= report.vm_stack_derived_escapes;
+        self.frame_pointer_lost |= report.vm_stack_pointer_lost;
     }
 
     fn follow_native_call(
@@ -3053,6 +3066,8 @@ pub fn recover_vm_cfg_with_observed(
         observed_branch_targets: &observed.branch_targets,
         private_frame_hi,
         frame_not_private: false,
+        frame_derived_escape: false,
+        frame_pointer_lost: false,
     };
     let mut pending = vec![Item {
         bytes: 0,
@@ -3249,6 +3264,8 @@ mod tests {
             observed_branch_targets: &observed.branch_targets,
             private_frame_hi: None,
             frame_not_private: false,
+            frame_derived_escape: false,
+            frame_pointer_lost: false,
         }
     }
 
@@ -3277,7 +3294,7 @@ mod tests {
             Register::R8,
             crate::BytecodeDirection::Descending,
         );
-        let report = |escapes: bool, store_hi: Option<i64>| {
+        let flagged = |escapes: bool, derived: bool, stored: bool, store_hi: Option<i64>| {
             let mut report = execute_symbolic_linear_block_with_initial_state(
                 &[],
                 None,
@@ -3287,8 +3304,13 @@ mod tests {
             )
             .expect("empty block executes");
             report.vm_stack_address_escapes = escapes;
+            report.vm_stack_derived_escapes = derived || escapes;
+            report.vm_stack_pointer_lost = stored;
             report.vm_stack_store_hi = store_hi;
             report
+        };
+        let report = |escapes: bool, store_hi: Option<i64>| {
+            flagged(escapes, false, false, store_hi)
         };
         let outcome = |frame_hi: Option<i64>, reports: &[SymbolicVmExecutionReport], nested: usize| {
             let mut walker = test_walker(&pe, base, &observed, &seeded);
@@ -3310,7 +3332,15 @@ mod tests {
         assert!(!outcome(None, &[quiet.clone()], 0), "frame unproven or exposed");
         assert!(!outcome(Some(0x30), &[report(true, None)], 0), "pointer leaked");
         assert!(!outcome(Some(0x30), &[report(false, Some(0x38))], 0), "write past the frame");
-        assert!(!outcome(Some(0x30), &[quiet], 1), "nested entry");
+        assert!(!outcome(Some(0x30), &[quiet.clone()], 1), "nested entry");
+        let data_only = flagged(false, true, false, Some(0x30));
+        assert!(outcome(Some(0x30), &[data_only.clone()], 0), "frame data leaving is benign");
+        let pointer_somewhere = flagged(false, false, true, Some(0x30));
+        assert!(outcome(Some(0x30), &[pointer_somewhere.clone(), quiet], 0));
+        assert!(
+            !outcome(Some(0x30), &[data_only, pointer_somewhere], 0),
+            "data may be a hidden frame pointer once one was stored"
+        );
     }
 
     /// SOUND-PATH INVARIANCE: with no transition active, every profile accessor
