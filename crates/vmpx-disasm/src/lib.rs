@@ -11,6 +11,7 @@ use vmpx_pe::{FileOffset, PeImage, PeKind, Rva, Va};
 mod dangling;
 mod dispatch_proof;
 mod iat_refs;
+mod import_stubs;
 mod native_expr;
 mod native_lift;
 #[cfg(test)]
@@ -25,6 +26,9 @@ pub use dispatch_proof::{
     RegisterDispatchProof, RegisterDispatchProofLimits, prove_register_dispatch_postlude,
 };
 pub use iat_refs::{IatReferenceScan, referenced_iat_slots, scan_iat_references};
+pub use import_stubs::{
+    ImportStubReport, ResolvedImportSite, StubShape, UnresolvedImportSite, resolve_import_stubs,
+};
 pub use native_expr::{NativeAlgebra, NativeExpr, NativeNode};
 pub use native_lift::{
     Algebra, AlgebraError, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, LiftOptions,

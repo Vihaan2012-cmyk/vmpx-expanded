@@ -132,6 +132,7 @@ impl From<CfgOptions> for LiftOptions {
     fn from(o: CfgOptions) -> Self {
         Self {
             assume_stack_disjoint: o.assume_stack_disjoint,
+            ..Self::default()
         }
     }
 }
