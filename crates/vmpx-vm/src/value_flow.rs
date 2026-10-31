@@ -1371,11 +1371,20 @@ fn cpuid_flow(
         return None;
     };
     let operation_index = instruction_index(active, *operation_rva)?;
-    if active[operation_index].instruction.mnemonic() != Mnemonic::Cpuid
-        || summary.vsp_delta != Some(-8)
-    {
+    if active[operation_index].instruction.mnemonic() != Mnemonic::Cpuid {
         return None;
     }
+    // Two proven layouts, distinguished by the net VSP delta:
+    //   -8  : two-operand form, a leaf at stack[0] and a subleaf at stack[4];
+    //   -12 : leaf-only form, a single leaf at stack[0] (the CPUID subleaf is the
+    //         native ECX on entry, an environment value, not a stack operand).
+    // In both, EAX/EBX/ECX/EDX land in four ordered dword cells. The output
+    // entry displacements shift with the VSP delta.
+    let leaf_only = match summary.vsp_delta {
+        Some(-8) => false,
+        Some(-12) => true,
+        _ => return None,
+    };
     let leaf_proven =
         latest_definition(active, operation_index, Register::EAX).is_some_and(|definition| {
             definition_is_load(
@@ -1388,8 +1397,10 @@ fn cpuid_flow(
                 BitWidth::W32,
             )
         });
-    let subleaf_proven =
-        latest_definition(active, operation_index, Register::ECX).is_some_and(|definition| {
+    // The leaf-only form has no stack subleaf to prove; its subleaf is the
+    // unconstrained entry ECX, modelled as an environment value downstream.
+    let subleaf_proven = leaf_only
+        || latest_definition(active, operation_index, Register::ECX).is_some_and(|definition| {
             definition_is_load(
                 active,
                 summary,
@@ -1401,12 +1412,22 @@ fn cpuid_flow(
             )
         });
     let mut last_store = None;
-    let outputs = [
-        (12, 4, Register::EAX),
-        (8, 0, Register::EBX),
-        (4, -4, Register::ECX),
-        (0, -8, Register::EDX),
-    ]
+    let output_layout = if leaf_only {
+        [
+            (12, 0, Register::EAX),
+            (8, -4, Register::EBX),
+            (4, -8, Register::ECX),
+            (0, -12, Register::EDX),
+        ]
+    } else {
+        [
+            (12, 4, Register::EAX),
+            (8, 0, Register::EBX),
+            (4, -4, Register::ECX),
+            (0, -8, Register::EDX),
+        ]
+    };
+    let outputs = output_layout
     .into_iter()
     .all(|(displacement, entry, register)| {
         let Some(store) = unique_effect_rva(

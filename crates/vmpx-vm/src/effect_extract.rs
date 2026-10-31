@@ -1191,6 +1191,31 @@ pub fn classify_handler_effects(
                     writes,
                 )
             });
+    // Leaf-only CPUID variant: a single leaf dword is read from the stack top
+    // (no stack subleaf operand; CPUID's ECX subleaf is whatever the native ECX
+    // holds on entry, an environment value), and EAX/EBX/ECX/EDX are written to
+    // four dword cells, net VSP delta -12. Distinct from `is_cpuid`'s two-operand
+    // (-8) form that reads both a leaf and a subleaf from the stack.
+    let is_cpuid_leaf_only = summary.cpuid_reads.len() == 1
+        && summary.vsp_delta == Some(-12)
+        && has_memory_width(
+            summary,
+            HandlerMemoryRegion::VmStack,
+            0,
+            BitWidth::W32.bytes(),
+            true,
+            false,
+        )
+        && (0..4).all(|slot| {
+            has_memory_width(
+                summary,
+                HandlerMemoryRegion::VmStack,
+                slot * 4,
+                BitWidth::W32.bytes(),
+                false,
+                true,
+            )
+        });
     let is_pop_flags = summary.native_flag_restores.len() == 1
         && summary.vsp_delta == Some(8)
         && has_memory_width(
@@ -1667,6 +1692,17 @@ pub fn classify_handler_effects(
         && summary.arithmetic_operations.is_empty()
         && is_cpuid
         && stack_effect_count == 6
+        && other_effect_count == 0
+    {
+        add_candidate(VmHandlerSemantic::Cpuid, Some(BitWidth::W32));
+    }
+    if ordinary_operandless
+        && !other_read
+        && !other_write
+        && !summary.captures_native_flags_to_vsp
+        && summary.arithmetic_operations.is_empty()
+        && is_cpuid_leaf_only
+        && stack_effect_count == 5
         && other_effect_count == 0
     {
         add_candidate(VmHandlerSemantic::Cpuid, Some(BitWidth::W32));
@@ -3988,6 +4024,34 @@ mod tests {
     fn classifies_cpuid_and_rejects_swapped_output_cells() {
         assert_class(cpuid_body(false), VmHandlerSemantic::Cpuid, BitWidth::W32);
         assert_unknown(cpuid_body(true));
+    }
+
+    fn cpuid_leaf_only_body(swap_outputs: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.mov(eax, dword_ptr(r11)).expect("leaf");
+            a.cpuid().expect("cpuid");
+            a.sub(r11, 12).expect("reserve");
+            a.mov(dword_ptr(r11 + 12), eax).expect("eax");
+            if swap_outputs {
+                a.mov(dword_ptr(r11 + 8), ecx).expect("ecx in the ebx cell");
+                a.mov(dword_ptr(r11 + 4), ebx).expect("ebx in the ecx cell");
+            } else {
+                a.mov(dword_ptr(r11 + 8), ebx).expect("ebx");
+                a.mov(dword_ptr(r11 + 4), ecx).expect("ecx");
+            }
+            a.mov(dword_ptr(r11), edx).expect("edx");
+        }
+    }
+
+    #[test]
+    fn classifies_leaf_only_cpuid_and_rejects_swapped_output_cells() {
+        // A leaf-only CPUID (no stack subleaf, net VSP delta -12) classifies and
+        // proves; the same shape with transposed EBX/ECX output cells stays
+        // Unknown, so a near-miss cannot be mistaken for the real handler.
+        let analysis =
+            assert_class(cpuid_leaf_only_body(false), VmHandlerSemantic::Cpuid, BitWidth::W32);
+        assert_eq!(analysis.stack_delta, Some(-12));
+        assert_unknown(cpuid_leaf_only_body(true));
     }
 
     fn pop_flags(pushed: AsmRegister64) -> impl FnOnce(&mut CodeAssembler) {

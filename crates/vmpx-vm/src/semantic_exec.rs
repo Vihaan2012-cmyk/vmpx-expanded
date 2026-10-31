@@ -1873,10 +1873,29 @@ fn execute_instruction(
             machine.store_stack(0, &flags)?;
         }
         VmHandlerSemantic::Cpuid => {
-            expected_delta(instruction, -8)?;
+            // Two layouts share one executor: the two-operand form (-8) reads a
+            // leaf and a subleaf from the stack; the leaf-only form (-12) reads
+            // only the leaf, and its subleaf is the native ECX on entry — an
+            // environment value modelled as a fresh opaque input. Either way the
+            // four result dwords are opaque, CPU-dependent intrinsics, so the
+            // leaf-only subleaf being unknown only widens an already-opaque
+            // result and stays sound.
+            let delta = instruction
+                .vsp_delta
+                .ok_or_else(|| "cpuid VSP delta is unknown".to_owned())?;
             let leaf = machine.load_stack(0, BitWidth::W32)?;
-            let subleaf = machine.load_stack(4, BitWidth::W32)?;
-            machine.adjust_vsp(-8)?;
+            let subleaf = match delta {
+                -8 => machine.load_stack(4, BitWidth::W32)?,
+                -12 => Expr::intrinsic(
+                    BitWidth::W32,
+                    format!("x86_cpuid_subleaf_{instruction_index}"),
+                    Vec::new(),
+                ),
+                other => {
+                    return Err(format!("unsupported cpuid VSP delta {other}"));
+                }
+            };
+            machine.adjust_vsp(delta)?;
             for (displacement, register) in [(12, "eax"), (8, "ebx"), (4, "ecx"), (0, "edx")] {
                 let value = Expr::intrinsic(
                     BitWidth::W32,
@@ -3652,6 +3671,43 @@ mod tests {
         let report = run(&block).expect("popfq executes");
         assert_eq!(report.final_vsp_offset, Some(0));
         assert!(format!("{:?}", report.final_flags).contains("x86_popfq_1"));
+    }
+
+    #[test]
+    fn leaf_only_cpuid_pushes_four_opaque_results_over_an_env_subleaf() {
+        // A single leaf dword on the stack, net VSP delta -12: the executor reads
+        // the leaf, synthesizes an environment subleaf, and writes four opaque
+        // dword results. The subleaf being unknown keeps the results opaque.
+        let block = vec![
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W32,
+                Some(1),
+                Some(-4),
+            ),
+            instruction(VmHandlerSemantic::Cpuid, BitWidth::W32, None, Some(-12)),
+        ];
+        let report = run(&block).expect("leaf-only cpuid executes");
+        assert_eq!(report.final_vsp_offset, Some(-16));
+        let dump = format!("{:?}", report.memory_values);
+        assert!(dump.contains("x86_cpuid_eax_"), "{dump}");
+        assert!(dump.contains("x86_cpuid_subleaf_"), "{dump}");
+    }
+
+    #[test]
+    fn cpuid_with_unsupported_delta_fails_closed() {
+        // Only the proven -8 and -12 layouts execute; any other recovered delta
+        // must error rather than guess a stack layout.
+        let block = vec![
+            instruction(
+                VmHandlerSemantic::ConstantPush,
+                BitWidth::W32,
+                Some(1),
+                Some(-4),
+            ),
+            instruction(VmHandlerSemantic::Cpuid, BitWidth::W32, None, Some(-16)),
+        ];
+        assert!(run(&block).is_err());
     }
 
     fn read_only_image_machine(source: &dyn SymbolicMemorySource) -> SymbolicMachine<'_> {
