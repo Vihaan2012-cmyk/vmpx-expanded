@@ -218,4 +218,37 @@ impl Memory {
     pub fn pages(&self) -> impl Iterator<Item = (u64, Perm, &[u8])> {
         self.pages.iter().map(|(&base, p)| (base, p.perm, &p.data[..]))
     }
+
+    /// Permission of the page containing `addr`, or `None` if unmapped.
+    #[must_use]
+    pub fn perm_at(&self, addr: u64) -> Option<Perm> {
+        self.pages.get(&(addr & !PAGE_MASK)).map(|p| p.perm)
+    }
+
+    /// Change the permission of every page overlapping `[addr, addr+len)` to
+    /// `perm` (an NT reprotect). The range is rounded out to page boundaries.
+    ///
+    /// # Errors
+    /// Faults (access `Write`) if any page in the range is unmapped; pages
+    /// before the gap keep the new permission (NT reprotect is not atomic).
+    pub fn protect(&mut self, addr: u64, len: u64, perm: Perm) -> Result<(), MemFault> {
+        let fault = |addr| MemFault { addr, access: Access::Write };
+        if len == 0 {
+            return Ok(());
+        }
+        let base = addr & !PAGE_MASK;
+        let end = addr.checked_add(len).ok_or_else(|| fault(addr))?;
+        let mut a = base;
+        while a < end {
+            match self.pages.get_mut(&a) {
+                Some(p) => p.perm = perm,
+                None => return Err(fault(a)),
+            }
+            match a.checked_add(PAGE_SIZE) {
+                Some(n) => a = n,
+                None => break,
+            }
+        }
+        Ok(())
+    }
 }

@@ -29,6 +29,7 @@ use crate::cpu::Cpu;
 use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, MemEvent};
 use crate::loader::LoadedImage;
 use crate::memory::{Access, MapError, Memory, Perm};
+use crate::ntdll::{NtDispatch, NtState};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 
 // Win64 integer-argument registers (RCX, RDX, R8, R9) and RAX/RSP by index
@@ -110,6 +111,13 @@ pub struct WinApiHook {
     /// (module, symbol-key) already recorded from the walk, to dedupe the
     /// repeated reads a binary search performs.
     walk_recorded: BTreeSet<(String, String)>,
+    /// Resolved export stub VA -> (module, symbol). Populated for every module
+    /// whose fake export table was published; a guest `call`/`jmp` to one of
+    /// these VAs is the protector invoking a directly-walked export (notably the
+    /// ntdll `Zw*` syscall stubs it uses to unpack). Dispatched like an IAT thunk.
+    export_stub_addrs: BTreeMap<u64, (String, String)>,
+    /// In-model NT object + memory state for the emulated ntdll syscall stubs.
+    nt: NtState,
 }
 
 /// A read-watch over one module's `AddressOfFunctions` array. When the protector
@@ -159,6 +167,8 @@ impl WinApiHook {
             export_reference: BTreeMap::new(),
             export_watches: Vec::new(),
             walk_recorded: BTreeSet::new(),
+            export_stub_addrs: BTreeMap::new(),
+            nt: NtState::new(),
         }
     }
 
@@ -233,11 +243,17 @@ impl WinApiHook {
         let h = self.hmodule_next;
         let exports = self.export_reference.get(&key).cloned().unwrap_or_default();
         match map_module_image(mem, h, &key, &exports) {
-            Ok(Some(layout)) => self.export_watches.push(ExportWatch {
-                module: key.clone(),
-                functions_va: layout.functions_va,
-                slots: layout.slots,
-            }),
+            Ok(Some(layout)) => {
+                for export in layout.slots.iter().flatten() {
+                    self.export_stub_addrs
+                        .insert(export.va, (key.clone(), symbol_key(&export.symbol)));
+                }
+                self.export_watches.push(ExportWatch {
+                    module: key.clone(),
+                    functions_va: layout.functions_va,
+                    slots: layout.slots,
+                });
+            }
             Ok(None) => {}
             Err(_) => return 0,
         }
@@ -384,14 +400,51 @@ impl Hook for WinApiHook {
     }
 
     fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
-        if !matches!(ev.kind, FlowKind::Call | FlowKind::Jmp) {
+        // A protector reaches a stub by `call`/`jmp` or the `push addr; ret`
+        // idiom (the popped target is the stub); all three are dispatched.
+        if !matches!(ev.kind, FlowKind::Call | FlowKind::Jmp | FlowKind::Ret) {
             return HookAction::Continue;
         }
-        let Some((dll, func)) = self.stubs.get(&ev.to).cloned() else {
-            return HookAction::Continue; // not an import thunk
-        };
+        // An IAT import thunk (the loader's STUB_REGION sentinels).
+        if let Some((dll, func)) = self.stubs.get(&ev.to).cloned() {
+            return self.dispatch_win32(&dll, &func, ev, cpu, mem);
+        }
+        // A directly-walked export stub (e.g. the ntdll Zw* the protector
+        // resolves to unpack). ntdll syscall stubs go to the NT emulator; any
+        // other walked export reuses the Win32 surface (unmodeled -> Stop).
+        if let Some((dll, func)) = self.export_stub_addrs.get(&ev.to).cloned() {
+            if dll == "ntdll.dll" && is_nt_syscall(&func) {
+                let sab = Self::stack_arg_base(ev, cpu);
+                return match self.nt.dispatch(&func, cpu, mem, sab) {
+                    NtDispatch::Status(s) => {
+                        cpu.regs[RAX] = s;
+                        Self::resume(ev, cpu, mem)
+                    }
+                    NtDispatch::Stop => HookAction::Stop,
+                };
+            }
+            return self.dispatch_win32(&dll, &func, ev, cpu, mem);
+        }
+        HookAction::Continue // not an import thunk
+    }
+}
 
-        match self.dispatch(&dll, &func, cpu, mem) {
+/// An ntdll export is a syscall stub when its name is an `Nt*`/`Zw*` pair.
+fn is_nt_syscall(func: &str) -> bool {
+    func.starts_with("Nt") || func.starts_with("Zw")
+}
+
+impl WinApiHook {
+    /// Dispatch a Win32 API by `(dll, func)` and return into the guest.
+    fn dispatch_win32(
+        &mut self,
+        dll: &str,
+        func: &str,
+        ev: &FlowEvent,
+        cpu: &mut Cpu,
+        mem: &mut Memory,
+    ) -> HookAction {
+        match self.dispatch(dll, func, cpu, mem) {
             Dispatch::Stop => HookAction::Stop,
             Dispatch::Ret(v) => {
                 cpu.regs[RAX] = v;
@@ -400,9 +453,24 @@ impl Hook for WinApiHook {
             Dispatch::Void => Self::resume(ev, cpu, mem),
         }
     }
-}
 
-impl WinApiHook {
+    /// Guest address of the 5th NT argument's stack slot. At a `Call`
+    /// interception the return address is not yet pushed, so the 5th arg sits at
+    /// `[RSP+0x20]` (above the 0x20 shadow space); a `Jmp` thunk has already
+    /// pushed a return address, shifting it to `[RSP+0x28]`.
+    fn stack_arg_base(ev: &FlowEvent, cpu: &Cpu) -> u64 {
+        // Offset to arg5 = (RSP at stub entry) + 0x28. A `Call` has not pushed
+        // the return address yet (entry RSP = RSP-8 => +0x20); a `Jmp` thunk has
+        // (entry RSP = RSP => +0x28); a `push;ret` pops the target first (entry
+        // RSP = RSP+8 => +0x30).
+        let shadow = match ev.kind {
+            FlowKind::Jmp => 0x28,
+            FlowKind::Ret => 0x30,
+            _ => 0x20,
+        };
+        cpu.regs[RSP].wrapping_add(shadow)
+    }
+
     /// Return into the guest after an emulated API.
     ///
     /// * `Call`: the emulator skips its implicit return-address push on
@@ -421,6 +489,19 @@ impl WinApiHook {
                 match mem.read_uint(sp, 8) {
                     Ok(ra) => {
                         cpu.regs[RSP] = sp.wrapping_add(8);
+                        cpu.rip = ra;
+                        HookAction::Redirect
+                    }
+                    Err(_) => HookAction::Stop,
+                }
+            }
+            // `push target; ret`: [RSP] = target (popped by this ret), [RSP+8] =
+            // the real return address the emulated stub's own `ret` lands on.
+            FlowKind::Ret => {
+                let sp = cpu.regs[RSP];
+                match mem.read_uint(sp.wrapping_add(8), 8) {
+                    Ok(ra) => {
+                        cpu.regs[RSP] = sp.wrapping_add(16);
                         cpu.rip = ra;
                         HookAction::Redirect
                     }

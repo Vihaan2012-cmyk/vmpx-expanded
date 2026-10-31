@@ -56,6 +56,7 @@ mod dump;
 mod emu;
 mod loader;
 mod memory;
+mod ntdll;
 mod observe;
 mod sysdll;
 mod vm_observe;
