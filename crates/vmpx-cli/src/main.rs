@@ -22,10 +22,15 @@ mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
+mod equiv_gate;
 mod generic_unpack;
 mod input_closed_functions;
 mod strip_wiring;
 mod vm_inventory;
+
+fn parse_rva(text: &str) -> Result<u32, String> {
+    u32::from_str_radix(text.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -85,6 +90,41 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// End-to-end equivalence gate: proves, refutes, or leaves unproven each
+    /// recovered function by checking the VM's recovered semantics against the
+    /// recompiled (lowered + optimized) replacement read back as semantics.
+    VerifyEquiv {
+        input: PathBuf,
+        /// Stop after this many recovered functions (bounded slice).
+        #[arg(long)]
+        max_functions: Option<usize>,
+        /// Restrict to these VM entry RVAs (hex, e.g. 0x1234); repeatable.
+        #[arg(long = "rva", value_parser = parse_rva)]
+        rva: Vec<u32>,
+        /// Check the unoptimized lowering instead of lowering + optimizer.
+        #[arg(long)]
+        no_optimize: bool,
+        /// Also consult z3/bitwuzla/cvc5 from PATH for cells the built-in
+        /// bounded backend cannot decide. Off by default.
+        #[arg(long)]
+        solver: bool,
+        /// Total free input bits up to which the built-in backend enumerates.
+        #[arg(long, default_value_t = 16)]
+        exhaustive_bits: u32,
+        /// Per-cell wall-clock limit per backend.
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u32,
+        /// VM instruction budget for entry-stream recovery.
+        #[arg(long, default_value_t = 512)]
+        instruction_limit: usize,
+        /// Treat a load after a possibly-aliasing store as unproven instead of
+        /// trusting the lifter's read-stability analysis for it.
+        #[arg(long)]
+        strict_memory: bool,
+        /// Print one line per function.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Perform structural validation without executing the input.
     Verify {
@@ -1053,6 +1093,29 @@ fn main() -> Result<()> {
                 print_report(&input, &digest, &report);
             }
         }
+        Command::VerifyEquiv {
+            input,
+            max_functions,
+            rva,
+            no_optimize,
+            solver,
+            exhaustive_bits,
+            timeout_ms,
+            instruction_limit,
+            strict_memory,
+            verbose,
+        } => equiv_gate::run(&equiv_gate::GateOptions {
+            input,
+            optimize: !no_optimize,
+            max_functions,
+            only: rva,
+            use_solver: solver,
+            exhaustive_bits,
+            timeout_ms,
+            instruction_limit,
+            strict_memory,
+            verbose,
+        })?,
         Command::Verify { input, json } => {
             let (data, report) = inspect(&input)?;
             let digest = sha256(&data);

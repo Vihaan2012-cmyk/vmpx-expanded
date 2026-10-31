@@ -84,6 +84,77 @@ pub struct LiftedCfgFunction {
     /// Nested VM entries inlined into the function.
     pub nested_entries: usize,
     pub assumptions: Vec<LiftAssumption>,
+    /// The configuration the replacement was built with (inputs, symbol
+    /// rewrites), needed to read the recompiled output back as semantics.
+    pub config: ReplacementConfig,
+    /// Every path of the lifted tree, segment by segment, or why the tree is
+    /// outside what can be enumerated (native calls, region exits).
+    pub recovered_paths: Result<Vec<RecoveredPath>, String>,
+    /// The emitted loops, in emission order.
+    pub emitted_loops: Vec<LoopInfo>,
+}
+
+/// One condition on a path: `selector == value` (or `!=`) at a branch node.
+#[derive(Clone, Debug)]
+pub struct PathCondition {
+    pub selector: Expr,
+    pub value: u64,
+    pub equal: bool,
+}
+
+/// A stretch of the lifted function enumerated on its own: the code from the
+/// function entry, or one iteration of a loop from its header with the loop's
+/// carried values as free symbols.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SegmentKey {
+    Root,
+    /// Loop by emission ordinal (matches [`LoopInfo`] order).
+    Loop(usize),
+}
+
+#[derive(Clone, Debug)]
+pub enum PathTerminal {
+    /// The function returns.
+    Exit {
+        semantics: crate::ExitSemantics,
+        /// The lift leaves flags clobbered on this path (nothing to compare).
+        rflags_clobbered: bool,
+        /// Bytes popped (a plain exit) or retained (a region exit).
+        return_pop: u32,
+        /// A region exit: returns through staged continuation stack.
+        retains: bool,
+    },
+    /// Control enters a loop; `seeds` are the carried values' initial values.
+    LoopEntry { ordinal: usize, seeds: Vec<Expr> },
+    /// The loop iterates again with these carried values.
+    BackEdge { ordinal: usize, next: Vec<Expr> },
+}
+
+/// One path of a segment. Conditions list every compare on the path in order
+/// (`!=` for each earlier arm, then `==` for the taken arm; for a loop exit,
+/// `==` the continue address for every exit not taken, `!=` for the one taken).
+#[derive(Clone, Debug)]
+pub struct RecoveredPath {
+    pub segment: SegmentKey,
+    pub conditions: Vec<PathCondition>,
+    /// External stores performed on this path within its segment, in order.
+    pub stores: Vec<crate::CollectedStore>,
+    pub terminal: PathTerminal,
+}
+
+/// Where the emitted IR keeps one loop-carried value.
+#[derive(Clone, Debug)]
+pub struct PhiInfo {
+    pub slot: SpillSlot,
+    pub width: BitWidth,
+    pub name: String,
+}
+
+/// One emitted loop: its header label and carried values, in emission order.
+#[derive(Clone, Debug)]
+pub struct LoopInfo {
+    pub header: Label,
+    pub phis: Vec<PhiInfo>,
 }
 
 /// The preferred-base VA of the caller's pushed return address when the entry
@@ -1940,7 +2011,7 @@ fn lift_with_nested(
         .uses_root
         .then(|| u32::try_from(input.frame.len() * 8).unwrap_or(u32::MAX));
     let region = (builder.region_exits > 0).then_some(builder.retained_bytes);
-    let replacement = build_tree_replacement(
+    let (replacement, loops) = build_tree_replacement_with_loops(
         &root,
         builder.call_sites,
         builder.read_sites,
@@ -1951,6 +2022,8 @@ fn lift_with_nested(
         &config,
         address,
     )?;
+    let recovered_paths = collect_paths(&root, &builder.phi_widths);
+    let config = effective_config(&config, frame_bytes)?;
     Ok(LiftedCfgFunction {
         replacement,
         blocks: builder.blocks,
@@ -1961,6 +2034,9 @@ fn lift_with_nested(
         native_calls: builder.call_sites,
         nested_entries: builder.nested_entries,
         assumptions: builder.assumptions,
+        config,
+        recovered_paths,
+        emitted_loops: loops,
     })
 }
 
@@ -1987,6 +2063,7 @@ struct Emitter<'c> {
     phi_base: u16,
     /// Base slot of the per-iteration staging slots for loop `phi` updates.
     phi_temp_base: u16,
+    loops: Vec<LoopInfo>,
 }
 
 impl Emitter<'_> {
@@ -2302,6 +2379,24 @@ impl Emitter<'_> {
         let header = Label(self.next_label);
         self.next_label += 1;
         self.operations.push(Operation::Label(header));
+        let phis = leaf
+            .phis
+            .iter()
+            .map(|phi| {
+                let name = loop_phi_name(phi.id);
+                let width = self
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == name)
+                    .map_or(BitWidth::W64, |input| input.width);
+                PhiInfo {
+                    slot: SpillSlot(self.phi_base + phi.id),
+                    width,
+                    name,
+                }
+            })
+            .collect();
+        self.loops.push(LoopInfo { header, phis });
         // One forward label per exit; its continuation is emitted past the
         // back-edge below.
         let mut exit_labels = Vec::with_capacity(leaf.exits.len());
@@ -2382,9 +2477,316 @@ impl Emitter<'_> {
     }
 }
 
-/// Emits the path tree as one function: capture the entry registers, then walk
-/// the tree, jumping to a labelled arm on a matching branch target and falling
-/// through into the last. Every leaf restores the exit registers and returns.
+#[derive(Clone, Default)]
+struct PathAcc {
+    conditions: Vec<PathCondition>,
+    stores: Vec<crate::CollectedStore>,
+    /// Captured-read slots resolved to the loads they hold.
+    bindings: BTreeMap<String, Expr>,
+}
+
+fn bind_reads(expression: &Expr, bindings: &BTreeMap<String, Expr>) -> Result<Expr, String> {
+    if bindings.is_empty() {
+        return Ok(expression.clone());
+    }
+    expression
+        .substitute(bindings)
+        .map_err(|error| error.to_string())
+}
+
+/// Numbers loops in emission order (a branch emits its fall-through arm first,
+/// then the taken arms; a loop emits its exit continuations in order).
+fn number_loops(node: &Node, ordinals: &mut HashMap<*const LoopLeaf, usize>) {
+    match &node.end {
+        End::Branch { arms, .. } => {
+            if let Some((last, taken)) = arms.split_last() {
+                number_loops(&last.1, ordinals);
+                for (_, arm) in taken {
+                    number_loops(arm, ordinals);
+                }
+            }
+        }
+        End::Loop(leaf) => {
+            let ordinal = ordinals.len();
+            ordinals.insert(std::ptr::from_ref(leaf), ordinal);
+            for exit in &leaf.exits {
+                number_loops(&exit.continuation, ordinals);
+            }
+        }
+        End::Exit(_) | End::Region(_) => {}
+    }
+}
+
+struct Collector<'a> {
+    ordinals: HashMap<*const LoopLeaf, usize>,
+    phi_widths: &'a [BitWidth],
+    out: Vec<RecoveredPath>,
+}
+
+/// Enumerates the tree's paths segment by segment, in the order a taken-first
+/// walk of the emitted code visits them (every taken arm before the
+/// fall-through; for a loop, each exit's continuation before the back-edge).
+/// Native calls and region exits are not enumerated.
+fn collect_paths(root: &Node, phi_widths: &[BitWidth]) -> Result<Vec<RecoveredPath>, String> {
+    let mut ordinals = HashMap::new();
+    number_loops(root, &mut ordinals);
+    let mut collector = Collector {
+        ordinals,
+        phi_widths,
+        out: Vec::new(),
+    };
+    collector.walk(root, SegmentKey::Root, PathAcc::default())?;
+    Ok(collector.out)
+}
+
+impl Collector<'_> {
+    fn apply_steps(&self, steps: &[Step], acc: &mut PathAcc) -> Result<(), String> {
+        for step in steps {
+            match &step.kind {
+                StepKind::Store(store) => {
+                    let address = bind_reads(&store.address, &acc.bindings)?;
+                    let value = bind_reads(&store.value, &acc.bindings)?;
+                    acc.stores.push(crate::CollectedStore {
+                        address,
+                        value,
+                        width: store.width,
+                    });
+                }
+                StepKind::Load(read) => {
+                    let load = Expr::load(read.width, bind_reads(&read.address, &acc.bindings)?);
+                    let widened = if read.width == BitWidth::W64 {
+                        load
+                    } else {
+                        Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, load)
+                            .map_err(|error| error.to_string())?
+                    };
+                    acc.bindings.insert(read_result_name(read.index), widened);
+                }
+                StepKind::Call(_) => return Err("a native call lies on a path".to_owned()),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, segment: SegmentKey, acc: PathAcc, terminal: PathTerminal) {
+        self.out.push(RecoveredPath {
+            segment,
+            conditions: acc.conditions,
+            stores: acc.stores,
+            terminal,
+        });
+    }
+
+    fn walk(&mut self, node: &Node, segment: SegmentKey, mut acc: PathAcc) -> Result<(), String> {
+        self.apply_steps(&node.steps, &mut acc)?;
+        match &node.end {
+            End::Exit(leaf) => {
+                let registers = leaf
+                    .registers
+                    .iter()
+                    .map(|(register, value)| Ok((*register, bind_reads(value, &acc.bindings)?)))
+                    .collect::<Result<BTreeMap<_, _>, String>>()?;
+                let rflags = leaf
+                    .rflags
+                    .as_ref()
+                    .map(|value| bind_reads(value, &acc.bindings))
+                    .transpose()?;
+                let semantics = crate::ExitSemantics {
+                    exit: NativeExitState {
+                        schema_version: 1,
+                        registers,
+                        rflags: rflags
+                            .clone()
+                            .unwrap_or_else(|| Expr::constant(BitWidth::W64, 0)),
+                        return_address: Expr::constant(BitWidth::W64, 0),
+                        frame_size: 0,
+                    },
+                    effects: crate::CollectedEffects {
+                        stores: acc.stores.clone(),
+                        calls: Vec::new(),
+                        unsupported: Vec::new(),
+                    },
+                };
+                self.finish(
+                    segment,
+                    acc,
+                    PathTerminal::Exit {
+                        semantics,
+                        rflags_clobbered: rflags.is_none(),
+                        return_pop: leaf.return_pop,
+                        retains: false,
+                    },
+                );
+                Ok(())
+            }
+            End::Region(leaf) => {
+                let registers = leaf
+                    .registers
+                    .iter()
+                    .map(|(register, value)| Ok((*register, bind_reads(value, &acc.bindings)?)))
+                    .collect::<Result<BTreeMap<_, _>, String>>()?;
+                let rflags = match &leaf.rflags {
+                    Some(value) => bind_reads(value, &acc.bindings)?,
+                    None => Expr::register(BitWidth::W64, "native_rflags_initial"),
+                };
+                let mut stores = acc.stores.clone();
+                for (index, word) in leaf.staged.iter().enumerate() {
+                    let offset = leaf
+                        .slot_offset
+                        .wrapping_add(8 * i64::try_from(index).unwrap_or(i64::MAX))
+                        .cast_unsigned();
+                    let address = Expr::binary(
+                        BinaryOp::Add,
+                        Expr::register(BitWidth::W64, "vsp_initial"),
+                        Expr::constant(BitWidth::W64, offset),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    stores.push(crate::CollectedStore {
+                        address,
+                        value: bind_reads(word, &acc.bindings)?,
+                        width: BitWidth::W64,
+                    });
+                }
+                let retained = u32::try_from(leaf.staged.len() * 8).unwrap_or(u32::MAX);
+                let semantics = crate::ExitSemantics {
+                    exit: NativeExitState {
+                        schema_version: 1,
+                        registers,
+                        rflags,
+                        return_address: Expr::constant(BitWidth::W64, 0),
+                        frame_size: 0,
+                    },
+                    effects: crate::CollectedEffects {
+                        stores,
+                        calls: Vec::new(),
+                        unsupported: Vec::new(),
+                    },
+                };
+                self.finish(
+                    segment,
+                    acc,
+                    PathTerminal::Exit {
+                        semantics,
+                        rflags_clobbered: false,
+                        return_pop: retained,
+                        retains: true,
+                    },
+                );
+                Ok(())
+            }
+            End::Loop(leaf) => {
+                let ordinal = *self
+                    .ordinals
+                    .get(&std::ptr::from_ref(leaf))
+                    .ok_or("loop was not numbered")?;
+                let seeds = leaf
+                    .phis
+                    .iter()
+                    .map(|phi| bind_reads(&phi.init, &acc.bindings))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bindings = acc.bindings.clone();
+                self.finish(segment, acc, PathTerminal::LoopEntry { ordinal, seeds });
+                self.walk_loop(leaf, ordinal, bindings)
+            }
+            End::Branch { condition, arms } => {
+                let selector = bind_reads(condition, &acc.bindings)?;
+                let (last, taken) = arms
+                    .split_last()
+                    .ok_or_else(|| "branch has no arms".to_owned())?;
+                let mut prefix = acc;
+                for (value, arm) in taken {
+                    let mut branch = prefix.clone();
+                    branch.conditions.push(PathCondition {
+                        selector: selector.clone(),
+                        value: *value,
+                        equal: true,
+                    });
+                    self.walk(arm, segment, branch)?;
+                    prefix.conditions.push(PathCondition {
+                        selector: selector.clone(),
+                        value: *value,
+                        equal: false,
+                    });
+                }
+                self.walk(&last.1, segment, prefix)
+            }
+        }
+    }
+
+    /// One iteration of a loop from its header: each exit in turn, then the
+    /// back-edge. Carried values are free symbols, stores restart empty.
+    fn walk_loop(
+        &mut self,
+        leaf: &LoopLeaf,
+        ordinal: usize,
+        bindings: BTreeMap<String, Expr>,
+    ) -> Result<(), String> {
+        let segment = SegmentKey::Loop(ordinal);
+        let mut acc = PathAcc {
+            bindings,
+            ..PathAcc::default()
+        };
+        let mut emitted = 0;
+        for exit in &leaf.exits {
+            while emitted < leaf.steps.len() && leaf.steps[emitted].epoch <= exit.epoch {
+                self.apply_steps(&leaf.steps[emitted..=emitted], &mut acc)?;
+                emitted += 1;
+            }
+            let selector = bind_reads(&exit.condition, &acc.bindings)?;
+            let mut leaving = acc.clone();
+            leaving.conditions.push(PathCondition {
+                selector: selector.clone(),
+                value: exit.continue_value,
+                equal: false,
+            });
+            self.walk(&exit.continuation, segment, leaving)?;
+            acc.conditions.push(PathCondition {
+                selector,
+                value: exit.continue_value,
+                equal: true,
+            });
+        }
+        self.apply_steps(&leaf.steps[emitted..], &mut acc)?;
+        let next = leaf
+            .phis
+            .iter()
+            .map(|phi| bind_reads(&phi.next, &acc.bindings))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _ = self.phi_widths;
+        self.finish(segment, acc, PathTerminal::BackEdge { ordinal, next });
+        Ok(())
+    }
+}
+
+/// The configuration the tree replacement is actually built with: when the
+/// function reads the VM stack root, that root is rederived from the entry
+/// stack pointer, which becomes one more captured input.
+fn effective_config(
+    config: &ReplacementConfig,
+    stack_root_bytes: Option<u32>,
+) -> Result<ReplacementConfig, ReplacementError> {
+    let Some(bytes) = stack_root_bytes else {
+        return Ok(config.clone());
+    };
+    let entry = Expr::register(BitWidth::W64, ENTRY_STACK_POINTER);
+    let root_pointer = Expr::binary(
+        BinaryOp::Sub,
+        entry,
+        Expr::constant(BitWidth::W64, u64::from(bytes)),
+    )
+    .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+    let mut owned = config.clone();
+    owned
+        .inputs
+        .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
+    owned
+        .symbol_rewrites
+        .insert("vsp_initial".to_owned(), root_pointer);
+    Ok(owned)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn build_tree_replacement(
     root: &Node,
     call_count: usize,
@@ -2396,27 +2798,36 @@ fn build_tree_replacement(
     config: &ReplacementConfig,
     address: CodeAddress,
 ) -> Result<Replacement, ReplacementError> {
-    let extended;
-    let config = if let Some(bytes) = stack_root_bytes {
-        let entry = Expr::register(BitWidth::W64, ENTRY_STACK_POINTER);
-        let root_pointer = Expr::binary(
-            BinaryOp::Sub,
-            entry,
-            Expr::constant(BitWidth::W64, u64::from(bytes)),
-        )
-        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
-        let mut owned = config.clone();
-        owned
-            .inputs
-            .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
-        owned
-            .symbol_rewrites
-            .insert("vsp_initial".to_owned(), root_pointer);
-        extended = owned;
-        &extended
-    } else {
-        config
-    };
+    build_tree_replacement_with_loops(
+        root,
+        call_count,
+        read_count,
+        loop_phis,
+        phi_widths,
+        stack_root_bytes,
+        region_retained,
+        config,
+        address,
+    )
+    .map(|(replacement, _)| replacement)
+}
+
+/// Emits the path tree as one function: capture the entry registers, then walk
+/// the tree, jumping to a labelled arm on a matching branch target and falling
+/// through into the last. Every leaf restores the exit registers and returns.
+fn build_tree_replacement_with_loops(
+    root: &Node,
+    call_count: usize,
+    read_count: usize,
+    loop_phis: u16,
+    phi_widths: &[BitWidth],
+    stack_root_bytes: Option<u32>,
+    region_retained: Option<u32>,
+    config: &ReplacementConfig,
+    address: CodeAddress,
+) -> Result<(Replacement, Vec<LoopInfo>), ReplacementError> {
+    let extended = effective_config(config, stack_root_bytes)?;
+    let config = &extended;
 
     let input_slots =
         u16::try_from(config.inputs.len()).map_err(|_| ReplacementError::TooManyInputs)?;
@@ -2495,6 +2906,7 @@ fn build_tree_replacement(
         flags_slot,
         phi_base,
         phi_temp_base,
+        loops: Vec::new(),
     };
     for (index, (name, physical)) in config.inputs.iter().enumerate() {
         let source = emitter.register(*physical);
@@ -2530,6 +2942,7 @@ fn build_tree_replacement(
         operations,
         assignments,
         trust,
+        loops,
         ..
     } = emitter;
     let mut preserve: Vec<PhysicalRegister> = Vec::new();
@@ -2574,11 +2987,14 @@ fn build_tree_replacement(
         },
     };
     let compiled = compile(&function, address)?;
-    Ok(Replacement {
-        function,
-        compiled,
-        emitted: X64NativeRegister::ALL.into_iter().collect(),
-        passthroughs: trust.passthroughs,
-        environment_boundaries: trust.environment_boundaries,
-    })
+    Ok((
+        Replacement {
+            function,
+            compiled,
+            emitted: X64NativeRegister::ALL.into_iter().collect(),
+            passthroughs: trust.passthroughs,
+            environment_boundaries: trust.environment_boundaries,
+        },
+        loops,
+    ))
 }

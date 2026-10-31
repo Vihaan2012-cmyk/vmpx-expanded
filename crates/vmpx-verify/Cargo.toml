@@ -11,6 +11,9 @@ vmpx-vm = { path = "../vmpx-vm" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
 z3 = { version = "0.22", optional = true }
 
+[dev-dependencies]
+vmpx-recompile = { path = "../vmpx-recompile" }
+
 [features]
 # Real SMT backend (Z3). Off by default: needs a system libz3 (headers + lib);
 # `smt-z3-bundled` instead builds Z3 from source (needs cmake + a C++ compiler).

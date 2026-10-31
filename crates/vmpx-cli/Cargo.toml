@@ -24,6 +24,7 @@ vmpx-vm = { path = "../vmpx-vm" }
 vmpx-rebuild = { path = "../vmpx-rebuild" }
 vmpx-recompile = { path = "../vmpx-recompile" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
+vmpx-verify = { path = "../vmpx-verify" }
 
 [lints]
 workspace = true

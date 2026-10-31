@@ -271,6 +271,60 @@ pub(crate) fn lift_entry(
     })
 }
 
+/// Recovers `rva`'s CFG and lifts it through the CFG lifter only, returning the
+/// lifted function (replacement IR plus the recovered decision tree) rather
+/// than just its bytes. Used by the equivalence gate.
+pub(crate) fn lift_entry_cfg(
+    pe: &PeImage<'_>,
+    rva: Rva,
+    instruction_limit: usize,
+) -> Result<vmpx_vmlift::LiftedCfgFunction, String> {
+    let candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
+        .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
+    let entry_limits = EntryProfileRecoveryLimits {
+        instruction_limit,
+        ..EntryProfileRecoveryLimits::default()
+    };
+    let stream = recover_entry_stream(pe, &candidate, entry_limits)
+        .map_err(|error| format!("stream recovery failed: {error}"))?;
+    let (frame, top_offset) = recover_entry_frame(
+        pe,
+        candidate.rva,
+        stream.profile.effect_roles.vsp,
+        entry_limits.trace,
+    )
+    .map_err(|error| format!("entry frame not recovered: {error}"))?;
+    let limits = VmCfgLimits {
+        entry: entry_limits,
+        ..VmCfgLimits::default()
+    };
+    let observed = ObservedRun::default();
+    let seeded = Cell::new(false);
+    let overlay = ObservedImage::new(ReadOnlyImage(pe), &observed.memory, &seeded);
+    let cfg = recover_vm_cfg_with_observed(pe, &candidate, limits, &observed)
+        .map_err(|error| format!("cfg recovery failed: {error}"))?;
+    let exits: BTreeMap<_, _> = stream
+        .decode
+        .handler_recoveries
+        .iter()
+        .filter_map(|(handler, recovery)| Some((*handler, recovery.vm_exit.clone()?)))
+        .collect();
+    let calls = cfg.native_calls();
+    let input = DecodedCfgInput {
+        cfg: &cfg,
+        frame: &frame,
+        top_offset,
+        image_base: pe.optional.image_base.0,
+        exits: &exits,
+        native_calls: &calls,
+        memory: Some(&overlay),
+        limits: SymbolicExecutionLimits::default(),
+        target_limits: limits,
+        max_expanded_blocks: 256,
+    };
+    lift_decoded_cfg(&input, CodeAddress(0x1_8000_0000)).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use vmpx_pe::Rva;
