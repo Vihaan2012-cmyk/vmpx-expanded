@@ -28,7 +28,7 @@ use std::rc::Rc;
 use crate::cpu::Cpu;
 use crate::emu::{FlowEvent, FlowKind, Hook, HookAction};
 use crate::loader::LoadedImage;
-use crate::memory::{Memory, Perm};
+use crate::memory::{MapError, Memory, Perm};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 
 // Win64 integer-argument registers (RCX, RDX, R8, R9) and RAX/RSP by index
@@ -43,6 +43,11 @@ const ALLOC_BASE: u64 = 0x0000_0050_0000_0000; // VirtualAlloc/HeapAlloc pages
 const PROC_BASE: u64 = 0x0000_0060_0000_0000; // GetProcAddress result sentinels
 const HMODULE_BASE: u64 = 0x0000_0070_0000_0000; // LoadLibrary/GetModuleHandle
 const PROCESS_HEAP: u64 = 0x0000_0070_FFFF_0000; // GetProcessHeap sentinel
+
+// Each minted HMODULE gets this much private address space; a faithful, readable
+// PE-header image is mapped there so the protector can walk the module it just
+// resolved (VMProtect dereferences GetModuleHandle results to parse headers).
+const MODULE_IMAGE_SIZE: u64 = 0x1_0000;
 
 // Fixed FILETIME (100ns ticks) written by GetSystemTimeAsFileTime.
 const FIXED_FILETIME: u64 = 0x01D0_0000_0000_0000;
@@ -73,6 +78,9 @@ pub struct WinApiHook {
     facts: Rc<RefCell<ObservedFacts>>,
     alloc_next: u64,
     hmodule_next: u64,
+    /// Base of the sample's own mapped image, returned for a `GetModuleHandle(NULL)`
+    /// so the protector walks the real (already-mapped) headers. 0 = unknown.
+    image_base: u64,
     /// Fake HMODULE -> lowercase module name (for `GetProcAddress` resolution).
     handle_names: BTreeMap<u64, String>,
     /// Lowercase module name -> fake HMODULE (stable across repeated lookups).
@@ -89,16 +97,20 @@ impl WinApiHook {
             facts: Rc::new(RefCell::new(ObservedFacts::new())),
             alloc_next: ALLOC_BASE,
             hmodule_next: HMODULE_BASE,
+            image_base: 0,
             handle_names: BTreeMap::new(),
             name_handles: BTreeMap::new(),
             procs: BTreeMap::new(),
         }
     }
 
-    /// Build a hook from a loaded image, copying its import-stub table.
+    /// Build a hook from a loaded image, copying its import-stub table and
+    /// recording the image base (returned for `GetModuleHandle(NULL)`).
     #[must_use]
     pub fn from_image(img: &LoadedImage) -> Self {
-        Self::new(img.import_stubs.clone())
+        let mut h = Self::new(img.import_stubs.clone());
+        h.image_base = img.image_base;
+        h
     }
 
     /// Shared handle to the observations collected during the run. Clone it
@@ -124,15 +136,32 @@ impl WinApiHook {
         va
     }
 
-    /// Deterministic fake HMODULE for `name` (lowercased), allocating one on
-    /// first sight and remembering the reverse mapping.
-    fn module_handle(&mut self, name: &str) -> u64 {
+    /// Resolve `name` to an HMODULE, mapping a readable module image behind it.
+    ///
+    /// A Win32 HMODULE *is* the module's load base, and protectors (VMProtect in
+    /// particular) dereference it to parse the PE headers of the module they just
+    /// resolved. So the handle must point at a readable, structurally faithful
+    /// image, not a bare sentinel:
+    ///
+    /// * `GetModuleHandle(NULL)` ("<self>") returns the sample's real, already
+    ///   mapped base — the protector then walks the genuine headers.
+    /// * Any other module gets a fresh base with a synthetic-but-valid PE header
+    ///   ([`Self::map_module_image`]) mapped once on first resolution.
+    ///
+    /// Returns 0 (NULL, the Win32 failure value) if the backing map fails.
+    fn module_handle(&mut self, mem: &mut Memory, name: &str) -> u64 {
+        if name == "<self>" && self.image_base != 0 {
+            return self.image_base;
+        }
         let key = name.to_lowercase();
         if let Some(&h) = self.name_handles.get(&key) {
             return h;
         }
         let h = self.hmodule_next;
-        self.hmodule_next += 0x1_0000;
+        if map_module_image(mem, h, &key).is_err() {
+            return 0;
+        }
+        self.hmodule_next += MODULE_IMAGE_SIZE;
         self.name_handles.insert(key.clone(), h);
         self.handle_names.insert(h, key);
         h
@@ -181,7 +210,7 @@ impl WinApiHook {
                         None => return Dispatch::Stop,
                     }
                 };
-                Dispatch::Ret(self.module_handle(&name))
+                Dispatch::Ret(self.module_handle(mem, &name))
             }
             (_, "GetModuleHandleW" | "LoadLibraryW") => {
                 let p = Self::arg(cpu, 0);
@@ -191,7 +220,7 @@ impl WinApiHook {
                         None => return Dispatch::Stop,
                     }
                 };
-                Dispatch::Ret(self.module_handle(&name))
+                Dispatch::Ret(self.module_handle(mem, &name))
             }
             // GetProcAddress(hModule, lpProcName) — the import bridge.
             (_, "GetProcAddress") => {
@@ -290,6 +319,70 @@ impl WinApiHook {
             _ => HookAction::Continue,
         }
     }
+}
+
+/// Map a readable, structurally faithful PE-header image for a resolved module
+/// at `base` and label its export directory with `name`.
+///
+/// This is the minimal shape the OS loader guarantees behind every HMODULE: a
+/// DOS stub (`MZ` + `e_lfanew`), NT headers (`PE\0\0`, a PE32+ optional header
+/// whose `ImageBase` is `base`), and a valid IMAGE_EXPORT_DIRECTORY. A module
+/// resolved here exports *nothing* — the directory is well-formed but empty.
+/// That is deliberate and sound: the module is faithfully present and its
+/// headers parse, but we do not fabricate export addresses we do not have. A
+/// protector that walks the table finds no entry and resolves NULL; any later
+/// use of that NULL faults and stops the run rather than proceeding on a guessed
+/// address. Everything is deterministic and self-contained (no host access).
+fn map_module_image(mem: &mut Memory, base: u64, name: &str) -> Result<(), MapError> {
+    const E_LFANEW: u32 = 0x40;
+    const EXPORT_RVA: u32 = 0x1000;
+    const NAME_RVA: u32 = 0x1100;
+    const EMPTY_ARR_RVA: u32 = 0x1200;
+
+    mem.map(base, MODULE_IMAGE_SIZE, Perm::R)?;
+    let mut w = |off: u64, bytes: &[u8]| {
+        // Within a region we just mapped; poke ignores perms and only faults if
+        // unmapped, which cannot happen here.
+        let _ = mem.poke(base + off, bytes);
+    };
+
+    // DOS header.
+    w(0x00, &0x5A4Du16.to_le_bytes()); // "MZ"
+    w(0x3C, &E_LFANEW.to_le_bytes());
+
+    // NT headers.
+    let nt = u64::from(E_LFANEW);
+    w(nt, &0x0000_4550u32.to_le_bytes()); // "PE\0\0"
+    // IMAGE_FILE_HEADER.
+    w(nt + 4, &0x8664u16.to_le_bytes()); // Machine = AMD64
+    w(nt + 6, &0u16.to_le_bytes()); // NumberOfSections
+    w(nt + 20, &0xF0u16.to_le_bytes()); // SizeOfOptionalHeader
+    w(nt + 22, &0x2022u16.to_le_bytes()); // Characteristics (DLL | executable)
+    // IMAGE_OPTIONAL_HEADER64.
+    let opt = nt + 24;
+    w(opt, &0x20Bu16.to_le_bytes()); // Magic = PE32+
+    w(opt + 24, &base.to_le_bytes()); // ImageBase
+    w(opt + 56, &(MODULE_IMAGE_SIZE as u32).to_le_bytes()); // SizeOfImage
+    w(opt + 108, &16u32.to_le_bytes()); // NumberOfRvaAndSizes
+    // Data directory[0] = export table.
+    w(opt + 112, &EXPORT_RVA.to_le_bytes());
+    w(opt + 116, &0x28u32.to_le_bytes()); // size (one IMAGE_EXPORT_DIRECTORY)
+
+    // IMAGE_EXPORT_DIRECTORY at EXPORT_RVA: well-formed, zero exports.
+    let exp = u64::from(EXPORT_RVA);
+    w(exp + 0x0C, &NAME_RVA.to_le_bytes()); // Name
+    w(exp + 0x10, &1u32.to_le_bytes()); // Base (ordinal base)
+    w(exp + 0x14, &0u32.to_le_bytes()); // NumberOfFunctions
+    w(exp + 0x18, &0u32.to_le_bytes()); // NumberOfNames
+    w(exp + 0x1C, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfFunctions
+    w(exp + 0x20, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNames
+    w(exp + 0x24, &EMPTY_ARR_RVA.to_le_bytes()); // AddressOfNameOrdinals
+
+    // Module name string (for a protector that reads the export Name field).
+    let mut nm = name.as_bytes().to_vec();
+    nm.push(0);
+    w(u64::from(NAME_RVA), &nm);
+    Ok(())
 }
 
 /// Read a NUL-terminated ASCII/ANSI string from guest memory (bounded).

@@ -18,6 +18,7 @@ const STUB_LOADLIB: u64 = 0x0000_0020_0000_0000;
 const STUB_GETPROC: u64 = 0x0000_0020_0000_0008;
 const STUB_ALLOC: u64 = 0x0000_0020_0000_0010;
 const STUB_UNMODELED: u64 = 0x0000_0020_0000_0018;
+const STUB_GETMODULE: u64 = 0x0000_0020_0000_0020;
 const RSP_START: u64 = STACK_TOP - 0x100;
 
 /// Build an emulator over a one-page RX code image, a writable data/stack
@@ -38,6 +39,7 @@ fn harness(code: &[u8], data: &[(u64, Vec<u8>)]) -> (Emulator, std::rc::Rc<std::
     stubs.insert(STUB_GETPROC, ("kernel32.dll".into(), "GetProcAddress".into()));
     stubs.insert(STUB_ALLOC, ("kernel32.dll".into(), "VirtualAlloc".into()));
     stubs.insert(STUB_UNMODELED, ("secret.dll".into(), "TotallyUnknownApi".into()));
+    stubs.insert(STUB_GETMODULE, ("kernel32.dll".into(), "GetModuleHandleA".into()));
 
     let hook = WinApiHook::new(stubs);
     let facts = hook.facts();
@@ -141,6 +143,38 @@ fn jmp_thunk_returns_via_stack() {
     let f = facts.borrow();
     assert_eq!(f.imports[0].symbol, SymbolOrOrdinal::Ordinal(7));
     assert_eq!(f.imports[0].module, "<unknown>");
+}
+
+/// Regression: a `GetModuleHandle` result is a *dereferenceable* module base,
+/// not a bare sentinel. VMProtect resolves a module (here "ntdll.dll") and then
+/// walks the returned HMODULE's PE headers; before the loader mapped a faithful
+/// header behind each handle, that walk faulted (a read of the sentinel module
+/// base — the real-sample `0x70_0000_0000` exec/read fault). Now the handle
+/// points at a valid DOS+NT header whose fields the guest reads cleanly.
+#[test]
+fn module_handle_is_a_walkable_pe_image() {
+    let ntdll = b"ntdll.dll\0".to_vec();
+    let name_ntdll = DATA;
+
+    let mut a = CodeAssembler::new(64).unwrap();
+    a.mov(rcx, name_ntdll).unwrap();
+    a.mov(rax, STUB_GETMODULE).unwrap();
+    a.call(rax).unwrap();
+    a.mov(rbx, rax).unwrap(); // save the HMODULE (= module base)
+    a.movzx(rdx, word_ptr(rax)).unwrap(); // DOS e_magic "MZ"
+    a.mov(esi, dword_ptr(rax + 0x3c)).unwrap(); // e_lfanew (zero-extends to rsi)
+    a.mov(r8, rbx).unwrap();
+    a.add(r8, rsi).unwrap(); // r8 = base + e_lfanew
+    a.mov(r9d, dword_ptr(r8)).unwrap(); // NT signature "PE\0\0"
+    let code = a.assemble(CODE).unwrap();
+    let end = CODE + code.len() as u64;
+
+    let (mut emu, _facts) = harness(&code, &[(name_ntdll, ntdll)]);
+    // The whole block retires with no fault on the handle dereference.
+    assert_eq!(emu.run_until(end, 1000), Stop::Reached, "walked the module header");
+    assert_ne!(emu.cpu.regs[3], 0, "GetModuleHandle returned a non-null base");
+    assert_eq!(emu.cpu.regs[2], 0x5A4D, "read DOS 'MZ' at module base");
+    assert_eq!(emu.cpu.regs[9], 0x0000_4550, "read 'PE\\0\\0' at base + e_lfanew");
 }
 
 /// Sanity: a transfer to a non-stub address is left alone (Continue).

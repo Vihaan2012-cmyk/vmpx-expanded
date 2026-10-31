@@ -30,6 +30,11 @@ use crate::winapi::WinApiHook;
 
 const DEFAULT_MAX_STEPS: u64 = 2_000_000;
 
+// COFF characteristic: the image is a DLL.
+const IMAGE_FILE_DLL: u16 = 0x2000;
+// DllMain reason code for process attach.
+const DLL_PROCESS_ATTACH: u64 = 1;
+
 /// Knobs for one detonation. `Default` runs the entry point to OEP with a dump.
 #[derive(Clone, Debug)]
 pub struct DetonateOptions {
@@ -152,6 +157,16 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     let image_base = img.image_base;
     let entry = img.entry.ok_or(DetonateError::NoEntry)?;
 
+    // A DLL's entry point is DllMain(hinstDLL, fdwReason, lpvReserved). With no
+    // explicit args, default to the PROCESS_ATTACH path — the attach branch is
+    // the one that runs the protector's startup/unpack to OEP (a DETACH or null
+    // reason returns almost immediately). Dynamic load => lpvReserved = NULL.
+    let args = if opts.args.is_empty() && pe.report().coff.characteristics & IMAGE_FILE_DLL != 0 {
+        vec![image_base, DLL_PROCESS_ATTACH, 0]
+    } else {
+        opts.args.clone()
+    };
+
     // Import emulation + OEP detection share one ObservedFacts.
     let winapi = WinApiHook::from_image(&img);
     let facts = winapi.facts();
@@ -168,9 +183,15 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
             (Box::new(oep), None)
         };
 
-    let mut emu = img.prepare(entry, &opts.args)?;
+    // Stop cleanly when the entry returns to the synthetic sentinel: for a DLL
+    // whose DllMain simply returns (no write-then-execute OEP handoff), this is
+    // a legitimate terminus (`Stop::Reached`) rather than an exec fault on the
+    // unmapped sentinel. An OEP transfer, when it happens, stops the run earlier
+    // via `OepHook` (`Stop::Hook`, with `observed.oep` set).
+    let sentinel = img.return_sentinel();
+    let mut emu = img.prepare(entry, &args)?;
     emu.hook = Some(hook);
-    let stop = emu.run(opts.max_steps);
+    let stop = emu.run_until(sentinel, opts.max_steps);
     let steps = emu.trace.len();
 
     let mut observed = facts.borrow().clone();
@@ -226,10 +247,29 @@ mod tests {
         a.assemble(IMAGE_BASE + ENTRY_RVA).unwrap()
     }
 
+    /// DllMain-style entry that records its `hinst` (RCX) and `reason` (RDX) into
+    /// two `.idata` globals, then performs the write-then-execute OEP transfer.
+    /// Used to assert the detonate driver's default DLL attach args.
+    fn arg_capture_code() -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(rax, IMAGE_BASE + 0x20E0).unwrap();
+        a.mov(qword_ptr(rax), rcx).unwrap(); // [0x20E0] = hinstDLL
+        a.mov(rax, IMAGE_BASE + 0x20E8).unwrap();
+        a.mov(qword_ptr(rax), rdx).unwrap(); // [0x20E8] = fdwReason
+        a.mov(rbx, OEP_TARGET).unwrap();
+        a.mov(qword_ptr(rbx), rbx).unwrap();
+        a.jmp(rbx).unwrap();
+        a.assemble(IMAGE_BASE + ENTRY_RVA).unwrap()
+    }
+
     /// A minimal PE32+ DLL: `.text` (RX) holds [`entry_code`]; `.idata` (RW)
     /// holds a KERNEL32 import table (`LoadLibraryA`, `GetProcAddress`) plus two
     /// argument strings. The parser must accept it and `load` must map it.
     fn synth_pe() -> Vec<u8> {
+        synth_pe_with_entry(&entry_code())
+    }
+
+    fn synth_pe_with_entry(entry: &[u8]) -> Vec<u8> {
         let mut d = vec![0u8; 0x1000];
         put(&mut d, 0, &0x5A4Du16.to_le_bytes()); // MZ
         put(&mut d, 0x3C, &0x80u32.to_le_bytes()); // e_lfanew
@@ -270,7 +310,7 @@ mod tests {
         }
 
         // .text raw at file 0x400.
-        put(&mut d, 0x400, &entry_code());
+        put(&mut d, 0x400, entry);
 
         // .idata raw at file 0x600 (RVA 0x2000).
         let idata = 0x600usize;
@@ -329,6 +369,29 @@ mod tests {
         for imp in res.observed.imports.iter().take(20) {
             eprintln!("    {} :: {:?}", imp.module, imp.symbol);
         }
+    }
+
+    #[test]
+    fn dll_defaults_to_process_attach_args() {
+        // With no explicit args, a DLL entry is driven as DllMain(hinst=image_base,
+        // reason=DLL_PROCESS_ATTACH, reserved=0). The entry records RCX/RDX; the
+        // captured globals must show the attach arguments.
+        let data = synth_pe_with_entry(&arg_capture_code());
+        let pe = PeImage::parse(&data).unwrap();
+        let opts = DetonateOptions {
+            capture_globals: vec![(IMAGE_BASE + 0x20E0, 8), (IMAGE_BASE + 0x20E8, 8)],
+            ..DetonateOptions::default()
+        };
+        let res = detonate(&pe, &opts).expect("detonation starts");
+        assert_eq!(res.stop, Stop::Hook, "reached the OEP transfer");
+
+        let g = &res.observed.globals;
+        let read = |va: u64| -> u64 {
+            let b = &g.iter().find(|x| x.va == va).expect("captured").bytes;
+            u64::from_le_bytes(b[..8].try_into().unwrap())
+        };
+        assert_eq!(read(IMAGE_BASE + 0x20E0), IMAGE_BASE, "hinstDLL == image base");
+        assert_eq!(read(IMAGE_BASE + 0x20E8), 1, "fdwReason == DLL_PROCESS_ATTACH");
     }
 
     #[test]
