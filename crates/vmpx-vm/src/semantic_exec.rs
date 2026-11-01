@@ -16,21 +16,26 @@ use crate::{
 };
 
 thread_local! {
-    static SERVED_PAGE_AUDIT: std::cell::RefCell<Option<BTreeSet<(u64, bool)>>> =
+    static SERVED_READ_AUDIT: std::cell::RefCell<Option<BTreeSet<(u64, u8)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// DIAGNOSTIC ONLY: start (or stop) recording, per thread, the 4 KiB pages
-/// (page number, proven-without-assumption) of image bytes served while image
-/// reads were suppressed, so a run can be audited against runtime evidence.
+/// Image bytes served as constants, by provenance (audit only).
+pub const SERVED_UNSUPPRESSED: u8 = 0;
+pub const SERVED_PROVEN_SUPPRESSED: u8 = 1;
+pub const SERVED_LABELED_SUPPRESSED: u8 = 2;
+
+/// DIAGNOSTIC ONLY: start (or stop) recording, per thread, the byte addresses of
+/// image bytes served as constants, with their provenance, so a run can be
+/// audited against runtime evidence.
 pub fn set_served_page_audit(enabled: bool) {
-    SERVED_PAGE_AUDIT.with(|sink| *sink.borrow_mut() = enabled.then(BTreeSet::new));
+    SERVED_READ_AUDIT.with(|sink| *sink.borrow_mut() = enabled.then(BTreeSet::new));
 }
 
-/// Drains the audit recorded on this thread since the last call.
+/// Drains the `(address, provenance)` audit recorded on this thread.
 #[must_use]
-pub fn take_served_page_audit() -> Vec<(u64, bool)> {
-    SERVED_PAGE_AUDIT.with(|sink| {
+pub fn take_served_page_audit() -> Vec<(u64, u8)> {
+    SERVED_READ_AUDIT.with(|sink| {
         sink.borrow_mut()
             .as_mut()
             .map(|set| std::mem::take(set).into_iter().collect())
@@ -38,10 +43,10 @@ pub fn take_served_page_audit() -> Vec<(u64, bool)> {
     })
 }
 
-fn note_served_page(address: u64, proven: bool) {
-    SERVED_PAGE_AUDIT.with(|sink| {
+fn note_served_read(address: u64, kind: u8) {
+    SERVED_READ_AUDIT.with(|sink| {
         if let Some(set) = sink.borrow_mut().as_mut() {
-            set.insert((address >> 12, proven));
+            set.insert((address, kind));
         }
     });
 }
@@ -680,6 +685,7 @@ impl<'a> SymbolicMachine<'a> {
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else if let Some(byte) = image_byte {
                     all_unknown = false;
+                    note_served_read(value, SERVED_UNSUPPRESSED);
                     self.resolved_image_addresses.insert(byte_va);
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else {
@@ -703,7 +709,7 @@ impl<'a> SymbolicMachine<'a> {
                 // instruction on this path since VM entry can have changed page
                 // protection, so an external store cannot have altered it.
                 all_unknown = false;
-                note_served_page(value, true);
+                note_served_read(value, SERVED_PROVEN_SUPPRESSED);
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else if let ExprKind::Const { value } = byte_address.kind
@@ -715,7 +721,7 @@ impl<'a> SymbolicMachine<'a> {
             {
                 all_unknown = false;
                 self.served_read_only_image = true;
-                note_served_page(value, false);
+                note_served_read(value, SERVED_LABELED_SUPPRESSED);
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else {

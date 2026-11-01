@@ -186,22 +186,46 @@ const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 static VOLATILE_PAGES: std::sync::RwLock<BTreeSet<u64>> =
     std::sync::RwLock::new(BTreeSet::new());
+/// Disjoint inclusive byte ranges keyed by start.
+static VOLATILE_RANGES: std::sync::RwLock<BTreeMap<u64, u64>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
 /// DYNAMIC-EVIDENCE VETO: declares 4 KiB pages (virtual address >> 12) that a
-/// run showed to change after load. Such pages are never served by
-/// [`SymbolicMemorySource::read_only_byte`]. It can only REMOVE served bytes;
-/// it is never evidence that a page is stable.
+/// run showed to change after load. No byte of such a page is served as a
+/// constant from the file. It can only REMOVE served bytes; it is never
+/// evidence that a page is stable.
 pub fn set_volatile_image_pages(pages: impl IntoIterator<Item = u64>) {
     *VOLATILE_PAGES
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = pages.into_iter().collect();
 }
 
+/// DYNAMIC-EVIDENCE VETO at byte granularity: inclusive `(start, end)` virtual
+/// address ranges whose bytes differed between the file image and a post-init
+/// run. A volatile byte reads as a fresh unknown on every path (suppressed or
+/// not) instead of as the file's value. Veto only, never a value source.
+pub fn set_volatile_image_ranges(ranges: impl IntoIterator<Item = (u64, u64)>) {
+    *VOLATILE_RANGES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        ranges.into_iter().filter(|(s, e)| s <= e).collect();
+}
+
 fn is_volatile_page(address: Va) -> bool {
-    VOLATILE_PAGES
+    let address = address.get();
+    if VOLATILE_PAGES
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&(address.get() >> 12))
+        .contains(&(address >> 12))
+    {
+        return true;
+    }
+    VOLATILE_RANGES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .range(..=address)
+        .next_back()
+        .is_some_and(|(_, &end)| address <= end)
 }
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -311,9 +335,6 @@ pub struct ReadOnlyImage<'a, 'data>(pub &'a PeImage<'data>);
 
 impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
     fn read_only_byte(&self, address: Va) -> Option<u8> {
-        if is_volatile_page(address) {
-            return None;
-        }
         self.read_byte(address)
     }
 
@@ -322,6 +343,9 @@ impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
     }
 
     fn read_byte(&self, address: Va) -> Option<u8> {
+        if is_volatile_page(address) {
+            return None;
+        }
         let pe = self.0;
         let rva = pe.optional.image_base.checked_rva_of(address)?;
         if rva.0 >= pe.optional.size_of_headers {
@@ -473,15 +497,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn volatile_pages_are_never_served() {
+    fn volatile_bytes_are_never_served() {
+        // The veto is process-global: probe addresses no other test reads.
         let bytes = two_section_pe64();
         let pe = PeImage::parse(&bytes).expect("synthetic PE");
         let source = ReadOnlyImage(&pe);
-        assert_eq!(source.read_only_byte(Va(RDATA_VA)), Some(0xEF));
-        set_volatile_image_pages([RDATA_VA >> 12]);
-        assert_eq!(source.read_only_byte(Va(RDATA_VA)), None);
+        let probe = RDATA_VA + 0x100;
+        assert_eq!(source.read_byte(Va(probe)), Some(0));
+        assert_eq!(source.read_only_byte(Va(probe)), Some(0));
+        set_volatile_image_ranges([(probe + 1, probe + 2)]);
+        assert_eq!(source.read_byte(Va(probe)), Some(0));
+        assert_eq!(source.read_byte(Va(probe + 1)), None);
+        assert_eq!(source.read_only_byte(Va(probe + 2)), None);
+        assert_eq!(source.read_byte(Va(probe + 3)), Some(0));
+        set_volatile_image_ranges([]);
+        assert_eq!(source.read_byte(Va(probe + 1)), Some(0));
+        set_volatile_image_pages([0x5000_0000 >> 12]);
+        assert!(is_volatile_page(Va(0x5000_0123)));
+        assert!(!is_volatile_page(Va(probe)));
         set_volatile_image_pages([]);
-        assert_eq!(source.read_only_byte(Va(RDATA_VA)), Some(0xEF));
     }
 
     #[test]
