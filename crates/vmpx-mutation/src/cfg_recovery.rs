@@ -116,6 +116,10 @@ pub struct CfgOptions {
     /// [`Terminator::Call`] (and continue at the next instruction) instead of
     /// refusing it. Only set it where the consumer models the call.
     pub model_calls: bool,
+    /// Record frame-versus-entry-pointer load/store pairs as
+    /// `BlockSemantics::deferred_alias` obligations instead of refusing the block.
+    /// Only for a consumer that discharges every obligation (the differential executor).
+    pub defer_frame_alias: bool,
 }
 
 impl CfgOptions {
@@ -124,18 +128,27 @@ impl CfgOptions {
         assume_stack_disjoint: false,
         model_xmm: false,
         model_calls: false,
+        defer_frame_alias: false,
     };
     /// [`Self::PROVEN`] plus the SSE scalar floating-point slice and call terminators.
     pub const PROVEN_FP: Self = Self {
         assume_stack_disjoint: false,
         model_xmm: true,
         model_calls: true,
+        defer_frame_alias: false,
+    };
+    /// [`Self::PROVEN_FP`] plus deferred frame-alias obligations; the consumer must
+    /// discharge `BlockSemantics::deferred_alias` for every block it executes.
+    pub const DIFFERENTIAL: Self = Self {
+        defer_frame_alias: true,
+        ..Self::PROVEN_FP
     };
     /// Stack-disjoint relaxation on (the default of the recovery entry points).
     pub const ASSUME_STACK_DISJOINT: Self = Self {
         assume_stack_disjoint: true,
         model_xmm: false,
         model_calls: false,
+        defer_frame_alias: false,
     };
 }
 
@@ -150,6 +163,7 @@ impl From<CfgOptions> for LiftOptions {
         Self {
             assume_stack_disjoint: o.assume_stack_disjoint,
             model_xmm: o.model_xmm,
+            defer_frame_alias: o.defer_frame_alias,
             ..Self::default()
         }
     }

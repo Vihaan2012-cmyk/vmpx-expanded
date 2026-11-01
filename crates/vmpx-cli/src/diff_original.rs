@@ -206,7 +206,7 @@ fn compare_one(
         frame_stores_dropped: 0,
         fidelity: None,
     };
-    let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::PROVEN_FP) {
+    let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::DIFFERENTIAL) {
         Ok(cfg) => cfg,
         Err(e) => return timeout(format!("original CFG: {e}")),
     };

@@ -270,6 +270,18 @@ pub struct MemoryRead<E> {
     pub width: Width,
 }
 
+/// A load treated as disjoint from an earlier frame store (or the reverse) only if the
+/// consumer proves it: with both addresses over the block-entry inputs, one must be
+/// the function's fresh frame below entry `rsp` and the other a pointer that existed
+/// at function entry. Only emitted under [`LiftOptions::defer_frame_alias`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredAlias<E> {
+    pub load_address: E,
+    pub load_width: Width,
+    pub store_address: E,
+    pub store_width: Width,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockSemantics<E> {
     /// Final value of all 16 GPRs as full 64-bit expressions of the `*_in` inputs.
@@ -291,6 +303,9 @@ pub struct BlockSemantics<E> {
     pub xmm: BTreeMap<u8, (E, E)>,
     /// XMM registers the block wrote.
     pub xmm_written: BTreeSet<u8>,
+    /// Frame-versus-pointer pairs the consumer must discharge; always empty unless
+    /// [`LiftOptions::defer_frame_alias`] is set.
+    pub deferred_alias: Vec<DeferredAlias<E>>,
 }
 
 /// Opt-in modeling assumptions; the default is assumption-free.
@@ -305,6 +320,9 @@ pub struct LiftOptions {
     /// Model the SSE/SSE2 scalar floating-point slice (see `sse`). Off by default so
     /// consumers that compare only GPR/flag/store state keep failing closed on SSE.
     pub model_xmm: bool,
+    /// Skip a store whose base differs from the load's when exactly one of the two is a
+    /// tracked `rsp` frame slot, recording a [`DeferredAlias`] the consumer must prove.
+    pub defer_frame_alias: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -544,6 +562,7 @@ struct Lifter<'a, A: Algebra> {
     rsp_off: Option<i64>,
     options: LiftOptions,
     used_assumption: bool,
+    deferred: Vec<DeferredAlias<A::Expr>>,
     /// GPRs whose value may be derived from `rsp` (only tracked under the assumption).
     tainted: [bool; 16],
     /// The instruction being executed reads `rsp` or a tainted register.
@@ -569,6 +588,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             rsp_off: Some(0),
             options,
             used_assumption: false,
+            deferred: Vec::new(),
             tainted: [false; 16],
             inst_derived: false,
             info: InstructionInfoFactory::new(),
@@ -595,6 +615,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             instruction_count,
             xmm: (0u8..).zip(self.xmm).collect(),
             xmm_written: self.xmm_written,
+            deferred_alias: self.deferred,
         }
     }
 
@@ -809,6 +830,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
     fn load_at(&mut self, address: A::Expr, key: &MemKey<A::Expr>, width: Width) -> R<A::Expr> {
         let assume = self.options.assume_stack_disjoint;
         let mut skipped_by_assumption = false;
+        let mut deferred: Vec<DeferredAlias<A::Expr>> = Vec::new();
         let mut forwarded: Option<(A::Expr, Rel, bool)> = None;
         for store in self.stores.iter().rev() {
             let rel = match relate(key, width, &store.key, store.write.width) {
@@ -824,6 +846,19 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                         && store.key.frame =>
                 {
                     skipped_by_assumption = true;
+                    Rel::Disjoint
+                }
+                Rel::Unknown
+                    if self.options.defer_frame_alias
+                        && key.sym != store.key.sym
+                        && key.frame != store.key.frame =>
+                {
+                    deferred.push(DeferredAlias {
+                        load_address: address.clone(),
+                        load_width: width,
+                        store_address: store.write.address.clone(),
+                        store_width: store.write.width,
+                    });
                     Rel::Disjoint
                 }
                 rel => rel,
@@ -842,6 +877,11 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             }
         }
         self.used_assumption |= skipped_by_assumption;
+        for d in deferred {
+            if !self.deferred.contains(&d) {
+                self.deferred.push(d);
+            }
+        }
         if let Some((value, rel, derived)) = forwarded {
             self.inst_derived |= derived;
             let Rel::Within(shift) = rel else {

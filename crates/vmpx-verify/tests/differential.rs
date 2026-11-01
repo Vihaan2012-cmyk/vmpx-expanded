@@ -194,3 +194,54 @@ fn z3_proves_a_differently_shaped_recovery() {
     let out = diff_against_original(&original(), &rec, &verifier, &AbiPolicy::win64(), false);
     assert_eq!(out.verdict, EquivVerdict::Proven, "{}", out.reason);
 }
+
+fn native(code: &[u8], options: CfgOptions) -> Result<vmpx_verify::differential::NativeFunction, String> {
+    let cfg = recover_native_cfg_opts(code, BASE, BASE, CfgLimits::default(), options)
+        .map_err(|e| e.to_string())?;
+    execute_native_function(&cfg, 100)
+}
+
+// push rbx ; mov rax,[rcx+8] ; pop rbx ; ret
+const SPILL_THEN_ARG_LOAD: [u8; 7] = [0x53, 0x48, 0x8B, 0x41, 0x08, 0x5B, 0xC3];
+
+#[test]
+fn an_entry_pointer_load_is_disjoint_from_a_prologue_spill() {
+    assert!(native(&SPILL_THEN_ARG_LOAD, CfgOptions::PROVEN_FP).is_err());
+    let f = native(&SPILL_THEN_ARG_LOAD, CfgOptions::DIFFERENTIAL).expect("lifts");
+    assert!(f.assumptions.iter().any(|a| a.contains("fresh stack frame")));
+    assert_eq!(f.frame_stores_dropped, 1);
+    let rax = f.semantics.exit.registers[&R::Rax].clone();
+    assert!(format!("{rax:?}").contains("native_rcx_initial"));
+}
+
+#[test]
+fn the_spill_rule_also_holds_across_blocks() {
+    // push rbx ; jmp +0 ; mov rax,[rcx+8] ; pop rbx ; ret
+    let code = [0x53, 0xEB, 0x00, 0x48, 0x8B, 0x41, 0x08, 0x5B, 0xC3];
+    let f = native(&code, CfgOptions::DIFFERENTIAL).expect("lifts");
+    assert!(f.assumptions.iter().any(|a| a.contains("fresh stack frame")));
+}
+
+#[test]
+fn a_leaked_frame_address_keeps_the_load_unproven() {
+    // push rbx ; lea rdx,[rsp] ; mov [rcx],rdx ; mov rax,[rcx+8] ; pop rbx ; ret
+    let code = [
+        0x53, 0x48, 0x8D, 0x14, 0x24, 0x48, 0x89, 0x11, 0x48, 0x8B, 0x41, 0x08, 0x5B, 0xC3,
+    ];
+    let err = native(&code, CfgOptions::DIFFERENTIAL).expect_err("must not model");
+    assert!(err.contains("alias"), "{err}");
+}
+
+#[test]
+fn a_frame_derived_pointer_is_not_an_entry_pointer() {
+    // push rbx ; lea rcx,[rsp] ; mov rax,[rcx+8] ; pop rbx ; ret
+    let code = [0x53, 0x48, 0x8D, 0x0C, 0x24, 0x48, 0x8B, 0x41, 0x08, 0x5B, 0xC3];
+    assert!(native(&code, CfgOptions::DIFFERENTIAL).is_err());
+}
+
+#[test]
+fn two_entry_pointers_still_may_alias() {
+    // mov [rcx],rax ; mov rbx,[rdx] ; ret
+    let code = [0x48, 0x89, 0x01, 0x48, 0x8B, 0x1A, 0xC3];
+    assert!(native(&code, CfgOptions::DIFFERENTIAL).is_err());
+}

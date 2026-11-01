@@ -89,6 +89,44 @@ fn disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
     ab == bb && (ao + i64::from(a_bytes) <= bo || bo + i64::from(b_bytes) <= ao)
 }
 
+/// The function's own frame: `native_rsp_entry + off` lying wholly below the entry `rsp`.
+fn is_frame_slot(address: &Expr, bytes: u32) -> bool {
+    let (base, off) = split_offset(address);
+    base == entry_symbol(Gpr::Rsp)
+        && off.checked_add(i64::from(bytes)).is_some_and(|end| end <= 0)
+}
+
+/// Built only from entry-time register values, constants and loads of such: the
+/// value existed before this call began, so it cannot name the (fresh) frame.
+fn is_entry_pointer(address: &Expr) -> bool {
+    address.intrinsic_dependencies().is_empty()
+        && address
+            .dependencies()
+            .iter()
+            .all(|d| d.starts_with("native_") && d.ends_with("_initial"))
+}
+
+/// One access is a slot of the function's own frame and the other a pointer that
+/// existed at function entry. Sound only while no frame address has escaped (the
+/// caller's `private_frame`): the frame was allocated by this call, so nothing that
+/// predates it can address it unless the function itself leaked its address.
+fn frame_vs_entry_pointer(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
+    (is_frame_slot(a, a_bytes) && is_entry_pointer(b))
+        || (is_frame_slot(b, b_bytes) && is_entry_pointer(a))
+}
+
+fn mentions_frame(e: &Expr) -> bool {
+    e.dependencies().contains(RSP_ENTRY)
+}
+
+/// Context for resolving loads in one block.
+struct LoadCtx<'a> {
+    after_call: Option<&'a NativeEnv>,
+    /// No frame address has escaped to memory or a call so far.
+    private_frame: bool,
+    used_frame_rule: std::cell::Cell<bool>,
+}
+
 /// A store `(address, value)` of `width`, as the memory model sees it.
 type Store = (Expr, Expr, BitWidth);
 
@@ -96,18 +134,18 @@ type Store = (Expr, Expr, BitWidth);
 /// the block) against the stores that happened before: an exact earlier store
 /// forwards its value, a provably disjoint one is skipped, anything else is an
 /// error. With no earlier stores the expression is returned unchanged.
-fn resolve_loads(e: &Expr, stores: &[Store], after_call: Option<&NativeEnv>) -> Result<Expr, String> {
-    if stores.is_empty() && after_call.is_none() {
+fn resolve_loads(e: &Expr, stores: &[Store], ctx: &LoadCtx) -> Result<Expr, String> {
+    if stores.is_empty() && ctx.after_call.is_none() {
         return Ok(e.clone());
     }
     let mut memo: HashMap<Expr, Expr> = HashMap::new();
-    rebuild(e, stores, after_call, &mut memo)
+    rebuild(e, stores, ctx, &mut memo)
 }
 
 fn rebuild(
     e: &Expr,
     stores: &[Store],
-    after_call: Option<&NativeEnv>,
+    ctx: &LoadCtx,
     memo: &mut HashMap<Expr, Expr>,
 ) -> Result<Expr, String> {
     if let Some(done) = memo.get(e) {
@@ -116,30 +154,30 @@ fn rebuild(
     let err = |x: vmpx_vm::ExprError| x.to_string();
     let out = match &e.kind {
         ExprKind::Const { .. } | ExprKind::Register { .. } => e.clone(),
-        ExprKind::Unary { op, value } => Expr::unary(*op, rebuild(value, stores, after_call, memo)?),
+        ExprKind::Unary { op, value } => Expr::unary(*op, rebuild(value, stores, ctx, memo)?),
         ExprKind::Binary { op, left, right } => {
-            Expr::binary(*op, rebuild(left, stores, after_call, memo)?, rebuild(right, stores, after_call, memo)?).map_err(err)?
+            Expr::binary(*op, rebuild(left, stores, ctx, memo)?, rebuild(right, stores, ctx, memo)?).map_err(err)?
         }
         ExprKind::Extract { value, lsb } => {
-            Expr::extract(e.width, *lsb, rebuild(value, stores, after_call, memo)?).map_err(err)?
+            Expr::extract(e.width, *lsb, rebuild(value, stores, ctx, memo)?).map_err(err)?
         }
         ExprKind::Concat { high, low } => {
-            Expr::concat(rebuild(high, stores, after_call, memo)?, rebuild(low, stores, after_call, memo)?).map_err(err)?
+            Expr::concat(rebuild(high, stores, ctx, memo)?, rebuild(low, stores, ctx, memo)?).map_err(err)?
         }
         ExprKind::Resize { op, value } => {
-            Expr::resize(*op, e.width, rebuild(value, stores, after_call, memo)?).map_err(err)?
+            Expr::resize(*op, e.width, rebuild(value, stores, ctx, memo)?).map_err(err)?
         }
         ExprKind::Intrinsic { name, arguments } => Expr::intrinsic(
             e.width,
             name.clone(),
             arguments
                 .iter()
-                .map(|a| rebuild(a, stores, after_call, memo))
+                .map(|a| rebuild(a, stores, ctx, memo))
                 .collect::<Result<_, _>>()?,
         ),
         ExprKind::Load { address } => {
-            let address = rebuild(address, stores, after_call, memo)?;
-            load_against(e.width, &address, stores, after_call)?
+            let address = rebuild(address, stores, ctx, memo)?;
+            load_against(e.width, &address, stores, ctx)?
         }
     };
     memo.insert(e.clone(), out.clone());
@@ -150,13 +188,20 @@ fn load_against(
     width: BitWidth,
     address: &Expr,
     stores: &[Store],
-    after_call: Option<&NativeEnv>,
+    ctx: &LoadCtx,
 ) -> Result<Expr, String> {
+    let after_call = ctx.after_call;
     for (store_address, value, store_width) in stores.iter().rev() {
         if store_address.simplify() == address.simplify() && *store_width == width {
             return Ok(value.clone());
         }
         if !disjoint(address, width.bytes(), store_address, store_width.bytes()) {
+            if ctx.private_frame
+                && frame_vs_entry_pointer(address, width.bytes(), store_address, store_width.bytes())
+            {
+                ctx.used_frame_rule.set(true);
+                continue;
+            }
             return Err(format!(
                 "a load may alias an earlier store ({} bytes at {:?})",
                 width.bytes(),
@@ -321,6 +366,7 @@ pub fn execute_native_function_in(
     let mut stores: Vec<Store> = Vec::new();
     let mut ip = cfg.entry;
     let mut decided = 0;
+    let mut frame_escaped = false;
     for executed in 1..=max_blocks {
         let block = cfg
             .blocks
@@ -341,7 +387,11 @@ pub fn execute_native_function_in(
             env.insert(format!("xmm{n}_lo_in"), lo.clone());
             env.insert(format!("xmm{n}_hi_in"), hi.clone());
         }
-        let after_call = (!calls.is_empty()).then_some(native_env);
+        let ctx = LoadCtx {
+            after_call: (!calls.is_empty()).then_some(native_env),
+            private_frame: !frame_escaped,
+            used_frame_rule: std::cell::Cell::new(false),
+        };
         let subst = |e: &Expr| -> Result<Expr, String> {
             let substituted = e.substitute(&env).map_err(|x| x.to_string())?.simplify();
             if let Some(stray) = substituted
@@ -351,7 +401,7 @@ pub fn execute_native_function_in(
             {
                 return Err(format!("block {ip:#x} reads `{stray}` before it is defined"));
             }
-            resolve_loads(&substituted, &stores, after_call)
+            resolve_loads(&substituted, &stores, &ctx)
         };
         let mut next_regs = BTreeMap::new();
         for (g, e) in &sem.regs {
@@ -384,6 +434,25 @@ pub fn execute_native_function_in(
             };
             new_stores.push((subst(&w.address)?, subst(&w.value)?, width));
         }
+        let escaping = new_stores.iter().any(|(_, value, _)| mentions_frame(value));
+        for d in &sem.deferred_alias {
+            let (la, sa) = (subst(&d.load_address)?, subst(&d.store_address)?);
+            let ok = ctx.private_frame
+                && !escaping
+                && frame_vs_entry_pointer(&la, d.load_width.bytes(), &sa, d.store_width.bytes());
+            if !ok {
+                return Err(format!(
+                    "block {ip:#x}: a load may alias an earlier store ({} bytes at {:?}); not a frame slot against an entry-time pointer",
+                    d.load_width.bytes(),
+                    la
+                ));
+            }
+            ctx.used_frame_rule.set(true);
+        }
+        if ctx.used_frame_rule.get() && !assumptions.iter().any(|a| a == FRAME_PRIVATE) {
+            assumptions.push(FRAME_PRIVATE.to_owned());
+        }
+        frame_escaped |= escaping;
         stores.extend(new_stores);
         regs = next_regs;
         xmm = next_xmm;
@@ -410,6 +479,7 @@ pub fn execute_native_function_in(
                         (format!("sub_{rva:#x}"), rva | 0x8000_0000)
                     }
                 };
+                frame_escaped |= exposes_frame(&regs, &xmm);
                 apply_call(&mut regs, &mut xmm, &mut flags, &mut calls, &label, iat_rva);
                 if calls.len() == 1 {
                     assumptions.push(
@@ -478,6 +548,17 @@ fn finish(
         frame_stores_dropped: dropped,
         assumptions,
     }
+}
+
+const FRAME_PRIVATE: &str = "a pointer that existed at function entry does not alias the function's own fresh stack frame (no frame address is stored to memory or exposed to a call)";
+
+/// Whether a value a callee can read (an argument register, a volatile scratch
+/// register or an XMM lane) mentions the function's frame address.
+fn exposes_frame(regs: &BTreeMap<Gpr, Expr>, xmm: &BTreeMap<u8, (Expr, Expr)>) -> bool {
+    [Gpr::Rax, Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9, Gpr::R10, Gpr::R11]
+        .iter()
+        .any(|g| mentions_frame(&regs[g]))
+        || xmm.values().any(|(lo, hi)| mentions_frame(lo) || mentions_frame(hi))
 }
 
 /// The argument registers a Win64 callee may read: `rcx rdx r8 r9`, `xmm0-3` low lanes.
