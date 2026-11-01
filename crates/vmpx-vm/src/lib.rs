@@ -63,7 +63,7 @@ pub use cfg::{
     BranchRefusalDiagnostic, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
     ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, DEFAULT_MAX_WALL_TIME, recover_vm_cfg,
-    recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
+    recover_entry_frame, recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
 };
 pub use env_gate::{
     EnvironmentGateFork, EnvironmentGateRoute, EnvironmentSource, take_environment_gate_forks,

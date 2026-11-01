@@ -162,6 +162,18 @@ pub struct LoopInfo {
 /// `native_return_address_initial` at the preferred image base. `None` (no such
 /// cell, or more than one) leaves the symbol unmaterializable so the lift fails
 /// closed rather than inventing a continuation address.
+/// A frame cell taken at its on-disk value is valid at the preferred base only.
+fn relocated_frame_assumptions(frame: &[NativeFrameSource]) -> Vec<LiftAssumption> {
+    if frame
+        .iter()
+        .any(|cell| matches!(cell, NativeFrameSource::RelocatedConstant { .. }))
+    {
+        vec![LiftAssumption::PreferredImageBase]
+    } else {
+        Vec::new()
+    }
+}
+
 fn return_address_va(frame: &[NativeFrameSource], image_base: u64) -> Option<u64> {
     let mut found = None;
     for cell in frame {
@@ -1878,7 +1890,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
         uses_entry_flags: false,
-        assumptions: Vec::new(),
+        assumptions: relocated_frame_assumptions(input.frame),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
         phi_widths: Vec::new(),
@@ -1964,7 +1976,7 @@ fn lift_with_nested(
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
         uses_entry_flags: false,
-        assumptions: Vec::new(),
+        assumptions: relocated_frame_assumptions(input.frame),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
         phi_widths: Vec::new(),

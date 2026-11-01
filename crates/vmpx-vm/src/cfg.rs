@@ -15,7 +15,7 @@ use iced_x86::{FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, 
 use serde::Serialize;
 use thiserror::Error;
 use vmpx_disasm::{DirectJumpTraceLimits, trace_direct_jump_fragments};
-use vmpx_pe::{PeImage, Va};
+use vmpx_pe::{PeImage, Rva, Va};
 
 use crate::env_gate::{
     EnvironmentGateRoute, has_environment_source, record_environment_fork,
@@ -538,13 +538,17 @@ fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
 /// off the frame top), and whether any pre-capture instruction exposed the
 /// stack pointer to a register or memory. Fails closed on anything it cannot
 /// model (nested calls, unknown stack writes, stack-pointer arithmetic).
-fn recover_entry_frame(
+///
+/// # Errors
+///
+/// Returns a note describing the first thing the stub does that is not modelled.
+pub fn recover_entry_frame(
     pe: &PeImage<'_>,
-    entry: &VmEntryCandidate,
+    entry: Rva,
     vsp: Register,
     limits: DirectJumpTraceLimits,
 ) -> Result<(Vec<NativeFrameSource>, u64, bool), String> {
-    let caller = trace_direct_jump_fragments(pe, entry.rva, limits).map_err(|e| e.to_string())?;
+    let caller = trace_direct_jump_fragments(pe, entry, limits).map_err(|e| e.to_string())?;
     let caller_instructions = caller.instructions().collect::<Vec<_>>();
     let (call_index, call) = caller_instructions
         .iter()
@@ -576,32 +580,100 @@ fn recover_entry_frame(
     });
 
     let target = trace_direct_jump_fragments(pe, call_target, limits).map_err(|e| e.to_string())?;
-    let mut provenance = initial_provenance();
-    let mut original_flags = true;
-    let mut factory = InstructionInfoFactory::new();
-    for decoded in target.instructions() {
+    let relocations = relocation_slots(pe);
+    let mut state = StubState {
+        stack,
+        provenance: initial_provenance(),
+        original_flags: true,
+        factory: InstructionInfoFactory::new(),
+    };
+    let mut remaining = target.instructions();
+    let mut capture = None;
+    for decoded in remaining.by_ref() {
         let instruction = &decoded.instruction;
         if let Some(top_offset) = vsp_capture_top_offset(instruction, vsp) {
-            stack.reverse();
-            return Ok((stack, top_offset, exposed));
+            capture = Some(top_offset);
+            update_provenance(&mut state.factory, instruction, &mut state.provenance);
+            break;
         }
         exposed |= exposes_stack_pointer(instruction);
+        state.step(decoded, false)?;
+        state.track_relocated(decoded, relocations.as_ref());
+    }
+    let top_offset = capture.ok_or("no VSP capture reached")?;
+    let mut captured = state.stack.clone();
+    captured.reverse();
+    // The stub keeps pushing below the captured VSP before the VM starts, so
+    // those cells hold stub-written values. Any failure to model them keeps the
+    // captured-frame result unchanged.
+    let (cells, top_offset) =
+        extend_below_capture(&mut state, remaining, relocations.as_ref(), vsp, top_offset)
+            .unwrap_or((captured, top_offset));
+    Ok((cells, top_offset, exposed))
+}
+
+/// Native-stub state while stepping its pushes and RSP-relative stores.
+struct StubState {
+    /// Bottom-first model of the native stack.
+    stack: Vec<NativeFrameSource>,
+    provenance: BTreeMap<Register, Provenance>,
+    original_flags: bool,
+    factory: InstructionInfoFactory,
+}
+
+impl StubState {
+    /// Applies one stub instruction to the stack and register provenance.
+    /// `keep_relocated` keeps a relocated immediate as the relocation delta
+    /// instead of its on-disk constant.
+    fn step(
+        &mut self,
+        decoded: &vmpx_disasm::DecodedInstruction,
+        keep_relocated: bool,
+    ) -> Result<(), String> {
+        let instruction = &decoded.instruction;
         match instruction.flow_control() {
             FlowControl::Next | FlowControl::UnconditionalBranch => {}
             _ => return Err(format!("unsupported control flow at {}", decoded.rva)),
         }
+        let relocated = |operand: u32| {
+            (keep_relocated
+                && instruction.op_kind(operand) == OpKind::Register
+                && instruction.op_register(operand).size() == 8)
+                .then(|| self.provenance.get(&canonical(instruction.op_register(operand))))
+                .flatten()
+                .and_then(|known| match known {
+                    Provenance::RelocatedConstant(value) => {
+                        Some(NativeFrameSource::RelocatedConstant { value: *value })
+                    }
+                    _ => None,
+                })
+        };
+        let plain: BTreeMap<Register, Provenance> = self
+            .provenance
+            .iter()
+            .map(|(register, known)| match known {
+                Provenance::RelocatedConstant(value) => (*register, Provenance::Constant(*value)),
+                other => (*register, other.clone()),
+            })
+            .collect();
         if matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq) {
-            let observed = observe_target_push(decoded, &provenance, original_flags)
-                .ok_or_else(|| format!("unsupported push at {}", decoded.rva))?;
+            let source = if instruction.mnemonic() == Mnemonic::Push && let Some(source) = relocated(0) {
+                source
+            } else {
+                observe_target_push(decoded, &plain, self.original_flags)
+                    .ok_or_else(|| format!("unsupported push at {}", decoded.rva))?
+                    .source
+            };
             if instruction.stack_pointer_increment() != -8 {
                 return Err(format!("non-qword push at {}", decoded.rva));
             }
-            stack.push(observed.source);
+            self.stack.push(source);
         } else {
             if instruction.stack_pointer_increment() != 0 {
                 return Err(format!("unproven stack mutation at {}", decoded.rva));
             }
-            let writes: Vec<_> = factory
+            let writes: Vec<_> = self
+                .factory
                 .info(instruction)
                 .used_memory()
                 .iter()
@@ -623,25 +695,171 @@ fn recover_entry_frame(
                     && instruction.mnemonic() == Mnemonic::Mov
                     && instruction.op0_kind() == OpKind::Memory
                     && displacement % 8 == 0)
-                    .then(|| stored_value(instruction, &provenance))
+                    .then(|| relocated(1).or_else(|| stored_value(instruction, &plain)))
                     .flatten()
                     .ok_or_else(|| format!("unproven memory write at {}", decoded.rva))?;
                 let from_top = usize::try_from(displacement / 8)
                     .map_err(|_| format!("stack write offset at {}", decoded.rva))?;
-                let position = stack
+                let position = self
+                    .stack
                     .len()
                     .checked_sub(1)
                     .and_then(|top| top.checked_sub(from_top))
                     .ok_or_else(|| format!("stack write outside the frame at {}", decoded.rva))?;
-                stack[position] = stored;
+                self.stack[position] = stored;
             }
         }
-        update_provenance(&mut factory, instruction, &mut provenance);
+        update_provenance(&mut self.factory, instruction, &mut self.provenance);
         if defines_flags(instruction) {
-            original_flags = false;
+            self.original_flags = false;
+        }
+        Ok(())
+    }
+
+    /// Marks the destination of a `mov r64, imm64` whose immediate a base
+    /// relocation covers: its runtime value is the immediate plus the delta.
+    /// With no parsed relocation table every such immediate is treated so.
+    fn track_relocated(
+        &mut self,
+        decoded: &vmpx_disasm::DecodedInstruction,
+        relocations: Option<&BTreeMap<u32, u32>>,
+    ) {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() != Mnemonic::Mov
+            || instruction.op0_kind() != OpKind::Register
+            || instruction.op1_kind() != OpKind::Immediate64
+        {
+            return;
+        }
+        let start = decoded.rva.0;
+        let end = start.saturating_add(u32::try_from(decoded.bytes.len()).unwrap_or(u32::MAX));
+        let covered = relocations.is_none_or(|slots| {
+            slots
+                .range(start.saturating_sub(7)..end)
+                .any(|(slot, size)| *slot < end && start < slot.saturating_add(*size))
+        });
+        if covered {
+            self.provenance.insert(
+                canonical(instruction.op0_register()),
+                Provenance::RelocatedConstant(instruction.immediate64()),
+            );
         }
     }
-    Err("no VSP capture reached".to_owned())
+}
+
+/// Base-relocation slots as `rva -> width`, or `None` when the table cannot be
+/// parsed.
+fn relocation_slots(pe: &PeImage<'_>) -> Option<BTreeMap<u32, u32>> {
+    let blocks = pe.parse_relocations().ok()?;
+    let mut slots = BTreeMap::new();
+    for block in &blocks {
+        for entry in block.entries.iter().filter(|entry| entry.kind != 0) {
+            let size = if entry.kind == 10 { 8 } else { 4 };
+            slots.insert(block.page_rva.0 + u32::from(entry.offset), size);
+        }
+    }
+    Some(slots)
+}
+
+/// Continues the stub past the VSP capture to the `mov rsp, reg` that moves the
+/// native stack below VSP, returning the full frame (top first) and the
+/// VSP-to-top offset. `None` (keep the captured frame) when anything in between
+/// is not modelled, the pushes would place the top cell below VSP, the new stack
+/// is not proven to lie at or below VSP, or the stub then writes any other memory.
+fn extend_below_capture<'a>(
+    state: &mut StubState,
+    remaining: impl Iterator<Item = &'a vmpx_disasm::DecodedInstruction>,
+    relocations: Option<&BTreeMap<u32, u32>>,
+    vsp: Register,
+    top_offset: u64,
+) -> Option<(Vec<NativeFrameSource>, u64)> {
+    let vsp = canonical(vsp);
+    let before = state.stack.len();
+    let mut at_or_below_vsp: BTreeSet<Register> = BTreeSet::new();
+    let mut result = None;
+    for decoded in remaining {
+        let instruction = &decoded.instruction;
+        let mut writes_memory = || {
+            state
+                .factory
+                .info(instruction)
+                .used_memory()
+                .iter()
+                .any(|memory| {
+                    matches!(
+                        memory.access(),
+                        OpAccess::Write
+                            | OpAccess::CondWrite
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                    )
+                })
+        };
+        if result.is_some() {
+            // Past the redirect every write lands at or below the new stack
+            // pointer, hence below the frame; nothing else may write memory.
+            let push = matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq);
+            let flow = matches!(
+                instruction.flow_control(),
+                FlowControl::Next | FlowControl::UnconditionalBranch | FlowControl::Return
+            );
+            if !flow || (!push && writes_memory()) {
+                return None;
+            }
+            continue;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == Register::RSP
+            && instruction.op1_register().size() == 8
+        {
+            if !at_or_below_vsp.contains(&canonical(instruction.op1_register())) {
+                return None;
+            }
+            let pushed = u64::try_from(state.stack.len() - before).ok()?;
+            let new_top = top_offset.checked_sub(pushed.checked_mul(8)?)?;
+            let mut cells = state.stack.clone();
+            cells.reverse();
+            result = Some((cells, new_top));
+            continue;
+        }
+        if exposes_stack_pointer(instruction) {
+            return None;
+        }
+        let writes = |state: &mut StubState, register: Register| {
+            crate::dispatch_extract::writes_register(&mut state.factory, instruction, register)
+        };
+        if !matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq)
+            && writes(state, Register::RSP)
+        {
+            return None;
+        }
+        if writes(state, vsp) {
+            return None;
+        }
+        // `and reg, imm` never increases the unsigned value, so an address at or
+        // below VSP stays so (stack alignment).
+        let narrowing_and = instruction.mnemonic() == Mnemonic::And
+            && instruction.op0_kind() == OpKind::Register
+            && crate::dispatch_extract::signed_immediate(instruction, 1).is_some();
+        at_or_below_vsp.retain(|register| {
+            (narrowing_and && canonical(instruction.op0_register()) == *register)
+                || !writes(state, *register)
+        });
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().size() == 8
+            && canonical(instruction.memory_base()) == vsp
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64().cast_signed() <= 0
+        {
+            at_or_below_vsp.insert(canonical(instruction.op0_register()));
+        }
+        state.step(decoded, true).ok()?;
+        state.track_relocated(decoded, relocations);
+    }
+    result
 }
 
 fn stored_value(
@@ -654,7 +872,9 @@ fn stored_value(
                 Provenance::Native(register) => Some(NativeFrameSource::Register {
                     register: *register,
                 }),
-                Provenance::Constant(value) => Some(NativeFrameSource::Constant { value: *value }),
+                Provenance::Constant(value) | Provenance::RelocatedConstant(value) => {
+                    Some(NativeFrameSource::Constant { value: *value })
+                }
                 Provenance::Unknown => Some(NativeFrameSource::Unknown {
                     description: "stored register of unproven value".to_owned(),
                 }),
@@ -2725,7 +2945,7 @@ impl Walker<'_, '_> {
         };
         let (cells, top_offset, _) = match recover_entry_frame(
             self.pe,
-            &candidate,
+            candidate.rva,
             setup.profile.effect_roles.vsp,
             self.limits.entry.trace,
         ) {
@@ -3133,7 +3353,7 @@ pub fn recover_vm_cfg_with_observed(
     let mut private_frame_hi = None;
     let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
         pe,
-        entry,
+        entry.rva,
         setup.profile.effect_roles.vsp,
         limits.entry.trace,
     ) {
