@@ -11,6 +11,7 @@ use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
 use vmpx_verify::branch_paths::diff_against_original_paths;
+use vmpx_verify::differential::native_loops::execute_native_loops;
 use vmpx_verify::differential::{AbiPolicy, DiffOutcome, ForkLimits, NativeEnv, execute_native_paths};
 use vmpx_verify::equiv::{Budget, CellVerdict, EquivVerdict, Method, Verifier};
 
@@ -222,8 +223,39 @@ fn compare_one(
             })
             .collect(),
     };
-    let natives = match execute_native_paths(&cfg, o.max_blocks, &native_env, ForkLimits::DEFAULT) {
+    if std::env::var_os("VMPX_DIAG_RECOVERED").is_some() {
+        match crate::native_chain::unroll_chained(protected, Rva(stub), o.instruction_limit, o.max_blocks, o.max_paths) {
+            Ok(r) => eprintln!("[diag] recovered ok: {} paths, {} forks", r.paths.len(), r.forks),
+            Err(e) => eprintln!("[diag] recovered failed: {e}"),
+        }
+    }
+    let env_limit = |name: &str, default: usize| -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let limits = ForkLimits {
+        max_forks_per_path: env_limit("VMPX_FORK_DEPTH", ForkLimits::DEFAULT.max_forks_per_path),
+        max_paths: env_limit("VMPX_FORK_PATHS", ForkLimits::DEFAULT.max_paths),
+    };
+    let natives = match execute_native_paths(&cfg, o.max_blocks, &native_env, limits) {
         Ok(n) => n,
+        Err(e) if e.starts_with("input-dependent loop") => {
+            return timeout(match execute_native_loops(&cfg, o.max_blocks, &native_env, limits) {
+                Ok(l) => {
+                    println!(
+                        "  native loops: {} cut(s) {:x?}; entry segment {} path(s); {} loop segment(s) with {} path(s)",
+                        l.cuts.len(),
+                        l.cuts,
+                        l.entry.len(),
+                        l.loops.len(),
+                        l.loops.values().map(|s| s.paths.len()).sum::<usize>()
+                    );
+                    format!(
+                        "{e}; the original is summarized as cut-point loop segments but the recovered side exposes no loop representation to pair them with"
+                    )
+                }
+                Err(x) => format!("{e}; not summarizable as cut-point segments: {x}"),
+            });
+        }
         Err(e) => return timeout(format!("original not modelable: {e}")),
     };
     let recovered = match crate::native_chain::unroll_chained(

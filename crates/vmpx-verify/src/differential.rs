@@ -9,7 +9,7 @@
 //! this module cannot model (undecidable branch, aliasing it cannot rule out, a
 //! flag read before definition, unbalanced stack) is an error, never a guess.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use vmpx_disasm::{Flag, FlagState, Gpr};
 use vmpx_mutation::cfg_recovery::{CallTarget, IndirectTarget, NativeCfg, Terminator};
@@ -100,10 +100,9 @@ fn is_frame_slot(address: &Expr, bytes: u32) -> bool {
 /// value existed before this call began, so it cannot name the (fresh) frame.
 fn is_entry_pointer(address: &Expr) -> bool {
     address.intrinsic_dependencies().is_empty()
-        && address
-            .dependencies()
-            .iter()
-            .all(|d| d.starts_with("native_") && d.ends_with("_initial"))
+        && address.dependencies().iter().all(|d| {
+            d.starts_with("native_") && (d.ends_with("_initial") || d.starts_with(native_loops::PHI_PREFIX))
+        })
 }
 
 /// One access is a slot of the function's own frame and the other a pointer that
@@ -128,7 +127,7 @@ struct LoadCtx<'a> {
 }
 
 /// A store `(address, value)` of `width`, as the memory model sees it.
-type Store = (Expr, Expr, BitWidth);
+pub type Store = (Expr, Expr, BitWidth);
 
 /// Rewrites every `Load(address)` (a read of memory as it was at the start of
 /// the block) against the stores that happened before: an exact earlier store
@@ -410,17 +409,63 @@ impl NativePath {
     /// # Errors
     /// An expression that cannot be rebuilt.
     pub fn condition(&self) -> Result<Expr, String> {
-        let mut all = Expr::constant(BitWidth::W8, 1);
-        for (predicate, polarity) in &self.literals {
-            let one = Expr::constant(BitWidth::W8, 1);
-            let lit = if *polarity {
-                predicate.clone()
-            } else {
-                bin(BinaryOp::Xor, predicate.clone(), one)?
-            };
-            all = bin(BinaryOp::And, all, lit)?;
-        }
-        Ok(all)
+        literals_condition(&self.literals)
+    }
+}
+
+/// The conjunction of branch literals as a `W8` 0/1 expression.
+///
+/// # Errors
+/// An expression that cannot be rebuilt.
+pub fn literals_condition(literals: &[(Expr, bool)]) -> Result<Expr, String> {
+    let mut all = Expr::constant(BitWidth::W8, 1);
+    for (predicate, polarity) in literals {
+        let one = Expr::constant(BitWidth::W8, 1);
+        let lit = if *polarity {
+            predicate.clone()
+        } else {
+            bin(BinaryOp::Xor, predicate.clone(), one)?
+        };
+        all = bin(BinaryOp::And, all, lit)?;
+    }
+    Ok(all)
+}
+
+pub mod native_loops;
+
+/// The machine state a segment hands to the cut it ends at.
+#[derive(Clone, Debug)]
+pub struct CutState {
+    pub regs: BTreeMap<Gpr, Expr>,
+    pub xmm: BTreeMap<u8, (Expr, Expr)>,
+    pub stores: Vec<Store>,
+    pub calls: Vec<CollectedCall>,
+    pub frame_escaped: bool,
+    pub assumptions: Vec<String>,
+}
+
+/// How one path of a segment ends.
+#[derive(Clone, Debug)]
+pub enum SegmentEnd {
+    Exit(NativeFunction),
+    Cut { header: u64, state: Box<CutState> },
+}
+
+/// One leaf of a segment: the literals it took and where it ends. The leaves of a
+/// segment partition the inputs of its start state.
+#[derive(Clone, Debug)]
+pub struct SegmentPath {
+    pub literals: Vec<(Expr, bool)>,
+    pub end: SegmentEnd,
+}
+
+impl SegmentPath {
+    /// The conjunction of the path's literals as a `W8` 0/1 expression.
+    ///
+    /// # Errors
+    /// An expression that cannot be rebuilt.
+    pub fn condition(&self) -> Result<Expr, String> {
+        literals_condition(&self.literals)
     }
 }
 
@@ -459,6 +504,8 @@ struct Run {
     decided: usize,
     /// A frame address has been stored to memory or exposed to a call on this path.
     frame_escaped: bool,
+    /// Blocks where this path took an input-dependent fork (a revisit is a loop).
+    forked_at: Vec<u64>,
 }
 
 /// [`execute_native_function_in`] that, at a branch the flags cannot decide, forks:
@@ -470,14 +517,25 @@ struct Run {
 /// # Errors
 /// As [`execute_native_function_in`], plus exceeding `limits` (fork depth or
 /// leaf count) on any path, which fails the whole function.
-#[allow(clippy::too_many_lines)]
 pub fn execute_native_paths(
     cfg: &NativeCfg,
     max_blocks: usize,
     native_env: &NativeEnv,
     limits: ForkLimits,
 ) -> Result<Vec<NativePath>, String> {
-    let first = Run {
+    let first = entry_run(cfg);
+    let leaves = run_segments(cfg, max_blocks, native_env, limits, &BTreeSet::new(), first, &mut 0)?;
+    Ok(leaves
+        .into_iter()
+        .filter_map(|leaf| match leaf.end {
+            SegmentEnd::Exit(function) => Some(NativePath { literals: leaf.literals, function }),
+            SegmentEnd::Cut { .. } => None,
+        })
+        .collect())
+}
+
+fn entry_run(cfg: &NativeCfg) -> Run {
+    Run {
         calls: Vec::new(),
         assumptions: Vec::new(),
         regs: Gpr::ALL.iter().map(|g| (*g, entry_symbol(*g))).collect(),
@@ -491,14 +549,47 @@ pub fn execute_native_paths(
         executed: 0,
         decided: 0,
         frame_escaped: false,
-    };
+        forked_at: Vec::new(),
+    }
+}
+
+/// Executes one segment: from `first` until every path returns or reaches a block
+/// of `cuts` (other than at the segment's first block). `total_blocks` is shared
+/// across segments for the `max_blocks` bound.
+#[allow(clippy::too_many_lines)]
+fn run_segments(
+    cfg: &NativeCfg,
+    max_blocks: usize,
+    native_env: &NativeEnv,
+    limits: ForkLimits,
+    cuts: &BTreeSet<u64>,
+    first: Run,
+    total_blocks: &mut usize,
+) -> Result<Vec<SegmentPath>, String> {
     let mut pending = vec![first];
-    let mut leaves: Vec<NativePath> = Vec::new();
-    let mut total_blocks = 0_usize;
+    let mut leaves: Vec<SegmentPath> = Vec::new();
     'paths: while let Some(mut run) = pending.pop() {
         loop {
-            total_blocks += 1;
-            if total_blocks > max_blocks {
+            if run.executed > 0 && cuts.contains(&run.ip) {
+                let ip = run.ip;
+                leaves.push(SegmentPath {
+                    literals: run.literals,
+                    end: SegmentEnd::Cut {
+                        header: ip,
+                        state: Box::new(CutState {
+                            regs: run.regs,
+                            xmm: run.xmm,
+                            stores: run.stores,
+                            calls: run.calls,
+                            frame_escaped: run.frame_escaped,
+                            assumptions: run.assumptions,
+                        }),
+                    },
+                });
+                continue 'paths;
+            }
+            *total_blocks += 1;
+            if *total_blocks > max_blocks {
                 return Err(format!("did not return within {max_blocks} blocks"));
             }
             run.executed += 1;
@@ -616,6 +707,11 @@ pub fn execute_native_paths(
                         run.decided += 1;
                         continue;
                     }
+                    if run.forked_at.contains(&ip) {
+                        return Err(format!(
+                            "input-dependent loop: block {ip:#x} forks again on revisit (the branch `{cc}` is re-decided with a new literal each iteration)"
+                        ));
+                    }
                     if run.literals.len() >= limits.max_forks_per_path {
                         return Err(format!(
                             "branch `{cc}` at block {ip:#x} exceeds the fork depth {}",
@@ -625,6 +721,7 @@ pub fn execute_native_paths(
                     if leaves.len() + pending.len() + 2 > limits.max_paths {
                         return Err(format!("the function has more than {} paths", limits.max_paths));
                     }
+                    run.forked_at.push(ip);
                     let mut other = run.clone();
                     other.literals.push((predicate.clone(), !polarity));
                     other.ip = *not_taken;
@@ -654,7 +751,7 @@ pub fn execute_native_paths(
                         run.executed,
                         run.decided,
                     );
-                    leaves.push(NativePath { literals: run.literals, function });
+                    leaves.push(SegmentPath { literals: run.literals, end: SegmentEnd::Exit(function) });
                     continue 'paths;
                 }
                 Terminator::Return => {
@@ -671,7 +768,7 @@ pub fn execute_native_paths(
                         run.executed,
                         run.decided,
                     );
-                    leaves.push(NativePath { literals: run.literals, function });
+                    leaves.push(SegmentPath { literals: run.literals, end: SegmentEnd::Exit(function) });
                     continue 'paths;
                 }
                 Terminator::Unsupported(why) => return Err(format!("block {ip:#x}: {why}")),

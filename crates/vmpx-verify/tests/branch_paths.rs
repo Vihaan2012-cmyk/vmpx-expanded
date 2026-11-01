@@ -107,9 +107,9 @@ fn the_legacy_entry_point_still_refuses_an_input_dependent_branch() {
 }
 
 #[test]
-fn an_input_dependent_loop_exceeds_the_fork_depth_and_fails_closed() {
+fn an_input_dependent_loop_fails_closed_naming_the_loop() {
     let err = paths(&COUNTDOWN).unwrap_err();
-    assert!(err.contains("fork depth") || err.contains("more than"), "{err}");
+    assert!(err.starts_with("input-dependent loop"), "{err}");
 }
 
 #[test]

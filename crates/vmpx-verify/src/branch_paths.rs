@@ -73,7 +73,7 @@ fn flip(b: &Expr) -> Result<Expr, String> {
 }
 
 /// 1 iff `x == 0`.
-fn is_zero(x: &Expr) -> Result<Expr, String> {
+pub(crate) fn is_zero(x: &Expr) -> Result<Expr, String> {
     let neg = Expr::unary(UnaryOp::Neg, x.clone());
     flip(&msb(&bin(BinaryOp::Or, x, &neg)?)?)
 }
@@ -203,7 +203,7 @@ pub fn expand_flags(e: &Expr) -> Result<Expr, String> {
 }
 
 /// Conjunction of two `W8` 0/1 conditions.
-fn and(a: &Expr, b: &Expr) -> Result<Expr, String> {
+pub(crate) fn and(a: &Expr, b: &Expr) -> Result<Expr, String> {
     bin(BinaryOp::And, a, b)
 }
 
@@ -229,7 +229,7 @@ pub fn recovered_condition(path: &vmpx_vmlift::UnrolledPath) -> Result<Expr, Str
 }
 
 /// Runs `f` over every expression of an exit.
-fn map_exit(
+pub(crate) fn map_exit(
     s: &ExitSemantics,
     f: &mut impl FnMut(&Expr) -> Result<Expr, String>,
 ) -> Result<ExitSemantics, String> {
@@ -267,7 +267,7 @@ fn map_exit(
 
 /// Restricts a cell to the inputs satisfying `condition`, unless the two sides
 /// are already identical.
-fn restrict(cell: &mut Cell, condition: &Expr) -> Result<(), String> {
+pub(crate) fn restrict(cell: &mut Cell, condition: &Expr) -> Result<(), String> {
     let (a, b) = (cell.vm.simplify(), cell.recovered.simplify());
     if a == b || a.width != b.width {
         return Ok(());

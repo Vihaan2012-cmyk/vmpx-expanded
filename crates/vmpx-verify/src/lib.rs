@@ -10,6 +10,7 @@ pub mod equiv;
 pub mod fidelity;
 pub mod fp;
 pub mod input_testing;
+pub mod loops;
 pub mod smt;
 pub mod sweep;
 pub mod smtlib;
