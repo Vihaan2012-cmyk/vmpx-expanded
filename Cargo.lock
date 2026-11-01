@@ -2748,6 +2748,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-concolic"
+version = "0.1.0"
+dependencies = [
+ "iced-x86",
+ "vmpx-emulate",
+ "vmpx-pe",
+ "vmpx-verify",
+ "vmpx-vm",
+ "vmpx-vmlift",
+]
+
+[[package]]
 name = "vmpx-demutate"
 version = "0.1.0"
 dependencies = [

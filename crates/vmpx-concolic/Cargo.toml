@@ -1,0 +1,22 @@
+[package]
+name = "vmpx-concolic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SPIKE: concolic (directed) dynamic-assist loop over a recovered VM function. Observed tier only."
+
+[dependencies]
+iced-x86.workspace = true
+vmpx-emulate = { path = "../vmpx-emulate" }
+vmpx-pe = { path = "../vmpx-pe" }
+vmpx-vm = { path = "../vmpx-vm" }
+vmpx-vmlift = { path = "../vmpx-vmlift" }
+vmpx-verify = { path = "../vmpx-verify" }
+
+[features]
+smt-z3 = ["vmpx-verify/smt-z3"]
+smt-z3-bundled = ["smt-z3", "vmpx-verify/smt-z3-bundled"]
+
+[lints]
+workspace = true

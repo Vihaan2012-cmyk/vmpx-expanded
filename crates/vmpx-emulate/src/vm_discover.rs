@@ -153,10 +153,17 @@ impl Survey {
     /// reported once with `vip: None`.
     #[must_use]
     pub fn discover(&self, image: (u64, u64)) -> Vec<DiscoveredVm> {
+        self.discover_min(image, MIN_EVENTS)
+    }
+
+    /// [`Survey::discover`] with a caller-chosen dispatch-event floor (a short run of a small
+    /// function has fewer than the default 1000 dispatches).
+    #[must_use]
+    pub fn discover_min(&self, image: (u64, u64), min_events: u64) -> Vec<DiscoveredVm> {
         let mut out = Vec::new();
         for r in 0..16 {
             let events = self.totals[r];
-            if events < MIN_EVENTS {
+            if events < min_events {
                 continue;
             }
             let mut sites: Vec<DispatchSite> = self

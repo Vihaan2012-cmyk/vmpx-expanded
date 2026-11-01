@@ -4,6 +4,7 @@ members = [
     "crates/vmpx-cli",
     "crates/vmpx-detect",
     "crates/vmpx-emulate",
+    "crates/vmpx-concolic",
     "crates/vmpx-mutation",
     "crates/vmpx-solvers",
     "crates/vmpx-tournament",
