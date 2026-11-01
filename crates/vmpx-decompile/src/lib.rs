@@ -3,6 +3,7 @@
 //! cannot prove falls back to labelled gotos, never to guessed structure.
 #![allow(clippy::pedantic, clippy::all, dead_code)]
 
+pub mod ctext;
 pub mod exec;
 pub mod ir;
 pub mod native;
@@ -30,6 +31,8 @@ pub struct Decompiled {
     /// `Ok(n)`: n random vectors agreed with the reference run. `Err`: why the
     /// check could not run (or the first disagreement).
     pub check: Result<usize, String>,
+    /// Rendered C text re-evaluated with C semantics vs the IR: (checked, skipped).
+    pub text_check: Result<(usize, usize), String>,
     pub loops: usize,
     pub ifs: usize,
     pub gotos: usize,
@@ -139,6 +142,80 @@ fn collect_decls(stmts: &[Stmt], out: &mut BTreeMap<String, BitWidth>) {
     }
 }
 
+const REG_NAMES: [&str; 16] = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+];
+
+fn input_env(rng: &mut Rng, k: usize) -> Env {
+    REG_NAMES
+        .iter()
+        .map(|r| {
+            let x = match k {
+                0 => 0,
+                1 => u64::MAX,
+                _ => rng.next(),
+            };
+            ((*r).to_owned(), x)
+        })
+        .collect()
+}
+
+/// Runs `f` and each `targets` expression (over register names / loads) on the
+/// same random register inputs; the return value must equal every target.
+pub fn linkage_vs_exprs(f: &Func, targets: &[vmpx_vm::Expr], vectors: usize) -> Result<usize, String> {
+    let mut rng = Rng(0x0BAD_5EED_1234_5678);
+    let mut f = f.clone();
+    opt::cleanup_all(&mut f);
+    for k in 0..vectors {
+        let env = input_env(&mut rng, k);
+        let want = run_reference(&f, &env)?.ret;
+        for (i, t) in targets.iter().enumerate() {
+            let got = exec::eval(t, &env).map_err(|e| format!("target {i}: {e}"))?;
+            if got != want {
+                return Err(format!("vector {k}: decompiled function returns {want:#x}, target {i} evaluates to {got:#x}"));
+            }
+        }
+    }
+    Ok(vectors)
+}
+
+/// Two IR functions on identical random inputs.
+pub fn linkage_vs_func(a: &Func, b: &Func, vectors: usize) -> Result<usize, String> {
+    let mut rng = Rng(0x5EED_0BAD_8765_4321);
+    let (mut a, mut b) = (a.clone(), b.clone());
+    opt::cleanup_all(&mut a);
+    opt::cleanup_all(&mut b);
+    for k in 0..vectors {
+        let env = input_env(&mut rng, k);
+        let (x, y) = (run_reference(&a, &env)?, run_reference(&b, &env)?);
+        if x.ret != y.ret {
+            return Err(format!("vector {k}: {:#x} vs {:#x}", x.ret, y.ret));
+        }
+    }
+    Ok(vectors)
+}
+
+/// Human-readable dump of the IR (debugging aid).
+pub fn dump_func(f: &Func, depth: u32) -> String {
+    let p = |e: &vmpx_vm::Expr| vmpx_verify::differential::pretty(e, depth);
+    let mut s = String::new();
+    for b in f.blocks.values() {
+        s.push_str(&format!("block {:#x}:\n", b.id));
+        for (v, e) in &b.assigns {
+            s.push_str(&format!("  {v} = {}\n", p(e)));
+        }
+        match &b.term {
+            Term::Goto(t) => s.push_str(&format!("  goto {t:#x}\n")),
+            Term::Branch { cond, then, els } => {
+                let c: Vec<String> = cond.exprs().into_iter().map(|e| p(e)).collect();
+                s.push_str(&format!("  branch {cond:?} [{}] then {then:#x} else {els:#x}\n", c.join(" ; ")));
+            }
+            Term::Return(v) => s.push_str(&format!("  return {}\n", p(&v[0].1))),
+        }
+    }
+    s
+}
+
 /// Runs the whole pipeline on `func` (consumed as the reference).
 pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     let reference = {
@@ -146,6 +223,9 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         opt::cleanup_all(&mut r);
         r
     };
+    if std::env::var_os("VMPX_DECOMP_DUMP").is_some() {
+        eprintln!("{}", dump_func(&reference, 14));
+    }
     let mut f = reference.clone();
     let live_in = opt::dce(&mut f);
     let widths = opt::narrow(&mut f, &live_in);
@@ -245,7 +325,7 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     ret_width(&body, &mut rw);
     let ret_ty = rw.map_or("void", ty);
 
-    let mut ctx = Ctx { r: Renderer { names: &names }, out: String::new() };
+    let mut ctx = Ctx { r: Renderer { names: &names }, out: String::new(), log: Vec::new() };
     let (mut loops, mut ifs, mut gotos) = (0, 0, 0);
     count(&body, &mut loops, &mut ifs, &mut gotos);
     let mut text = String::new();
@@ -264,6 +344,8 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     ctx.stmts(&body, 1, rw);
     text.push_str(&ctx.out);
     text.push_str("}\n");
+
+    let text_check = check_text(&ctx.log, &names);
 
     // cross-check against the reference run
     let check = (|| -> Result<usize, String> {
@@ -308,5 +390,83 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         Ok(n)
     })();
 
-    Ok(Decompiled { text, structured, fallback_reason, check, loops, ifs, gotos })
+    Ok(Decompiled { text, structured, fallback_reason, check, text_check, loops, ifs, gotos })
+}
+
+fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {
+    xu::rewrite(e, &mut |n| {
+        if let vmpx_vm::ExprKind::Register { name } = &n.kind {
+            out.insert(name.clone(), n.width);
+            return Some(n.clone());
+        }
+        None
+    });
+}
+
+/// Re-evaluates every rendered expression/condition as C text (real C typing
+/// rules, UB detection) against the IR expression it came from.
+fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>) -> Result<(usize, usize), String> {
+    let mut rng = Rng(0xC0DE_C0DE_1357_9BDF);
+    let (mut checked, mut skipped) = (0, 0);
+    for (item, text) in log {
+        let mut regs = BTreeMap::new();
+        match item {
+            render::Logged::E(e) => registers_of(e, &mut regs),
+            render::Logged::C(c) => c.exprs().into_iter().for_each(|e| registers_of(e, &mut regs)),
+        }
+        if let render::Logged::C(ir::Cond::Opaque { .. }) = item {
+            skipped += 1;
+            continue;
+        }
+        let mut unsupported = false;
+        for k in 0..24 {
+            let mut env_ir = Env::new();
+            let mut env_c = std::collections::HashMap::new();
+            for (n, w) in &regs {
+                let x = w.truncate(match k {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => rng.next(),
+                });
+                env_ir.insert(n.clone(), x);
+                let d = names.get(n).cloned().unwrap_or_else(|| n.clone());
+                env_c.insert(d, (x, w.bits()));
+            }
+            let (want, width_mask) = match item {
+                render::Logged::E(e) => match exec::eval(e, &env_ir) {
+                    Ok(v) => (v, e.width.mask()),
+                    Err(_) => {
+                        unsupported = true;
+                        break;
+                    }
+                },
+                render::Logged::C(c) => match exec::eval_cond(c, &env_ir) {
+                    Ok(b) => (u64::from(b), u64::MAX),
+                    Err(_) => {
+                        unsupported = true;
+                        break;
+                    }
+                },
+            };
+            match ctext::eval(text, &env_c) {
+                Ok(got) => {
+                    let got = if matches!(item, render::Logged::C(_)) { u64::from(got != 0) } else { got & width_mask };
+                    if got != want {
+                        return Err(format!("rendered text `{text}` evaluates to {got:#x}, IR says {want:#x} (sample {k})"));
+                    }
+                }
+                Err(e) if e.contains("unsupported call") || e.contains("unknown identifier") => {
+                    unsupported = true;
+                    break;
+                }
+                Err(e) => return Err(format!("rendered text `{text}`: {e}")),
+            }
+        }
+        if unsupported {
+            skipped += 1;
+        } else {
+            checked += 1;
+        }
+    }
+    Ok((checked, skipped))
 }

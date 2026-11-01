@@ -40,8 +40,8 @@ fn main() {
                 Ok(d) => {
                     print!("{}", d.text);
                     println!(
-                        "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?}\n",
-                        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check
+                        "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?} ctext={:?}\n",
+                        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
                     );
                 }
             },

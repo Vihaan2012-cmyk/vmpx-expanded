@@ -53,7 +53,7 @@ fn is_push_imm(i: &iced_x86::Instruction) -> bool {
 }
 
 /// Export -> (jmp ->)* `push seed; call wrapper` stub RVA.
-fn resolve_stub(pe: &PeImage<'_>, data: &[u8], export: u32) -> std::result::Result<u32, String> {
+pub(crate) fn resolve_stub(pe: &PeImage<'_>, data: &[u8], export: u32) -> std::result::Result<u32, String> {
     let mut rva = export;
     for _ in 0..3 {
         let off = pe
