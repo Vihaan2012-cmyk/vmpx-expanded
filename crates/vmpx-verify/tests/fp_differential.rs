@@ -87,12 +87,14 @@ fn recovered(rax: Expr) -> UnrolledFunction {
             return_pop: 0,
             blocks_executed: 1,
             region_exit: false,
+            region: None,
             env_forks: 0,
         }],
         branches_decided: 0,
         forks: 0,
         spin_arms_pruned: 0,
         entry_sp_offset: 0,
+        notes: Vec::new(),
     }
 }
 

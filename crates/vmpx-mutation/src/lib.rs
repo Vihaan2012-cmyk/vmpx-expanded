@@ -19,7 +19,7 @@ pub mod state_model;
 pub mod substitution;
 
 pub use cfg_recovery::{
-    CfgError, CfgLimits, CfgOptions, EdgeKind, NativeBlock, NativeCfg, Terminator, VmAlgebra,
+    CallTarget, CfgError, CfgLimits, CfgOptions, EdgeKind, NativeBlock, NativeCfg, Terminator, VmAlgebra,
     lift_native_block, lift_native_block_with, recover_native_cfg, recover_native_cfg_opts,
     recover_native_cfg_pe, recover_native_cfg_pe_with, recover_native_cfg_proven,
     recover_native_cfg_with,

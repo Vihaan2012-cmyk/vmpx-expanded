@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
-use vmpx_verify::differential::{AbiPolicy, DiffOutcome, diff_against_original, execute_native_function};
+use vmpx_verify::differential::{
+    AbiPolicy, DiffOutcome, NativeEnv, diff_against_original, execute_native_function_in,
+};
 use vmpx_verify::equiv::{Budget, CellVerdict, EquivVerdict, Method, Verifier};
 
 pub(crate) struct DiffOptions {
@@ -207,11 +209,24 @@ fn compare_one(
         Ok(cfg) => cfg,
         Err(e) => return timeout(format!("original CFG: {e}")),
     };
-    let native = match execute_native_function(&cfg, o.max_blocks) {
+    let image_base = original.optional.image_base.0;
+    let native_env = NativeEnv {
+        image_base,
+        readonly: original
+            .sections
+            .iter()
+            .filter(|s| s.characteristics & 0x8000_0000 == 0)
+            .map(|s| {
+                let lo = image_base + u64::from(s.virtual_address.0);
+                (lo, lo + u64::from(s.virtual_size.max(s.size_of_raw_data)))
+            })
+            .collect(),
+    };
+    let native = match execute_native_function_in(&cfg, o.max_blocks, &native_env) {
         Ok(n) => n,
         Err(e) => return timeout(format!("original not modelable: {e}")),
     };
-    let recovered = match crate::decoded_splice::unroll_entry_cfg(
+    let recovered = match crate::native_chain::unroll_chained(
         protected,
         Rva(stub),
         o.instruction_limit,
@@ -221,6 +236,12 @@ fn compare_one(
         Ok(r) => r,
         Err(e) => return timeout(format!("protected recovery/unroll: {e}")),
     };
+    for assumption in &native.assumptions {
+        println!("  assumption: {assumption}");
+    }
+    for note in &recovered.notes {
+        println!("  note: {note}");
+    }
     println!(
         "  [{stub:#x}] original: {} blocks executed ({} branches decided, {} dead-frame stores dropped); recovered: {} paths ({} forks, {} counted-loop branches decided)",
         native.blocks_executed,
