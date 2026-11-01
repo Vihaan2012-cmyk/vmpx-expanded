@@ -56,6 +56,8 @@ const ERROR_FILE_NOT_FOUND: u64 = 2;
 const ERROR_NO_MORE_FILES: u64 = 18;
 const ERROR_BAD_LENGTH: u64 = 24;
 const ERROR_INVALID_PARAMETER: u64 = 87;
+const ERROR_INVALID_ADDRESS: u64 = 487;
+const ERROR_NOACCESS: u64 = 998;
 const ERROR_BUFFER_OVERFLOW: u64 = 111;
 const ERROR_MORE_DATA: u64 = 234;
 const ERROR_UNSUPPORTED_TYPE: u64 = 1630;
@@ -76,7 +78,7 @@ const EXPORT_RVA: u32 = 0x1000;
 const MODULE_NAME_RVA: u32 = 0x1100;
 const EXPORT_DATA_RVA: u32 = 0x1200; // arrays + name strings bump from here
 const STUB_REGION_RVA: u32 = 0x4_0000; // per-function fake addresses from here
-const STUB_STRIDE: u32 = 0x10;
+const STUB_STRIDE: u32 = 0x20;
 const EXPORT_DIR_SIZE: u32 = STUB_REGION_RVA - EXPORT_RVA;
 
 // Fixed FILETIME (100ns ticks) written by GetSystemTimeAsFileTime.
@@ -189,6 +191,21 @@ pub struct WinApiHook {
     watch_span: (u64, u64),
     /// In-model NT object + memory state for the emulated ntdll syscall stubs.
     nt: NtState,
+    /// Real syscall numbers by `Nt*`/`Zw*` export name (offline System32 ntdll).
+    syscall_numbers: BTreeMap<String, u32>,
+    /// Placeholder syscall number per `Nt`/`Zw`-stripped name, for exports with no
+    /// real number (recorded in the audit log).
+    syscall_placeholders: BTreeMap<String, u32>,
+    /// Syscall number -> `Nt*` function name, for `syscall` dispatch.
+    syscall_names: BTreeMap<u32, String>,
+    /// Backed ntdll stub VA -> its syscall number (pristine-bytes check).
+    nt_stub_nr: BTreeMap<u64, u32>,
+    /// Half-open span of the backed ntdll stubs; guest reads/writes of it are audited.
+    nt_mem_span: (u64, u64),
+    nt_stub_audited: u32,
+    memcalls: u32,
+    /// Most recent dispatched calls, dumped when a probe stops the run.
+    recent: std::collections::VecDeque<String>,
     /// Recording host-SDK model; XPLM/XPWidgets imports route here (never forwarded).
     xplm: Option<Rc<RefCell<Xplm>>>,
     /// Every import address this hook has handed out (see [`AddressBook`]).
@@ -305,6 +322,14 @@ impl WinApiHook {
             walk_recorded: BTreeSet::new(),
             export_stub_addrs: BTreeMap::new(),
             nt: NtState::new(),
+            syscall_numbers: BTreeMap::new(),
+            syscall_placeholders: BTreeMap::new(),
+            syscall_names: BTreeMap::new(),
+            nt_stub_nr: BTreeMap::new(),
+            nt_mem_span: (0, 0),
+            nt_stub_audited: 0,
+            memcalls: 0,
+            recent: std::collections::VecDeque::new(),
             xplm: None,
             addr_book,
             audit: Rc::new(RefCell::new(BTreeMap::new())),
@@ -344,6 +369,14 @@ impl WinApiHook {
     #[must_use]
     pub fn with_xplm(mut self, xplm: Rc<RefCell<Xplm>>) -> Self {
         self.xplm = Some(xplm);
+        self
+    }
+
+    /// Attach the real `Nt*`/`Zw*` syscall numbers (from an offline System32 ntdll)
+    /// used to back the ntdll export stubs with canonical `syscall` code.
+    #[must_use]
+    pub fn with_syscall_numbers(mut self, numbers: BTreeMap<String, u32>) -> Self {
+        self.syscall_numbers = numbers;
         self
     }
 
@@ -498,6 +531,9 @@ impl WinApiHook {
         let exports = self.export_reference.get(&key).cloned().unwrap_or_default();
         match map_module_image(mem, h, &key, &exports) {
             Ok(Some(layout)) => {
+                if key == "ntdll.dll" && self.install_nt_stubs(mem, h, &layout.slots).is_err() {
+                    return 0;
+                }
                 for export in layout.slots.iter().flatten() {
                     self.export_span.0 = self.export_span.0.min(export.va);
                     self.export_span.1 = self.export_span.1.max(export.va);
@@ -561,6 +597,21 @@ impl WinApiHook {
     }
 
     /// Record an anti-analysis probe and the clean answer it received.
+    fn log_call(&mut self, what: String) {
+        if self.memcalls < 400
+            && ["Protect", "VirtualAlloc", "VirtualFree", "Free", "Allocate", "WriteProcess", "Query"]
+                .iter()
+                .any(|k| what.contains(k))
+        {
+            self.note(&format!("MEMCALL {:04} {what}", self.memcalls));
+            self.memcalls += 1;
+        }
+        if self.recent.len() >= 48 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(what);
+    }
+
     fn note(&self, what: &str) {
         *self.audit.borrow_mut().entry(what.to_string()).or_insert(0) += 1;
     }
@@ -957,6 +1008,56 @@ impl WinApiHook {
         Dispatch::Ret(1)
     }
 
+    /// Back every ntdll `Nt*`/`Zw*` export with canonical Win10 x64 syscall-stub
+    /// code (`mov r10,rcx; mov eax,N; test [KUSD+0x308],1; jne; syscall; ret;
+    /// int 2e; ret`) so a protector reading the export bytes (API-hook integrity
+    /// checks) sees real code. `N` is the real number when known, else a stable
+    /// recorded placeholder.
+    fn install_nt_stubs(
+        &mut self,
+        mem: &mut Memory,
+        base: u64,
+        slots: &[Option<ResolvedExport>],
+    ) -> Result<(), MapError> {
+        if self.syscall_numbers.is_empty() {
+            self.note("SYSCALL_NUMBERS_UNAVAILABLE (placeholder numbers)");
+        }
+        for export in slots.iter().flatten() {
+            let SymbolOrOrdinal::Name(name) = &export.symbol else { continue };
+            if !is_nt_syscall(name) {
+                continue;
+            }
+            let nr = match self.syscall_numbers.get(name) {
+                Some(&n) => n,
+                None => {
+                    let stem = name[2..].to_string();
+                    let next = SYSCALL_PLACEHOLDER_BASE + self.syscall_placeholders.len() as u32;
+                    let n = *self.syscall_placeholders.entry(stem).or_insert(next);
+                    if !self.syscall_numbers.is_empty() {
+                        self.note(&format!("SYSCALL_PLACEHOLDER {name}"));
+                    }
+                    n
+                }
+            };
+            mem.poke(export.va, &nt_stub_bytes(nr)).map_err(|_| MapError::Overlap)?;
+            self.nt_stub_nr.insert(export.va, nr);
+            let hi = export.va + u64::from(STUB_STRIDE);
+            self.nt_mem_span = if self.nt_mem_span.1 == 0 {
+                (export.va, hi)
+            } else {
+                (self.nt_mem_span.0.min(export.va), self.nt_mem_span.1.max(hi))
+            };
+            if !self.syscall_names.contains_key(&nr) || name.starts_with("Nt") {
+                self.syscall_names.insert(nr, name.clone());
+            }
+        }
+        let stub_va = base + u64::from(STUB_REGION_RVA);
+        let len = round_up(slots.len() as u64 * u64::from(STUB_STRIDE));
+        let (lo, hi) = self.nt_mem_span;
+        self.watch_span = (self.watch_span.0.min(lo), self.watch_span.1.max(hi));
+        mem.protect(stub_va, len, Perm::RX).map_err(|_| MapError::Overlap)
+    }
+
     /// A read landing in a watched `AddressOfFunctions` slot is the protector
     /// resolving that export through the direct walk: record the function it
     /// just obtained the address of (deduped across the binary search's reads).
@@ -1014,8 +1115,32 @@ impl WinApiHook {
             // ---- Memory ------------------------------------------------------
             // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
             (_, "VirtualAlloc") => {
-                let size = Self::arg(cpu, 1);
-                Dispatch::Ret(self.alloc(mem, size))
+                let (addr, size) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+                // An absent/zero protection keeps the historical read-write default.
+                let perm = match Self::arg(cpu, 3) & 0xff {
+                    0 => Perm::RW,
+                    p => page_to_perm(p),
+                };
+                if addr == 0 {
+                    let va = self.alloc(mem, size);
+                    if va != 0 && perm != Perm::RW && mem.protect(va, round_up(size.max(1)), perm).is_err() {
+                        return Dispatch::Ret(0);
+                    }
+                    return Dispatch::Ret(va);
+                }
+                // A requested address is honoured only over wholly free pages
+                // (or an already-mapped range being committed); else it fails.
+                let va = addr & !(PAGE - 1);
+                let len = round_up(addr + size.max(1)) - va;
+                let free = (0..len / PAGE).all(|i| mem.perm_at(va + i * PAGE).is_none());
+                let mapped = (0..len / PAGE).all(|i| mem.perm_at(va + i * PAGE).is_some());
+                if (free && mem.map(va, len, perm).is_ok())
+                    || (mapped && mem.protect(va, len, perm).is_ok())
+                {
+                    Dispatch::Ret(addr)
+                } else {
+                    self.fail(ERROR_INVALID_ADDRESS)
+                }
             }
             // HeapAlloc(hHeap, dwFlags, dwBytes) — pages are already zeroed.
             (_, "HeapAlloc") => {
@@ -1211,6 +1336,32 @@ impl WinApiHook {
             // ---- Process / thread identity ----------------------------------
             // Pseudo-handles (current process = -1, current thread = -2) and the
             // fixed in-model ids, kept consistent with the NT info queries.
+            // Self-process only (pseudo-handle -1): a plain guest copy through the
+            // page permissions. Any other process handle is unmodeled -> Stop.
+            (_, "WriteProcessMemory" | "ReadProcessMemory") => {
+                if Self::arg(cpu, 0) != 0xFFFF_FFFF_FFFF_FFFF {
+                    return Dispatch::Stop;
+                }
+                let (remote, local, n) = (Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3));
+                let Some(p_done) = Self::stack_arg(cpu, mem, sab, 4) else { return Dispatch::Stop };
+                if n > 0x100_0000 {
+                    return Dispatch::Stop;
+                }
+                let mut buf = vec![0u8; n as usize];
+                let ok = if func == "WriteProcessMemory" {
+                    mem.read(local, &mut buf).is_ok() && mem.write(remote, &buf).is_ok()
+                } else {
+                    mem.read(remote, &mut buf).is_ok() && mem.write(local, &buf).is_ok()
+                };
+                if !ok {
+                    return self.fail(ERROR_NOACCESS);
+                }
+                if p_done != 0 && mem.write_uint(p_done, 8, n).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+            (_, "FlushInstructionCache") => Dispatch::Ret(1),
             (_, "GetCurrentProcess") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFF),
             (_, "GetCurrentThread") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFE),
             (_, "GetCurrentProcessId") => Dispatch::Ret(crate::ntdll::FAKE_PID),
@@ -1838,14 +1989,24 @@ impl Hook for WinApiHook {
         let (st, ex) = (incl(self.stub_span), incl(self.export_span));
         Interest {
             read: [kusd, self.watch_span],
-            write: [kusd, (0, 0)],
+            write: [kusd, self.nt_mem_span],
             flow: [st, ex],
             flow_all: st.1 == u64::MAX || ex.1 == u64::MAX,
             ..Interest::NONE
         }
     }
 
-    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+    fn on_mem(&mut self, ev: &MemEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+        if ev.addr >= self.nt_mem_span.0 && ev.addr < self.nt_mem_span.1 && self.nt_stub_audited < 96 {
+            self.nt_stub_audited += 1;
+            let off = ev.addr - (ev.addr - self.nt_mem_span.0) % u64::from(STUB_STRIDE);
+            let name = self.export_stub_addrs.get(&off).map_or("?", |(_, f)| f.as_str()).to_string();
+            let acc = if ev.access == Access::Write { "WRITE" } else { "READ" };
+            self.note(&format!(
+                "NTSTUB {acc} {name}+{:#x} size={} rip={:#x}",
+                ev.addr - off, ev.size, cpu.rip
+            ));
+        }
         // The fixed KUSER_SHARED_DATA page is provided by the OS at a constant
         // address; map it in-model on first touch (on_mem runs before the read,
         // so the faulting access then succeeds).
@@ -1884,10 +2045,20 @@ impl Hook for WinApiHook {
         // other walked export reuses the Win32 surface (unmodeled -> Stop).
         if let Some((dll, func)) = self.export_stub_addrs.get(&ev.to).cloned() {
             if dll == "ntdll.dll" && is_nt_syscall(&func) {
+                // A stub the guest has patched (an API hook) runs as real code;
+                // its `syscall` is dispatched by `on_syscall`.
+                if let Some(&nr) = self.nt_stub_nr.get(&ev.to) {
+                    let mut cur = [0u8; NT_STUB_LEN];
+                    if mem.read(ev.to, &mut cur).is_err() || cur != nt_stub_bytes(nr)[..NT_STUB_LEN] {
+                        return HookAction::Continue;
+                    }
+                }
                 let sab = Self::stack_arg_base(ev, cpu);
+                let a0 = [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)];
                 return match self.nt.dispatch(&func, cpu, mem, sab) {
                     NtDispatch::Status(s) => {
                         self.note_nt(&func, cpu, s);
+                        self.log_call(format!("{func}(name-keyed,{:#x},{:#x},{:#x},{:#x}) from={:#x} -> {s:#x}", a0[0], a0[1], a0[2], a0[3], ev.from));
                         cpu.regs[RAX] = s;
                         Self::resume(ev, cpu, mem)
                     }
@@ -1901,6 +2072,58 @@ impl Hook for WinApiHook {
         }
         HookAction::Continue // not an import thunk
     }
+
+    /// `syscall`: map `eax` back to its `Nt*` handler, run it, and return as the
+    /// stub's `syscall` would (RAX = NTSTATUS, RCX = next rip, R11 = rflags).
+    fn on_syscall(&mut self, cpu: &mut Cpu, mem: &mut Memory) -> Option<HookAction> {
+        let nr = cpu.regs[RAX] as u32;
+        let Some(func) = self.syscall_names.get(&nr).cloned() else {
+            self.note(&format!("UNMODELED syscall {nr:#x} (run stopped)"));
+            return Some(HookAction::Stop);
+        };
+        // Kernel ABI: arg0 is in R10; stack args start above ret + shadow space.
+        cpu.regs[ARG[0]] = cpu.regs[R10];
+        let a0 = [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)];
+        let sab = cpu.regs[RSP].wrapping_add(0x28);
+        Some(match self.nt.dispatch(&func, cpu, mem, sab) {
+            NtDispatch::Status(s) => {
+                self.note_nt(&func, cpu, s);
+                self.log_call(format!("{func}(syscall,{:#x},{:#x},{:#x},{:#x}) rip={:#x} -> {s:#x}", a0[0], a0[1], a0[2], a0[3], cpu.rip));
+                cpu.regs[RAX] = s;
+                cpu.regs[ARG[0]] = cpu.rip.wrapping_add(2);
+                cpu.regs[R11] = cpu.rflags;
+                HookAction::Continue
+            }
+            NtDispatch::Stop => {
+                self.note(&format!("UNMODELED {func} (run stopped)"));
+                HookAction::Stop
+            }
+        })
+    }
+}
+
+const NT_STUB_LEN: usize = 24;
+const SYSCALL_PLACEHOLDER_BASE: u32 = 0x7000;
+const R10: usize = 10;
+const R11: usize = 11;
+
+/// Canonical Win10 x64 `Nt*` stub for syscall number `nr`, padded to
+/// [`STUB_STRIDE`] with `int3`.
+fn nt_stub_bytes(nr: u32) -> [u8; STUB_STRIDE as usize] {
+    let mut b = [0xCCu8; STUB_STRIDE as usize];
+    let n = nr.to_le_bytes();
+    let code: [u8; NT_STUB_LEN] = [
+        0x4C, 0x8B, 0xD1, // mov r10, rcx
+        0xB8, n[0], n[1], n[2], n[3], // mov eax, nr
+        0xF6, 0x04, 0x25, 0x08, 0x03, 0xFE, 0x7F, 0x01, // test byte [7FFE0308h], 1
+        0x75, 0x03, // jne +3
+        0x0F, 0x05, // syscall
+        0xC3, // ret
+        0xCD, 0x2E, // int 2Eh
+        0xC3, // ret
+    ];
+    b[..NT_STUB_LEN].copy_from_slice(&code);
+    b
 }
 
 /// `Memory` as the XPLM model's guest-memory interface.
@@ -2010,7 +2233,14 @@ impl WinApiHook {
             let wide = func.ends_with('W');
             let rd = |p| if wide { read_wstr(mem, p) } else { read_cstr(mem, p) };
             let (text, cap) = (rd(Self::arg(cpu, 1)), rd(Self::arg(cpu, 2)));
-            self.note(&format!("UNMODELED {func} text={text:?} caption={cap:?} (run stopped)"));
+            for (i, c) in self.recent.iter().enumerate() {
+                self.note(&format!("RECENT-{i:02} {c}"));
+            }
+            let ra = mem.read_uint(cpu.regs[RSP], 8).unwrap_or(0);
+            self.note(&format!(
+                "UNMODELED {func} text={text:?} caption={cap:?} from={:#x} stack_ret={ra:#x} (run stopped)",
+                ev.from
+            ));
             return HookAction::Stop;
         }
         if let Some(x) = self.xplm.clone() {
@@ -3351,5 +3581,148 @@ mod tests {
         // Cannot run a stored guest filter: fail closed.
         assert!(matches!(h.dispatch("kernel32.dll", "UnhandledExceptionFilter", &cpu, &mut mem, s), Dispatch::Stop));
         assert!(matches!(h.dispatch("kernel32.dll", "DebugBreak", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    // ---- ntdll syscall-stub fidelity ----------------------------------------
+
+    const NT_PROTECT_NR: u32 = 0x50;
+    const T_CODE: u64 = 0x0000_0030_0000_0000;
+
+    fn ntdll_hook() -> WinApiHook {
+        let names = ["NtProtectVirtualMemory", "ZwProtectVirtualMemory", "NtMadeUpCall"];
+        let reference = BTreeMap::from([(
+            "ntdll.dll".to_string(),
+            names.iter().map(|n| SymbolOrOrdinal::Name((*n).into())).collect(),
+        )]);
+        let numbers = BTreeMap::from([
+            ("NtProtectVirtualMemory".to_string(), NT_PROTECT_NR),
+            ("ZwProtectVirtualMemory".to_string(), NT_PROTECT_NR),
+            ("NtMadeUpCall".to_string(), 0x1234),
+        ]);
+        WinApiHook::new(BTreeMap::new())
+            .with_export_reference(reference)
+            .with_syscall_numbers(numbers)
+    }
+
+    fn export_va(h: &WinApiHook, name: &str) -> u64 {
+        *h.export_stub_addrs.iter().find(|(_, (_, f))| f == name).map(|(va, _)| va).unwrap()
+    }
+
+    /// Run `NtProtectVirtualMemory(-1, &base, &size, PAGE_READONLY, &old)` against
+    /// `target` (the export VA, or an RX copy of its bytes) and return
+    /// (rax, old protection written, resulting perm, stop).
+    fn run_nt_protect(via_copy: bool) -> (u64, u64, Option<Perm>, crate::emu::Stop) {
+        use iced_x86::code_asm::*;
+        let mut h = ntdll_hook();
+        let mut mem = Memory::new();
+        mem.map(T_STACK, 0x8000, Perm::RW).unwrap();
+        mem.map(T_DATA, 0x8000, Perm::RW).unwrap();
+        mem.map(T_CODE, 0x1000, Perm::RWX).unwrap();
+        h.module_handle(&mut mem, "ntdll.dll");
+        let export = export_va(&h, "NtProtectVirtualMemory");
+        let target = if via_copy {
+            let mut stub = [0u8; 32];
+            mem.read(export, &mut stub).unwrap();
+            mem.poke(T_CODE + 0x800, &stub).unwrap();
+            T_CODE + 0x800
+        } else {
+            export
+        };
+        // [T_DATA]=region base, [T_DATA+8]=size, [T_DATA+16]=old protect.
+        let region = T_DATA + 0x2000;
+        mem.write_uint(T_DATA, 8, region).unwrap();
+        mem.write_uint(T_DATA + 8, 8, 0x1000).unwrap();
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.sub(rsp, 0x28).unwrap();
+        a.mov(rcx, -1i64).unwrap();
+        a.mov(rdx, T_DATA).unwrap();
+        a.mov(r8, T_DATA + 8).unwrap();
+        a.mov(r9d, 2).unwrap();
+        a.mov(rax, T_DATA + 16).unwrap();
+        a.mov(qword_ptr(rsp + 0x20), rax).unwrap();
+        a.mov(rax, target).unwrap();
+        a.call(rax).unwrap();
+        a.add(rsp, 0x28).unwrap();
+        a.nop().unwrap();
+        let code = a.assemble(T_CODE).unwrap();
+        mem.poke(T_CODE, &code).unwrap();
+        let end = T_CODE + code.len() as u64 - 1;
+        let mut cpu = Cpu::new(T_CODE);
+        cpu.regs[RSP] = T_STACK + 0x4000;
+        let mut emu = crate::emu::Emulator::new(cpu, mem);
+        emu.hook = Some(Box::new(h));
+        let stop = emu.run_until(end, 1000);
+        let old = emu.mem.read_uint(T_DATA + 16, 4).unwrap();
+        (emu.cpu.regs[RAX], old, emu.mem.perm_at(region), stop)
+    }
+
+    #[test]
+    fn ntdll_exports_have_real_stub_bytes() {
+        let mut h = ntdll_hook();
+        let mut mem = Memory::new();
+        h.module_handle(&mut mem, "ntdll.dll");
+        for name in ["NtProtectVirtualMemory", "ZwProtectVirtualMemory"] {
+            let mut b = [0u8; 32];
+            mem.read(export_va(&h, name), &mut b).unwrap();
+            assert_eq!(b[..4], [0x4C, 0x8B, 0xD1, 0xB8], "{name} mov r10,rcx; mov eax");
+            assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), NT_PROTECT_NR);
+            assert!(b[8..].windows(2).any(|w| w == [0x0F, 0x05]), "{name} has syscall");
+            assert!(b.iter().any(|&x| x != 0));
+        }
+    }
+
+    #[test]
+    fn syscall_path_matches_name_keyed_handler() {
+        let by_name = run_nt_protect(false);
+        let by_syscall = run_nt_protect(true);
+        assert_eq!(by_name, by_syscall);
+        assert_eq!(by_syscall.0, 0, "STATUS_SUCCESS");
+        assert_eq!(by_syscall.1, 0x04, "old protection was PAGE_READWRITE");
+        assert_eq!(by_syscall.2, Some(Perm::R), "region is now read-only");
+        assert_eq!(by_syscall.3, crate::emu::Stop::Reached);
+    }
+
+    #[test]
+    fn unmodeled_and_unknown_syscalls_fail_closed() {
+        use crate::emu::Stop;
+        let run = |nr: u32| {
+            let mut h = ntdll_hook();
+            let mut mem = Memory::new();
+            mem.map(T_CODE, 0x1000, Perm::RWX).unwrap();
+            h.module_handle(&mut mem, "ntdll.dll");
+            // eax = nr; syscall
+            let mut code = vec![0xB8];
+            code.extend(nr.to_le_bytes());
+            code.extend([0x0F, 0x05, 0x90]);
+            mem.poke(T_CODE, &code).unwrap();
+            let mut emu = crate::emu::Emulator::new(Cpu::new(T_CODE), mem);
+            emu.hook = Some(Box::new(h));
+            emu.run_until(T_CODE + 7, 100)
+        };
+        assert_eq!(run(0x1234), Stop::Hook, "known stub, no NT handler");
+        assert_eq!(run(0x9999), Stop::Hook, "number not backed by any stub");
+        // No hook at all: unsupported, never a guessed return.
+        let mut mem = Memory::new();
+        mem.map(T_CODE, 0x1000, Perm::RWX).unwrap();
+        mem.poke(T_CODE, &[0x0F, 0x05]).unwrap();
+        let mut emu = crate::emu::Emulator::new(Cpu::new(T_CODE), mem);
+        assert!(matches!(emu.run(10), Stop::Unsupported { .. }));
+    }
+
+    #[test]
+    fn write_process_memory_self_only_respects_page_perms() {
+        let (mut h, mut cpu, mut mem, sab) = harness();
+        let (dst, src, done) = (T_DATA + 0x1000, T_DATA + 0x2000, T_DATA + 0x3000);
+        mem.write(src, b"abcd").unwrap();
+        mem.write_uint(sab, 8, done).unwrap();
+        set_args(&mut cpu, [u64::MAX, dst, src, 4]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab)), 1);
+        assert_eq!(mem.read_uint(dst, 4).unwrap(), u64::from(u32::from_le_bytes(*b"abcd")));
+        assert_eq!(mem.read_uint(done, 8).unwrap(), 4);
+        mem.protect(dst, 0x1000, Perm::R).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab)), 0);
+        assert_eq!(h.last_error, ERROR_NOACCESS);
+        set_args(&mut cpu, [0x1234, dst, src, 4]);
+        assert!(matches!(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab), Dispatch::Stop));
     }
 }

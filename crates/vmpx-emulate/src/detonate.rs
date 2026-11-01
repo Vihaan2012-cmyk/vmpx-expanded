@@ -308,6 +308,10 @@ impl Hook for MultiHook {
         }
         acc
     }
+
+    fn on_syscall(&mut self, cpu: &mut Cpu, mem: &mut Memory) -> Option<HookAction> {
+        self.hooks.iter_mut().find_map(|h| h.on_syscall(cpu, mem))
+    }
 }
 
 /// Load `pe`, install a composite hook (import emulation + OEP detection, and VM
@@ -375,6 +379,12 @@ fn detonate_with(
     // Import emulation + OEP detection share one ObservedFacts.
     let mut winapi =
         WinApiHook::from_image(&img).with_export_reference(opts.export_reference.clone());
+    // Offline System32 ntdll supplies the real syscall numbers behind the stub bytes.
+    if opts.export_reference.keys().any(|k| k.eq_ignore_ascii_case("ntdll.dll")) {
+        if let Some(n) = crate::SysDllDb::new().syscall_numbers("ntdll.dll") {
+            winapi = winapi.with_syscall_numbers(n);
+        }
+    }
     let xplm = (opts.xplm || opts.lifecycle.is_some()).then(|| Rc::new(RefCell::new(Xplm::new())));
     if let Some(x) = &xplm {
         winapi = winapi.with_xplm(Rc::clone(x));
@@ -441,6 +451,16 @@ fn detonate_with(
     // Only the retired count is consumed; skip the per-step trace allocation.
     emu.record_trace = false;
     let stop = emu.run_until(sentinel, opts.max_steps);
+    if let Stop::Fault { addr, access, rip } = &stop {
+        let perm = emu.mem.perm_at(*addr);
+        audit.borrow_mut().insert(
+            format!(
+                "FAULT {access:?} {addr:#x} rip={rip:#x} perm={perm:?} rsp={:#x} stack=[{:#x},{:#x})",
+                emu.cpu.regs[4], img.stack_base, img.stack_top
+            ),
+            1,
+        );
+    }
     let lifecycle = opts.lifecycle.as_ref().map(|lc| {
         let env = LifecycleEnv {
             exports: &img.exports,
@@ -1054,6 +1074,11 @@ mod tests {
                 }
             }),
             dump: std::env::var("VMPX_NO_DUMP").is_err(),
+            // VMPX_STACK_KB=<n> overrides the guest stack size (default 256 KiB).
+            stack_size: std::env::var("VMPX_STACK_KB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(LoadOptions::default().stack_size, |kb| kb * 1024),
             ..DetonateOptions::default()
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
@@ -1118,7 +1143,7 @@ mod tests {
                 eprintln!("    {e:?}");
             }
         }
-        for (k, n) in res.audit.iter().filter(|(k, _)| k.contains("UNMODELED") || k.contains("BLOCKED")) {
+        for (k, n) in res.audit.iter().filter(|(k, _)| k.contains("UNMODELED") || k.contains("BLOCKED") || k.contains("NTSTUB") || k.contains("SYSCALL") || k.contains("RECENT") || k.contains("MEMCALL") || k.starts_with("FAULT")) {
             eprintln!("  audit stop: {k} x{n}");
         }
         if let Some(lc) = &res.lifecycle {

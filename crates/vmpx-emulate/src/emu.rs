@@ -152,6 +152,12 @@ pub trait Hook {
     fn on_flow(&mut self, _ev: &FlowEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         HookAction::Continue
     }
+    /// A `syscall` instruction at `cpu.rip`. `Some(Continue)` = handled (the hook
+    /// set RAX/RCX/R11 as the kernel would; execution resumes after the
+    /// instruction), `Some(Stop)` = stop, `None` = not handled (fail-closed stop).
+    fn on_syscall(&mut self, _cpu: &mut Cpu, _mem: &mut Memory) -> Option<HookAction> {
+        None
+    }
     /// Which events this hook can be affected by; `run`/`run_until` skip
     /// building and delivering the rest. Re-queried after every delivered
     /// callback and at the start of each `run`/`run_until`, so it may depend on
@@ -2097,6 +2103,20 @@ impl Emulator {
                     HookOutcome::Redirect => self.cpu.rip,
                     HookOutcome::Continue => t,
                 });
+            }
+            Mnemonic::Syscall => {
+                self.cpu.rip = self.cur.0;
+                let Self { hook, cpu, mem, .. } = self;
+                let act = hook.as_mut().and_then(|h| h.on_syscall(cpu, mem));
+                if self.gate.active {
+                    self.gate.fq = [EMPTY_PAGE; GATE_SLOTS];
+                    self.refresh_gate();
+                }
+                match act {
+                    Some(HookAction::Continue) => {}
+                    Some(_) => return Err(Stop::Hook),
+                    None => return Err(self.unsup()),
+                }
             }
             _ if sse::is_vector(ins) => self.exec_sse(ins, mn)?,
             _ => return Err(self.unsup()),
