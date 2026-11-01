@@ -515,6 +515,12 @@ pub fn recover_handler_codecs(
             dispatch_analysis.candidates.len()
         ));
     }
+    diagnostics.extend(dispatch_analysis.rejected_sources.iter().map(|rejection| {
+        format!(
+            "dispatch source {}: {}",
+            rejection.encoded_load, rejection.reason
+        )
+    }));
     if operand_analysis.candidates.len() > 1 {
         diagnostics.push(format!(
             "multiple operand codecs remain: {}",
