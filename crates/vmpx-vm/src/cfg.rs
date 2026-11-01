@@ -17,6 +17,10 @@ use thiserror::Error;
 use vmpx_disasm::{DirectJumpTraceLimits, trace_direct_jump_fragments};
 use vmpx_pe::{PeImage, Va};
 
+use crate::env_gate::{
+    EnvironmentGateRoute, has_environment_source, record_environment_fork,
+    resolve_generalized_environment_gate,
+};
 use crate::{
     BinaryOp, BitWidth, DecodedVmInstruction, DispatchExtractionCandidate,
     EntryProfileRecoveryError, EntryProfileRecoveryLimits, Expr, ExprError, ExprKind,
@@ -230,6 +234,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+pub(crate) fn diagnostics_enabled() -> bool {
+    DIAG_ENABLED.with(Cell::get)
+}
+
 /// Switches the per-thread branch-refusal diagnostic collection on or off and
 /// clears anything collected. Off by default; it never influences recovery.
 pub fn set_branch_refusal_diagnostics(enabled: bool) {
@@ -271,7 +279,10 @@ pub enum VmCfgAssumption {
     /// by a sound both-target over-approximation: the environment value is an
     /// unknown input, so both sides of the gate were enumerated and followed. A
     /// host-CPU-specific dead path is conservatively included; no reachable
-    /// behavior is dropped.
+    /// behavior is dropped. Also set when the gate condition is rooted in any
+    /// other host-environment source (see [`crate::EnvironmentSource`]: API
+    /// returns, PEB/TEB loads, constant out-of-image probes): the same
+    /// both-target fork, never an assumption about the runtime value.
     OverApproximatedEnvironmentGate,
     /// A provably-null image read (a global pointer slot that is zero in the
     /// static image but runtime-initialized) was resolved using a concrete value
@@ -1353,9 +1364,20 @@ fn image_base_relative_only(expr: &Expr, name: &str, is_image_va: &impl Fn(u64) 
 /// in-image preferred-base address. That is the relocation delta / image base,
 /// which is 0 at the preferred base every image read in the tool assumes. A
 /// register used as any other value is left untouched (the branch then stalls).
-fn bind_preferred_base_registers(
+pub(crate) fn bind_preferred_base_registers(
     target: &Expr,
     is_image_va: &impl Fn(u64) -> bool,
+) -> (Expr, BTreeSet<String>) {
+    bind_preferred_base_registers_except(target, is_image_va, &BTreeSet::new())
+}
+
+/// [`bind_preferred_base_registers`] that never binds a register in `except`
+/// (the environment gate passes its abstracted environment variables: one that
+/// merely sits next to an image address is a free value, not the delta).
+pub(crate) fn bind_preferred_base_registers_except(
+    target: &Expr,
+    is_image_va: &impl Fn(u64) -> bool,
+    except: &BTreeSet<String>,
 ) -> (Expr, BTreeSet<String>) {
     const MAX_NODES: usize = 4_096;
     if target.node_count_bounded(MAX_NODES) > MAX_NODES {
@@ -1364,7 +1386,7 @@ fn bind_preferred_base_registers(
     let mut replacements = BTreeMap::new();
     let mut bound = BTreeSet::new();
     for name in target.dependencies() {
-        if image_base_relative_only(target, &name, is_image_va) {
+        if !except.contains(&name) && image_base_relative_only(target, &name, is_image_va) {
             replacements.insert(name.clone(), Expr::constant(BitWidth::W64, 0));
             bound.insert(name);
         }
@@ -1378,6 +1400,9 @@ fn bind_preferred_base_registers(
         Err(_) => (target.clone(), BTreeSet::new()),
     }
 }
+
+/// Distinct flag bits the ordinary flag-fork fallback enumerates.
+const DEFAULT_MAX_FLAGS: usize = 2;
 
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
@@ -1393,6 +1418,17 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
 /// domain (or the bounded flag-fork fallback). Shared by the direct path and the
 /// environment-gate over-approximation.
 fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    resolve_over_inputs_capped(simplified, limits, DEFAULT_MAX_FLAGS)
+}
+
+/// [`resolve_over_inputs`] with an explicit bound on the distinct flag bits the
+/// flag-fork fallback may enumerate. The environment-gate path raises it: every
+/// flag there derives from unconstrained environment variables only.
+pub(crate) fn resolve_over_inputs_capped(
+    simplified: &Expr,
+    limits: VmCfgLimits,
+    max_flags: usize,
+) -> Result<(Vec<u64>, bool), String> {
     let inferred = match infer_branch_input_domains(simplified, limits.input_domain) {
         Ok(inferred) => inferred,
         Err(refusal) => {
@@ -1400,7 +1436,7 @@ fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u6
             // of flag bits the affine-domain path cannot characterize still
             // forks exactly when every input reaches the target through a
             // boolean, by enumerating that boolean over {0, 1}.
-            return match flag_fork_analysis(simplified, limits) {
+            return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!(
                     "target depends on unproven input: {refusal} [flagfork={why}]"
@@ -1424,7 +1460,7 @@ fn resolve_over_inputs(simplified: &Expr, limits: VmCfgLimits) -> Result<(Vec<u6
             // real target set is tiny. Enumerate those flags over {0, 1} instead.
             // Sound: each substituted flag is proven single-bit, and any residual
             // input dependence fails the branch closed rather than guessing.
-            return match flag_fork_analysis(simplified, limits) {
+            return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!("target enumeration failed: {error} [flagfork={why}]")),
             };
@@ -1454,7 +1490,7 @@ fn is_environment_intrinsic(name: &str) -> bool {
 
 /// A `vm_flags_*` status-word intrinsic: a pure function of its operands, adding
 /// no observation of its own (the input-domain inference treats it as such).
-fn is_flags_intrinsic(name: &str) -> bool {
+pub(crate) fn is_flags_intrinsic(name: &str) -> bool {
     name.starts_with("vm_flags_")
 }
 
@@ -1681,7 +1717,7 @@ fn classify_frontier_leaf(leaf: &FrontierLeaf) -> FlagForkRefusal {
 
 /// Replaces each subexpression equal to a flag in `assignment` with its assigned
 /// bit, rebuilding and resimplifying the rest.
-fn substitute_flags(
+pub(crate) fn substitute_flags(
     expr: &Expr,
     assignment: &[(&Expr, u64)],
     memo: &mut std::collections::HashMap<*const Expr, Expr>,
@@ -1727,13 +1763,16 @@ fn substitute_flags(
 /// a target, never drop one.
 #[cfg(test)]
 fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
-    flag_fork_analysis(target, limits).ok()
+    flag_fork_analysis(target, limits, DEFAULT_MAX_FLAGS).ok()
 }
 
 /// `flag_fork_targets` with the refusal reason retained.
-fn flag_fork_analysis(target: &Expr, limits: VmCfgLimits) -> Result<Vec<u64>, FlagForkRefusal> {
+fn flag_fork_analysis(
+    target: &Expr,
+    limits: VmCfgLimits,
+    max_flags: usize,
+) -> Result<Vec<u64>, FlagForkRefusal> {
     const MAX_NODES: usize = 4_096;
-    const MAX_FLAGS: usize = 2;
     if target.node_count_bounded(MAX_NODES) > MAX_NODES {
         return Err(FlagForkRefusal::Other("node_cap"));
     }
@@ -1762,7 +1801,7 @@ fn flag_fork_analysis(target: &Expr, limits: VmCfgLimits) -> Result<Vec<u64>, Fl
     if flags.is_empty() {
         return Err(FlagForkRefusal::NoFlags);
     }
-    if flags.len() > MAX_FLAGS {
+    if flags.len() > max_flags {
         return Err(FlagForkRefusal::TooManyFlags(flags.len()));
     }
     let mut targets = BTreeSet::new();
@@ -2356,9 +2395,20 @@ impl Walker<'_, '_> {
         let is_image_va = |value: u64| bytecode_section(self.pe, Va(value)).is_some();
         let (bound_target, direct_registers) =
             bind_preferred_base_registers(target, &is_image_va);
-        let (targets, guarded, bound_registers, environment_gate) =
+        let image_lo = self.pe.optional.image_base.0;
+        let image_hi = image_lo.saturating_add(u64::from(self.pe.optional.size_of_image));
+        let in_image = |value: u64| value >= image_lo && value < image_hi;
+        let mut gate_route = None;
+        let mut primary_resolved = false;
+        let (targets, guarded, bound_registers, mut environment_gate) =
             match resolve_targets(&bound_target, self.limits) {
-                Ok((targets, guarded)) => (targets, guarded, direct_registers, false),
+                Ok((targets, guarded)) => {
+                    primary_resolved = true;
+                    if diagnostics_enabled() {
+                        gate_route = Some(EnvironmentGateRoute::Primary);
+                    }
+                    (targets, guarded, direct_registers, false)
+                }
                 Err(reason) => {
                     // A VMProtect CPUID / timestamp-counter anti-analysis gate
                     // stalls here because the environment value is statically
@@ -2366,6 +2416,7 @@ impl Walker<'_, '_> {
                     if let Some((targets, guarded, gate_registers)) =
                         resolve_environment_gate(target, &is_image_va, self.limits)
                     {
+                        gate_route = Some(EnvironmentGateRoute::LegacyGate);
                         (targets, guarded, gate_registers, true)
                     } else if let Some(targets) = self.resolve_readonly_image_table(&bound_target) {
                         // A jump/const-table branch whose next-VIP reads a
@@ -2385,8 +2436,17 @@ impl Walker<'_, '_> {
                         // observed for this branch site (and re-validated as real
                         // bytecode) resolved it; nothing else to enumerate here.
                         return;
+                    } else if let Some(gate) =
+                        resolve_generalized_environment_gate(target, &is_image_va, &in_image, self.limits)
+                    {
+                        // The branch is gated on a host-environment / API source
+                        // the narrow CPUID gate does not model: the same sound
+                        // both-target fork, labeled.
+                        gate_route = Some(EnvironmentGateRoute::Generalized);
+                        (gate.targets, gate.guarded, gate.bound_registers, true)
                     } else {
                         let reason = format!("unresolved branch target: {reason}");
+                        record_environment_fork(vip, EnvironmentGateRoute::Refused, target, &in_image, &[]);
                         if DIAG_ENABLED.with(Cell::get) {
                             let causes = diagnose_branch_refusals(
                                 &bound_target.simplify(),
@@ -2412,10 +2472,19 @@ impl Walker<'_, '_> {
                 .assumptions
                 .insert(VmCfgAssumption::PreferredImageBase);
         }
+        // A fork the ordinary path resolved over an environment-sourced condition
+        // (the source only fed a flag word) is the same both-arm superset: label
+        // it too, so no environment fork is silent.
+        if primary_resolved && targets.len() > 1 && has_environment_source(target, &in_image) {
+            environment_gate = true;
+        }
         if environment_gate {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::OverApproximatedEnvironmentGate);
+        }
+        if let Some(route) = gate_route {
+            record_environment_fork(vip, route, target, &in_image, &targets);
         }
         // Consulted at most once, only when a target falls out of the bytecode
         // section (CASE-C). An observed real target for this branch site, once

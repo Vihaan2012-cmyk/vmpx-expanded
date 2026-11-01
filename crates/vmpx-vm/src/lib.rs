@@ -8,6 +8,7 @@ mod codec_recovery;
 mod decoder;
 mod dispatch_extract;
 mod effect_extract;
+mod env_gate;
 mod entry_paths;
 mod entry_profile;
 mod exception_flow;
@@ -62,6 +63,9 @@ pub use cfg::{
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
     ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, DEFAULT_MAX_WALL_TIME, recover_vm_cfg,
     recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
+};
+pub use env_gate::{
+    EnvironmentGateFork, EnvironmentGateRoute, EnvironmentSource, take_environment_gate_forks,
 };
 pub use checksum::{
     ChecksumAccumulatorSource, ChecksumCombine, ChecksumShift, ChecksumTableIndex,

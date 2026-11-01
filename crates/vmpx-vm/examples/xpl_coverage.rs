@@ -24,13 +24,18 @@ use std::time::Instant;
 
 use vmpx_pe::PeImage;
 use vmpx_vm::{
-    BranchRefusalDiagnostic, EntryProfileRecoveryLimits, ObservedBranchTargets, ObservedRun,
+    BranchRefusalDiagnostic, EnvironmentGateFork, EnvironmentGateRoute, take_environment_gate_forks, EntryProfileRecoveryLimits, ObservedBranchTargets, ObservedRun,
     VmCfgAssumption, VmCfgLimits, VmDiscoveryLimits, discover_vm_entries, recover_vm_cfg,
     recover_vm_cfg_with_observed, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
 };
 
 const DEFAULT_IMAGE: &str = "E:/downloads/systems.original.xpl";
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
+
+// Environment-sourced branches seen by every entry (rva, fork); filled from the
+// worker threads, reported once at the end. Diagnostic only.
+static ENV_FORKS: std::sync::Mutex<Vec<(u32, EnvironmentGateFork)>> =
+    std::sync::Mutex::new(Vec::new());
 
 enum Outcome {
     Complete { assumptions: Vec<VmCfgAssumption> },
@@ -144,6 +149,13 @@ fn recover_one(
     set_branch_refusal_diagnostics(true);
     let result = panic::catch_unwind(AssertUnwindSafe(|| recover_vm_cfg(pe, entry, limits)));
     let diags = take_branch_refusal_diagnostics();
+    {
+        let forks = take_environment_gate_forks();
+        if !forks.is_empty() {
+            let mut sink = ENV_FORKS.lock().unwrap_or_else(|e| e.into_inner());
+            sink.extend(forks.into_iter().map(|f| (entry.rva.0, f)));
+        }
+    }
     match result {
         Err(_) => Outcome::Panic,
         Ok(Err(error)) => Outcome::Error(normalize(&error.to_string())),
@@ -794,6 +806,58 @@ fn main() {
         }
     }
 
+
+    // ---------------- environment-gate fork tier ----------------
+    {
+        let forks = ENV_FORKS.lock().unwrap_or_else(|e| e.into_inner());
+        println!("
+==================== ENVIRONMENT-GATE FORKS ====================");
+        let sites = |route: EnvironmentGateRoute| {
+            forks
+                .iter()
+                .filter(|(_, f)| f.route == route)
+                .map(|(_, f)| f.vip.0)
+                .collect::<BTreeSet<_>>()
+        };
+        println!("  environment-sourced branch sites (distinct VIPs):");
+        println!("    resolved by the ordinary proven path (unlabeled) : {}", sites(EnvironmentGateRoute::Primary).len());
+        println!("    legacy CPUID/timestamp gate (labeled)            : {}", sites(EnvironmentGateRoute::LegacyGate).len());
+        println!("    NEWLY forked by the generalized gate (labeled)   : {}", sites(EnvironmentGateRoute::Generalized).len());
+        println!("    environment-sourced but REFUSED (stay stalls)    : {}", sites(EnvironmentGateRoute::Refused).len());
+        let mut by_source: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        for (_, f) in forks.iter().filter(|(_, f)| f.route == EnvironmentGateRoute::Generalized) {
+            by_source.entry(format!("{:?}", f.sources)).or_default().insert(f.vip.0);
+        }
+        for (k, v) in &by_source {
+            println!("      generalized by source set {k}: {}", v.len());
+        }
+        let gen_entries: BTreeSet<u32> = forks
+            .iter()
+            .filter(|(_, f)| f.route == EnvironmentGateRoute::Generalized)
+            .map(|(r, _)| *r)
+            .collect();
+        let gen_complete = results
+            .iter()
+            .filter(|r| gen_entries.contains(&r.rva) && matches!(r.outcome, Outcome::Complete { .. }))
+            .count();
+        println!("  entries containing a generalized fork: {} (of which complete: {gen_complete})", gen_entries.len());
+        let primary_entries: BTreeSet<u32> = forks
+            .iter()
+            .filter(|(_, f)| f.route == EnvironmentGateRoute::Primary)
+            .map(|(r, _)| *r)
+            .collect();
+        let primary_proven = complete_sets
+            .iter()
+            .filter(|(r, a)| a.is_empty() && primary_entries.contains(r))
+            .count();
+        println!(
+            "  entries with an unlabeled (primary-path) environment fork: {} (of which strict-PROVEN complete: {primary_proven})",
+            primary_entries.len()
+        );
+        for (rva, f) in forks.iter().filter(|(_, f)| f.route == EnvironmentGateRoute::Generalized).take(10) {
+            println!("    entry {rva:#x} vip {:#x} sources {:?} targets {:x?}", f.vip.0, f.sources, f.targets);
+        }
+    }
 
     // ---------------- assumption-tier split of the complete set ----------------
     {
