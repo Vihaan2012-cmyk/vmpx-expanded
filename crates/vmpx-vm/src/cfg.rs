@@ -933,7 +933,8 @@ fn widen_state(
     if a.fresh_allocations != r.fresh_allocations {
         return Err("loop changes the fresh allocations".to_owned());
     }
-    let mut changed = false;
+    let mut changed = (r.image_reads_suppressed && !a.image_reads_suppressed)
+        || (r.protection_may_have_changed && !a.protection_may_have_changed);
     let flags = generalize(Some(&a.flags), Some(&r.flags), key, "f", &mut changed)?
         .unwrap_or_else(|| a.flags.clone());
     let mut context_values = BTreeMap::new();
@@ -986,6 +987,8 @@ fn widen_state(
         memory_epoch: a.memory_epoch.max(r.memory_epoch),
         memory_tainted: false,
         image_reads_suppressed: a.image_reads_suppressed || r.image_reads_suppressed,
+        protection_may_have_changed: a.protection_may_have_changed
+            || r.protection_may_have_changed,
         next_native_call_epoch: a.next_native_call_epoch.max(r.next_native_call_epoch),
         fresh_allocations: a.fresh_allocations.clone(),
     }))
@@ -4267,6 +4270,23 @@ mod tests {
         assert!(is_havoc(&widened.context_values[&8]));
         assert_eq!(widened.vsp, a.vsp);
         assert!(matches!(widen_state(Va(0x1000), &widened, &r), Ok(None)));
+    }
+
+    #[test]
+    fn re_entry_that_lost_image_or_protection_proof_is_not_subsumed() {
+        let a = loop_state(0, w64(0));
+        for lose in [
+            |s: &mut SymbolicVmInitialState| s.image_reads_suppressed = true,
+            |s: &mut SymbolicVmInitialState| s.protection_may_have_changed = true,
+        ] {
+            let mut r = loop_state(0, w64(0));
+            lose(&mut r);
+            let widened = widen_state(Va(0x1000), &a, &r)
+                .expect("widens")
+                .expect("a state with weaker facts must be re-analysed");
+            assert!(widened.image_reads_suppressed || widened.protection_may_have_changed);
+            assert!(matches!(widen_state(Va(0x1000), &widened, &r), Ok(None)));
+        }
     }
 
     #[test]

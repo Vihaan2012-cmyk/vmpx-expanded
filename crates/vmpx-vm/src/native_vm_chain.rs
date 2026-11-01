@@ -96,6 +96,8 @@ fn overlay_prior_memory(
     initial.memory_values = byte_values;
     initial.memory_epoch = prior.memory_epoch;
     initial.memory_tainted = prior.memory_tainted;
+    initial.image_reads_suppressed |= prior.image_reads_suppressed;
+    initial.protection_may_have_changed |= prior.protection_may_have_changed;
     initial.next_native_call_epoch = prior.next_native_call_epoch;
     initial
         .fresh_allocations
@@ -222,6 +224,8 @@ pub fn continue_through_native_vm_entry(
         .ok_or(NativeVmEntryContinuationError::IncompleteContext)?
         .substitute(&replacements)?;
     overlay_prior_memory(&mut composed_initial, prior_symbolic)?;
+    // Arbitrary native code ran between the two VM regions.
+    composed_initial.protection_may_have_changed = true;
     let first = entry_profile
         .bootstrap
         .codec

@@ -192,7 +192,8 @@ pub use semantic_exec::{
     SymbolicMemoryWrite, SymbolicNativeCall, SymbolicVmExecutionReport, SymbolicVmInitialState,
     canonicalize_symbolic_pointer, execute_symbolic_linear_block,
     execute_symbolic_linear_block_with_initial_state,
-    execute_symbolic_native_call_boundary_with_initial_state, symbolic_pointer_offset,
+    execute_symbolic_native_call_boundary_with_initial_state, set_served_page_audit,
+    symbolic_pointer_offset, take_served_page_audit,
 };
 pub use symbolic_domain::{
     SymbolicConcreteAlternative, SymbolicDomainError, SymbolicDomainLimits, SymbolicDomainReport,

@@ -37,6 +37,9 @@ const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 static ENV_FORKS: std::sync::Mutex<Vec<(u32, EnvironmentGateFork)>> =
     std::sync::Mutex::new(Vec::new());
 
+// (entry rva, page number, proven) of suppressed-read image serves; audit only.
+static SERVED_PAGES: std::sync::Mutex<Vec<(u32, u64, bool)>> = std::sync::Mutex::new(Vec::new());
+
 enum Outcome {
     Complete { assumptions: Vec<VmCfgAssumption> },
     // Non-complete but recovery returned a CFG: distinct normalized stall
@@ -139,6 +142,7 @@ fn recover_one(
             instruction_limit,
             symbolic: vmpx_vm::SymbolicExecutionLimits {
                 serve_read_only_when_suppressed: std::env::var_os("XPL_SERVE_RO").is_some(),
+                prove_read_only_when_suppressed: std::env::var_os("XPL_NO_PROVEN_RO").is_none(),
                 ..vmpx_vm::SymbolicExecutionLimits::default()
             },
             ..EntryProfileRecoveryLimits::default()
@@ -147,8 +151,19 @@ fn recover_one(
         ..VmCfgLimits::default()
     };
     set_branch_refusal_diagnostics(true);
+    let audit = std::env::var_os("XPL_SERVED_PAGES_OUT").is_some();
+    vmpx_vm::set_served_page_audit(audit);
     let result = panic::catch_unwind(AssertUnwindSafe(|| recover_vm_cfg(pe, entry, limits)));
     let diags = take_branch_refusal_diagnostics();
+    if audit {
+        let pages = vmpx_vm::take_served_page_audit();
+        if !pages.is_empty() {
+            SERVED_PAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(pages.into_iter().map(|(page, proven)| (entry.rva.0, page, proven)));
+        }
+    }
     {
         let forks = take_environment_gate_forks();
         if !forks.is_empty() {
@@ -1182,6 +1197,15 @@ fn main() {
             out.push_str(&format!("{rva:#x} {} {}\n", set.iter().collect::<String>(), vas.join(",")));
         }
         std::fs::write(path, out).expect("write dump");
+    }
+
+    if let Some(path) = std::env::var_os("XPL_SERVED_PAGES_OUT") {
+        let served = SERVED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = String::new();
+        for (rva, page, proven) in served.iter() {
+            out.push_str(&format!("{rva:#x} {page:#x} {}\n", if *proven { "proven" } else { "labeled" }));
+        }
+        std::fs::write(path, out).expect("write served pages");
     }
 
     let pct = complete as f64 * 100.0 / swept_f;
