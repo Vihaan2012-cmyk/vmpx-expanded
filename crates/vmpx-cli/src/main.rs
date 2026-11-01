@@ -22,6 +22,7 @@ mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
+mod decompile_cmd;
 mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
@@ -180,6 +181,30 @@ enum Command {
         /// original; every verdict must then be REFUTED.
         #[arg(long)]
         control: bool,
+    },
+    /// SPIKE: raise a recovered function to C-like pseudocode. With --native the
+    /// input is an unprotected PE (native CFG); otherwise a protected PE whose
+    /// virtualized exports are decompiled from the recovered VM CFG.
+    Decompile {
+        input: PathBuf,
+        /// Restrict to these export names; repeatable.
+        #[arg(long = "function")]
+        function: Vec<String>,
+        /// Restrict to these VM entry RVAs (hex); repeatable.
+        #[arg(long = "rva", value_parser = parse_rva)]
+        rva: Vec<u32>,
+        /// Treat the input as an unprotected PE and decompile its native CFG.
+        #[arg(long)]
+        native: bool,
+        /// Unprotected original PE: cross-check the decompiled function against it.
+        #[arg(long)]
+        original: Option<PathBuf>,
+        /// Print the recovered-path/loop structure instead of pseudocode.
+        #[arg(long)]
+        probe: bool,
+        /// VM instruction budget for entry-stream recovery.
+        #[arg(long, default_value_t = 100_000)]
+        instruction_limit: usize,
     },
     /// Perform structural validation without executing the input.
     Verify {
@@ -1210,6 +1235,23 @@ fn main() -> Result<()> {
             max_blocks,
             max_paths,
             control,
+        })?,
+        Command::Decompile {
+            input,
+            function,
+            rva,
+            native,
+            original,
+            probe,
+            instruction_limit,
+        } => decompile_cmd::run(decompile_cmd::Options {
+            input,
+            only: function,
+            rvas: rva,
+            native,
+            original,
+            probe,
+            instruction_limit,
         })?,
         Command::Verify { input, json } => {
             let (data, report) = inspect(&input)?;

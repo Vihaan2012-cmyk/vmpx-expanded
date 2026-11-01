@@ -27,6 +27,7 @@ vmpx-recompile = { path = "../vmpx-recompile" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
 vmpx-verify = { path = "../vmpx-verify" }
 vmpx-mutation = { path = "../vmpx-mutation" }
+vmpx-decompile = { path = "../vmpx-decompile" }
 
 [features]
 smt-z3 = ["vmpx-verify/smt-z3"]

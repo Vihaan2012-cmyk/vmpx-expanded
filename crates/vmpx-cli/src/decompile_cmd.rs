@@ -1,0 +1,191 @@
+//! `vmpx decompile` (SPIKE): pseudocode from recovered IR. Static only.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
+use vmpx_pe::{PeImage, Rva};
+
+pub(crate) struct Options {
+    pub input: PathBuf,
+    pub only: Vec<String>,
+    pub rvas: Vec<u32>,
+    pub native: bool,
+    pub original: Option<PathBuf>,
+    pub probe: bool,
+    pub instruction_limit: usize,
+}
+
+pub(crate) fn run(o: Options) -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || go(&o))
+        .context("spawn")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("worker panicked"))?
+}
+
+fn go(o: &Options) -> Result<()> {
+    let bytes = std::fs::read(&o.input).context("read input")?;
+    if o.native {
+        return native(o, &bytes);
+    }
+    let mapped = crate::equiv_gate::load_pe(&bytes)?;
+    let pe = PeImage::parse(&mapped).context("image failed reparse")?;
+    let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
+    let mut targets: Vec<(String, u32)> = Vec::new();
+    for sym in symbols {
+        let Some(name) = sym.name.clone() else { continue };
+        if !o.only.is_empty() && !o.only.contains(&name) {
+            continue;
+        }
+        match crate::diff_original::resolve_stub(&pe, &mapped, sym.rva.0) {
+            Ok(stub) => targets.push((name, stub)),
+            Err(why) => println!("// {name}: not a virtualized user function ({why})"),
+        }
+    }
+    for rva in &o.rvas {
+        targets.push((format!("vm_{rva:x}"), *rva));
+    }
+    for (name, stub) in targets {
+        println!("// ==== {name} [{stub:#x}]");
+        match vm_one(o, &pe, &name, stub) {
+            Ok(()) => {}
+            Err(e) => println!("// {name}: {e}\n"),
+        }
+    }
+    Ok(())
+}
+
+fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::Result<(), String> {
+    if o.probe {
+        crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+            let cfg = input.cfg;
+            println!("// cfg: entry={} blocks={} edges={} stalls={} complete={}", cfg.entry, cfg.blocks.len(), cfg.edges.len(), cfg.stalls.len(), cfg.is_complete());
+            for (k, b) in &cfg.blocks {
+                println!("//  block {k} addr={:?} instrs={} exit={:?}", b.address, b.instructions.len(), b.exit);
+            }
+            for e in &cfg.edges {
+                println!("//  edge {} -> {} {:?}", e.from, e.to, e.kind);
+            }
+        })?;
+        let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+            vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+        })??;
+        println!("// rolled: loops={} forks={} blocks_walked={}", rolled.loops, rolled.forks, rolled.straight_blocks);
+        print_tree(&rolled.root, 0);
+        return Ok(());
+    }
+    let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+        vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+    })??;
+    let low = vmpx_decompile::vm::lower(&rolled, name)?;
+    let d = vmpx_decompile::decompile(&low.func)?;
+    for n in &low.notes {
+        println!("// note: {n}");
+    }
+    print!("{}", d.text);
+    println!(
+        "// structured={} loops={} ifs={} gotos={} fallback={:?}
+// IR round-trip (structured program vs its IR): {:?}
+// C-text re-evaluation (C typing, UB checks) vs IR (checked, skipped): {:?}",
+        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
+    );
+    // linkage 1: the decompiled function against the unrolled (PROVEN) paths
+    let unrolled = crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64)?;
+    let mut targets = Vec::new();
+    for path in unrolled.paths.iter().filter(|p| !p.region_exit) {
+        if let Some(rax) = path.semantics.exit.registers.get(&vmpx_vm::X64NativeRegister::Rax) {
+            targets.push(vmpx_decompile::vm::fix(rax));
+        }
+    }
+    println!(
+        "// linkage vs unrolled recovered paths ({} callee-return path(s)): {:?}",
+        targets.len(),
+        vmpx_decompile::linkage_vs_exprs(&low.func, &targets, 64)
+    );
+    if let Some(orig) = &o.original {
+        let obytes = std::fs::read(orig).map_err(|e| e.to_string())?;
+        let ope = PeImage::parse(&obytes).map_err(|e| e.to_string())?;
+        let osym = ope
+            .report()
+            .exports
+            .map(|e| e.symbols)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|s| s.name.as_deref() == Some(name))
+            .ok_or("no such export in the original")?;
+        let cfg = recover_native_cfg_pe_with(&ope, Rva(osym.rva.0), CfgOptions::PROVEN).map_err(|e| e.to_string())?;
+        let nf = vmpx_decompile::native::lower(&cfg, name)?;
+        println!(
+            "// linkage vs ORIGINAL native function (both lifted to IR): {:?}",
+            vmpx_decompile::linkage_vs_func(&low.func, &nf, 64)
+        );
+    }
+    println!();
+    Ok(())
+}
+
+fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
+    use vmpx_vmlift::RNode;
+    let pad = "  ".repeat(depth);
+    let p = |e: &vmpx_vm::Expr, d| vmpx_verify::differential::pretty(&e.simplify(), d);
+    match n {
+        RNode::Exit(x) => {
+            println!("// {pad}EXIT region={}", x.region);
+            for (r, e) in &x.registers {
+                println!("// {pad}  {r:?} = {}", p(e, 7));
+            }
+        }
+        RNode::Fork { selector, env, block, arms } => {
+            println!("// {pad}FORK at {block} env={env} selector={}", p(selector, 9));
+            for (v, a) in arms {
+                println!("// {pad} arm {v:#x}:");
+                print_tree(a, depth + 2);
+            }
+        }
+        RNode::Loop { header, phis, body } => {
+            println!("// {pad}LOOP header={header} phis={}", phis.len());
+            for ph in phis {
+                println!("// {pad}  {} ({:?}) init={}", ph.name, ph.width, p(&ph.init, 7));
+            }
+            print_tree(body, depth + 1);
+        }
+        RNode::BackEdge { next } => {
+            println!("// {pad}BACKEDGE");
+            for (i, e) in next.iter().enumerate() {
+                println!("// {pad}  next[{i}] = {}", p(e, 9));
+            }
+        }
+        RNode::Dead(why) => println!("// {pad}DEAD {why}"),
+    }
+}
+
+fn native(o: &Options, bytes: &[u8]) -> Result<()> {
+    let pe = PeImage::parse(bytes).context("not a supported PE")?;
+    let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
+    for sym in symbols {
+        let Some(name) = sym.name.clone() else { continue };
+        if !o.only.is_empty() && !o.only.contains(&name) {
+            continue;
+        }
+        let cfg = match recover_native_cfg_pe_with(&pe, Rva(sym.rva.0), CfgOptions::PROVEN) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("// {name}: cfg recovery failed: {e}\n");
+                continue;
+            }
+        };
+        match vmpx_decompile::native::lower(&cfg, &name).and_then(|f| vmpx_decompile::decompile(&f)) {
+            Err(e) => println!("// {name}: {e}\n"),
+            Ok(d) => {
+                print!("{}", d.text);
+                println!(
+                    "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?} ctext={:?}\n",
+                    d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
+                );
+            }
+        }
+    }
+    Ok(())
+}

@@ -349,9 +349,28 @@ impl Wrapped for (String, u8) {
 pub struct Ctx<'a> {
     pub r: Renderer<'a>,
     pub out: String,
+    pub log: Vec<(Logged, String)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Logged {
+    E(Expr),
+    C(Cond),
 }
 
 impl Ctx<'_> {
+    fn lexpr(&mut self, e: &Expr) -> String {
+        let t = self.r.expr(e);
+        self.log.push((Logged::E(e.clone()), t.clone()));
+        t
+    }
+
+    fn lcond(&mut self, c: &Cond) -> String {
+        let t = self.r.cond(c);
+        self.log.push((Logged::C(c.clone()), t.clone()));
+        t
+    }
+
     fn line(&mut self, depth: usize, s: &str) {
         for _ in 0..depth {
             self.out.push_str("    ");
@@ -376,16 +395,16 @@ impl Ctx<'_> {
         match s {
             Stmt::Assign(v, e) => {
                 let name = self.r.name(v);
-                let t = self.r.expr(e);
+                let t = self.lexpr(e);
                 self.line(depth, &format!("{name} = {t};"));
             }
             Stmt::Store(st) => {
                 let a = self.r.rx(&st.address, false).0;
-                let v = self.r.expr(&st.value);
+                let v = self.lexpr(&st.value);
                 self.line(depth, &format!("*({} *)({a}) = {v};", ty(st.value.width)));
             }
             Stmt::If { cond, then, els } => {
-                let c = self.r.cond(cond);
+                let c = self.lcond(cond);
                 self.line(depth, &format!("if ({c}) {{"));
                 self.stmts(then, depth + 1, ret_w);
                 if els.is_empty() {
@@ -401,27 +420,27 @@ impl Ctx<'_> {
             }
             Stmt::Loop(body) => self.block("for (;;)", body, depth, ret_w),
             Stmt::While { cond, body } => {
-                let c = self.r.cond(cond);
+                let c = self.lcond(cond);
                 self.block(&format!("while ({c})"), body, depth, ret_w);
             }
             Stmt::DoWhile { body, cond } => {
                 self.line(depth, "do {");
                 self.stmts(body, depth + 1, ret_w);
-                let c = self.r.cond(cond);
+                let c = self.lcond(cond);
                 self.line(depth, &format!("}} while ({c});"));
             }
             Stmt::Break => self.line(depth, "break;"),
             Stmt::Continue => self.line(depth, "continue;"),
             Stmt::Return(vals) => {
                 let (_, first) = &vals[0];
-                let e = self.r.expr(first);
+                let e = self.lexpr(first);
                 let _ = ret_w;
                 self.line(depth, &format!("return {e};"));
             }
             Stmt::Label(n) => self.line(0, &format!("L_{n:x}:")),
             Stmt::Goto(n) => self.line(depth, &format!("goto L_{n:x};")),
             Stmt::IfGoto { cond, target } => {
-                let c = self.r.cond(cond);
+                let c = self.lcond(cond);
                 self.line(depth, &format!("if ({c}) goto L_{target:x};"));
             }
             Stmt::Comment(c) => self.line(depth, &format!("/* {c} */")),

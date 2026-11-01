@@ -298,7 +298,7 @@ pub(crate) fn unroll_entry_cfg(
     })?
 }
 
-fn with_entry_input<R>(
+pub(crate) fn with_entry_input<R>(
     pe: &PeImage<'_>,
     rva: Rva,
     instruction_limit: usize,

@@ -17,9 +17,11 @@ mod live_in;
 mod nested_entry;
 mod passthrough;
 mod replacement;
+mod rolled;
 mod unroll;
 
 pub use unroll::{UnrolledFunction, UnrolledPath, unroll_decoded_cfg};
+pub use rolled::{RExit, RNode, RPhi, RolledFunction, roll_decoded_cfg};
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
 pub use cfg_lift::{

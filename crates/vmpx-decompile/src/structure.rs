@@ -362,6 +362,10 @@ fn simplify_one(s: Stmt) -> Stmt {
                     let rest = body[1..].to_vec();
                     return Stmt::While { cond, body: rest };
                 }
+                // if (c) break; else { rest }  ==  while (!c) { rest }
+                if matches!(then.as_slice(), [Stmt::Break]) && !els.is_empty() && body.len() == 1 {
+                    return Stmt::While { cond: negate(cond), body: els.clone() };
+                }
             }
             Stmt::Loop(body)
         }
