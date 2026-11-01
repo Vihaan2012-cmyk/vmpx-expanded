@@ -13,6 +13,7 @@ vmpx-rebuild = { path = "../vmpx-rebuild" }
 
 [dev-dependencies]
 iced-x86 = { workspace = true, features = ["code_asm"] }
+vmpx-unpack = { path = "../vmpx-unpack" }
 
 [lints]
 workspace = true

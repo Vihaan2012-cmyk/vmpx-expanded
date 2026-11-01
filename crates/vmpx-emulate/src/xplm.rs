@@ -108,7 +108,7 @@ const DATA_SLOTS: [DataSlot; 12] = [
 pub enum CallbackKind {
     /// `float f(float sinceLast, float sinceLoop, int counter, void* refcon)`
     FlightLoop,
-    /// `int f(XPLMDrawingPhase, int isBefore, void* refcon)`; `aux` = phase.
+    /// `int f(XPLMDrawingPhase, int isBefore, void* refcon)`; `aux` = phase, `name` = "before"/"after".
     Draw,
     /// `int f(char key, XPLMKeyFlags, char vkey, void* refcon)`
     KeySniffer,
@@ -155,6 +155,145 @@ pub struct RecordedCallback {
     pub handle: u64,
     /// False once the plugin unregistered/destroyed it.
     pub active: bool,
+}
+
+/// How a driven guest call returns its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetKind {
+    Void,
+    Int,
+    Float,
+    Double,
+}
+
+/// One host-to-plugin call in Win64 form: positional args 0-3 ride in rcx/rdx/r8/r9 (or
+/// `xmm[i]` when `Some`, for float/double), args 4+ go on the stack after the shadow space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestCall {
+    pub va: u64,
+    pub ints: [u64; 4],
+    pub xmm: [Option<u128>; 4],
+    pub stack: Vec<u64>,
+    pub ret: RetKind,
+    pub label: String,
+}
+
+impl GuestCall {
+    #[must_use]
+    pub fn new(label: impl Into<String>, va: u64, ints: [u64; 4], ret: RetKind) -> Self {
+        Self { va, ints, xmm: [None; 4], stack: Vec::new(), ret, label: label.into() }
+    }
+}
+
+const TICK: f32 = 1.0 / 60.0;
+const KEY_A: u64 = 0x61;
+const VK_A: u64 = 0x41;
+const KEY_DOWN_FLAG: u64 = 8;
+const MOUSE_DOWN: u64 = 1;
+const MOUSE_UP: u64 = 3;
+const CURSOR_XY: u64 = 100;
+
+fn f32_bits(v: f32) -> u128 {
+    u128::from(v.to_bits())
+}
+
+impl RecordedCallback {
+    /// Benign deterministic calls that exercise this callback; `scratch` is a zeroed guest
+    /// buffer (>= 256 bytes) for out/in arrays. Repeating kinds (flight loop, draw) are
+    /// driven every `iteration`; the rest only on iteration 0. Kinds the host never
+    /// initiates a call for (object-loaded, error, feature, monitor) yield nothing.
+    #[must_use]
+    pub fn invocations(&self, iteration: u32, scratch: u64) -> Vec<GuestCall> {
+        let (va, rc) = (self.callback_va, self.refcon);
+        let tag = format!("{:?}@{va:#x}", self.kind);
+        let call = |ints, ret| GuestCall::new(tag.clone(), va, ints, ret);
+        let repeating = matches!(self.kind, CallbackKind::FlightLoop | CallbackKind::Draw);
+        if iteration > 0 && !repeating {
+            return Vec::new();
+        }
+        match self.kind {
+            CallbackKind::FlightLoop => {
+                let mut g = call([0, 0, u64::from(iteration) + 1, rc], RetKind::Float);
+                g.xmm[0] = Some(f32_bits(TICK));
+                g.xmm[1] = Some(f32_bits(TICK));
+                vec![g]
+            }
+            CallbackKind::Draw => {
+                let before = u64::from(self.name.as_deref() == Some("before"));
+                vec![call([self.aux, before, rc, 0], RetKind::Int)]
+            }
+            CallbackKind::KeySniffer => {
+                vec![call([KEY_A, KEY_DOWN_FLAG, VK_A, rc], RetKind::Int)]
+            }
+            CallbackKind::CommandHandler => [0, 2]
+                .map(|phase| call([self.handle, phase, rc, 0], RetKind::Int))
+                .to_vec(),
+            CallbackKind::DataAccessor(slot) => data_accessor_calls(&call, slot, rc, scratch),
+            CallbackKind::MenuItem => vec![call([rc, self.aux, 0, 0], RetKind::Void)],
+            CallbackKind::WindowDraw => vec![call([self.handle, rc, 0, 0], RetKind::Void)],
+            CallbackKind::WindowMouseClick | CallbackKind::WindowRightClick => {
+                [MOUSE_DOWN, MOUSE_UP]
+                    .map(|st| {
+                        let mut g = call([self.handle, CURSOR_XY, CURSOR_XY, st], RetKind::Int);
+                        g.stack = vec![rc];
+                        g
+                    })
+                    .to_vec()
+            }
+            CallbackKind::WindowKey => {
+                let mut g = call([self.handle, KEY_A, KEY_DOWN_FLAG, VK_A], RetKind::Void);
+                g.stack = vec![rc, 0];
+                vec![g]
+            }
+            CallbackKind::WindowCursor => {
+                vec![call([self.handle, CURSOR_XY, CURSOR_XY, rc], RetKind::Int)]
+            }
+            CallbackKind::WindowMouseWheel => {
+                let mut g = call([self.handle, CURSOR_XY, CURSOR_XY, 0], RetKind::Int);
+                g.stack = vec![1, rc];
+                vec![g]
+            }
+            CallbackKind::Camera => vec![call([scratch, 0, rc, 0], RetKind::Int)],
+            CallbackKind::ObjectLoaded
+            | CallbackKind::ErrorCallback
+            | CallbackKind::FeatureEnumerator
+            | CallbackKind::MonitorBounds => Vec::new(),
+        }
+    }
+}
+
+fn data_accessor_calls(
+    call: &dyn Fn([u64; 4], RetKind) -> GuestCall,
+    slot: DataSlot,
+    rc: u64,
+    scratch: u64,
+) -> Vec<GuestCall> {
+    use DataSlot::{
+        ReadData, ReadDouble, ReadFloat, ReadFloatArray, ReadInt, ReadIntArray, WriteData,
+        WriteDouble, WriteFloat, WriteFloatArray, WriteInt, WriteIntArray,
+    };
+    // Arrays and blobs: a NULL size query, then a bounded transfer.
+    let arrays = |ret| vec![call([rc, 0, 0, 0], ret), call([rc, scratch, 0, 8], ret)];
+    match slot {
+        ReadInt => vec![call([rc, 0, 0, 0], RetKind::Int)],
+        ReadFloat => vec![call([rc, 0, 0, 0], RetKind::Float)],
+        ReadDouble => vec![call([rc, 0, 0, 0], RetKind::Double)],
+        ReadIntArray | ReadFloatArray | ReadData => arrays(RetKind::Int),
+        WriteInt => vec![call([rc, 1, 0, 0], RetKind::Void)],
+        WriteFloat => {
+            let mut g = call([rc, 0, 0, 0], RetKind::Void);
+            g.xmm[1] = Some(f32_bits(1.0));
+            vec![g]
+        }
+        WriteDouble => {
+            let mut g = call([rc, 0, 0, 0], RetKind::Void);
+            g.xmm[1] = Some(u128::from(1.0f64.to_bits()));
+            vec![g]
+        }
+        WriteIntArray | WriteFloatArray | WriteData => {
+            vec![call([rc, scratch, 0, 1], RetKind::Void)]
+        }
+    }
 }
 
 /// Argument/return accessor handed to stub handlers.
@@ -521,7 +660,8 @@ fn destroy_flight_loop(x: &mut Xplm, c: &mut Ctx) -> Ret {
 }
 
 fn register_draw(x: &mut Xplm, c: &mut Ctx) -> Ret {
-    x.record(CallbackKind::Draw, c.a(0), c.a(3), c.a(1), None, 0);
+    let when = if c.a(2) as u32 != 0 { "before" } else { "after" };
+    x.record(CallbackKind::Draw, c.a(0), c.a(3), c.a(1), Some(when.to_owned()), 0);
     Ret::int(1)
 }
 fn unregister_draw(x: &mut Xplm, c: &mut Ctx) -> Ret {
@@ -1175,5 +1315,37 @@ mod tests {
             assert!(x.is_modeled("XPWidgets_64.dll", n), "{n}");
         }
         assert!(x.unlisted().is_empty());
+    }
+
+    #[test]
+    fn invocations_follow_each_callback_abi() {
+        let rec = |kind, aux, name: Option<&str>| RecordedCallback {
+            kind,
+            callback_va: 0x10,
+            refcon: 0x20,
+            aux,
+            name: name.map(str::to_owned),
+            handle: 0x30,
+            active: true,
+        };
+        let fl = rec(CallbackKind::FlightLoop, 0, None).invocations(2, 0x900);
+        assert_eq!(fl.len(), 1);
+        assert_eq!((fl[0].ints, fl[0].ret), ([0, 0, 3, 0x20], RetKind::Float));
+        assert_eq!(fl[0].xmm[0], Some(u128::from((1.0f32 / 60.0).to_bits())));
+        // Only repeating kinds run past the first round.
+        assert!(rec(CallbackKind::CommandHandler, 0, None).invocations(1, 0x900).is_empty());
+        let cmd = rec(CallbackKind::CommandHandler, 0, None).invocations(0, 0x900);
+        assert_eq!(cmd.iter().map(|c| c.ints[1]).collect::<Vec<_>>(), [0, 2]);
+        let draw = rec(CallbackKind::Draw, 5, Some("before")).invocations(1, 0x900);
+        assert_eq!(draw[0].ints, [5, 1, 0x20, 0]);
+        // The 5th/6th args of a wheel callback ride the stack.
+        let wheel = rec(CallbackKind::WindowMouseWheel, 0, None).invocations(0, 0x900);
+        assert_eq!(wheel[0].stack, [1, 0x20]);
+        // Arrays: a NULL size query, then a bounded transfer; scalar writes carry the value in xmm1.
+        let arr = rec(CallbackKind::DataAccessor(DataSlot::ReadFloatArray), 0, None).invocations(0, 0x900);
+        assert_eq!((arr[0].ints[1], arr[1].ints[1], arr[1].ints[3]), (0, 0x900, 8));
+        let wf = rec(CallbackKind::DataAccessor(DataSlot::WriteFloat), 0, None).invocations(0, 0x900);
+        assert_eq!(wf[0].xmm[1], Some(u128::from(1.0f32.to_bits())));
+        assert!(rec(CallbackKind::ErrorCallback, 0, None).invocations(0, 0x900).is_empty());
     }
 }

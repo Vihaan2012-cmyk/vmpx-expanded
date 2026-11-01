@@ -22,15 +22,15 @@ use vmpx_pe::PeImage;
 
 use crate::cpu::Cpu;
 use crate::dump::{DumpImage, OepHook, capture_globals, dump_image};
-use crate::emu::{FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
+use crate::emu::{Emulator, FlowEvent, Hook, HookAction, Interest, MemEvent, Stop};
 use crate::iat_fill::{self, IatFill, IatFillHook};
 use crate::loader::{LoadError, LoadOptions, load};
-use crate::memory::Memory;
+use crate::memory::{Memory, Perm};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 use crate::vm_discover::{DiscoveredVm, SurveyHook};
 use crate::vm_observe::{VmInstanceSpec, VmObservations, VmObserveHook};
 use crate::winapi::WinApiHook;
-use crate::xplm::{RecordedCallback, Xplm};
+use crate::xplm::{CallbackKind, GuestCall, RecordedCallback, RetKind, Xplm};
 use std::cell::RefCell;
 
 const DEFAULT_MAX_STEPS: u64 = 2_000_000;
@@ -92,6 +92,31 @@ pub struct DetonateOptions {
     pub resolve_undefined_flags: bool,
     /// Region watched for import-slot fills (see [`DetonationResult::iat_fill`]).
     pub iat_region: IatRegion,
+    /// After the entry returns, drive the X-Plane plugin lifecycle in the same emulator
+    /// (see [`LifecycleOptions`]). Implies `xplm`, and an OEP no longer stops the run.
+    pub lifecycle: Option<LifecycleOptions>,
+}
+
+/// Bounds for the in-model plugin lifecycle (all offline, step-capped).
+#[derive(Clone, Debug)]
+pub struct LifecycleOptions {
+    /// Rounds in which flight-loop and draw callbacks are driven (others run once).
+    pub iterations: u32,
+    /// Total instruction budget across every lifecycle call.
+    pub max_steps: u64,
+    /// Instruction cap for one guest call.
+    pub call_steps: u64,
+    /// Cap on the number of guest calls.
+    pub max_calls: usize,
+    /// Drive the lifecycle even if the entry returned FALSE (a real loader would unload
+    /// the DLL). Off = fail closed. Observed what-if tier only.
+    pub force_after_false_entry: bool,
+}
+
+impl Default for LifecycleOptions {
+    fn default() -> Self {
+        Self { iterations: 4, max_steps: 2_000_000_000, call_steps: 500_000_000, max_calls: 256, force_after_false_entry: false }
+    }
 }
 
 impl Default for DetonateOptions {
@@ -110,6 +135,7 @@ impl Default for DetonateOptions {
             dump: true,
             resolve_undefined_flags: true,
             iat_region: IatRegion::Auto,
+            lifecycle: None,
         }
     }
 }
@@ -196,6 +222,8 @@ pub struct DetonationResult {
     /// Import-slot fills observed in `opts.iat_region`, mapped to `module!name`
     /// only on an exact known-address match.
     pub iat_fill: IatFill,
+    /// What the plugin-lifecycle driver did, when `opts.lifecycle` was set.
+    pub lifecycle: Option<LifecycleReport>,
 }
 
 /// What the recording host-SDK model captured during the run.
@@ -345,13 +373,16 @@ fn detonate_with(
     // Import emulation + OEP detection share one ObservedFacts.
     let mut winapi =
         WinApiHook::from_image(&img).with_export_reference(opts.export_reference.clone());
-    let xplm = opts.xplm.then(|| Rc::new(RefCell::new(Xplm::new())));
+    let xplm = (opts.xplm || opts.lifecycle.is_some()).then(|| Rc::new(RefCell::new(Xplm::new())));
     if let Some(x) = &xplm {
         winapi = winapi.with_xplm(Rc::clone(x));
     }
     let facts = winapi.facts();
     let book = winapi.address_book();
-    let oep = OepHook::wrapping(winapi, Rc::clone(&facts));
+    let mut oep = OepHook::wrapping(winapi, Rc::clone(&facts));
+    if opts.lifecycle.is_some() {
+        oep = oep.keep_running();
+    }
 
     // Fold in VM observation only when a dispatcher/loop-head is configured.
     let (hook, vm_handle): (Box<dyn Hook>, _) = if let Some(extra) = extra {
@@ -407,6 +438,16 @@ fn detonate_with(
     // Only the retired count is consumed; skip the per-step trace allocation.
     emu.record_trace = false;
     let stop = emu.run_until(sentinel, opts.max_steps);
+    let lifecycle = opts.lifecycle.as_ref().map(|lc| {
+        let env = LifecycleEnv {
+            exports: &img.exports,
+            sentinel,
+            entry_rsp: img.initial_rsp,
+            xplm: xplm.as_ref(),
+            vm: vm_handle.as_ref(),
+        };
+        run_lifecycle(lc, &mut emu, &env, &stop)
+    });
     let steps = emu.steps() as usize;
 
     let mut observed = facts.borrow().clone();
@@ -453,7 +494,272 @@ fn detonate_with(
         xplm,
         discovered: Vec::new(),
         iat_fill,
+        lifecycle,
     })
+}
+
+// ---- plugin lifecycle driver ------------------------------------------------
+
+// Host-owned guest scratch (name/sig/desc buffers + callback in/out buffers).
+const HOST_SCRATCH: u64 = 0x0000_0090_0000_0000;
+const HOST_SCRATCH_LEN: u64 = 0x4000;
+const NAME_BUF: u64 = HOST_SCRATCH;
+const SIG_BUF: u64 = HOST_SCRATCH + 0x100;
+const DESC_BUF: u64 = HOST_SCRATCH + 0x200;
+const CB_SCRATCH: u64 = HOST_SCRATCH + 0x1000;
+// Two VIPs further apart than this count as a far (non-sequential) jump.
+const FAR_JUMP: u64 = 0x100;
+// XPLM_PLUGIN_XPLANE sender id and the benign broadcast messages X-Plane sends a loaded plugin.
+const XPLANE_ID: u64 = 0;
+const XPLM_MESSAGES: [u64; 3] = [102, 103, 104]; // PLANE_LOADED, AIRPORT_LOADED, SCENERY_LOADED
+const WIN64_ARGS: [usize; 4] = [1, 2, 8, 9];
+const RAX: usize = 0;
+const RSP: usize = 4;
+
+/// VM-observer totals at a point in the lifecycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmCounts {
+    /// Distinct `(instance, from, to, handler)` edges.
+    pub edges: usize,
+    /// Distinct `(site_vip, target_vip)` pairs.
+    pub branch_targets: usize,
+    /// Of those, pairs more than 0x100 apart (the branch edges the static side queries).
+    pub far_branch_targets: usize,
+}
+
+impl VmCounts {
+    fn of(vm: &VmObservations) -> Self {
+        Self {
+            edges: vm.edges.len(),
+            branch_targets: vm.branch_targets.len(),
+            far_branch_targets: vm
+                .branch_targets
+                .iter()
+                .filter(|(a, b)| a.abs_diff(*b) > FAR_JUMP)
+                .count(),
+        }
+    }
+}
+
+/// One host-to-plugin call made by the lifecycle driver.
+#[derive(Clone, Debug)]
+pub struct LifecycleCall {
+    pub label: String,
+    pub va: u64,
+    pub stop: Stop,
+    /// Instructions retired by this call.
+    pub steps: u64,
+    /// `rax` on return, or the low bits of `xmm0` for a float/double callback.
+    pub ret: u64,
+    /// Observer totals after the call (zero when no VM observer was installed).
+    pub vm_after: VmCounts,
+}
+
+/// What the lifecycle driver did.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleReport {
+    /// Why no (further) lifecycle call was made, when it was cut short.
+    pub skipped: Option<String>,
+    /// Observer totals when the entry (DllMain) returned: the DllMain-only baseline.
+    pub vm_init: VmCounts,
+    /// Observer totals after the last lifecycle call.
+    pub vm_final: VmCounts,
+    /// Strings `XPluginStart` wrote into its name/signature/description buffers.
+    pub plugin_name: String,
+    pub plugin_sig: String,
+    pub plugin_desc: String,
+    pub calls: Vec<LifecycleCall>,
+    /// Instructions retired by lifecycle calls only.
+    pub steps: u64,
+}
+
+struct LifecycleEnv<'a> {
+    exports: &'a BTreeMap<String, u64>,
+    sentinel: u64,
+    /// 16-aligned rsp before the synthetic return address is pushed.
+    entry_rsp: u64,
+    xplm: Option<&'a Rc<RefCell<Xplm>>>,
+    vm: Option<&'a Rc<RefCell<VmObservations>>>,
+}
+
+fn read_cstr(mem: &Memory, va: u64) -> String {
+    let mut out = Vec::new();
+    for i in 0..255u64 {
+        match mem.read_uint(va + i, 1) {
+            Ok(0) | Err(_) => break,
+            Ok(b) => out.push(b as u8),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Run one guest call to completion (or its cap) inside `emu`.
+fn invoke(emu: &mut Emulator, env: &LifecycleEnv<'_>, g: &GuestCall, budget: u64) -> LifecycleCall {
+    let sp = env.entry_rsp - 8;
+    let mut ok = emu.mem.poke(sp, &env.sentinel.to_le_bytes()).is_ok();
+    for (i, v) in g.stack.iter().enumerate() {
+        ok &= emu.mem.poke(sp + 0x28 + 8 * i as u64, &v.to_le_bytes()).is_ok();
+    }
+    emu.cpu.regs[RSP] = sp;
+    emu.cpu.rflags = 2;
+    emu.cpu.undef_flags = 0;
+    for (i, &r) in WIN64_ARGS.iter().enumerate() {
+        emu.cpu.regs[r] = g.ints[i];
+    }
+    for (i, x) in g.xmm.iter().enumerate() {
+        if let Some(v) = x {
+            emu.cpu.xmm[i] = *v;
+        }
+    }
+    emu.cpu.rip = g.va;
+    if let Some(vm) = env.vm {
+        vm.borrow_mut().break_chain();
+    }
+    let before = emu.steps();
+    let stop = if ok { emu.run_until(env.sentinel, budget) } else { Stop::Hook };
+    let ret = match g.ret {
+        RetKind::Float => u64::from(emu.cpu.xmm[0] as u32),
+        RetKind::Double => emu.cpu.xmm[0] as u64,
+        _ => emu.cpu.regs[RAX],
+    };
+    LifecycleCall {
+        label: g.label.clone(),
+        va: g.va,
+        stop,
+        steps: emu.steps() - before,
+        ret,
+        vm_after: env.vm.map(|v| VmCounts::of(&v.borrow())).unwrap_or_default(),
+    }
+}
+
+/// Drive `XPluginStart`/`Enable`/`ReceiveMessage`, then the callbacks the plugin registered
+/// (flight loop, draw, command, dataref accessor, key, menu, window, camera) for
+/// `lc.iterations` rounds, then `Disable`/`Stop`. Everything runs inside the emulator against
+/// the recording XPLM model; no callback is forwarded anywhere. Any non-returning call is
+/// recorded and fail-closed (an entry-point failure ends the lifecycle; a callback failure
+/// retires only that callback).
+fn run_lifecycle(
+    lc: &LifecycleOptions,
+    emu: &mut Emulator,
+    env: &LifecycleEnv<'_>,
+    init_stop: &Stop,
+) -> LifecycleReport {
+    let mut rep = LifecycleReport {
+        vm_init: env.vm.map(|v| VmCounts::of(&v.borrow())).unwrap_or_default(),
+        ..LifecycleReport::default()
+    };
+    rep.vm_final = rep.vm_init;
+    if *init_stop != Stop::Reached {
+        rep.skipped = Some(format!("entry did not return: {init_stop:?}"));
+        return rep;
+    }
+    if emu.cpu.regs[RAX] as u32 == 0 && !lc.force_after_false_entry {
+        rep.skipped = Some("entry (DllMain) returned FALSE".into());
+        return rep;
+    }
+    let Some(xplm) = env.xplm else {
+        rep.skipped = Some("no XPLM model".into());
+        return rep;
+    };
+    let Some(&start) = env.exports.get("XPluginStart") else {
+        rep.skipped = Some("no XPluginStart export".into());
+        return rep;
+    };
+    if emu.mem.map(HOST_SCRATCH, HOST_SCRATCH_LEN, Perm::RW).is_err() {
+        rep.skipped = Some("cannot map host scratch".into());
+        return rep;
+    }
+
+    let mut left = lc.max_steps;
+    let mut run = |rep: &mut LifecycleReport, emu: &mut Emulator, g: &GuestCall| -> Option<usize> {
+        if left == 0 || rep.calls.len() >= lc.max_calls {
+            rep.skipped.get_or_insert_with(|| "lifecycle budget exhausted".into());
+            return None;
+        }
+        let call = invoke(emu, env, g, left.min(lc.call_steps));
+        left = left.saturating_sub(call.steps);
+        rep.steps += call.steps;
+        rep.vm_final = call.vm_after;
+        rep.calls.push(call);
+        Some(rep.calls.len() - 1)
+    };
+    let entry = |name: &str, ret| env.exports.get(name).map(|&va| GuestCall::new(name, va, [0; 4], ret));
+
+    // XPluginStart(char* outName, char* outSig, char* outDesc) -> int
+    let g = GuestCall::new("XPluginStart", start, [NAME_BUF, SIG_BUF, DESC_BUF, 0], RetKind::Int);
+    let Some(i) = run(&mut rep, emu, &g) else { return rep };
+    rep.plugin_name = read_cstr(&emu.mem, NAME_BUF);
+    rep.plugin_sig = read_cstr(&emu.mem, SIG_BUF);
+    rep.plugin_desc = read_cstr(&emu.mem, DESC_BUF);
+    if rep.calls[i].stop != Stop::Reached || rep.calls[i].ret as u32 == 0 {
+        rep.skipped = Some("XPluginStart failed or declined".into());
+        return rep;
+    }
+
+    // XPluginEnable() -> int
+    if let Some(g) = entry("XPluginEnable", RetKind::Int) {
+        let Some(i) = run(&mut rep, emu, &g) else { return rep };
+        if rep.calls[i].stop != Stop::Reached || rep.calls[i].ret as u32 == 0 {
+            rep.skipped = Some("XPluginEnable failed or declined".into());
+            return rep;
+        }
+    }
+
+    // XPluginReceiveMessage(XPLMPluginID from, int msg, void* param)
+    if let Some(&va) = env.exports.get("XPluginReceiveMessage") {
+        for msg in XPLM_MESSAGES {
+            let label = format!("XPluginReceiveMessage({msg})");
+            let g = GuestCall::new(label, va, [XPLANE_ID, msg, 0, 0], RetKind::Void);
+            if run(&mut rep, emu, &g).is_none() {
+                return rep;
+            }
+        }
+    }
+
+    // Registered callbacks. A callback that fails to return is retired; a flight loop that
+    // returns 0.0 asks not to be called again.
+    let mut retired = Vec::new();
+    for it in 0..lc.iterations {
+        let live: Vec<RecordedCallback> =
+            xplm.borrow().callbacks().iter().filter(|c| c.active).cloned().collect();
+        for cb in live {
+            let key = (cb.callback_va, cb.refcon, cb.kind);
+            if retired.contains(&key) {
+                continue;
+            }
+            for g in cb.invocations(it, CB_SCRATCH) {
+                let Some(i) = run(&mut rep, emu, &g) else { return rep };
+                let c = &rep.calls[i];
+                let wants_off = cb.kind == CallbackKind::FlightLoop
+                    && f32::from_bits(c.ret as u32) == 0.0;
+                if c.stop != Stop::Reached || wants_off {
+                    retired.push(key);
+                    break;
+                }
+            }
+        }
+    }
+
+    for name in ["XPluginDisable", "XPluginStop"] {
+        if let Some(g) = entry(name, RetKind::Void) {
+            if run(&mut rep, emu, &g).is_none() {
+                return rep;
+            }
+        }
+    }
+    rep
+}
+
+/// The observed VIP-to-VIP pairs as `from to` lines in hex, the input format of the static
+/// observed-branch bridge (`VMPX_OBSERVED_EDGES`). Absolute guest addresses.
+#[must_use]
+pub fn observed_edges_text(vm: &VmObservations) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(vm.branch_targets.len() * 24);
+    for (from, to) in &vm.branch_targets {
+        let _ = writeln!(out, "{from:#x} {to:#x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -635,7 +941,15 @@ mod tests {
     #[ignore = "needs VMPX_DETONATE_SAMPLE"]
     fn detonate_probe_real_sample() {
         let path = std::env::var("VMPX_DETONATE_SAMPLE").unwrap();
-        let data = std::fs::read(&path).unwrap();
+        let mut data = std::fs::read(&path).unwrap();
+        // VMPX_STATIC_UNPACK=1: detonate the statically unpacked mapped image. The runtime
+        // unpack of the real .xpl is gated on an integrity check that fails closed in
+        // containment, so this is the way to get the plugin's real .text into the guest.
+        if std::env::var("VMPX_STATIC_UNPACK").is_ok_and(|v| v == "1") {
+            data = vmpx_unpack::unpack_to_mapped_image(&data, vmpx_unpack::UnpackLimits::default())
+                .expect("static unpack")
+                .image;
+        }
         let pe = PeImage::parse(&data).expect("parse sample");
         // Reference bytes must outlive the parsed original.
         let reference_data = std::env::var("VMPX_IMPORT_REFERENCE")
@@ -723,7 +1037,19 @@ mod tests {
             resolve_undefined_flags,
             xplm: std::env::var("VMPX_XPLM").is_ok_and(|v| v == "1"),
             vm_discover: std::env::var("VMPX_VM_DISCOVER").is_ok_and(|v| v == "1"),
-            dump: true,
+            // VMPX_LIFECYCLE=1 drives XPluginStart/Enable + registered callbacks after the
+            // entry returns; _ITERS rounds, _MAXSTEPS total budget (defaults otherwise).
+            lifecycle: std::env::var("VMPX_LIFECYCLE").is_ok_and(|v| v == "1").then(|| {
+                let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+                let d = LifecycleOptions::default();
+                LifecycleOptions {
+                    iterations: num("VMPX_LIFECYCLE_ITERS").map_or(d.iterations, |n| n as u32),
+                    max_steps: num("VMPX_LIFECYCLE_MAXSTEPS").unwrap_or(d.max_steps),
+                    force_after_false_entry: std::env::var("VMPX_LIFECYCLE_FORCE").is_ok_and(|v| v == "1"),
+                    ..d
+                }
+            }),
+            dump: std::env::var("VMPX_NO_DUMP").is_err(),
             ..DetonateOptions::default()
         };
         let res = detonate(&pe, &opts).expect("detonation starts");
@@ -787,6 +1113,34 @@ mod tests {
             for e in vm.edges.iter().take(12) {
                 eprintln!("    {e:?}");
             }
+        }
+        if let Some(lc) = &res.lifecycle {
+            let c = |v: VmCounts| {
+                format!("edges={} branch_targets={} far={}", v.edges, v.branch_targets, v.far_branch_targets)
+            };
+            eprintln!(
+                "  lifecycle: skipped={:?} name={:?} sig={:?} desc={:?} steps={}",
+                lc.skipped, lc.plugin_name, lc.plugin_sig, lc.plugin_desc, lc.steps
+            );
+            eprintln!("    after DllMain only: {}", c(lc.vm_init));
+            let mut prev = lc.vm_init;
+            for call in &lc.calls {
+                eprintln!(
+                    "    {} stop={:?} steps={} ret={:#x} +edges={} +far={}",
+                    call.label,
+                    call.stop,
+                    call.steps,
+                    call.ret,
+                    call.vm_after.edges - prev.edges,
+                    call.vm_after.far_branch_targets - prev.far_branch_targets,
+                );
+                prev = call.vm_after;
+            }
+            eprintln!("    after full lifecycle: {}", c(lc.vm_final));
+        }
+        if let (Some(vm), Ok(out)) = (&res.vm, std::env::var("VMPX_EDGES_OUT")) {
+            std::fs::write(&out, observed_edges_text(vm)).expect("write edges");
+            eprintln!("  wrote {} VIP edges to {out}", vm.branch_targets.len());
         }
         if let Some(x) = &res.xplm {
             eprintln!(
@@ -1059,5 +1413,222 @@ mod tests {
             .unwrap();
         assert_eq!(res.stop, Stop::StepLimit);
         assert_eq!(res.observed.oep, None, "OEP not reached under the tiny budget");
+    }
+
+    // ---- plugin lifecycle ----------------------------------------------------
+
+    const IAT_REG_FLIGHT: u64 = IMAGE_BASE + 0x2050;
+    const COUNTERS: u64 = IMAGE_BASE + 0x2200; // [calls, last counter arg, refcon seen]
+    const REFCON: u64 = 0xC0FF_EE00;
+    const RVA_START: u64 = 0x1040;
+    const RVA_ENABLE: u64 = 0x1100;
+    const RVA_FLIGHT: u64 = 0x1120;
+    const RVA_DISPATCH: u64 = 0x1180;
+    const VIP_A: u64 = 0x1_4000_3000;
+    const VIP_B: u64 = 0x1_4000_3040;
+
+    fn asm_at(rva: u64, build: impl FnOnce(&mut CodeAssembler)) -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        build(&mut a);
+        a.assemble(IMAGE_BASE + rva).unwrap()
+    }
+
+    /// A plugin DLL: DllMain returns TRUE; `XPluginStart` names itself and registers a flight
+    /// loop through `XPLMRegisterFlightLoopCallback`; the flight loop counts its calls, records
+    /// its counter/refcon args, runs two VM dispatches (VIP in RSI) and returns 1.0.
+    fn synth_plugin_pe(start_ok: bool) -> Vec<u8> {
+        let mut d = vec![0u8; 0xC00];
+        put(&mut d, 0, &0x5A4Du16.to_le_bytes());
+        put(&mut d, 0x3C, &0x80u32.to_le_bytes());
+        put(&mut d, 0x80, &0x0000_4550u32.to_le_bytes());
+        put(&mut d, 0x84, &0x8664u16.to_le_bytes());
+        put(&mut d, 0x86, &2u16.to_le_bytes());
+        put(&mut d, 0x94, &0xF0u16.to_le_bytes());
+        put(&mut d, 0x96, &0x2022u16.to_le_bytes());
+        let o = 0x98usize;
+        put(&mut d, o, &0x20Bu16.to_le_bytes());
+        put(&mut d, o + 16, &(ENTRY_RVA as u32).to_le_bytes());
+        put(&mut d, o + 24, &IMAGE_BASE.to_le_bytes());
+        put(&mut d, o + 32, &0x1000u32.to_le_bytes());
+        put(&mut d, o + 36, &0x200u32.to_le_bytes());
+        put(&mut d, o + 56, &0x3000u32.to_le_bytes());
+        put(&mut d, o + 60, &0x200u32.to_le_bytes());
+        put(&mut d, o + 68, &3u16.to_le_bytes());
+        put(&mut d, o + 108, &16u32.to_le_bytes());
+        put(&mut d, o + 112, &0x2100u32.to_le_bytes()); // export dir RVA
+        put(&mut d, o + 116, &0x60u32.to_le_bytes());
+        put(&mut d, o + 112 + 8, &0x2000u32.to_le_bytes()); // import dir RVA
+        put(&mut d, o + 112 + 12, &40u32.to_le_bytes());
+        for (i, (name, rva, raw, flags)) in [
+            (&b".text"[..], 0x1000u32, 0x400u32, 0x6000_0020u32),
+            (b".idata", 0x2000, 0x800, 0xC000_0040),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = 0x188 + i * 40;
+            put(&mut d, at, name);
+            put(&mut d, at + 8, &0x400u32.to_le_bytes());
+            put(&mut d, at + 12, &rva.to_le_bytes());
+            put(&mut d, at + 16, &0x400u32.to_le_bytes());
+            put(&mut d, at + 20, &raw.to_le_bytes());
+            put(&mut d, at + 36, &flags.to_le_bytes());
+        }
+
+        // .text (file 0x400 == RVA 0x1000)
+        let text = 0x400usize;
+        let dllmain = asm_at(ENTRY_RVA, |a| {
+            a.mov(eax, 1).unwrap();
+            a.ret().unwrap();
+        });
+        let start = asm_at(RVA_START, |a| {
+            a.sub(rsp, 0x28).unwrap();
+            a.mov(dword_ptr(rcx), 0x6775_6c70).unwrap(); // "plug"
+            a.mov(byte_ptr(rcx + 4), 0).unwrap();
+            a.mov(word_ptr(rdx), 0x73).unwrap(); // "s"
+            a.mov(word_ptr(r8), 0x64).unwrap(); // "d"
+            a.mov(rcx, IMAGE_BASE + RVA_FLIGHT).unwrap();
+            a.mov(r8, REFCON).unwrap();
+            a.mov(rax, IAT_REG_FLIGHT).unwrap();
+            a.mov(rax, qword_ptr(rax)).unwrap();
+            a.call(rax).unwrap();
+            a.mov(eax, u32::from(start_ok)).unwrap();
+            a.add(rsp, 0x28).unwrap();
+            a.ret().unwrap();
+        });
+        let enable = asm_at(RVA_ENABLE, |a| {
+            a.mov(eax, 1).unwrap();
+            a.ret().unwrap();
+        });
+        let flight = asm_at(RVA_FLIGHT, |a| {
+            a.sub(rsp, 0x28).unwrap();
+            a.mov(rax, COUNTERS).unwrap();
+            a.inc(qword_ptr(rax)).unwrap();
+            a.mov(qword_ptr(rax + 8), r8).unwrap();
+            a.mov(qword_ptr(rax + 16), r9).unwrap();
+            a.mov(rsi, VIP_A).unwrap();
+            a.mov(rax, IMAGE_BASE + RVA_DISPATCH).unwrap();
+            a.call(rax).unwrap();
+            a.mov(rsi, VIP_B).unwrap();
+            a.mov(rax, IMAGE_BASE + RVA_DISPATCH).unwrap();
+            a.call(rax).unwrap();
+            a.mov(eax, 0x3f80_0000).unwrap();
+            a.movd(xmm0, eax).unwrap();
+            a.add(rsp, 0x28).unwrap();
+            a.ret().unwrap();
+        });
+        let dispatch = asm_at(RVA_DISPATCH, |a| {
+            a.ret().unwrap();
+        });
+        for (rva, code) in [
+            (ENTRY_RVA, dllmain),
+            (RVA_START, start),
+            (RVA_ENABLE, enable),
+            (RVA_FLIGHT, flight),
+            (RVA_DISPATCH, dispatch),
+        ] {
+            put(&mut d, text + (rva - 0x1000) as usize, &code);
+        }
+
+        // .idata (file 0x800 == RVA 0x2000)
+        let idata = 0x800usize;
+        put(&mut d, idata, &0x2030u32.to_le_bytes()); // ILT
+        put(&mut d, idata + 12, &0x20C0u32.to_le_bytes()); // dll name
+        put(&mut d, idata + 16, &0x2050u32.to_le_bytes()); // IAT
+        put(&mut d, idata + 0x30, &0x2080u64.to_le_bytes());
+        put(&mut d, idata + 0x50, &0x2080u64.to_le_bytes());
+        put(&mut d, idata + 0x80 + 2, b"XPLMRegisterFlightLoopCallback\0");
+        put(&mut d, idata + 0xC0, b"XPLM_64.dll\0");
+        // export directory at RVA 0x2100
+        let e = idata + 0x100;
+        put(&mut d, e + 12, &0x2190u32.to_le_bytes()); // module name
+        put(&mut d, e + 16, &1u32.to_le_bytes()); // ordinal base
+        put(&mut d, e + 20, &2u32.to_le_bytes()); // functions
+        put(&mut d, e + 24, &2u32.to_le_bytes()); // names
+        put(&mut d, e + 28, &0x2130u32.to_le_bytes());
+        put(&mut d, e + 32, &0x2140u32.to_le_bytes());
+        put(&mut d, e + 36, &0x2150u32.to_le_bytes());
+        put(&mut d, idata + 0x130, &(RVA_START as u32).to_le_bytes());
+        put(&mut d, idata + 0x134, &(RVA_ENABLE as u32).to_le_bytes());
+        put(&mut d, idata + 0x140, &0x2160u32.to_le_bytes());
+        put(&mut d, idata + 0x144, &0x2170u32.to_le_bytes());
+        put(&mut d, idata + 0x152, &1u16.to_le_bytes());
+        put(&mut d, idata + 0x160, b"XPluginStart\0");
+        put(&mut d, idata + 0x170, b"XPluginEnable\0");
+        put(&mut d, idata + 0x190, b"plug.xpl\0");
+        d
+    }
+
+    fn lifecycle_opts(iterations: u32) -> DetonateOptions {
+        DetonateOptions {
+            vm_dispatcher: Some(IMAGE_BASE + RVA_DISPATCH),
+            lifecycle: Some(LifecycleOptions { iterations, ..LifecycleOptions::default() }),
+            ..DetonateOptions::default()
+        }
+    }
+
+    #[test]
+    fn lifecycle_calls_start_then_drives_registered_flight_loop() {
+        const N: u32 = 3;
+        let data = synth_plugin_pe(true);
+        let pe = PeImage::parse(&data).expect("plugin PE parses");
+        let opts = DetonateOptions {
+            capture_globals: vec![(COUNTERS, 24)],
+            ..lifecycle_opts(N)
+        };
+        let res = detonate(&pe, &opts).expect("detonation starts");
+        assert_eq!(res.stop, Stop::Reached, "DllMain returned");
+        let lc = res.lifecycle.expect("lifecycle ran");
+        assert_eq!(lc.skipped, None);
+        assert!(lc.calls.iter().all(|c| c.stop == Stop::Reached), "{:?}", lc.calls);
+
+        // Order: Start (fills name/sig/desc, registers), Enable, then the flight loop N times.
+        let labels: Vec<_> = lc.calls.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels[..2], ["XPluginStart", "XPluginEnable"]);
+        assert_eq!(labels.len(), 2 + N as usize);
+        assert!(labels[2..].iter().all(|l| l.starts_with("FlightLoop@")));
+        assert_eq!(
+            (lc.plugin_name.as_str(), lc.plugin_sig.as_str(), lc.plugin_desc.as_str()),
+            ("plug", "s", "d")
+        );
+
+        // The registration was recorded; the guest saw N calls, the last counter, and its refcon.
+        let x = res.xplm.expect("xplm summary");
+        assert_eq!(x.callbacks.len(), 1);
+        assert_eq!(
+            (x.callbacks[0].callback_va, x.callbacks[0].refcon),
+            (IMAGE_BASE + RVA_FLIGHT, REFCON)
+        );
+        let g = &res.observed.globals.iter().find(|g| g.va == COUNTERS).unwrap().bytes;
+        let word = |i: usize| u64::from_le_bytes(g[i * 8..i * 8 + 8].try_into().unwrap());
+        assert_eq!((word(0), word(1), word(2)), (u64::from(N), u64::from(N), REFCON));
+
+        // The observer saw nothing during DllMain, then A->B once per call and no edge across calls.
+        assert_eq!(lc.vm_init, VmCounts::default());
+        assert_eq!(lc.vm_final.edges, 1);
+        let vm = res.vm.expect("vm observations");
+        assert_eq!(vm.branch_targets, vec![(VIP_A, VIP_B)]);
+        assert_eq!(vm.edges[0].dispatch_count, u64::from(N));
+        assert_eq!(observed_edges_text(&vm), format!("{VIP_A:#x} {VIP_B:#x}\n"));
+    }
+
+    #[test]
+    fn lifecycle_fail_closed_when_start_declines() {
+        let data = synth_plugin_pe(false);
+        let pe = PeImage::parse(&data).unwrap();
+        let res = detonate(&pe, &lifecycle_opts(3)).unwrap();
+        let lc = res.lifecycle.unwrap();
+        assert_eq!(lc.calls.len(), 1, "no Enable and no callbacks after a declined Start");
+        assert_eq!(lc.skipped.as_deref(), Some("XPluginStart failed or declined"));
+    }
+
+    #[test]
+    fn lifecycle_skipped_without_the_plugin_exports_or_when_off() {
+        let data = synth_pe();
+        let pe = PeImage::parse(&data).unwrap();
+        let opts = DetonateOptions { lifecycle: Some(LifecycleOptions::default()), ..Default::default() };
+        let lc = detonate(&pe, &opts).unwrap().lifecycle.unwrap();
+        assert!(lc.calls.is_empty() && lc.skipped.is_some());
+        assert!(detonate(&pe, &DetonateOptions::default()).unwrap().lifecycle.is_none());
     }
 }

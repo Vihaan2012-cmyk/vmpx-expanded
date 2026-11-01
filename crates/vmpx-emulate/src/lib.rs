@@ -70,8 +70,9 @@ mod xplm;
 
 pub use alu::{Alu, Flags, Shift};
 pub use detonate::{
-    DetonateError, DetonateOptions, DetonationResult, XplmSummary, IatRegion, detonate, export_reference_from_exports,
-    export_reference_from_imports,
+    DetonateError, DetonateOptions, DetonationResult, IatRegion, LifecycleCall, LifecycleOptions,
+    LifecycleReport, VmCounts, XplmSummary, detonate, export_reference_from_exports,
+    export_reference_from_imports, observed_edges_text,
 };
 pub use dump::{
     DumpImage, DumpRegion, OepHook, RebuildModuleError, capture_globals, dump_image,
@@ -99,4 +100,4 @@ pub use sysdll::{DEFAULT_SYSTEM_MODULES, SysDllDb, system_root};
 pub use vm_discover::{DiscoveredVm, DispatchSite, Survey, SurveyHook, VipChoice};
 pub use vm_observe::{DispatchAt, ObservedVmEdge, VipLoc, VmInstance, VmInstanceSpec, VmObservations, VmObserveHook};
 pub use winapi::WinApiHook;
-pub use xplm::{CallbackKind, RecordedCallback, Xplm};
+pub use xplm::{CallbackKind, GuestCall, RecordedCallback, RetKind, Xplm};
