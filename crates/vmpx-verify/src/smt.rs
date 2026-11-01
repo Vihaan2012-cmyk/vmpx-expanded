@@ -155,6 +155,7 @@ mod z3_backend {
         if x.get_size() != y.get_size() {
             return SolveOutcome::Unknown("width mismatch".to_owned());
         }
+        z3::set_global_param("memory_max_size", "3072");
         let solver = Solver::new();
         let mut params = Params::new();
         params.set_u32("timeout", timeout_ms);

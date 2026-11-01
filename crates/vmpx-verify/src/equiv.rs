@@ -291,6 +291,9 @@ pub struct FunctionReport {
 pub struct Verifier {
     pub budget: Budget,
     backends: Vec<Box<dyn SmtBackend>>,
+    /// Verdicts of cells already decided, keyed by their simplified terms:
+    /// paths of one function often share cells.
+    cache: std::cell::RefCell<std::collections::HashMap<(Expr, Expr), CellVerdict>>,
 }
 
 impl Default for Verifier {
@@ -305,6 +308,7 @@ impl Verifier {
         Self {
             budget,
             backends: vec![Box::new(NativeBackend)],
+            cache: std::cell::RefCell::default(),
         }
     }
 
@@ -323,7 +327,15 @@ impl Verifier {
 
     #[must_use]
     pub fn check_cell(&self, cell: &Cell) -> CellVerdict {
+        let trace = std::env::var_os("VMPX_GATE_TRACE").is_some();
+        let started = Instant::now();
+        if trace {
+            eprintln!("[gate] cell {:?}: simplifying", cell.id);
+        }
         let (a, b) = (cell.vm.simplify(), cell.recovered.simplify());
+        if trace {
+            eprintln!("[gate] cell {:?}: simplified in {:?}", cell.id, started.elapsed());
+        }
         if a.width != b.width {
             return CellVerdict::Unproven(Unproven::ModelingGap(format!(
                 "width {} vs {}",
@@ -334,6 +346,17 @@ impl Verifier {
         if a == b {
             return CellVerdict::Proven(Method::Structural);
         }
+        let key = (a.clone(), b.clone());
+        if let Some(done) = self.cache.borrow().get(&key) {
+            return done.clone();
+        }
+        let verdict = self.decide(&a, &b);
+        self.cache.borrow_mut().insert(key, verdict.clone());
+        verdict
+    }
+
+    fn decide(&self, a: &Expr, b: &Expr) -> CellVerdict {
+        let (a, b) = (a.clone(), b.clone());
         let mut worst = Unproven::Unknown("no backend decided".to_owned());
         for backend in &self.backends {
             match backend.check_distinct(&a, &b, &self.budget) {
@@ -401,11 +424,12 @@ impl Verifier {
         } else {
             EquivVerdict::Timeout
         };
-        let uninterpreted_terms = paths
-            .iter()
-            .flat_map(|p| &p.cells)
-            .map(|c| uninterpreted_count(&c.vm) + uninterpreted_count(&c.recovered))
-            .sum();
+        let uninterpreted_terms = uninterpreted_terms(
+            paths
+                .iter()
+                .flat_map(|p| &p.cells)
+                .flat_map(|c| [&c.vm, &c.recovered]),
+        );
         FunctionReport {
             verdict,
             paths: reports,
@@ -444,19 +468,37 @@ fn replay(a: &Expr, b: &Expr, model: &BTreeMap<String, u64>) -> Option<Counterex
     })
 }
 
-fn uninterpreted_count(e: &Expr) -> usize {
-    match &e.kind {
-        ExprKind::Const { .. } | ExprKind::Register { .. } => 0,
-        ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => 1,
-        ExprKind::Unary { value, .. }
-        | ExprKind::Extract { value, .. }
-        | ExprKind::Resize { value, .. } => uninterpreted_count(value),
-        ExprKind::Binary { left, right, .. }
-        | ExprKind::Concat {
-            high: left,
-            low: right,
-        } => uninterpreted_count(left) + uninterpreted_count(right),
+/// Distinct `Load`/`Intrinsic` terms reachable from the cells (shared sub-terms
+/// counted once: the terms are DAGs, a tree walk is exponential on them).
+fn uninterpreted_terms<'a>(roots: impl Iterator<Item = &'a Expr>) -> usize {
+    let mut seen: std::collections::HashSet<Expr> = std::collections::HashSet::new();
+    let mut stack: Vec<Expr> = roots.cloned().collect();
+    let mut count = 0;
+    while let Some(e) = stack.pop() {
+        if !seen.insert(e.clone()) {
+            continue;
+        }
+        match &e.kind {
+            ExprKind::Const { .. } | ExprKind::Register { .. } => {}
+            ExprKind::Load { address } => {
+                count += 1;
+                stack.push((**address).clone());
+            }
+            ExprKind::Intrinsic { arguments, .. } => {
+                count += 1;
+                stack.extend(arguments.iter().cloned());
+            }
+            ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => stack.push((**value).clone()),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat { high: left, low: right } => {
+                stack.push((**left).clone());
+                stack.push((**right).clone());
+            }
+        }
     }
+    count
 }
 
 #[cfg(test)]

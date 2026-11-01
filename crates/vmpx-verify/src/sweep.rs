@@ -264,6 +264,9 @@ fn current(
 fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOutcome {
     let deadline = Instant::now() + Duration::from_millis(u64::from(budget.timeout_ms));
     let (nodes, root_a, root_b) = collect(a, b);
+    if std::env::var_os("VMPX_SWEEP_TRACE").is_some() {
+        eprintln!("[sweep] start: {} nodes, budget {} ms", nodes.len(), budget.timeout_ms);
+    }
     let mut sims: Vec<Vec<u64>> = Vec::new();
     for trial in 0..TRIALS as u64 {
         match simulate(&nodes, trial) {
@@ -307,6 +310,9 @@ fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOu
             for c in candidates.into_iter().take(CANDIDATES_PER_NODE) {
                 let now = Instant::now();
                 if now >= deadline {
+                    if std::env::var_os("VMPX_SWEEP_TRACE").is_some() {
+                        eprintln!("[sweep] deadline at node {i}");
+                    }
                     return SolveOutcome::Timeout;
                 }
                 let remaining = u32::try_from((deadline - now).as_millis()).unwrap_or(u32::MAX);
@@ -330,14 +336,19 @@ fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOu
                         merged = Some(c);
                         break;
                     }
-                    SolveOutcome::Timeout => return SolveOutcome::Timeout,
+                    SolveOutcome::Timeout => {
+                        if std::env::var_os("VMPX_SWEEP_TRACE").is_some() {
+                            eprintln!("[sweep] inner timeout at node {i}");
+                        }
+                        return SolveOutcome::Timeout;
+                    }
                     other => {
                         // The abstraction may hide a relation between a shared
                         // variable and the inputs; retry on the unabstracted
                         // cones before giving up on this pair.
                         let mut full = HashMap::new();
                         let mut retried = SolveOutcome::Unknown("not retried".to_owned());
-                        for depth in [1_u32, 3, 1_000] {
+                        for depth in [1_u32, 2, 4, 1_000] {
                             let a_open = opened_form(&kid_classes, &node.expr, depth, &class_var, &class_shape, &nodes, &mut full);
                             let b_open = opened_form(shape_kids, &nodes[*shape_node].expr, depth, &class_var, &class_shape, &nodes, &mut full);
                             let (Some(x), Some(y)) = (a_open, b_open) else { break };
