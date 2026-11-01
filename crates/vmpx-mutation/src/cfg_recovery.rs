@@ -112,6 +112,10 @@ pub struct CfgOptions {
     /// Model the SSE/SSE2 scalar floating-point slice (XMM lanes in the block
     /// semantics). Only set it where the consumer compares the XMM state.
     pub model_xmm: bool,
+    /// End a block at a direct `call rel32` or an `call [rip+slot]` import call with
+    /// [`Terminator::Call`] (and continue at the next instruction) instead of
+    /// refusing it. Only set it where the consumer models the call.
+    pub model_calls: bool,
 }
 
 impl CfgOptions {
@@ -119,16 +123,19 @@ impl CfgOptions {
     pub const PROVEN: Self = Self {
         assume_stack_disjoint: false,
         model_xmm: false,
+        model_calls: false,
     };
-    /// [`Self::PROVEN`] plus the SSE scalar floating-point slice.
+    /// [`Self::PROVEN`] plus the SSE scalar floating-point slice and call terminators.
     pub const PROVEN_FP: Self = Self {
         assume_stack_disjoint: false,
         model_xmm: true,
+        model_calls: true,
     };
     /// Stack-disjoint relaxation on (the default of the recovery entry points).
     pub const ASSUME_STACK_DISJOINT: Self = Self {
         assume_stack_disjoint: true,
         model_xmm: false,
+        model_calls: false,
     };
 }
 
@@ -184,9 +191,21 @@ pub enum Terminator {
         not_taken: u64,
     },
     Return,
+    /// A direct or import call (only with [`CfgOptions::model_calls`]); execution
+    /// continues at `next`. The callee is not analysed.
+    Call { target: CallTarget, next: u64 },
     /// Indirect/computed branch, call, out-of-range target, undecodable bytes or a
     /// body the lifter refuses. No successor edges are recorded.
     Unsupported(String),
+}
+
+/// What a modeled call transfers to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallTarget {
+    /// `call rel32` to this virtual address.
+    Direct(u64),
+    /// `call qword ptr [rip+disp]` through the import slot at this virtual address.
+    Import(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,11 +295,27 @@ enum Flow {
     Jmp(u64),
     Jcc(String, u64, u64),
     Ret,
+    Call(CallTarget, u64),
     Other(String),
 }
 
-fn classify(ins: &Instruction) -> Flow {
+fn classify(ins: &Instruction, model_calls: bool) -> Flow {
     match ins.flow_control() {
+        FlowControl::Call | FlowControl::IndirectCall if model_calls => {
+            if ins.is_call_near() {
+                return Flow::Call(CallTarget::Direct(ins.near_branch_target()), ins.next_ip());
+            }
+            if ins.is_call_near_indirect()
+                && ins.op0_kind() == iced_x86::OpKind::Memory
+                && ins.is_ip_rel_memory_operand()
+                && ins.memory_size().size() == 8
+            {
+                return Flow::Call(CallTarget::Import(ins.ip_rel_memory_address()), ins.next_ip());
+            }
+            let mut text = String::new();
+            IntelFormatter::new().format(ins, &mut text);
+            Flow::Other(format!("Call `{text}`"))
+        }
         FlowControl::Next => Flow::Next,
         FlowControl::UnconditionalBranch if ins.is_jmp_short_or_near() => {
             Flow::Jmp(ins.near_branch_target())
@@ -397,11 +432,12 @@ pub fn recover_native_cfg_opts(
                 return Err(CfgError::LimitExceeded);
             }
             let mut targets = [None, None];
-            match classify(&ins) {
+            match classify(&ins, options.model_calls) {
                 Flow::Next => {
                     ip = ins.next_ip();
                     continue;
                 }
+                Flow::Call(_, next) => targets[0] = Some(next),
                 Flow::Jmp(t) => targets[0] = Some(t),
                 Flow::Jcc(_, t, f) => targets = [Some(t), Some(f)],
                 Flow::Ret | Flow::Other(_) => {}
@@ -428,7 +464,15 @@ pub fn recover_native_cfg_opts(
                 let why = bad.get(&ip).map_or("undecoded bytes", String::as_str);
                 break Terminator::Unsupported(why.to_owned());
             };
-            match classify(ins) {
+            match classify(ins, options.model_calls) {
+                Flow::Call(target, next) if leaders.contains(&next) => {
+                    ip = ins.next_ip();
+                    break Terminator::Call { target, next };
+                }
+                Flow::Call(..) => {
+                    ip = ins.next_ip();
+                    break Terminator::Unsupported("call continuation outside code".to_owned());
+                }
                 Flow::Next => {
                     body.push(*ins);
                     ip = ins.next_ip();
@@ -478,6 +522,7 @@ pub fn recover_native_cfg_opts(
                 edges.push((start, *taken, EdgeKind::Taken));
                 edges.push((start, *not_taken, EdgeKind::NotTaken));
             }
+            Terminator::Call { next, .. } => edges.push((start, *next, EdgeKind::FallThrough)),
             Terminator::Return | Terminator::Unsupported(_) => {}
         }
         blocks.insert(

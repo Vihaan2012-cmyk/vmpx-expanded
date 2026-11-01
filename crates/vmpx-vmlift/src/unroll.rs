@@ -37,9 +37,21 @@ pub struct UnrolledPath {
     /// The path returns through staged stack (not a callee return); the exit
     /// registers are those of the continuation, and `semantics` is not comparable.
     pub region_exit: bool,
+    /// For a region exit: where it transfers to and how many stack words it stages.
+    pub region: Option<RegionTarget>,
     /// Forks on this path whose selector is an environment probe (cpuid, `gs`
     /// loads, constant-address loads), i.e. protector gates, not user branches.
     pub env_forks: usize,
+}
+
+/// The computed continuation a region exit `ret`s to.
+#[derive(Clone, Debug)]
+pub struct RegionTarget {
+    /// The address the exit transfers to (word zero of the staged continuation).
+    pub target: Expr,
+    /// Words staged from the `ret` slot up to the entry stack pointer; 1 means
+    /// the `ret` leaves the stack exactly at the entry stack pointer.
+    pub staged_words: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +66,9 @@ pub struct UnrolledFunction {
     /// Byte offset of the entry stack pointer from `vsp_initial`: everything
     /// below it is the VM's own frame, dead once the function returns.
     pub entry_sp_offset: i64,
+    /// Region exits a consumer tried to follow and could not (why), reported next
+    /// to the verdict; empty from [`unroll_decoded_cfg`] itself.
+    pub notes: Vec<String>,
 }
 
 struct Walker<'a, 'b> {
@@ -88,7 +103,12 @@ pub fn unroll_decoded_cfg(
     max_paths: usize,
 ) -> Result<UnrolledFunction, String> {
     if !input.cfg.is_complete() {
-        return Err("the CFG is incomplete".to_owned());
+        let why = input
+            .cfg
+            .stalls
+            .first()
+            .map_or_else(|| format!("{:?}", input.cfg.limit_hit), |stall| format!("{stall:?}"));
+        return Err(format!("the CFG is incomplete: {why}"));
     }
     let (state, _) = frame_initial_state(input.frame, input.top_offset);
     let mut walker = Walker {
@@ -119,6 +139,7 @@ pub fn unroll_decoded_cfg(
         entry_sp_offset: i64::try_from(input.top_offset)
             .unwrap_or(i64::MAX)
             .saturating_add(i64::try_from(input.frame.len() * 8).unwrap_or(i64::MAX)),
+        notes: Vec::new(),
     })
 }
 
@@ -220,17 +241,14 @@ impl Walker<'_, '_> {
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
                     let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset)
                         .map_err(|e| e.to_string())?;
+                    let mut region_target = None;
                     let (exit, region_exit) = match recovered {
                         RecoveredExit::Callee(exit) => (exit, false),
                         RecoveredExit::Region(region) => {
-                            if std::env::var_os("VMPX_DIFF_TRACE").is_some() {
-                                eprintln!(
-                                    "[region exit] block {key} slot_offset={} staged={} target={:?}",
-                                    region.slot_offset,
-                                    region.staged.len(),
-                                    region.staged.first().map(|e| e.simplify())
-                                );
-                            }
+                            region_target = region.staged.first().map(|target| RegionTarget {
+                                target: target.simplify(),
+                                staged_words: region.staged.len(),
+                            });
                             (
                             crate::decoded_lift::StubExit {
                                 registers: region.registers,
@@ -272,6 +290,7 @@ impl Walker<'_, '_> {
                         return_pop: exit.return_pop,
                         blocks_executed: walk.executed,
                         region_exit,
+                        region: region_target,
                         env_forks: walk.env_trail.len(),
                     });
                     return Ok(());

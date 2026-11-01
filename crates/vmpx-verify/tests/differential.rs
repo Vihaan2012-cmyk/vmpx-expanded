@@ -79,12 +79,14 @@ fn recovered(tail: u64, clobber_rbx: bool) -> UnrolledFunction {
             return_pop: 0,
             blocks_executed: 5,
             region_exit: false,
+            region: None,
             env_forks: 0,
         }],
         branches_decided: 2,
         forks: 0,
         spin_arms_pruned: 0,
         entry_sp_offset: 136,
+        notes: Vec::new(),
     }
 }
 

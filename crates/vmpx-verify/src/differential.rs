@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use vmpx_disasm::{Flag, FlagState, Gpr};
-use vmpx_mutation::cfg_recovery::{NativeCfg, Terminator};
+use vmpx_mutation::cfg_recovery::{CallTarget, NativeCfg, Terminator};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, NativeExitState, X64NativeRegister};
-use vmpx_vmlift::{CollectedEffects, CollectedStore, ExitSemantics};
+use vmpx_vmlift::{CollectedCall, CollectedEffects, CollectedStore, ExitSemantics};
 
 use crate::equiv::{CellId, CellVerdict, EquivVerdict, FunctionReport, Obligation, Verifier};
 
@@ -39,6 +39,12 @@ pub fn xmm_entry_symbol(reg: u8, hi: bool) -> Expr {
 
 fn xmm_entry_name(reg: u8, hi: bool) -> String {
     format!("native_xmm{reg}_{}_initial", if hi { "hi" } else { "lo" })
+}
+
+/// The general-purpose register an exit register names.
+#[must_use]
+pub fn gpr_of(r: X64NativeRegister) -> Gpr {
+    native_register(r)
 }
 
 fn native_register(r: X64NativeRegister) -> Gpr {
@@ -90,52 +96,62 @@ type Store = (Expr, Expr, BitWidth);
 /// the block) against the stores that happened before: an exact earlier store
 /// forwards its value, a provably disjoint one is skipped, anything else is an
 /// error. With no earlier stores the expression is returned unchanged.
-fn resolve_loads(e: &Expr, stores: &[Store]) -> Result<Expr, String> {
-    if stores.is_empty() {
+fn resolve_loads(e: &Expr, stores: &[Store], after_call: Option<&NativeEnv>) -> Result<Expr, String> {
+    if stores.is_empty() && after_call.is_none() {
         return Ok(e.clone());
     }
     let mut memo: HashMap<Expr, Expr> = HashMap::new();
-    rebuild(e, stores, &mut memo)
+    rebuild(e, stores, after_call, &mut memo)
 }
 
-fn rebuild(e: &Expr, stores: &[Store], memo: &mut HashMap<Expr, Expr>) -> Result<Expr, String> {
+fn rebuild(
+    e: &Expr,
+    stores: &[Store],
+    after_call: Option<&NativeEnv>,
+    memo: &mut HashMap<Expr, Expr>,
+) -> Result<Expr, String> {
     if let Some(done) = memo.get(e) {
         return Ok(done.clone());
     }
     let err = |x: vmpx_vm::ExprError| x.to_string();
     let out = match &e.kind {
         ExprKind::Const { .. } | ExprKind::Register { .. } => e.clone(),
-        ExprKind::Unary { op, value } => Expr::unary(*op, rebuild(value, stores, memo)?),
+        ExprKind::Unary { op, value } => Expr::unary(*op, rebuild(value, stores, after_call, memo)?),
         ExprKind::Binary { op, left, right } => {
-            Expr::binary(*op, rebuild(left, stores, memo)?, rebuild(right, stores, memo)?).map_err(err)?
+            Expr::binary(*op, rebuild(left, stores, after_call, memo)?, rebuild(right, stores, after_call, memo)?).map_err(err)?
         }
         ExprKind::Extract { value, lsb } => {
-            Expr::extract(e.width, *lsb, rebuild(value, stores, memo)?).map_err(err)?
+            Expr::extract(e.width, *lsb, rebuild(value, stores, after_call, memo)?).map_err(err)?
         }
         ExprKind::Concat { high, low } => {
-            Expr::concat(rebuild(high, stores, memo)?, rebuild(low, stores, memo)?).map_err(err)?
+            Expr::concat(rebuild(high, stores, after_call, memo)?, rebuild(low, stores, after_call, memo)?).map_err(err)?
         }
         ExprKind::Resize { op, value } => {
-            Expr::resize(*op, e.width, rebuild(value, stores, memo)?).map_err(err)?
+            Expr::resize(*op, e.width, rebuild(value, stores, after_call, memo)?).map_err(err)?
         }
         ExprKind::Intrinsic { name, arguments } => Expr::intrinsic(
             e.width,
             name.clone(),
             arguments
                 .iter()
-                .map(|a| rebuild(a, stores, memo))
+                .map(|a| rebuild(a, stores, after_call, memo))
                 .collect::<Result<_, _>>()?,
         ),
         ExprKind::Load { address } => {
-            let address = rebuild(address, stores, memo)?;
-            load_against(e.width, &address, stores)?
+            let address = rebuild(address, stores, after_call, memo)?;
+            load_against(e.width, &address, stores, after_call)?
         }
     };
     memo.insert(e.clone(), out.clone());
     Ok(out)
 }
 
-fn load_against(width: BitWidth, address: &Expr, stores: &[Store]) -> Result<Expr, String> {
+fn load_against(
+    width: BitWidth,
+    address: &Expr,
+    stores: &[Store],
+    after_call: Option<&NativeEnv>,
+) -> Result<Expr, String> {
     for (store_address, value, store_width) in stores.iter().rev() {
         if store_address.simplify() == address.simplify() && *store_width == width {
             return Ok(value.clone());
@@ -148,7 +164,34 @@ fn load_against(width: BitWidth, address: &Expr, stores: &[Store]) -> Result<Exp
             ));
         }
     }
+    if let Some(env) = after_call {
+        // Memory is no longer the function-entry image once a callee has run. Only
+        // read-only image bytes and the caller's own frame above the return address
+        // (assumed not to escape to the callee) are still the entry values.
+        let (base, offset) = split_offset(address);
+        let readonly = base == Expr::constant(BitWidth::W64, 0)
+            && env.readonly.iter().any(|(lo, hi)| {
+                let a = offset.cast_unsigned();
+                a >= *lo && a.saturating_add(u64::from(width.bytes())) <= *hi
+            });
+        let caller_frame = base == entry_symbol(Gpr::Rsp) && offset >= 8;
+        if !readonly && !caller_frame {
+            return Err(format!(
+                "a load of {:?} after a call reads memory the callee may have written",
+                address.simplify()
+            ));
+        }
+    }
     Ok(Expr::load(width, address.clone()))
+}
+
+/// The image facts the native executor needs to model calls and post-call loads.
+#[derive(Clone, Debug, Default)]
+pub struct NativeEnv {
+    /// Preferred load address of the image (calls are keyed by RVA).
+    pub image_base: u64,
+    /// Virtual-address ranges of read-only sections (`[lo, hi)`).
+    pub readonly: Vec<(u64, u64)>,
 }
 
 /// The original function as executed along its input-independent path.
@@ -159,6 +202,8 @@ pub struct NativeFunction {
     pub branches_decided: usize,
     /// Stores below the entry stack pointer (the callee's own dead frame).
     pub frame_stores_dropped: usize,
+    /// Labeled modeling assumptions the result depends on (calls only).
+    pub assumptions: Vec<String>,
 }
 
 fn flag_value(e: &Expr) -> Option<u64> {
@@ -246,6 +291,28 @@ fn condition(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Result<bool, String> {
 /// an unmodeled flag/condition, aliasing the memory model cannot rule out, an
 /// unbalanced stack at the return, or exceeding `max_blocks`.
 pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<NativeFunction, String> {
+    execute_native_function_in(cfg, max_blocks, &NativeEnv::default())
+}
+
+/// [`execute_native_function`] with the image environment that call blocks need.
+///
+/// A call is modeled as the Win64 ABI defines it and nothing more: the result
+/// register(s) and the volatile registers are call-site-specific `fp_call_*`
+/// functions of the eight argument registers (`rcx rdx r8 r9`, `xmm0-3` low
+/// lanes); callee-saved registers survive; flags are undefined afterwards. The
+/// callee's memory effects are *not* modeled, so a later load must hit read-only
+/// image bytes, the caller's frame, or a store the function made itself.
+///
+/// # Errors
+/// As [`execute_native_function`], plus a call block without the image base.
+#[allow(clippy::too_many_lines)]
+pub fn execute_native_function_in(
+    cfg: &NativeCfg,
+    max_blocks: usize,
+    native_env: &NativeEnv,
+) -> Result<NativeFunction, String> {
+    let mut calls: Vec<CollectedCall> = Vec::new();
+    let mut assumptions: Vec<String> = Vec::new();
     let mut regs: BTreeMap<Gpr, Expr> = Gpr::ALL.iter().map(|g| (*g, entry_symbol(*g))).collect();
     let mut xmm: BTreeMap<u8, (Expr, Expr)> = (0..16u8)
         .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
@@ -274,6 +341,7 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
             env.insert(format!("xmm{n}_lo_in"), lo.clone());
             env.insert(format!("xmm{n}_hi_in"), hi.clone());
         }
+        let after_call = (!calls.is_empty()).then_some(native_env);
         let subst = |e: &Expr| -> Result<Expr, String> {
             let substituted = e.substitute(&env).map_err(|x| x.to_string())?.simplify();
             if let Some(stray) = substituted
@@ -283,7 +351,7 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
             {
                 return Err(format!("block {ip:#x} reads `{stray}` before it is defined"));
             }
-            resolve_loads(&substituted, &stores)
+            resolve_loads(&substituted, &stores, after_call)
         };
         let mut next_regs = BTreeMap::new();
         for (g, e) in &sem.regs {
@@ -326,12 +394,39 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
                 ip = if condition(cc, &flags)? { *taken } else { *not_taken };
                 decided += 1;
             }
+            Terminator::Call { target, next } => {
+                if native_env.image_base == 0 {
+                    return Err(format!("block {ip:#x} calls, but the image base is unknown"));
+                }
+                let (label, iat_rva) = match *target {
+                    CallTarget::Import(slot) => {
+                        let rva = u32::try_from(slot.wrapping_sub(native_env.image_base))
+                            .map_err(|_| format!("import slot {slot:#x} outside the image"))?;
+                        (format!("iat_{rva:#x}"), rva)
+                    }
+                    CallTarget::Direct(va) => {
+                        let rva = u32::try_from(va.wrapping_sub(native_env.image_base))
+                            .map_err(|_| format!("call target {va:#x} outside the image"))?;
+                        (format!("sub_{rva:#x}"), rva | 0x8000_0000)
+                    }
+                };
+                apply_call(&mut regs, &mut xmm, &mut flags, &mut calls, &label, iat_rva);
+                if calls.len() == 1 {
+                    assumptions.push(
+                        "callee memory effects are not modeled; later loads are limited to read-only image bytes, the caller frame and the function's own stores".to_owned(),
+                    );
+                    assumptions.push(
+                        "no pointer into the function's frame or the caller frame escapes to a callee".to_owned(),
+                    );
+                }
+                ip = *next;
+            }
             Terminator::Return => {
                 let rsp = regs[&Gpr::Rsp].simplify();
                 if rsp != entry_symbol(Gpr::Rsp) {
                     return Err(format!("stack is unbalanced at the return: rsp = {rsp:?}"));
                 }
-                return Ok(finish(&regs, xmm, stores, executed, decided));
+                return Ok(finish(&regs, xmm, stores, calls, assumptions, executed, decided));
             }
             Terminator::Unsupported(why) => return Err(format!("block {ip:#x}: {why}")),
         }
@@ -343,6 +438,8 @@ fn finish(
     regs: &BTreeMap<Gpr, Expr>,
     xmm: BTreeMap<u8, (Expr, Expr)>,
     stores: Vec<Store>,
+    calls: Vec<CollectedCall>,
+    assumptions: Vec<String>,
     blocks: usize,
     decided: usize,
 ) -> NativeFunction {
@@ -372,14 +469,251 @@ fn finish(
             },
             effects: CollectedEffects {
                 stores: kept,
-                calls: Vec::new(),
+                calls,
                 unsupported: Vec::new(),
             },
         },
         blocks_executed: blocks,
         branches_decided: decided,
         frame_stores_dropped: dropped,
+        assumptions,
     }
+}
+
+/// The argument registers a Win64 callee may read: `rcx rdx r8 r9`, `xmm0-3` low lanes.
+fn call_arguments(regs: &BTreeMap<Gpr, Expr>, xmm: &BTreeMap<u8, (Expr, Expr)>) -> Vec<Expr> {
+    let mut args: Vec<Expr> = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9]
+        .iter()
+        .map(|g| regs[g].simplify())
+        .collect();
+    args.extend((0..4u8).map(|n| xmm[&n].0.simplify()));
+    args
+}
+
+fn opaque(name: String, args: &[Expr]) -> Expr {
+    Expr::intrinsic(BitWidth::W64, name, args.to_vec())
+}
+
+/// Applies the Win64 effect of one call site to the register state.
+fn apply_call(
+    regs: &mut BTreeMap<Gpr, Expr>,
+    xmm: &mut BTreeMap<u8, (Expr, Expr)>,
+    flags: &mut BTreeMap<Flag, Expr>,
+    calls: &mut Vec<CollectedCall>,
+    label: &str,
+    iat_rva: u32,
+) {
+    let args = call_arguments(regs, xmm);
+    let site = format!("{label}_c{}", calls.len());
+    let f64_result = format!("fp_call_{site}_f64");
+    calls.push(CollectedCall {
+        result_intrinsic: f64_result.clone(),
+        iat_rva,
+        arguments: args.clone(),
+    });
+    regs.insert(Gpr::Rax, opaque(format!("fp_call_{site}_rax_f64"), &args));
+    for (g, tag) in [
+        (Gpr::Rcx, "rcx"),
+        (Gpr::Rdx, "rdx"),
+        (Gpr::R8, "r8"),
+        (Gpr::R9, "r9"),
+        (Gpr::R10, "r10"),
+        (Gpr::R11, "r11"),
+    ] {
+        regs.insert(g, opaque(format!("fp_call_{site}_{tag}_f64"), &args));
+    }
+    xmm.insert(
+        0,
+        (
+            opaque(f64_result, &args),
+            opaque(format!("fp_call_{site}_xmm0hi_f64"), &args),
+        ),
+    );
+    for n in 1..6u8 {
+        xmm.insert(
+            n,
+            (
+                opaque(format!("fp_call_{site}_xmm{n}lo_f64"), &args),
+                opaque(format!("fp_call_{site}_xmm{n}hi_f64"), &args),
+            ),
+        );
+    }
+    flags.clear();
+}
+
+/// Bit position of a flag in RFLAGS.
+const fn flag_bit(f: Flag) -> u32 {
+    match f {
+        Flag::Cf => 0,
+        Flag::Pf => 2,
+        Flag::Af => 4,
+        Flag::Zf => 6,
+        Flag::Sf => 7,
+        Flag::Of => 11,
+    }
+}
+
+fn c64(v: u64) -> Expr {
+    Expr::constant(BitWidth::W64, v)
+}
+
+fn bin(op: BinaryOp, a: Expr, b: Expr) -> Result<Expr, String> {
+    Expr::binary(op, a, b).map_err(|e| e.to_string())
+}
+
+/// The 0/1 value of RFLAGS bit `bit` as a `W8` expression.
+fn flag_in(rflags: &Expr, bit: u32) -> Result<Expr, String> {
+    let shifted = bin(BinaryOp::Shr, rflags.clone(), c64(u64::from(bit)))?;
+    let byte = Expr::resize(vmpx_vm::ResizeOp::Truncate, BitWidth::W8, shifted)
+        .map_err(|e| e.to_string())?;
+    bin(BinaryOp::And, byte, Expr::constant(BitWidth::W8, 1))
+}
+
+/// Applies a straight-line native segment (lifted over `<reg>_in` / `xmm<n>_*_in` /
+/// `<flag>_in` inputs) to the state `prev` it starts from. The segment must leave
+/// the stack exactly as it found it and write no memory, and may not clobber a
+/// flag the next VM region could read: anything else is an error, never a guess.
+///
+/// # Errors
+/// An unbalanced stack, a memory write, a clobbered flag, or an expression that
+/// cannot be rebuilt.
+pub fn apply_native_segment(
+    prev: &ExitSemantics,
+    seg: &vmpx_disasm::BlockSemantics<Expr>,
+) -> Result<ExitSemantics, String> {
+    if !seg.writes.is_empty() {
+        return Err("native segment writes memory; its ordering against the VM frames is not modeled".to_owned());
+    }
+    let mut env: BTreeMap<String, Expr> = BTreeMap::new();
+    for r in X64NativeRegister::ALL {
+        let v = prev
+            .exit
+            .registers
+            .get(&r)
+            .ok_or_else(|| format!("register {r:?} is not tracked before the native segment"))?;
+        env.insert(native_register(r).input_name(), v.clone());
+    }
+    env.insert(Gpr::Rsp.input_name(), entry_symbol(Gpr::Rsp));
+    for n in 0..16u8 {
+        let (lo, hi) = prev
+            .exit
+            .xmm
+            .get(&n)
+            .cloned()
+            .unwrap_or_else(|| (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true)));
+        env.insert(format!("xmm{n}_lo_in"), lo);
+        env.insert(format!("xmm{n}_hi_in"), hi);
+    }
+    for f in [Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of] {
+        env.insert(format!("{}_in", f.name()), flag_in(&prev.exit.rflags, flag_bit(f))?);
+    }
+    let subst = |e: &Expr| e.substitute(&env).map(|x| x.simplify()).map_err(|x| x.to_string());
+    let rsp = subst(&seg.regs[&Gpr::Rsp])?;
+    if rsp != entry_symbol(Gpr::Rsp) {
+        return Err(format!("native segment changes the stack pointer: rsp = {rsp:?}"));
+    }
+    let mut out = prev.clone();
+    for r in X64NativeRegister::ALL {
+        out.exit.registers.insert(r, subst(&seg.regs[&native_register(r)])?);
+    }
+    let mut xmm = prev.exit.xmm.clone();
+    if xmm.is_empty() {
+        xmm = (0..16u8)
+            .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+            .collect();
+    }
+    for (n, (lo, hi)) in &seg.xmm {
+        if seg.xmm_written.contains(n) {
+            xmm.insert(*n, (subst(lo)?, subst(hi)?));
+        }
+    }
+    out.exit.xmm = xmm;
+    if !seg.flags.is_empty() {
+        let mut mask = 0u64;
+        let mut set: Option<Expr> = None;
+        for (f, st) in &seg.flags {
+            let FlagState::Value(v) = st else {
+                return Err(format!("native segment clobbers flag {}", f.name()));
+            };
+            mask |= 1 << flag_bit(*f);
+            let wide = Expr::resize(vmpx_vm::ResizeOp::ZeroExtend, BitWidth::W64, subst(v)?)
+                .map_err(|e| e.to_string())?;
+            let placed = bin(BinaryOp::Shl, wide, c64(u64::from(flag_bit(*f))))?;
+            set = Some(match set {
+                Some(acc) => bin(BinaryOp::Or, acc, placed)?,
+                None => placed,
+            });
+        }
+        let kept = bin(BinaryOp::And, prev.exit.rflags.clone(), c64(!mask))?;
+        out.exit.rflags = match set {
+            Some(bits) => bin(BinaryOp::Or, kept, bits)?.simplify(),
+            None => kept.simplify(),
+        };
+    }
+    Ok(out)
+}
+
+/// Feeds the state `prev` into a prepared VM region `next` whose exit is expressed
+/// over its own entry symbols (`native_<reg>_initial`, `native_rflags_initial`,
+/// `native_xmm<n>_*_initial`), yielding the composite exit.
+///
+/// # Errors
+/// `next` stores to memory, or an expression cannot be rebuilt.
+pub fn compose_into_next(prev: &ExitSemantics, next: &ExitSemantics) -> Result<ExitSemantics, String> {
+    if !next.effects.stores.is_empty() || !next.effects.calls.is_empty() {
+        return Err("a chained VM region has stores or calls; composition is not modeled".to_owned());
+    }
+    let mut env: BTreeMap<String, Expr> = BTreeMap::new();
+    for r in X64NativeRegister::ALL {
+        let v = prev
+            .exit
+            .registers
+            .get(&r)
+            .ok_or_else(|| format!("register {r:?} is not tracked at the chain point"))?;
+        env.insert(entry_name(native_register(r)), v.clone());
+    }
+    env.insert("native_rflags_initial".to_owned(), prev.exit.rflags.clone());
+    for n in 0..16u8 {
+        let (lo, hi) = prev
+            .exit
+            .xmm
+            .get(&n)
+            .cloned()
+            .unwrap_or_else(|| (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true)));
+        env.insert(xmm_entry_name(n, false), lo);
+        env.insert(xmm_entry_name(n, true), hi);
+    }
+    let subst = |e: &Expr| e.substitute(&env).map(|x| x.simplify()).map_err(|x| x.to_string());
+    let mut out = next.clone();
+    for v in out.exit.registers.values_mut() {
+        *v = subst(v)?;
+    }
+    out.exit.rflags = subst(&out.exit.rflags)?;
+    if out.exit.xmm.is_empty() {
+        out.exit.xmm = (0..16u8)
+            .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+            .collect();
+    }
+    for (lo, hi) in out.exit.xmm.values_mut() {
+        *lo = subst(lo)?;
+        *hi = subst(hi)?;
+    }
+    Ok(out)
+}
+
+/// The observable exit of the two semantics is expression-for-expression equal.
+#[must_use]
+pub fn same_exit(a: &ExitSemantics, b: &ExitSemantics) -> bool {
+    let norm = |s: &ExitSemantics| -> Vec<Expr> {
+        let mut v: Vec<Expr> = s.exit.registers.values().map(Expr::simplify).collect();
+        for (lo, hi) in s.exit.xmm.values() {
+            v.push(lo.simplify());
+            v.push(hi.simplify());
+        }
+        v.push(s.exit.rflags.simplify());
+        v
+    };
+    a.exit.registers.keys().eq(b.exit.registers.keys()) && norm(a) == norm(b)
 }
 
 /// Which exit registers the calling convention makes observable.
@@ -419,7 +753,17 @@ pub fn differential_obligation(
     original: &ExitSemantics,
     policy: &AbiPolicy,
 ) -> Obligation {
-    let mut o = Obligation::from_exits(recovered, original);
+    // A side that tracks no XMM state leaves every XMM register at its entry value.
+    let identity = |s: &ExitSemantics| -> ExitSemantics {
+        let mut s = s.clone();
+        if s.exit.xmm.is_empty() {
+            s.exit.xmm = (0..16u8)
+                .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+                .collect();
+        }
+        s
+    };
+    let mut o = Obligation::from_exits(&identity(recovered), &identity(original));
     o.cells.retain(|c| match &c.id {
         CellId::Register(r) => policy.compared.contains(r),
         CellId::Xmm { reg, hi } => policy.compared_xmm.contains(&(*reg, *hi)),

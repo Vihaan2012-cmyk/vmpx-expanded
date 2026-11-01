@@ -27,6 +27,7 @@ mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
 mod input_closed_functions;
+mod native_chain;
 mod report_cmd;
 mod strip_wiring;
 mod vm_inventory;

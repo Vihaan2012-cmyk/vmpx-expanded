@@ -174,6 +174,9 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
                 };
                 Term::Return(vec![("rax".to_owned(), rax)])
             }
+            Terminator::Call { .. } => {
+                return Err(format!("block {addr:#x}: calls are not lifted by the decompiler"));
+            }
             Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),
         };
         // a block that stores and loads cannot be ordered faithfully here
