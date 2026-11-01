@@ -56,6 +56,8 @@ const ERROR_FILE_NOT_FOUND: u64 = 2;
 const ERROR_NO_MORE_FILES: u64 = 18;
 const ERROR_BAD_LENGTH: u64 = 24;
 const ERROR_INVALID_PARAMETER: u64 = 87;
+const ERROR_INVALID_ADDRESS: u64 = 487;
+const ERROR_NOACCESS: u64 = 998;
 const ERROR_BUFFER_OVERFLOW: u64 = 111;
 const ERROR_MORE_DATA: u64 = 234;
 const ERROR_UNSUPPORTED_TYPE: u64 = 1630;
@@ -198,6 +200,11 @@ pub struct WinApiHook {
     syscall_names: BTreeMap<u32, String>,
     /// Backed ntdll stub VA -> its syscall number (pristine-bytes check).
     nt_stub_nr: BTreeMap<u64, u32>,
+    /// Half-open span of the backed ntdll stubs; guest reads/writes of it are audited.
+    nt_mem_span: (u64, u64),
+    nt_stub_audited: u32,
+    /// Most recent dispatched calls, dumped when a probe stops the run.
+    recent: std::collections::VecDeque<String>,
     /// Recording host-SDK model; XPLM/XPWidgets imports route here (never forwarded).
     xplm: Option<Rc<RefCell<Xplm>>>,
     /// Every import address this hook has handed out (see [`AddressBook`]).
@@ -318,6 +325,9 @@ impl WinApiHook {
             syscall_placeholders: BTreeMap::new(),
             syscall_names: BTreeMap::new(),
             nt_stub_nr: BTreeMap::new(),
+            nt_mem_span: (0, 0),
+            nt_stub_audited: 0,
+            recent: std::collections::VecDeque::new(),
             xplm: None,
             addr_book,
             audit: Rc::new(RefCell::new(BTreeMap::new())),
@@ -585,6 +595,13 @@ impl WinApiHook {
     }
 
     /// Record an anti-analysis probe and the clean answer it received.
+    fn log_call(&mut self, what: String) {
+        if self.recent.len() >= 48 {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(what);
+    }
+
     fn note(&self, what: &str) {
         *self.audit.borrow_mut().entry(what.to_string()).or_insert(0) += 1;
     }
@@ -1014,12 +1031,20 @@ impl WinApiHook {
             };
             mem.poke(export.va, &nt_stub_bytes(nr)).map_err(|_| MapError::Overlap)?;
             self.nt_stub_nr.insert(export.va, nr);
+            let hi = export.va + u64::from(STUB_STRIDE);
+            self.nt_mem_span = if self.nt_mem_span.1 == 0 {
+                (export.va, hi)
+            } else {
+                (self.nt_mem_span.0.min(export.va), self.nt_mem_span.1.max(hi))
+            };
             if !self.syscall_names.contains_key(&nr) || name.starts_with("Nt") {
                 self.syscall_names.insert(nr, name.clone());
             }
         }
         let stub_va = base + u64::from(STUB_REGION_RVA);
         let len = round_up(slots.len() as u64 * u64::from(STUB_STRIDE));
+        let (lo, hi) = self.nt_mem_span;
+        self.watch_span = (self.watch_span.0.min(lo), self.watch_span.1.max(hi));
         mem.protect(stub_va, len, Perm::RX).map_err(|_| MapError::Overlap)
     }
 
@@ -1080,8 +1105,28 @@ impl WinApiHook {
             // ---- Memory ------------------------------------------------------
             // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
             (_, "VirtualAlloc") => {
-                let size = Self::arg(cpu, 1);
-                Dispatch::Ret(self.alloc(mem, size))
+                let (addr, size) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+                let perm = page_to_perm(Self::arg(cpu, 3));
+                if addr == 0 {
+                    let va = self.alloc(mem, size);
+                    if va != 0 && perm != Perm::RW && mem.protect(va, round_up(size.max(1)), perm).is_err() {
+                        return Dispatch::Ret(0);
+                    }
+                    return Dispatch::Ret(va);
+                }
+                // A requested address is honoured only over wholly free pages
+                // (or an already-mapped range being committed); else it fails.
+                let va = addr & !(PAGE - 1);
+                let len = round_up(addr + size.max(1)) - va;
+                let free = (0..len / PAGE).all(|i| mem.perm_at(va + i * PAGE).is_none());
+                let mapped = (0..len / PAGE).all(|i| mem.perm_at(va + i * PAGE).is_some());
+                if (free && mem.map(va, len, perm).is_ok())
+                    || (mapped && mem.protect(va, len, perm).is_ok())
+                {
+                    Dispatch::Ret(addr)
+                } else {
+                    self.fail(ERROR_INVALID_ADDRESS)
+                }
             }
             // HeapAlloc(hHeap, dwFlags, dwBytes) — pages are already zeroed.
             (_, "HeapAlloc") => {
@@ -1277,6 +1322,32 @@ impl WinApiHook {
             // ---- Process / thread identity ----------------------------------
             // Pseudo-handles (current process = -1, current thread = -2) and the
             // fixed in-model ids, kept consistent with the NT info queries.
+            // Self-process only (pseudo-handle -1): a plain guest copy through the
+            // page permissions. Any other process handle is unmodeled -> Stop.
+            (_, "WriteProcessMemory" | "ReadProcessMemory") => {
+                if Self::arg(cpu, 0) != 0xFFFF_FFFF_FFFF_FFFF {
+                    return Dispatch::Stop;
+                }
+                let (remote, local, n) = (Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3));
+                let Some(p_done) = Self::stack_arg(cpu, mem, sab, 4) else { return Dispatch::Stop };
+                if n > 0x100_0000 {
+                    return Dispatch::Stop;
+                }
+                let mut buf = vec![0u8; n as usize];
+                let ok = if func == "WriteProcessMemory" {
+                    mem.read(local, &mut buf).is_ok() && mem.write(remote, &buf).is_ok()
+                } else {
+                    mem.read(remote, &mut buf).is_ok() && mem.write(local, &buf).is_ok()
+                };
+                if !ok {
+                    return self.fail(ERROR_NOACCESS);
+                }
+                if p_done != 0 && mem.write_uint(p_done, 8, n).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(1)
+            }
+            (_, "FlushInstructionCache") => Dispatch::Ret(1),
             (_, "GetCurrentProcess") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFF),
             (_, "GetCurrentThread") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFE),
             (_, "GetCurrentProcessId") => Dispatch::Ret(crate::ntdll::FAKE_PID),
@@ -1904,14 +1975,24 @@ impl Hook for WinApiHook {
         let (st, ex) = (incl(self.stub_span), incl(self.export_span));
         Interest {
             read: [kusd, self.watch_span],
-            write: [kusd, (0, 0)],
+            write: [kusd, self.nt_mem_span],
             flow: [st, ex],
             flow_all: st.1 == u64::MAX || ex.1 == u64::MAX,
             ..Interest::NONE
         }
     }
 
-    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+    fn on_mem(&mut self, ev: &MemEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
+        if ev.addr >= self.nt_mem_span.0 && ev.addr < self.nt_mem_span.1 && self.nt_stub_audited < 96 {
+            self.nt_stub_audited += 1;
+            let off = ev.addr - (ev.addr - self.nt_mem_span.0) % u64::from(STUB_STRIDE);
+            let name = self.export_stub_addrs.get(&off).map_or("?", |(_, f)| f.as_str()).to_string();
+            let acc = if ev.access == Access::Write { "WRITE" } else { "READ" };
+            self.note(&format!(
+                "NTSTUB {acc} {name}+{:#x} size={} rip={:#x}",
+                ev.addr - off, ev.size, cpu.rip
+            ));
+        }
         // The fixed KUSER_SHARED_DATA page is provided by the OS at a constant
         // address; map it in-model on first touch (on_mem runs before the read,
         // so the faulting access then succeeds).
@@ -1962,6 +2043,7 @@ impl Hook for WinApiHook {
                 return match self.nt.dispatch(&func, cpu, mem, sab) {
                     NtDispatch::Status(s) => {
                         self.note_nt(&func, cpu, s);
+                        self.log_call(format!("{func}(name-keyed) from={:#x} -> {s:#x}", ev.from));
                         cpu.regs[RAX] = s;
                         Self::resume(ev, cpu, mem)
                     }
@@ -1990,6 +2072,7 @@ impl Hook for WinApiHook {
         Some(match self.nt.dispatch(&func, cpu, mem, sab) {
             NtDispatch::Status(s) => {
                 self.note_nt(&func, cpu, s);
+                self.log_call(format!("{func}(syscall) rip={:#x} -> {s:#x}", cpu.rip));
                 cpu.regs[RAX] = s;
                 cpu.regs[ARG[0]] = cpu.rip.wrapping_add(2);
                 cpu.regs[R11] = cpu.rflags;
@@ -2134,7 +2217,14 @@ impl WinApiHook {
             let wide = func.ends_with('W');
             let rd = |p| if wide { read_wstr(mem, p) } else { read_cstr(mem, p) };
             let (text, cap) = (rd(Self::arg(cpu, 1)), rd(Self::arg(cpu, 2)));
-            self.note(&format!("UNMODELED {func} text={text:?} caption={cap:?} (run stopped)"));
+            for (i, c) in self.recent.iter().enumerate() {
+                self.note(&format!("RECENT-{i:02} {c}"));
+            }
+            let ra = mem.read_uint(cpu.regs[RSP], 8).unwrap_or(0);
+            self.note(&format!(
+                "UNMODELED {func} text={text:?} caption={cap:?} from={:#x} stack_ret={ra:#x} (run stopped)",
+                ev.from
+            ));
             return HookAction::Stop;
         }
         if let Some(x) = self.xplm.clone() {
@@ -3601,5 +3691,22 @@ mod tests {
         mem.poke(T_CODE, &[0x0F, 0x05]).unwrap();
         let mut emu = crate::emu::Emulator::new(Cpu::new(T_CODE), mem);
         assert!(matches!(emu.run(10), Stop::Unsupported { .. }));
+    }
+
+    #[test]
+    fn write_process_memory_self_only_respects_page_perms() {
+        let (mut h, mut cpu, mut mem, sab) = harness();
+        let (dst, src, done) = (T_DATA + 0x1000, T_DATA + 0x2000, T_DATA + 0x3000);
+        mem.write(src, b"abcd").unwrap();
+        mem.write_uint(sab, 8, done).unwrap();
+        set_args(&mut cpu, [u64::MAX, dst, src, 4]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab)), 1);
+        assert_eq!(mem.read_uint(dst, 4).unwrap(), u64::from(u32::from_le_bytes(*b"abcd")));
+        assert_eq!(mem.read_uint(done, 8).unwrap(), 4);
+        mem.protect(dst, 0x1000, Perm::R).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab)), 0);
+        assert_eq!(h.last_error, ERROR_NOACCESS);
+        set_args(&mut cpu, [0x1234, dst, src, 4]);
+        assert!(matches!(h.dispatch("kernel32.dll", "WriteProcessMemory", &cpu, &mut mem, sab), Dispatch::Stop));
     }
 }

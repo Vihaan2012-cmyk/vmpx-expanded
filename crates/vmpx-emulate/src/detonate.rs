@@ -1128,7 +1128,7 @@ mod tests {
                 eprintln!("    {e:?}");
             }
         }
-        for (k, n) in res.audit.iter().filter(|(k, _)| k.contains("UNMODELED") || k.contains("BLOCKED")) {
+        for (k, n) in res.audit.iter().filter(|(k, _)| k.contains("UNMODELED") || k.contains("BLOCKED") || k.contains("NTSTUB") || k.contains("SYSCALL") || k.contains("RECENT")) {
             eprintln!("  audit stop: {k} x{n}");
         }
         if let Some(lc) = &res.lifecycle {
