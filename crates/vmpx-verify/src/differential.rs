@@ -31,6 +31,16 @@ fn entry_name(r: Gpr) -> String {
     format!("native_{}_initial", r.name())
 }
 
+/// Entry symbol of one 64-bit XMM lane (`native_xmm<n>_lo_initial`).
+#[must_use]
+pub fn xmm_entry_symbol(reg: u8, hi: bool) -> Expr {
+    Expr::register(BitWidth::W64, xmm_entry_name(reg, hi))
+}
+
+fn xmm_entry_name(reg: u8, hi: bool) -> String {
+    format!("native_xmm{reg}_{}_initial", if hi { "hi" } else { "lo" })
+}
+
 fn native_register(r: X64NativeRegister) -> Gpr {
     match r {
         X64NativeRegister::Rax => Gpr::Rax,
@@ -237,6 +247,9 @@ fn condition(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Result<bool, String> {
 /// unbalanced stack at the return, or exceeding `max_blocks`.
 pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<NativeFunction, String> {
     let mut regs: BTreeMap<Gpr, Expr> = Gpr::ALL.iter().map(|g| (*g, entry_symbol(*g))).collect();
+    let mut xmm: BTreeMap<u8, (Expr, Expr)> = (0..16u8)
+        .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+        .collect();
     let mut flags: BTreeMap<Flag, Expr> = BTreeMap::new();
     let mut stores: Vec<Store> = Vec::new();
     let mut ip = cfg.entry;
@@ -257,6 +270,10 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
         for (f, e) in &flags {
             env.insert(format!("{}_in", f.name()), e.clone());
         }
+        for (n, (lo, hi)) in &xmm {
+            env.insert(format!("xmm{n}_lo_in"), lo.clone());
+            env.insert(format!("xmm{n}_hi_in"), hi.clone());
+        }
         let subst = |e: &Expr| -> Result<Expr, String> {
             let substituted = e.substitute(&env).map_err(|x| x.to_string())?.simplify();
             if let Some(stray) = substituted
@@ -271,6 +288,12 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
         let mut next_regs = BTreeMap::new();
         for (g, e) in &sem.regs {
             next_regs.insert(*g, subst(e)?);
+        }
+        let mut next_xmm = xmm.clone();
+        for (n, (lo, hi)) in &sem.xmm {
+            if sem.xmm_written.contains(n) {
+                next_xmm.insert(*n, (subst(lo)?, subst(hi)?));
+            }
         }
         let mut next_flags = flags.clone();
         for (f, st) in &sem.flags {
@@ -295,6 +318,7 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
         }
         stores.extend(new_stores);
         regs = next_regs;
+        xmm = next_xmm;
         flags = next_flags;
         match &block.terminator {
             Terminator::FallThrough(t) | Terminator::Jump(t) => ip = *t,
@@ -307,7 +331,7 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
                 if rsp != entry_symbol(Gpr::Rsp) {
                     return Err(format!("stack is unbalanced at the return: rsp = {rsp:?}"));
                 }
-                return Ok(finish(&regs, stores, executed, decided));
+                return Ok(finish(&regs, xmm, stores, executed, decided));
             }
             Terminator::Unsupported(why) => return Err(format!("block {ip:#x}: {why}")),
         }
@@ -315,7 +339,13 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
     Err(format!("did not return within {max_blocks} blocks"))
 }
 
-fn finish(regs: &BTreeMap<Gpr, Expr>, stores: Vec<Store>, blocks: usize, decided: usize) -> NativeFunction {
+fn finish(
+    regs: &BTreeMap<Gpr, Expr>,
+    xmm: BTreeMap<u8, (Expr, Expr)>,
+    stores: Vec<Store>,
+    blocks: usize,
+    decided: usize,
+) -> NativeFunction {
     let rsp = entry_symbol(Gpr::Rsp);
     let mut kept = Vec::new();
     let mut dropped = 0;
@@ -330,6 +360,7 @@ fn finish(regs: &BTreeMap<Gpr, Expr>, stores: Vec<Store>, blocks: usize, decided
     NativeFunction {
         semantics: ExitSemantics {
             exit: NativeExitState {
+                xmm,
                 schema_version: 1,
                 registers: X64NativeRegister::ALL
                     .iter()
@@ -355,17 +386,27 @@ fn finish(regs: &BTreeMap<Gpr, Expr>, stores: Vec<Store>, blocks: usize, decided
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbiPolicy {
     pub compared: Vec<X64NativeRegister>,
+    /// XMM registers whose lanes are compared (`(register, high lane)`).
+    pub compared_xmm: Vec<(u8, bool)>,
 }
 
 impl AbiPolicy {
     /// Win64: the return value (`rax`) and the callee-saved registers
     /// (`rbx rbp rsi rdi r12-r15`) must agree; volatile registers (`rcx rdx
     /// r8-r11`), flags and the return-address slot are not part of the contract.
+    /// FP: `xmm0` (the return value, low lane) and the callee-saved `xmm6-15` (both
+    /// lanes); `xmm1-5` are volatile.
     #[must_use]
     pub fn win64() -> Self {
         use X64NativeRegister as R;
+        let mut compared_xmm = vec![(0, false)];
+        for n in 6..16u8 {
+            compared_xmm.push((n, false));
+            compared_xmm.push((n, true));
+        }
         Self {
             compared: vec![R::Rax, R::Rbx, R::Rbp, R::Rsi, R::Rdi, R::R12, R::R13, R::R14, R::R15],
+            compared_xmm,
         }
     }
 }
@@ -381,6 +422,7 @@ pub fn differential_obligation(
     let mut o = Obligation::from_exits(recovered, original);
     o.cells.retain(|c| match &c.id {
         CellId::Register(r) => policy.compared.contains(r),
+        CellId::Xmm { reg, hi } => policy.compared_xmm.contains(&(*reg, *hi)),
         CellId::Rflags | CellId::ReturnAddress => false,
         _ => true,
     });
@@ -471,6 +513,18 @@ pub fn prepare_recovered(
     let mut out = semantics.clone();
     for v in out.exit.registers.values_mut() {
         *v = fix(v)?;
+    }
+    // The recovered side models only the integer VM; handlers fail closed on any
+    // XMM-touching instruction, so an exit that tracks no XMM state leaves every
+    // XMM register at its entry value.
+    if out.exit.xmm.is_empty() {
+        out.exit.xmm = (0..16u8)
+            .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+            .collect();
+    }
+    for (lo, hi) in out.exit.xmm.values_mut() {
+        *lo = fix(lo)?;
+        *hi = fix(hi)?;
     }
     out.effects.stores.clear();
     if out.exit.registers.values().any(|e| e.dependencies().contains("vsp_initial")) {

@@ -12,6 +12,10 @@ use crate::{
 pub struct NativeExitState {
     pub schema_version: u32,
     pub registers: BTreeMap<X64NativeRegister, Expr>,
+    /// `(low, high)` 64-bit lanes of the XMM registers whose value is known
+    /// (xmm0 carries an FP return; xmm6-15 are callee-saved). Empty when the
+    /// exit does not track XMM state.
+    pub xmm: BTreeMap<u8, (Expr, Expr)>,
     pub rflags: Expr,
     pub return_address: Expr,
     pub frame_size: u32,
@@ -108,6 +112,7 @@ pub fn recover_native_exit_state(
         BitWidth::W64,
     )?;
     Ok(NativeExitState {
+        xmm: std::collections::BTreeMap::new(),
         schema_version: 1,
         registers,
         rflags,

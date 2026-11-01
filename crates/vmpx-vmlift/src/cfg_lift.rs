@@ -2593,6 +2593,7 @@ impl Collector<'_> {
                     .transpose()?;
                 let semantics = crate::ExitSemantics {
                     exit: NativeExitState {
+                        xmm: std::collections::BTreeMap::new(),
                         schema_version: 1,
                         registers,
                         rflags: rflags
@@ -2650,6 +2651,7 @@ impl Collector<'_> {
                 let retained = u32::try_from(leaf.staged.len() * 8).unwrap_or(u32::MAX);
                 let semantics = crate::ExitSemantics {
                     exit: NativeExitState {
+                        xmm: std::collections::BTreeMap::new(),
                         schema_version: 1,
                         registers,
                         rflags,

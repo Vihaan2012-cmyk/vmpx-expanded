@@ -66,6 +66,7 @@ fn exit(rax: Expr) -> ExitSemantics {
         .collect();
     ExitSemantics {
         exit: NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers,
             rflags: Expr::constant(BitWidth::W64, 0),

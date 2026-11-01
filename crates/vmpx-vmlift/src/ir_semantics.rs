@@ -1087,6 +1087,7 @@ fn rewrite_exit(
     let r = |e: &Expr| recovered_expr(e, rewrites);
     Ok(ExitSemantics {
         exit: NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: semantics.exit.schema_version,
             registers: semantics
                 .exit
@@ -1171,6 +1172,7 @@ fn recompiled_semantics(vm: &ExitSemantics, exit: &IrExit) -> Result<ExitSemanti
     };
     Ok(ExitSemantics {
         exit: NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: vm.exit.schema_version,
             registers,
             rflags: exit
@@ -1231,6 +1233,7 @@ pub fn recompiled_pair(
 fn effects_only(stores: Vec<CollectedStore>, gaps: Vec<String>) -> ExitSemantics {
     ExitSemantics {
         exit: NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers: BTreeMap::new(),
             rflags: Expr::constant(BitWidth::W64, 0),

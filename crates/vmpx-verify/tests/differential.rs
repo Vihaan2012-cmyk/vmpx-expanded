@@ -61,6 +61,7 @@ fn recovered(tail: u64, clobber_rbx: bool) -> UnrolledFunction {
             conditions: Vec::new(),
             semantics: ExitSemantics {
                 exit: NativeExitState {
+                    xmm: std::collections::BTreeMap::new(),
                     schema_version: 1,
                     registers,
                     rflags: k(0),

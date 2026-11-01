@@ -28,6 +28,8 @@ use iced_x86::{
 };
 use thiserror::Error;
 
+mod sse;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Width {
     W8,
@@ -284,6 +286,11 @@ pub struct BlockSemantics<E> {
     /// [`LiftOptions::assume_stack_disjoint`]; never set by the default options.
     pub assumes_stack_disjoint: bool,
     pub instruction_count: usize,
+    /// Final `(low, high)` 64-bit lanes of all 16 XMM registers over the
+    /// `xmm<n>_lo_in`/`xmm<n>_hi_in` inputs. Unwritten registers are those inputs.
+    pub xmm: BTreeMap<u8, (E, E)>,
+    /// XMM registers the block wrote.
+    pub xmm_written: BTreeSet<u8>,
 }
 
 /// Opt-in modeling assumptions; the default is assumption-free.
@@ -295,6 +302,9 @@ pub struct LiftOptions {
     /// A load from a constant absolute address (e.g. a loaded-image slot) does not
     /// alias any store addressed `rsp_in + k`: the thread stack is not image memory.
     pub absolute_disjoint_from_frame: bool,
+    /// Model the SSE/SSE2 scalar floating-point slice (see `sse`). Off by default so
+    /// consumers that compare only GPR/flag/store state keep failing closed on SSE.
+    pub model_xmm: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -539,6 +549,8 @@ struct Lifter<'a, A: Algebra> {
     /// The instruction being executed reads `rsp` or a tainted register.
     inst_derived: bool,
     info: InstructionInfoFactory,
+    xmm: Vec<(A::Expr, A::Expr)>,
+    xmm_written: BTreeSet<u8>,
 }
 
 impl<'a, A: Algebra> Lifter<'a, A> {
@@ -560,6 +572,15 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             tainted: [false; 16],
             inst_derived: false,
             info: InstructionInfoFactory::new(),
+            xmm: (0..16)
+                .map(|n| {
+                    (
+                        alg.input(Width::W64, &format!("xmm{n}_lo_in")),
+                        alg.input(Width::W64, &format!("xmm{n}_hi_in")),
+                    )
+                })
+                .collect(),
+            xmm_written: BTreeSet::new(),
         }
     }
 
@@ -572,6 +593,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             reads: self.reads,
             assumes_stack_disjoint: self.used_assumption,
             instruction_count,
+            xmm: (0u8..).zip(self.xmm).collect(),
+            xmm_written: self.xmm_written,
         }
     }
 
@@ -1339,6 +1362,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 self.set_flag(Flag::Cf, cf);
                 Ok(())
             }
+            m if self.options.model_xmm && sse::handles(inst, m) => self.exec_sse(inst, m),
             other => unsupported(format!("mnemonic {other:?} is not modeled")),
         }
     }

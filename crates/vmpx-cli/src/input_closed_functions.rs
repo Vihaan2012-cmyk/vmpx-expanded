@@ -342,6 +342,7 @@ mod tests {
         InputClosedFunction {
             rva: Rva(0x1000),
             exit: NativeExitState {
+                xmm: std::collections::BTreeMap::new(),
                 schema_version: 1,
                 registers: BTreeMap::new(),
                 rflags: Expr::constant(BitWidth::W64, 0x202),

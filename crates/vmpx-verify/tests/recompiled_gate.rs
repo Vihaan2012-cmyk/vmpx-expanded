@@ -57,6 +57,7 @@ fn recovered(mask: u64) -> ExitSemantics {
     registers.insert(R::Rdx, bin(BinaryOp::Mul, reg(R::Rdx), k(3)));
     ExitSemantics {
         exit: NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers,
             rflags: k(0x246),

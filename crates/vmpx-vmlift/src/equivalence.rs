@@ -269,6 +269,7 @@ mod tests {
     fn semantics() -> ExitSemantics {
         ExitSemantics {
             exit: NativeExitState {
+                xmm: std::collections::BTreeMap::new(),
                 schema_version: 1,
                 registers: X64NativeRegister::ALL
                     .into_iter()

@@ -90,6 +90,7 @@ fn cell_kind(id: &CellId) -> String {
             .map_or("named", |k| k)
             .to_owned(),
         CellId::Register(_) => "register".to_owned(),
+        CellId::Xmm { .. } => "xmm lane".to_owned(),
         CellId::StoreAddress(_) => "store address".to_owned(),
         CellId::StoreValue(_) => "store value".to_owned(),
         other => format!("{other:?}"),

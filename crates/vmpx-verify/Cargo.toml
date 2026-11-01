@@ -14,6 +14,8 @@ z3 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 vmpx-recompile = { path = "../vmpx-recompile" }
+vmpx-emulate = { path = "../vmpx-emulate" }
+iced-x86 = { workspace = true, features = ["code_asm"] }
 
 [features]
 # Real SMT backend (Z3). Off by default: needs a system libz3 (headers + lib);

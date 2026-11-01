@@ -1017,6 +1017,7 @@ mod tests {
             Expr::constant(BitWidth::W64, IMAGE_BASE + u64::from(SOURCE_RVA)),
         );
         let initial = NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers,
             rflags: Expr::constant(BitWidth::W64, 0),
@@ -1064,6 +1065,7 @@ mod tests {
         let bytes = executable_pe64(&code, &[]);
         let pe = PeImage::parse(&bytes).expect("valid synthetic PE");
         let initial = NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers: BTreeMap::new(),
             rflags: Expr::register(BitWidth::W64, "unknown_flags"),
