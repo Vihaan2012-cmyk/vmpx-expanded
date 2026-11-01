@@ -37,6 +37,14 @@ const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 static ENV_FORKS: std::sync::Mutex<Vec<(u32, EnvironmentGateFork)>> =
     std::sync::Mutex::new(Vec::new());
 
+// (entry rva, page number, proven) of suppressed-read image serves; audit only.
+static SERVED_PAGES: std::sync::Mutex<Vec<(u32, u64, u64, u8)>> = std::sync::Mutex::new(Vec::new());
+static COMPLETES: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+
+// Post-init snapshot bytes for the volatile ranges (OBSERVED tier): consulted only
+// where the file byte is vetoed, labeled ObservedGlobal.
+static OBSERVED_SLOTS: std::sync::OnceLock<vmpx_vm::ObservedMemory> = std::sync::OnceLock::new();
+
 enum Outcome {
     Complete { assumptions: Vec<VmCfgAssumption> },
     // Non-complete but recovery returned a CFG: distinct normalized stall
@@ -120,6 +128,10 @@ fn parse_hex_after(reason: &str, marker: &str) -> Option<u64> {
     u64::from_str_radix(&hex[..end], 16).ok()
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn recover_one(
     pe: &PeImage<'_>,
     entry: &vmpx_vm::VmEntryCandidate,
@@ -139,16 +151,47 @@ fn recover_one(
             instruction_limit,
             symbolic: vmpx_vm::SymbolicExecutionLimits {
                 serve_read_only_when_suppressed: std::env::var_os("XPL_SERVE_RO").is_some(),
+                prove_read_only_when_suppressed: std::env::var_os("XPL_NO_PROVEN_RO").is_none(),
                 ..vmpx_vm::SymbolicExecutionLimits::default()
             },
             ..EntryProfileRecoveryLimits::default()
         },
         max_wall_time,
+        max_profile_transitions: env_usize("XPL_MAX_TRANS", VmCfgLimits::default().max_profile_transitions),
+        max_transition_visits: env_usize("XPL_TRANS_VISITS", VmCfgLimits::default().max_transition_visits),
+        max_transition_instructions: env_usize("XPL_TRANS_INSTR", VmCfgLimits::default().max_transition_instructions),
         ..VmCfgLimits::default()
     };
     set_branch_refusal_diagnostics(true);
-    let result = panic::catch_unwind(AssertUnwindSafe(|| recover_vm_cfg(pe, entry, limits)));
+    let audit = std::env::var_os("XPL_SERVED_PAGES_OUT").is_some();
+    vmpx_vm::set_served_page_audit(audit);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| match OBSERVED_SLOTS.get() {
+        Some(observed) => vmpx_vm::recover_vm_cfg_with_observed_memory(pe, entry, limits, observed),
+        None => recover_vm_cfg(pe, entry, limits),
+    }));
     let diags = take_branch_refusal_diagnostics();
+    if audit {
+        // Coalesce per provenance into contiguous [start, end] runs.
+        let mut runs: Vec<(u32, u64, u64, u8)> = Vec::new();
+        let all = vmpx_vm::take_served_page_audit();
+        for kind in 0..3u8 {
+            let mut last: Option<(u64, u64)> = None;
+            for (addr, _) in all.iter().copied().filter(|(_, k)| *k == kind) {
+                match last {
+                    Some((s0, e0)) if addr == e0 + 1 => last = Some((s0, addr)),
+                    Some((s0, e0)) => {
+                        runs.push((entry.rva.0, s0, e0, kind));
+                        last = Some((addr, addr));
+                    }
+                    None => last = Some((addr, addr)),
+                }
+            }
+            if let Some((s0, e0)) = last {
+                runs.push((entry.rva.0, s0, e0, kind));
+            }
+        }
+        SERVED_PAGES.lock().unwrap_or_else(|e| e.into_inner()).extend(runs);
+    }
     {
         let forks = take_environment_gate_forks();
         if !forks.is_empty() {
@@ -161,6 +204,10 @@ fn recover_one(
         Ok(Err(error)) => Outcome::Error(normalize(&error.to_string())),
         Ok(Ok(cfg)) => {
             if cfg.all_paths_reach_vm_exit() {
+                COMPLETES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((entry.rva.0, cfg.assumptions.is_empty()));
                 Outcome::Complete { assumptions: cfg.assumptions.iter().copied().collect() }
             } else {
                 let mut causes: Vec<String> = cfg
@@ -302,6 +349,35 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(2);
+    // Optional dynamic-evidence veto: file of hex page numbers (VA >> 12), one per
+    // line, that a run showed to change after load; never served.
+    if let Some(path) = std::env::var_os("XPL_VOLATILE_PAGES") {
+        let text = std::fs::read_to_string(path).expect("read XPL_VOLATILE_PAGES");
+        vmpx_vm::set_volatile_image_pages(text.lines().filter_map(|line| {
+            u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).ok()
+        }));
+    }
+    if let Some(path) = std::env::var_os("XPL_OBSERVED_SLOTS") {
+        let text = std::fs::read_to_string(path).expect("read XPL_OBSERVED_SLOTS");
+        let slots = text.lines().filter_map(|line| {
+            let (start, hex) = line.split_once(' ')?;
+            let bytes = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .ok()?;
+            Some((u64::from_str_radix(start, 16).ok()?, bytes))
+        });
+        let _ = OBSERVED_SLOTS.set(vmpx_vm::ObservedMemory::from_slots(slots));
+    }
+    if let Some(path) = std::env::var_os("XPL_VOLATILE_RANGES") {
+        let text = std::fs::read_to_string(path).expect("read XPL_VOLATILE_RANGES");
+        vmpx_vm::set_volatile_image_ranges(text.lines().filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let start = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let end = u64::from_str_radix(parts.next()?, 16).ok()?;
+            Some((start, end))
+        }));
+    }
     // Per-block decode budget (4th arg). Default 512 keeps a naive run memory-safe;
     // raise it deliberately (with memory headroom) to reclaim InstructionLimit stalls.
     let instruction_limit: usize = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(512);
@@ -1174,6 +1250,18 @@ fn main() {
         let _ = fn_has_nonx;
     }
 
+    if let Ok(path) = std::env::var("XPL_RAW_DUMP") {
+        let mut out = String::new();
+        for r in &results {
+            if let Outcome::Incomplete { raw, .. } = &r.outcome {
+                for (i, x) in raw.iter().enumerate() {
+                    out.push_str(&format!("{:#x}\t{}\t{}\t{}\n", r.rva, i, categorize(x), x.replace('\n', " ")));
+                }
+            }
+        }
+        std::fs::write(path, out).expect("write raw dump");
+    }
+
     if let Some(path) = args.get(6) {
         let mut out = String::new();
         for (rva, set) in &fn_sets {
@@ -1182,6 +1270,18 @@ fn main() {
             out.push_str(&format!("{rva:#x} {} {}\n", set.iter().collect::<String>(), vas.join(",")));
         }
         std::fs::write(path, out).expect("write dump");
+    }
+
+    if let Some(path) = std::env::var_os("XPL_SERVED_PAGES_OUT") {
+        let served = SERVED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = String::new();
+        for (rva, start, end, kind) in served.iter() {
+            out.push_str(&format!("SERVED {rva:#x} {start:#x} {end:#x} {kind}\n"));
+        }
+        for (rva, proven) in COMPLETES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            out.push_str(&format!("COMPLETE {rva:#x} {}\n", if *proven { "proven" } else { "assumed" }));
+        }
+        std::fs::write(path, out).expect("write served pages");
     }
 
     let pct = complete as f64 * 100.0 / swept_f;

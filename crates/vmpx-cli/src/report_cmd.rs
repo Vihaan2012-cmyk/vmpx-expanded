@@ -27,6 +27,7 @@ pub struct ReportOptions {
     pub threads: usize,
     pub instruction_limit: usize,
     pub dynamic: bool,
+    pub serve_ro: bool,
 }
 
 impl ReportOptions {
@@ -40,6 +41,7 @@ impl ReportOptions {
             threads: threads.max(1),
             instruction_limit: 512,
             dynamic,
+            serve_ro: false,
         }
     }
 }
@@ -133,10 +135,14 @@ enum Outcome {
     Panic,
 }
 
-fn cfg_limits(instruction_limit: usize) -> VmCfgLimits {
+fn cfg_limits(instruction_limit: usize, serve_ro: bool) -> VmCfgLimits {
     VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
             instruction_limit,
+            symbolic: vmpx_vm::SymbolicExecutionLimits {
+                serve_read_only_when_suppressed: serve_ro,
+                ..vmpx_vm::SymbolicExecutionLimits::default()
+            },
             ..EntryProfileRecoveryLimits::default()
         },
         ..VmCfgLimits::default()
@@ -164,7 +170,7 @@ fn recover_all(
         return Vec::new();
     }
     let chunk = entries.len().div_ceil(opts.threads).max(1);
-    let limits = cfg_limits(opts.instruction_limit);
+    let limits = cfg_limits(opts.instruction_limit, opts.serve_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
     let out = std::thread::scope(|scope| {
@@ -293,6 +299,48 @@ fn run_dynamic(
         observed_tier_completions: completions,
         observed_tier_rerun_entries: pending.len(),
     })
+}
+
+/// Installs the dynamic-evidence VOLATILITY VETO: every byte of the (already
+/// mapped) analysis image that differs from the same address in a post-init
+/// emulator snapshot is marked volatile, so the symbolic executor never serves it
+/// as a constant from the file. The snapshot is observed-tier and is used ONLY to
+/// veto a byte, never to supply a value. Returns `(volatile ranges, volatile bytes)`.
+///
+/// # Errors
+///
+/// Fails when the image is not a PE or the snapshot cannot be read.
+pub fn install_volatility_veto(image: &[u8], snapshot: &std::path::Path) -> Result<(usize, u64)> {
+    use vmpx_pe::Va;
+    use vmpx_vm::SymbolicMemorySource;
+    let pe = PeImage::parse(image).context("volatility veto: image is not a PE")?;
+    let (_, memory) = vmpx_emulate::snapshot::load(snapshot)
+        .with_context(|| format!("read snapshot {}", snapshot.display()))?;
+    let lo = pe.optional.image_base.get();
+    let hi = lo.saturating_add(u64::from(pe.optional.size_of_image));
+    let mut pages: Vec<(u64, &[u8])> = memory
+        .pages()
+        .filter(|(base, _, _)| *base >= lo && *base < hi)
+        .map(|(base, _, data)| (base, data))
+        .collect();
+    pages.sort_by_key(|(base, _)| *base);
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (base, data) in pages {
+        for (offset, &runtime) in data.iter().enumerate() {
+            let address = base + offset as u64;
+            if SymbolicMemorySource::read_byte(&pe, Va(address)).is_some_and(|file| file != runtime)
+            {
+                match ranges.last_mut() {
+                    Some((_, end)) if *end + 1 == address => *end = address,
+                    _ => ranges.push((address, address)),
+                }
+            }
+        }
+    }
+    let bytes = ranges.iter().map(|(s, e)| e - s + 1).sum();
+    let count = ranges.len();
+    vmpx_vm::set_volatile_image_ranges(ranges);
+    Ok((count, bytes))
 }
 
 /// # Errors

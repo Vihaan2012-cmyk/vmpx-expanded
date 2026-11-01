@@ -145,6 +145,9 @@ pub enum NativeFrameSource {
     Constant { value: u64 },
     ReturnAddress { call_site: Rva, continuation: Rva },
     EntryImmediate { ordinal: u32, value: u64 },
+    /// A 64-bit immediate under a base relocation: `value` plus the image
+    /// relocation delta (0 at the preferred base).
+    RelocatedConstant { value: u64 },
     Unknown { description: String },
 }
 
@@ -162,6 +165,14 @@ impl NativeFrameSource {
                 BitWidth::W64,
                 "native_return_address_initial",
             )),
+            Self::RelocatedConstant { value } => {
+                let delta = Expr::register(BitWidth::W64, "image_reloc_delta");
+                if *value == 0 {
+                    Some(delta)
+                } else {
+                    Expr::binary(BinaryOp::Add, delta, Expr::constant(BitWidth::W64, *value)).ok()
+                }
+            }
             Self::Unknown { .. } => None,
         }
     }
@@ -243,6 +254,8 @@ impl NativeContextMappingReport {
 pub(crate) enum Provenance {
     Native(X64NativeRegister),
     Constant(u64),
+    /// A `mov r64, imm64` whose immediate a base relocation covers.
+    RelocatedConstant(u64),
     Unknown,
 }
 

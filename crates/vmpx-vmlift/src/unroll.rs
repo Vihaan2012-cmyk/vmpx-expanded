@@ -13,7 +13,7 @@
 //! either is an error, never a partial result.
 
 use vmpx_vm::{
-    BlockExit, CfgEdgeKind, Expr, ExprKind, NativeExitState, SymbolicExecutionLimits,
+    BlockExit, CfgEdgeKind, Expr, ExprKind, NativeExitState, NativeFrameSource, SymbolicExecutionLimits,
     SymbolicVmInitialState, VmHandlerSemantic, execute_symbolic_linear_block_with_initial_state,
 };
 use vmpx_pe::Va;
@@ -139,7 +139,18 @@ pub fn unroll_decoded_cfg(
         entry_sp_offset: i64::try_from(input.top_offset)
             .unwrap_or(i64::MAX)
             .saturating_add(i64::try_from(input.frame.len() * 8).unwrap_or(i64::MAX)),
-        notes: Vec::new(),
+        notes: if input
+            .frame
+            .iter()
+            .any(|cell| matches!(cell, NativeFrameSource::RelocatedConstant { .. }))
+        {
+            vec![
+                "preferred-base frame: relocated entry-stub immediates taken at their on-disk value (relocation delta 0)"
+                    .to_owned(),
+            ]
+        } else {
+            Vec::new()
+        },
     })
 }
 

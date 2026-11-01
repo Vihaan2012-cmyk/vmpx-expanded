@@ -63,7 +63,7 @@ pub use cfg::{
     BranchRefusalDiagnostic, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
     ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, DEFAULT_MAX_WALL_TIME, recover_vm_cfg,
-    recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
+    recover_entry_frame, recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
 };
 pub use env_gate::{
     EnvironmentGateFork, EnvironmentGateRoute, EnvironmentSource, take_environment_gate_forks,
@@ -130,7 +130,7 @@ pub use image_concretize::{
     ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
     concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
 };
-pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage};
+pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage, set_volatile_image_pages, set_volatile_image_ranges};
 pub use input_closed::{is_expr_input_closed, is_input_closed};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
@@ -192,7 +192,9 @@ pub use semantic_exec::{
     SymbolicMemoryWrite, SymbolicNativeCall, SymbolicVmExecutionReport, SymbolicVmInitialState,
     canonicalize_symbolic_pointer, execute_symbolic_linear_block,
     execute_symbolic_linear_block_with_initial_state,
-    execute_symbolic_native_call_boundary_with_initial_state, symbolic_pointer_offset,
+    execute_symbolic_native_call_boundary_with_initial_state, set_served_page_audit,
+    symbolic_pointer_offset, take_served_page_audit, SERVED_LABELED_SUPPRESSED,
+    SERVED_PROVEN_SUPPRESSED, SERVED_UNSUPPRESSED,
 };
 pub use symbolic_domain::{
     SymbolicConcreteAlternative, SymbolicDomainError, SymbolicDomainLimits, SymbolicDomainReport,

@@ -15,6 +15,42 @@ use crate::{
     resolve_native_call_import, summarize_known_import,
 };
 
+thread_local! {
+    static SERVED_READ_AUDIT: std::cell::RefCell<Option<BTreeSet<(u64, u8)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Image bytes served as constants, by provenance (audit only).
+pub const SERVED_UNSUPPRESSED: u8 = 0;
+pub const SERVED_PROVEN_SUPPRESSED: u8 = 1;
+pub const SERVED_LABELED_SUPPRESSED: u8 = 2;
+
+/// DIAGNOSTIC ONLY: start (or stop) recording, per thread, the byte addresses of
+/// image bytes served as constants, with their provenance, so a run can be
+/// audited against runtime evidence.
+pub fn set_served_page_audit(enabled: bool) {
+    SERVED_READ_AUDIT.with(|sink| *sink.borrow_mut() = enabled.then(BTreeSet::new));
+}
+
+/// Drains the `(address, provenance)` audit recorded on this thread.
+#[must_use]
+pub fn take_served_page_audit() -> Vec<(u64, u8)> {
+    SERVED_READ_AUDIT.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|set| std::mem::take(set).into_iter().collect())
+            .unwrap_or_default()
+    })
+}
+
+fn note_served_read(address: u64, kind: u8) {
+    SERVED_READ_AUDIT.with(|sink| {
+        if let Some(set) = sink.borrow_mut().as_mut() {
+            set.insert((address, kind));
+        }
+    });
+}
+
 const WIN64_ARGUMENT_REGISTERS: [&str; 4] = ["RCX", "RDX", "R8", "R9"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +63,10 @@ pub struct SymbolicExecutionLimits {
     /// page is re-protected writable at runtime; the block is labeled
     /// `AssumesImageProtectionStable`.
     pub serve_read_only_when_suppressed: bool,
+    /// Serve declared read-only file-backed pages after an external store when
+    /// no call that may change page protection has run on the path (a proof,
+    /// no assumption). Off only to A/B the baseline.
+    pub prove_read_only_when_suppressed: bool,
 }
 
 impl Default for SymbolicExecutionLimits {
@@ -36,6 +76,7 @@ impl Default for SymbolicExecutionLimits {
             max_memory_bytes: 1_048_576,
             max_expression_nodes: 200_000,
             serve_read_only_when_suppressed: false,
+            prove_read_only_when_suppressed: true,
         }
     }
 }
@@ -109,6 +150,13 @@ pub struct SymbolicVmExecutionReport {
     /// True when a suppressed constant read was served from a read-only
     /// file-backed page; the CFG records `AssumesImageProtectionStable`.
     pub served_read_only_image: bool,
+    /// True once a native call that is not a trusted allocation contract has run
+    /// on this path since VM entry: the callee could change page protections.
+    /// While false, no instruction on the path can make a non-writable image
+    /// page writable, so a store can never alter a declared read-only page
+    /// (it faults) and such pages are served from the file even after an
+    /// external store, with no assumption. Carried across blocks; OR-merged.
+    pub protection_may_have_changed: bool,
     /// True when a value derived from `vsp_initial` was stored to an address that
     /// is not a tracked VM-stack cell, or passed to a native call as target or
     /// argument: the frame address may then be reachable from outside the VM.
@@ -156,6 +204,8 @@ pub struct SymbolicVmInitialState {
     /// successor block so its image-source reads stay withheld after a narrowed
     /// external store.
     pub image_reads_suppressed: bool,
+    /// See `SymbolicVmExecutionReport::protection_may_have_changed`.
+    pub protection_may_have_changed: bool,
     pub next_native_call_epoch: u64,
     pub fresh_allocations: Vec<SymbolicFreshAllocation>,
 }
@@ -170,6 +220,7 @@ impl Default for SymbolicVmInitialState {
             memory_epoch: 0,
             memory_tainted: false,
             image_reads_suppressed: false,
+            protection_may_have_changed: false,
             next_native_call_epoch: 0,
             fresh_allocations: Vec::new(),
         }
@@ -206,6 +257,7 @@ impl SymbolicVmInitialState {
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
             image_reads_suppressed: self.image_reads_suppressed,
+            protection_may_have_changed: self.protection_may_have_changed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self
                 .fresh_allocations
@@ -236,6 +288,7 @@ impl SymbolicVmExecutionReport {
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
             image_reads_suppressed: self.image_reads_suppressed,
+            protection_may_have_changed: self.protection_may_have_changed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self.fresh_allocations.clone(),
         }
@@ -294,6 +347,14 @@ pub trait SymbolicMemorySource {
     /// immune to stores, provided the page protection never changes.
     fn read_only_byte(&self, _address: Va) -> Option<u8> {
         None
+    }
+
+    /// PROOF that nothing in the analyzed image can change page protection (see
+    /// `image_cannot_reprotect`). While true and no call on the path can either,
+    /// a non-writable page keeps its loader protection, so no store can alter
+    /// it. The default `false` keeps every serve a labeled assumption.
+    fn protection_stability_proven(&self) -> bool {
+        false
     }
 
     fn resolve_native_call_import(&self, _target: u64) -> Option<NativeCallImportResolution> {
@@ -431,7 +492,10 @@ struct SymbolicMachine<'a> {
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
     serve_read_only_when_suppressed: bool,
+    prove_read_only_when_suppressed: bool,
     served_read_only_image: bool,
+    protection_may_have_changed: bool,
+    image_protection_stable_cache: Option<bool>,
     vm_stack_address_escapes: bool,
     vm_stack_derived_escapes: bool,
     vm_stack_pointer_lost: bool,
@@ -519,7 +583,10 @@ impl<'a> SymbolicMachine<'a> {
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
+            prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
             served_read_only_image: false,
+            protection_may_have_changed: initial.protection_may_have_changed,
+            image_protection_stable_cache: None,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,
@@ -574,6 +641,13 @@ impl<'a> SymbolicMachine<'a> {
         self.store_memory(&address, value)
     }
 
+    fn image_protection_stable(&mut self) -> bool {
+        let source = self.memory_source;
+        *self.image_protection_stable_cache.get_or_insert_with(|| {
+            source.is_some_and(|source| source.protection_stability_proven())
+        })
+    }
+
     fn load_memory(&mut self, address: Expr, width: BitWidth) -> Result<Expr, String> {
         let address = canonicalize_pointer(address);
         let mut bytes = Vec::with_capacity(width.bytes() as usize);
@@ -611,6 +685,7 @@ impl<'a> SymbolicMachine<'a> {
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else if let Some(byte) = image_byte {
                     all_unknown = false;
+                    note_served_read(value, SERVED_UNSUPPRESSED);
                     self.resolved_image_addresses.insert(byte_va);
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else {
@@ -621,6 +696,23 @@ impl<'a> SymbolicMachine<'a> {
                     ));
                 }
             } else if let ExprKind::Const { value } = byte_address.kind
+                && self.prove_read_only_when_suppressed
+                && self.image_reads_suppressed
+                && !self.protection_may_have_changed
+                && !self.memory_tainted
+                && self.image_protection_stable()
+                && let Some(byte) = self
+                    .memory_source
+                    .and_then(|source| source.read_only_byte(Va(value)))
+            {
+                // PROVEN: only a non-writable file-backed page reaches here, and no
+                // instruction on this path since VM entry can have changed page
+                // protection, so an external store cannot have altered it.
+                all_unknown = false;
+                note_served_read(value, SERVED_PROVEN_SUPPRESSED);
+                self.resolved_image_addresses.insert(Va(value));
+                bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value } = byte_address.kind
                 && self.serve_read_only_when_suppressed
                 && !self.memory_tainted
                 && let Some(byte) = self
@@ -629,6 +721,7 @@ impl<'a> SymbolicMachine<'a> {
             {
                 all_unknown = false;
                 self.served_read_only_image = true;
+                note_served_read(value, SERVED_LABELED_SUPPRESSED);
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else {
@@ -939,6 +1032,7 @@ impl<'a> SymbolicMachine<'a> {
 
         match &applied.memory {
             NativeCallMemoryDecision::HavocTracked { reason } => {
+                self.protection_may_have_changed = true;
                 self.advance_memory_epoch()?;
                 self.retain_memory(|_| false);
                 self.memory_tainted = false;
@@ -955,7 +1049,9 @@ impl<'a> SymbolicMachine<'a> {
                     cause: reason.clone(),
                 });
             }
-            NativeCallMemoryDecision::PreserveTracked => {}
+            NativeCallMemoryDecision::PreserveTracked => {
+                self.protection_may_have_changed = true;
+            }
             NativeCallMemoryDecision::PreserveTrackedAndCreateFreshAllocation {
                 allocation,
                 size,
@@ -2409,6 +2505,7 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
         served_read_only_image: machine.served_read_only_image,
+        protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
         vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
         vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
@@ -2508,6 +2605,7 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
         served_read_only_image: machine.served_read_only_image,
+        protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
         vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
         vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
@@ -2568,6 +2666,7 @@ mod tests {
             memory_epoch: 3,
             memory_tainted: false,
             image_reads_suppressed: false,
+            protection_may_have_changed: true,
             next_native_call_epoch: 5,
             fresh_allocations: vec![SymbolicFreshAllocation {
                 allocation: dependency.clone(),
@@ -2583,6 +2682,7 @@ mod tests {
             )]))
             .expect("replacement width matches");
         assert_eq!(specialized.vsp, constant);
+        assert!(specialized.protection_may_have_changed);
         assert!(
             specialized
                 .context_values
@@ -4036,6 +4136,7 @@ mod tests {
         let data = Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA);
         let suppressed = SymbolicVmInitialState {
             image_reads_suppressed: true,
+            protection_may_have_changed: true,
             ..SymbolicVmInitialState::default()
         };
         let mut off = SymbolicMachine::new(
@@ -4063,6 +4164,83 @@ mod tests {
         let value = writable.load_memory(data, BitWidth::W32).expect("load");
         assert!(!matches!(value.kind, ExprKind::Const { .. }));
         assert!(!writable.served_read_only_image);
+    }
+
+    // After an external store, a declared read-only page is served PROVEN (no
+    // assumption flag) while no non-allocation call has run on the path; an
+    // opaque native call (which may change protection) withdraws the proof.
+    #[test]
+    fn suppressed_read_only_page_is_proven_until_a_call_may_reprotect() {
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = crate::ReadOnlyImage(&pe);
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let data = Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA);
+        let mut machine = SymbolicMachine::new(
+            &SymbolicVmInitialState::default(),
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        machine
+            .store_external(
+                1,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("external store");
+        assert!(machine.image_reads_suppressed);
+        let value = machine
+            .load_memory(rdata.clone(), BitWidth::W32)
+            .expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(!machine.served_read_only_image, "proven serve carries no assumption");
+        let writable = machine.load_memory(data, BitWidth::W32).expect("load");
+        assert!(!matches!(writable.kind, ExprKind::Const { .. }));
+
+        machine.protection_may_have_changed = true;
+        let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+        assert!(machine.protection_may_have_changed && machine.image_reads_suppressed);
+    }
+
+    // Without a whole-image proof that protection cannot change, the in-path
+    // proof alone is not enough: nothing is served unless the labeled flag is on.
+    #[test]
+    fn unwitnessed_image_is_never_served_as_proven() {
+        struct Unwitnessed<'a, 'data>(crate::ReadOnlyImage<'a, 'data>);
+        impl SymbolicMemorySource for Unwitnessed<'_, '_> {
+            fn read_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_byte(address)
+            }
+            fn read_only_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_only_byte(address)
+            }
+        }
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = Unwitnessed(crate::ReadOnlyImage(&pe));
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let suppressed = SymbolicVmInitialState {
+            image_reads_suppressed: true,
+            ..SymbolicVmInitialState::default()
+        };
+        let mut machine = SymbolicMachine::new(
+            &suppressed,
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        let value = machine.load_memory(rdata.clone(), BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+        let labeled = SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let mut machine = SymbolicMachine::new(&suppressed, Some(&source), labeled).expect("state");
+        let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(machine.served_read_only_image, "served only as a labeled assumption");
     }
 
     #[test]
