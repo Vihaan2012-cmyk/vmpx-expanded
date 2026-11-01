@@ -22,6 +22,11 @@
 //!   range is restricted to `[0, 2^span)` (see [`flags_cover_in`]);
 //! * a register observed through complements, constant shifts, masks and or-masks
 //!   only, which depends on exactly the bits those select ([`demanded_bits`]).
+//!   A `x86_double_shift_{left,right}_wN_*` (SHLD/SHRD) by a constant byte count is
+//!   a fixed bit permutation of its two operands, so it is one more such step
+//!   (see [`double_shift_demand`]); beneath it a constant addend demands bits
+//!   `0..=i` of its operand. Any other double shift is a pure function of its
+//!   operands and adds no observation of its own, like the logical flags words.
 //!
 //! A `memory_load_epoch_N(address)` read that no tracked store covers is an
 //! unconstrained value: it is replaced by a free register named after the read
@@ -595,6 +600,13 @@ fn sign_order_cover(register_bits: u32, bits: u32) -> Vec<u64> {
 /// masks, or-masks, xor, extracts and zero extension only. Every other bit of
 /// the register is irrelevant to those result bits.
 fn demanded_bits(expr: &Expr, demand: u64) -> Option<(&str, BitWidth, u64)> {
+    demanded_bits_in(expr, demand, false)
+}
+
+/// [`demanded_bits`], which also looks through a double shift of one register
+/// (see [`double_shift_demand`]). Beneath a double shift (`arith`) a constant
+/// addend is also modelled: bit `i` of `x ± c` is a function of bits `0..=i` of `x`.
+fn demanded_bits_in(expr: &Expr, demand: u64, arith: bool) -> Option<(&str, BitWidth, u64)> {
     let demand = demand & mask(expr.width.bits());
     match &expr.kind {
         ExprKind::Register { name } => Some((name, expr.width, demand)),
@@ -605,8 +617,26 @@ fn demanded_bits(expr: &Expr, demand: u64) -> Option<(&str, BitWidth, u64)> {
         | ExprKind::Resize {
             op: ResizeOp::Truncate | ResizeOp::ZeroExtend,
             value,
-        } => demanded_bits(value, demand),
-        ExprKind::Extract { value, lsb } if *lsb < 64 => demanded_bits(value, demand << lsb),
+        } => demanded_bits_in(value, demand, arith),
+        ExprKind::Extract { value, lsb } if *lsb < 64 => {
+            demanded_bits_in(value, demand << lsb, arith)
+        }
+        ExprKind::Intrinsic { name, arguments } => {
+            let parts = double_shift_demand(expr, name, arguments, demand)?
+                .into_iter()
+                .filter(|(_, bits)| *bits != 0)
+                .map(|(operand, bits)| demanded_bits_in(operand, bits, true))
+                .collect::<Option<Vec<_>>>()?;
+            let ((register, width, first), rest) = parts.split_first()?;
+            let mut union = *first;
+            for (other, other_width, bits) in rest {
+                if other != register || other_width != width {
+                    return None;
+                }
+                union |= bits;
+            }
+            Some((register, *width, union))
+        }
         ExprKind::Binary { op, left, right } => {
             let (inner, c) = match (constant_of(left), constant_of(right)) {
                 (None, Some(c)) => (left, c),
@@ -616,16 +646,94 @@ fn demanded_bits(expr: &Expr, demand: u64) -> Option<(&str, BitWidth, u64)> {
                 _ => return None,
             };
             match op {
-                BinaryOp::Shr if c < 64 => demanded_bits(inner, demand << c),
-                BinaryOp::Shl if c < 64 => demanded_bits(inner, demand >> c),
-                BinaryOp::And => demanded_bits(inner, demand & c),
-                BinaryOp::Or => demanded_bits(inner, demand & !c),
-                BinaryOp::Xor => demanded_bits(inner, demand),
+                BinaryOp::Shr if c < 64 => demanded_bits_in(inner, demand << c, arith),
+                BinaryOp::Shl if c < 64 => demanded_bits_in(inner, demand >> c, arith),
+                BinaryOp::And => demanded_bits_in(inner, demand & c, arith),
+                BinaryOp::Or => demanded_bits_in(inner, demand & !c, arith),
+                BinaryOp::Xor => demanded_bits_in(inner, demand, arith),
+                BinaryOp::Add | BinaryOp::Sub if arith => {
+                    demanded_bits_in(inner, through_msb(demand), arith)
+                }
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Every bit from 0 up to the highest set bit of `demand`.
+fn through_msb(demand: u64) -> u64 {
+    mask(64 - demand.leading_zeros())
+}
+
+/// `(left, bits)` of a `x86_double_shift_{left,right}_wN_<instruction>` intrinsic
+/// (SHLD / SHRD), whose value is a pure function of its three operands.
+fn double_shift_shape(name: &str) -> Option<(bool, u32)> {
+    let rest = name.strip_prefix("x86_double_shift_")?;
+    let (left, rest) = match rest.strip_prefix("left_w") {
+        Some(rest) => (true, rest),
+        None => (false, rest.strip_prefix("right_w")?),
+    };
+    let (bits, index) = rest.split_once('_')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match bits {
+        "16" => Some((left, 16)),
+        "32" => Some((left, 32)),
+        "64" => Some((left, 64)),
+        _ => None,
+    }
+}
+
+/// The bits of the destination and source operands of a double shift by a
+/// constant count that the `demand`ed result bits are a function of.
+///
+/// For a count `c` in `1..=N` the result of `shld(d, s, c)` is `d << c | s >> (N - c)`
+/// and of `shrd(d, s, c)` is `d >> c | s << (N - c)` (counts are masked to 5 bits,
+/// 6 for 64-bit operands, and a count of 0 returns `d`). Both are fixed bit
+/// permutations of the two operands, so result bit `i` is exactly one operand
+/// bit. A count above the operand width is architecturally undefined and refused.
+fn double_shift_demand<'a>(
+    expr: &Expr,
+    name: &str,
+    arguments: &'a [Expr],
+    demand: u64,
+) -> Option<[(&'a Expr, u64); 2]> {
+    let (left, bits) = double_shift_shape(name)?;
+    let [destination, source, count] = arguments else {
+        return None;
+    };
+    if expr.width.bits() != bits
+        || destination.width.bits() != bits
+        || source.width.bits() != bits
+        || count.width != BitWidth::W8
+    {
+        return None;
+    }
+    let count = u32::try_from(constant_of(count)? & if bits == 64 { 0x3F } else { 0x1F }).ok()?;
+    if count > bits {
+        return None;
+    }
+    let demand = demand & mask(bits);
+    if count == 0 {
+        return Some([(destination, demand), (source, 0)]);
+    }
+    let (from_destination, from_source) = if left {
+        // result[i] = d[i - c] for i >= c, s[N - c + i] for i < c.
+        (demand >> count, (demand & mask(count)) << (bits - count))
+    } else {
+        // result[i] = d[i + c] for i < N - c, s[i - (N - c)] for i >= N - c.
+        (
+            (demand & mask(bits - count)) << count,
+            demand >> (bits - count),
+        )
+    };
+    Some([(destination, from_destination), (source, from_source)])
+}
+
+fn is_pure_double_shift(name: &str) -> bool {
+    double_shift_shape(name).is_some()
 }
 
 /// Two distinct full-width registers whose `vm_flags_subN` word is observed only
@@ -744,7 +852,9 @@ impl Scan {
                     self.note_width(name, value.width);
                     let uses = self.uses.entry(name.clone()).or_default();
                     uses.direct_mask |= mask(expr.width.bits());
-                } else {
+                } else if !(matches!(value.kind, ExprKind::Intrinsic { .. })
+                    && self.visit_demand(expr))
+                {
                     self.visit(value);
                 }
             }
@@ -764,6 +874,18 @@ impl Scan {
                     // register only through the bits the operands observe.
                     for argument in arguments {
                         self.visit(argument);
+                    }
+                    return;
+                }
+                if is_pure_double_shift(name) {
+                    // A fixed bit permutation of its operands (see
+                    // `double_shift_demand`): the register bits it observes are
+                    // the demanded ones when those are one register's, else
+                    // everything the operands observe.
+                    if !self.visit_demand(expr) {
+                        for argument in arguments {
+                            self.visit(argument);
+                        }
                     }
                     return;
                 }
@@ -1984,8 +2106,8 @@ mod tests {
         );
         let (_, reason) = unsupported_reason(&opaque, limits);
         assert!(reason.contains("other than add flags"), "{reason}");
-        // A double shift of a wide read is not affine (the bit it carries across
-        // the operands breaks any cell cover): it stays refused, not guessed.
+        // A double shift of a wide read whose whole result is observed depends on
+        // all 32 bits of the read: it stays refused, not guessed.
         let read = stack_load(1, 8);
         let shrd = Expr::intrinsic(
             BitWidth::W32,
@@ -1993,11 +2115,11 @@ mod tests {
             vec![
                 Expr::resize(ResizeOp::Truncate, BitWidth::W32, read.clone()).expect("t"),
                 Expr::resize(ResizeOp::Truncate, BitWidth::W32, read).expect("t"),
-                Expr::constant(BitWidth::W32, 1),
+                Expr::constant(BitWidth::W8, 1),
             ],
         );
         let (_, reason) = unsupported_reason(&shrd, limits);
-        assert!(reason.contains("other than add flags"), "{reason}");
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
         // Flags observed at two widths on one register.
         let mixed = Expr::binary(
             BinaryOp::Add,
@@ -2832,5 +2954,414 @@ mod tests {
         assert_eq!(leaf("constant_global", 0).constant_address, Some(0x2000));
         leaf("native_register", 0);
         assert_eq!(leaf("vsp", 1).vsp_offset, Some(16));
+    }
+
+    // ---- double shifts (SHLD / SHRD) by a constant count ----
+
+    fn dshift(left: bool, bits: u32, destination: Expr, source: Expr, count: u64) -> Expr {
+        Expr::intrinsic(
+            BitWidth::from_bits(bits).expect("width"),
+            format!(
+                "x86_double_shift_{}_w{bits}_7",
+                if left { "left" } else { "right" }
+            ),
+            vec![destination, source, Expr::constant(BitWidth::W8, count)],
+        )
+    }
+
+    fn const_value(expr: &Expr) -> u64 {
+        match expr.simplify().kind {
+            ExprKind::Const { value } => value,
+            other => panic!("not concrete: {other:?}"),
+        }
+    }
+
+    fn trunc8(value: Expr) -> Expr {
+        Expr::resize(ResizeOp::Truncate, BitWidth::W8, value).expect("trunc")
+    }
+
+    /// `base + zext64(value)`: a computed branch target that observes `value`.
+    fn target_of(value: Expr) -> Expr {
+        Expr::binary(
+            BinaryOp::Add,
+            Expr::constant(BitWidth::W64, 0x1_4000_1000),
+            zext(64, value),
+        )
+        .expect("add")
+    }
+
+    fn eval_target(target: &Expr, assignments: &[(&str, u64, u32)]) -> u64 {
+        let replacements: BTreeMap<String, Expr> = assignments
+            .iter()
+            .map(|(name, value, bits)| {
+                (
+                    (*name).to_owned(),
+                    Expr::constant(BitWidth::from_bits(*bits).expect("width"), *value),
+                )
+            })
+            .collect();
+        const_value(&target.substitute(&replacements).expect("substitute"))
+    }
+
+    #[test]
+    fn double_shift_demand_is_an_exact_bit_permutation() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for (left, bits, counts) in [
+            (true, 16, (0..=16).collect::<Vec<u32>>()),
+            (false, 16, (0..=16).collect()),
+            (true, 32, vec![0, 1, 2, 7, 8, 16, 24, 31]),
+            (false, 32, vec![0, 1, 2, 7, 8, 16, 24, 31]),
+            (true, 64, vec![0, 1, 2, 31, 32, 33, 63]),
+            (false, 64, vec![0, 1, 2, 31, 32, 33, 63]),
+        ] {
+            let m = mask(bits);
+            let (d, s) = (reg(bits, "d"), reg(bits, "s"));
+            for count in counts {
+                let probe = dshift(left, bits, d.clone(), s.clone(), u64::from(count));
+                let ExprKind::Intrinsic { name, arguments } = &probe.kind else {
+                    panic!("symbolic operands must stay an intrinsic");
+                };
+                let run = |dv: u64, sv: u64| {
+                    let concrete = dshift(
+                        left,
+                        bits,
+                        Expr::constant(BitWidth::from_bits(bits).expect("w"), dv),
+                        Expr::constant(BitWidth::from_bits(bits).expect("w"), sv),
+                        u64::from(count),
+                    );
+                    const_value(&concrete)
+                };
+                // Single output bits: exactly one operand bit, and it flips the output.
+                for out_bit in 0..bits {
+                    let [(_, dd), (_, ss)] =
+                        double_shift_demand(&probe, name, arguments, 1 << out_bit).expect("model");
+                    assert_eq!((dd | ss).count_ones(), 1, "{left} w{bits} c{count} bit{out_bit}");
+                    assert_eq!(dd & ss, 0);
+                    for _ in 0..4 {
+                        let (dv, sv) = (xorshift(&mut state) & m, xorshift(&mut state) & m);
+                        let base = run(dv, sv);
+                        let flipped = run(dv ^ dd, sv ^ ss);
+                        assert_eq!(
+                            (base ^ flipped) & (1 << out_bit),
+                            1 << out_bit,
+                            "{left} w{bits} c{count} bit{out_bit}"
+                        );
+                        // Flipping every other operand bit leaves the bit alone.
+                        let other = run(dv ^ (m & !dd), sv ^ (m & !ss));
+                        assert_eq!((base ^ other) & (1 << out_bit), 0);
+                    }
+                }
+                // Arbitrary demand: outputs depend only on the demanded operand bits.
+                for _ in 0..16 {
+                    let demand = xorshift(&mut state) & m;
+                    let [(_, dd), (_, ss)] =
+                        double_shift_demand(&probe, name, arguments, demand).expect("model");
+                    let (dv, sv) = (xorshift(&mut state) & m, xorshift(&mut state) & m);
+                    let (dn, sn) = (xorshift(&mut state) & m, xorshift(&mut state) & m);
+                    let (dw, sw) = ((dv & dd) | (dn & !dd), (sv & ss) | (sn & !ss));
+                    assert_eq!(run(dv, sv) & demand, run(dw, sw) & demand);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn double_shift_demand_refuses_what_it_cannot_model() {
+        let (d, s) = (reg(16, "d"), reg(16, "s"));
+        // A 16-bit count above the width is architecturally undefined.
+        let over = dshift(true, 16, d.clone(), s.clone(), 17);
+        let ExprKind::Intrinsic { name, arguments } = &over.kind else {
+            panic!("intrinsic")
+        };
+        assert!(double_shift_demand(&over, name, arguments, 0xFF).is_none());
+        // A count that is not a constant byte.
+        let variable = Expr::intrinsic(
+            BitWidth::W16,
+            "x86_double_shift_left_w16_7",
+            vec![d.clone(), s.clone(), reg(8, "c")],
+        );
+        let ExprKind::Intrinsic { name, arguments } = &variable.kind else {
+            panic!("intrinsic")
+        };
+        assert!(double_shift_demand(&variable, name, arguments, 0xFF).is_none());
+        // A count that is not a byte.
+        let wide_count = Expr::intrinsic(
+            BitWidth::W16,
+            "x86_double_shift_left_w16_7",
+            vec![d, s, Expr::constant(BitWidth::W32, 1)],
+        );
+        let ExprKind::Intrinsic { name, arguments } = &wide_count.kind else {
+            panic!("intrinsic")
+        };
+        assert!(double_shift_demand(&wide_count, name, arguments, 0xFF).is_none());
+        // Only the architectural names are double shifts.
+        for name in [
+            "x86_double_shift_left_w24_7",
+            "x86_double_shift_left_w32_",
+            "x86_double_shift_left_w32_x",
+            "x86_double_shift_sideways_w32_7",
+            "vm_flags_double_shift_left_w32_7",
+            "native_call_return_epoch_1",
+        ] {
+            assert!(!is_pure_double_shift(name), "{name}");
+        }
+        assert!(is_pure_double_shift("x86_double_shift_right_w64_200"));
+    }
+
+    /// Checks `target` against its domains: the domain image is a superset of the
+    /// image over `samples` full-width values, and the target is a function of the
+    /// masked bits alone.
+    fn assert_demanded_cover(target: &Expr, register: &str, bits: u32, observed: u64) {
+        let inferred = infer_branch_input_domains(target, InputDomainLimits::default())
+            .expect("bounded by the demanded bits");
+        assert_eq!(
+            inferred.certificates[register],
+            DomainCertificate::MaskedExhaustive { mask: observed }
+        );
+        assert_eq!(
+            inferred.domains[register].len(),
+            1 << observed.count_ones()
+        );
+        let report = crate::enumerate_symbolic_value(
+            target,
+            &inferred.domains,
+            crate::SymbolicDomainLimits {
+                max_values_per_variable: 4_096,
+                ..crate::SymbolicDomainLimits::default()
+            },
+        )
+        .expect("enumerates");
+        assert!(report.complete);
+        let m = mask(bits);
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        // Exhaustive over the demanded bits, with random values elsewhere.
+        for sub in submasks(observed, InputDomainLimits::default()).expect("submasks") {
+            for _ in 0..3 {
+                let x = (sub | (xorshift(&mut state) & !observed)) & m;
+                let value = eval_target(target, &[(register, x, bits)]);
+                assert_eq!(value, eval_target(target, &[(register, sub, bits)]), "x={x:#x}");
+                assert!(report.unique_values.contains(&value), "x={x:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn rotate_of_a_wide_read_is_bounded_by_the_demanded_bits() {
+        let r = reg(32, "native_rcx_initial");
+        let not_r = Expr::unary(UnaryOp::Not, r.clone());
+        // shrd(~r, r + k, 1), low byte: output bits 0..7 are bits 1..8 of ~r.
+        let plus = Expr::binary(
+            BinaryOp::Add,
+            r.clone(),
+            Expr::constant(BitWidth::W32, 0x1234_5679),
+        )
+        .expect("add");
+        let low = target_of(trunc8(dshift(false, 32, not_r.clone(), plus.clone(), 1)));
+        assert_demanded_cover(&low, "native_rcx_initial", 32, 0x1FE);
+        // The top byte also takes source bit 0 (the carried-in bit) of `r + k`,
+        // which is bit 0 of `r` however large the addend.
+        let top = Expr::extract(
+            BitWidth::W8,
+            24,
+            dshift(false, 32, not_r, plus, 1),
+        )
+        .expect("extract");
+        assert_demanded_cover(&target_of(top), "native_rcx_initial", 32, 0xFE00_0001);
+        // shld(r, ~r, 3), low byte: bits 3..7 from `r`, bits 0..2 from `~r[29..32]`.
+        let left = dshift(
+            true,
+            32,
+            r.clone(),
+            Expr::unary(UnaryOp::Not, r.clone()),
+            3,
+        );
+        assert_demanded_cover(
+            &target_of(trunc8(left)),
+            "native_rcx_initial",
+            32,
+            0xE000_001F,
+        );
+        // Add of a constant propagates demand through the carry chain: output
+        // bits 3..7 of shld(r + k, r, 3) need bits 0..=4 of `r + k`.
+        let plus_k = Expr::binary(
+            BinaryOp::Add,
+            r.clone(),
+            Expr::constant(BitWidth::W32, 0xFFFF_FFFB),
+        )
+        .expect("add");
+        assert_demanded_cover(
+            &target_of(trunc8(dshift(true, 32, plus_k.clone(), r.clone(), 3))),
+            "native_rcx_initial",
+            32,
+            0xE000_001F,
+        );
+        // The same add under a rotate right by 4 needs bits 0..=11: twelve bits,
+        // beyond the exhaustive width, so it stays refused.
+        let wide = target_of(trunc8(dshift(false, 32, plus_k, r, 4)));
+        let (_, reason) = unsupported_reason(&wide, InputDomainLimits::default());
+        assert!(reason.contains("beyond the exhaustive width"), "{reason}");
+    }
+
+    #[test]
+    fn rotate_of_a_sixty_four_bit_read_is_bounded_by_the_demanded_bits() {
+        let r = reg(64, "native_rax_initial");
+        let rotated = dshift(true, 64, r.clone(), r, 1);
+        // Low byte of shld(r, r, 1): bits 1..7 are r[0..6], bit 0 is r[63].
+        assert_demanded_cover(
+            &target_of(trunc8(rotated)),
+            "native_rax_initial",
+            64,
+            0x8000_0000_0000_007F,
+        );
+    }
+
+    #[test]
+    fn rotate_of_a_byte_splat_resolves_over_the_two_input_bytes() {
+        // The shape the sweep meets: a byte of two inputs is splatted across a
+        // dword, rotated by one through SHLD, and only its low byte is observed.
+        let (x, y) = (reg(8, "memory_load_epoch_43@x"), reg(8, "native_r13_initial"));
+        let w = Expr::binary(
+            BinaryOp::Add,
+            Expr::binary(BinaryOp::Or, Expr::unary(UnaryOp::Not, x), y).expect("or"),
+            Expr::constant(BitWidth::W8, 0x35),
+        )
+        .expect("add");
+        let splat16 = Expr::binary(
+            BinaryOp::Add,
+            Expr::binary(
+                BinaryOp::Shl,
+                zext(16, w.clone()),
+                Expr::constant(BitWidth::W16, 8),
+            )
+            .expect("shl"),
+            zext(16, w),
+        )
+        .expect("add");
+        let splat32 = Expr::concat(splat16.clone(), splat16).expect("concat");
+        let rotated = dshift(true, 32, splat32.clone(), splat32, 1);
+        let low = trunc8(Expr::extract(BitWidth::W16, 0, rotated).expect("extract"));
+        let target = target_of(low);
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("two bytes are observed");
+        for register in ["memory_load_epoch_43@x", "native_r13_initial"] {
+            assert_eq!(inferred.domains[register].len(), 256, "{register}");
+            assert_eq!(
+                inferred.certificates[register],
+                DomainCertificate::Exhaustive { bits: 8 }
+            );
+        }
+        // The cross product (65536 > the default 4096 combinations) is the next
+        // gate, and it is a limit the enumerator reports, not a guess.
+        assert!(matches!(
+            crate::enumerate_symbolic_value(
+                &target,
+                &inferred.domains,
+                crate::SymbolicDomainLimits {
+                    max_values_per_variable: 4_096,
+                    ..crate::SymbolicDomainLimits::default()
+                },
+            ),
+            Err(crate::SymbolicDomainError::CombinationLimit { .. })
+        ));
+        // With the product allowed the image equals the native rotate-by-one model.
+        let report = crate::enumerate_symbolic_value(
+            &target,
+            &inferred.domains,
+            crate::SymbolicDomainLimits {
+                max_values_per_variable: 4_096,
+                max_combinations: 70_000,
+                ..crate::SymbolicDomainLimits::default()
+            },
+        )
+        .expect("enumerates");
+        assert!(report.complete);
+        let mut expected = BTreeSet::new();
+        for a in 0..=255_u8 {
+            for b in 0..=255_u8 {
+                let w = (!a | b).wrapping_add(0x35);
+                expected.insert(0x1_4000_1000 + u64::from(w.rotate_left(1)));
+            }
+        }
+        assert_eq!(
+            report.unique_values.iter().copied().collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn double_shift_of_distinct_registers_is_covered_by_their_observed_bits() {
+        // Two distinct byte registers: the demanded model cannot name one
+        // register, so every observed byte is enumerated.
+        let (x, y) = (reg(8, "native_rcx_initial"), reg(8, "native_rdx_initial"));
+        let shifted = dshift(true, 32, zext(32, x), zext(32, y), 3);
+        let target = target_of(trunc8(shifted));
+        let inferred = infer_branch_input_domains(&target, InputDomainLimits::default())
+            .expect("two bytes");
+        assert_eq!(inferred.domains["native_rcx_initial"].len(), 256);
+        assert_eq!(inferred.domains["native_rdx_initial"].len(), 256);
+        let mut state = 0xA076_1D64_78BD_642F_u64;
+        for _ in 0..2_000 {
+            let (a, b) = (xorshift(&mut state) & 0xFF, xorshift(&mut state) & 0xFF);
+            let value = eval_target(
+                &target,
+                &[("native_rcx_initial", a, 8), ("native_rdx_initial", b, 8)],
+            );
+            let model = ((u32::try_from(a).expect("byte") << 3) | (u32::try_from(b).expect("byte") >> 29)) & 0xFF;
+            assert_eq!(value, 0x1_4000_1000 + u64::from(model));
+        }
+    }
+
+    #[test]
+    fn double_shifts_the_model_cannot_bound_stay_refused() {
+        let limits = InputDomainLimits::default();
+        let r = reg(32, "native_rcx_initial");
+        // The whole result observed: all 32 bits of the read.
+        let whole = target_of(dshift(false, 32, r.clone(), r.clone(), 1));
+        assert!(unsupported_reason(&whole, limits).1.contains("beyond the exhaustive width"));
+        // A 16-bit field of the result: 16 distinct read bits.
+        let field = Expr::extract(BitWidth::W16, 0, dshift(false, 32, r.clone(), r.clone(), 1))
+            .expect("extract");
+        assert!(
+            unsupported_reason(&target_of(field), limits)
+                .1
+                .contains("beyond the exhaustive width")
+        );
+        // A variable count is not a permutation the model fixes: the read stays whole.
+        let variable = Expr::intrinsic(
+            BitWidth::W32,
+            "x86_double_shift_left_w32_7",
+            vec![r.clone(), r.clone(), reg(8, "native_rdx_initial")],
+        );
+        assert!(
+            unsupported_reason(&target_of(trunc8(variable)), limits)
+                .1
+                .contains("beyond the exhaustive width")
+        );
+        // Not a double shift by name: an opaque intrinsic is never a pure function.
+        for name in ["x86_double_shift_left_w32_x", "x86_double_shift_left_w24_7"] {
+            let opaque = Expr::intrinsic(
+                BitWidth::W32,
+                name,
+                vec![reg(8, "native_rcx_initial"), Expr::constant(BitWidth::W8, 1)],
+            );
+            let (_, reason) = unsupported_reason(&target_of(trunc8(opaque)), limits);
+            assert!(reason.contains("other than add flags"), "{name}: {reason}");
+        }
+        // An undefined 16-bit count is inferred over its operands but never folds
+        // to a value, so the enumerator fails closed.
+        let b = reg(8, "native_rcx_initial");
+        let undefined = target_of(trunc8(dshift(true, 16, zext(16, b.clone()), zext(16, b), 17)));
+        let inferred = infer_branch_input_domains(&undefined, limits).expect("one byte");
+        assert!(matches!(
+            crate::enumerate_symbolic_value(
+                &undefined,
+                &inferred.domains,
+                crate::SymbolicDomainLimits {
+                    max_values_per_variable: 4_096,
+                    ..crate::SymbolicDomainLimits::default()
+                },
+            ),
+            Err(crate::SymbolicDomainError::NonConcreteResult)
+        ));
     }
 }
