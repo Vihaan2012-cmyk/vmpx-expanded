@@ -27,6 +27,7 @@ pub struct ReportOptions {
     pub threads: usize,
     pub instruction_limit: usize,
     pub dynamic: bool,
+    pub serve_ro: bool,
 }
 
 impl ReportOptions {
@@ -40,6 +41,7 @@ impl ReportOptions {
             threads: threads.max(1),
             instruction_limit: 512,
             dynamic,
+            serve_ro: false,
         }
     }
 }
@@ -133,10 +135,14 @@ enum Outcome {
     Panic,
 }
 
-fn cfg_limits(instruction_limit: usize) -> VmCfgLimits {
+fn cfg_limits(instruction_limit: usize, serve_ro: bool) -> VmCfgLimits {
     VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
             instruction_limit,
+            symbolic: vmpx_vm::SymbolicExecutionLimits {
+                serve_read_only_when_suppressed: serve_ro,
+                ..vmpx_vm::SymbolicExecutionLimits::default()
+            },
             ..EntryProfileRecoveryLimits::default()
         },
         ..VmCfgLimits::default()
@@ -164,7 +170,7 @@ fn recover_all(
         return Vec::new();
     }
     let chunk = entries.len().div_ceil(opts.threads).max(1);
-    let limits = cfg_limits(opts.instruction_limit);
+    let limits = cfg_limits(opts.instruction_limit, opts.serve_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
     let out = std::thread::scope(|scope| {

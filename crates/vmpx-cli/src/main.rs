@@ -115,6 +115,11 @@ enum Command {
         /// value). Use it to keep runtime-rewritten pages out of the proven tier.
         #[arg(long)]
         volatility_snapshot: Option<PathBuf>,
+        /// Labeled OPENED tier: serve unvetoed read-only image bytes under
+        /// suppression. Such entries carry an unproven assumption and never
+        /// count toward N2 PROVEN.
+        #[arg(long)]
+        serve_ro: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -1171,13 +1176,15 @@ fn main() -> Result<()> {
             threads,
             dynamic,
             volatility_snapshot,
+            serve_ro,
         } => {
             let data = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             if let Some(snapshot) = &volatility_snapshot {
                 let (ranges, bytes) = report_cmd::install_volatility_veto(&data, snapshot)?;
                 eprintln!("[report] volatility veto: {bytes} byte(s) in {ranges} range(s) differ from the post-init snapshot");
             }
-            let opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
+            let mut opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
+            opts.serve_ro = serve_ro;
             let report = report_cmd::build_report(&input.display().to_string(), &data, &opts)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
