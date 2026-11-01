@@ -217,6 +217,8 @@ struct ModEntry {
 enum SnapKind {
     Procs(Vec<crate::hostmodel::ProcEntry>),
     Mods(Vec<ModEntry>),
+    /// `(thread id, owner pid)` of the contained process's threads.
+    Threads(Vec<(u64, u64)>),
 }
 
 struct Snapshot {
@@ -815,6 +817,8 @@ impl WinApiHook {
             procs.push((crate::ntdll::FAKE_PID, crate::hostmodel::PARENT_PID, "program.exe", 4));
             procs.sort_by_key(|p| p.0);
             SnapKind::Procs(procs)
+        } else if flags == 0x4 {
+            SnapKind::Threads(vec![(crate::ntdll::FAKE_TID, crate::ntdll::FAKE_PID)])
         } else if flags & 0x18 != 0 && flags & !0x18 == 0 {
             if pid != 0 && pid != crate::ntdll::FAKE_PID {
                 self.last_error = ERROR_INVALID_PARAMETER;
@@ -825,6 +829,7 @@ impl WinApiHook {
                 None => return Dispatch::Stop,
             }
         } else {
+            self.note(&format!("UNMODELED snapshot flags={flags:#x} pid={pid:#x} (run stopped)"));
             return Dispatch::Stop;
         };
         let h = self.snap_next;
@@ -855,7 +860,7 @@ impl WinApiHook {
         let Some(snap) = self.snapshots.get_mut(&h) else {
             return err(le, ERROR_INVALID_HANDLE);
         };
-        if matches!(snap.kind, SnapKind::Mods(_)) != modules {
+        if matches!(snap.kind, SnapKind::Mods(_)) != modules || matches!(snap.kind, SnapKind::Threads(_)) {
             return err(le, ERROR_INVALID_HANDLE);
         }
         let Ok(dw_size) = mem.read_uint(out, 4) else {
@@ -891,6 +896,7 @@ impl WinApiHook {
                 b[36..40].copy_from_slice(&8u32.to_le_bytes()); // pcPriClassBase
                 put_str(&mut b, 44, name);
             }
+            SnapKind::Threads(_) => return err(le, ERROR_INVALID_HANDLE),
             SnapKind::Mods(m) => {
                 let Some(e) = m.get(idx) else {
                     return err(le, ERROR_NO_MORE_FILES);
@@ -907,6 +913,44 @@ impl WinApiHook {
             }
         }
         snap.cursor = idx + 1;
+        if mem.write(out, &b).is_err() {
+            return Dispatch::Stop;
+        }
+        Dispatch::Ret(1)
+    }
+
+    /// `Thread32First/Next` over a thread snapshot (THREADENTRY32, 28 bytes).
+    fn thread_step(&mut self, mem: &mut Memory, cpu: &Cpu, first: bool) -> Dispatch {
+        let (h, out) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
+        let fail = |this: &mut Self, e: u64| {
+            this.last_error = e;
+            Dispatch::Ret(0)
+        };
+        let Some(snap) = self.snapshots.get_mut(&h) else {
+            return fail(self, ERROR_INVALID_HANDLE);
+        };
+        let SnapKind::Threads(t) = &snap.kind else {
+            return fail(self, ERROR_INVALID_HANDLE);
+        };
+        let Ok(dw_size) = mem.read_uint(out, 4) else {
+            return Dispatch::Stop;
+        };
+        if dw_size != 28 {
+            return fail(self, ERROR_BAD_LENGTH);
+        }
+        if first {
+            snap.cursor = 0;
+        }
+        let Some(&(tid, pid)) = t.get(snap.cursor) else {
+            return fail(self, ERROR_NO_MORE_FILES);
+        };
+        snap.cursor += 1;
+        let mut b = [0u8; 28];
+        b[0..4].copy_from_slice(&28u32.to_le_bytes());
+        b[4..8].copy_from_slice(&1u32.to_le_bytes()); // cntUsage
+        b[8..12].copy_from_slice(&(tid as u32).to_le_bytes());
+        b[12..16].copy_from_slice(&(pid as u32).to_le_bytes());
+        b[16..20].copy_from_slice(&8u32.to_le_bytes()); // tpBasePri
         if mem.write(out, &b).is_err() {
             return Dispatch::Stop;
         }
@@ -1174,6 +1218,23 @@ impl WinApiHook {
 
             // Fixed monotonic clocks: a constant reading makes any elapsed-time
             // anti-debug delta zero (the no-debugger-present path). Deterministic.
+            (_, "GetSystemInfo" | "GetNativeSystemInfo") => {
+                // SYSTEM_INFO (48 bytes): x64, 4 KiB pages, 64 KiB granularity, 4 CPUs.
+                let mut b = [0u8; 48];
+                b[0..2].copy_from_slice(&9u16.to_le_bytes());
+                b[4..8].copy_from_slice(&0x1000u32.to_le_bytes());
+                b[8..16].copy_from_slice(&0x1_0000u64.to_le_bytes());
+                b[16..24].copy_from_slice(&0x7FFF_FFFE_FFFFu64.to_le_bytes());
+                b[24..32].copy_from_slice(&0xFu64.to_le_bytes());
+                b[32..36].copy_from_slice(&4u32.to_le_bytes());
+                b[36..40].copy_from_slice(&8664u32.to_le_bytes());
+                b[40..44].copy_from_slice(&0x1_0000u32.to_le_bytes());
+                b[44..46].copy_from_slice(&6u16.to_le_bytes());
+                if mem.write(Self::arg(cpu, 0), &b).is_err() {
+                    return Dispatch::Stop;
+                }
+                Dispatch::Ret(0)
+            }
             (_, "GetTickCount") => Dispatch::Ret(FIXED_TICK),
             (_, "GetTickCount64") => Dispatch::Ret(FIXED_TICK),
             // QueryPerformanceCounter(*lpPerformanceCount) -> BOOL; fixed counter.
@@ -1555,6 +1616,8 @@ impl WinApiHook {
             (_, "Module32NextW") => self.snap_step(mem, cpu, (true, true, false)),
             (_, "Module32First") => self.snap_step(mem, cpu, (true, false, true)),
             (_, "Module32Next") => self.snap_step(mem, cpu, (true, false, false)),
+            (_, "Thread32First") => self.thread_step(mem, cpu, true),
+            (_, "Thread32Next") => self.thread_step(mem, cpu, false),
 
             // PSAPI, current process only. EnumProcessModulesEx(.., dwFilterFlag):
             // default/64-bit/all filters list every module; the 32-bit filter is
@@ -1939,9 +2002,17 @@ impl WinApiHook {
         // "network access blocked: <module>!<func> — contained, air-gapped").
         // This only guards; nothing here can reach the host (no FFI/syscall path).
         if is_network_api(dll, func) {
+            self.note(&format!("NETWORK-BLOCKED {dll}!{func} (run stopped)"));
             return HookAction::Stop;
         }
         let sab = Self::stack_arg_base(ev, cpu);
+        if func.starts_with("MessageBox") {
+            let wide = func.ends_with('W');
+            let rd = |p| if wide { read_wstr(mem, p) } else { read_cstr(mem, p) };
+            let (text, cap) = (rd(Self::arg(cpu, 1)), rd(Self::arg(cpu, 2)));
+            self.note(&format!("UNMODELED {func} text={text:?} caption={cap:?} (run stopped)"));
+            return HookAction::Stop;
+        }
         if let Some(x) = self.xplm.clone() {
             let call = XCall {
                 args: [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)],
@@ -3153,15 +3224,43 @@ mod tests {
                 assert!(!n.contains(bad), "{n}");
             }
         }
-        // Wrong dwSize is rejected; the snapshot closes; a thread snapshot is unmodeled.
+        // Wrong dwSize is rejected; the snapshot closes; a heap snapshot is unmodeled.
         mem.write_uint(pe, 4, 100).unwrap();
         set_args(&mut cpu, [snap, pe, 0, 0]);
         assert_eq!(ret_of(h.dispatch("kernel32.dll", "Process32FirstW", &cpu, &mut mem, s)), 0);
         assert_eq!(h.last_error, ERROR_BAD_LENGTH);
         set_args(&mut cpu, [snap, 0, 0, 0]);
         assert_eq!(ret_of(h.dispatch("kernel32.dll", "CloseHandle", &cpu, &mut mem, s)), 1);
-        set_args(&mut cpu, [4, 0, 0, 0]);
+        set_args(&mut cpu, [1, 0, 0, 0]);
         assert!(matches!(h.dispatch("kernel32.dll", "CreateToolhelp32Snapshot", &cpu, &mut mem, s), Dispatch::Stop));
+    }
+
+    #[test]
+    fn get_system_info_fills_a_fixed_x64_struct() {
+        let (mut h, mut cpu, mut mem, s) = img_harness();
+        set_args(&mut cpu, [T_DATA, 0, 0, 0]);
+        h.dispatch("kernel32.dll", "GetSystemInfo", &cpu, &mut mem, s);
+        assert_eq!(mem.read_uint(T_DATA, 2).unwrap(), 9);
+        assert_eq!(mem.read_uint(T_DATA + 4, 4).unwrap(), 0x1000);
+        assert_eq!(mem.read_uint(T_DATA + 32, 4).unwrap(), 4);
+    }
+
+    #[test]
+    fn thread_snapshot_lists_only_the_contained_thread() {
+        let (mut h, mut cpu, mut mem, s) = img_harness();
+        let te = T_DATA;
+        set_args(&mut cpu, [4, 0, 0, 0]);
+        let snap = ret_of(h.dispatch("kernel32.dll", "CreateToolhelp32Snapshot", &cpu, &mut mem, s));
+        mem.write_uint(te, 4, 28).unwrap();
+        set_args(&mut cpu, [snap, te, 0, 0]);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "Thread32First", &cpu, &mut mem, s)), 1);
+        assert_eq!(mem.read_uint(te + 8, 4).unwrap(), crate::ntdll::FAKE_TID);
+        assert_eq!(mem.read_uint(te + 12, 4).unwrap(), crate::ntdll::FAKE_PID);
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "Thread32Next", &cpu, &mut mem, s)), 0);
+        assert_eq!(h.last_error, ERROR_NO_MORE_FILES);
+        mem.write_uint(te, 4, 100).unwrap();
+        assert_eq!(ret_of(h.dispatch("kernel32.dll", "Thread32First", &cpu, &mut mem, s)), 0);
+        assert_eq!(h.last_error, ERROR_BAD_LENGTH);
     }
 
     #[test]
