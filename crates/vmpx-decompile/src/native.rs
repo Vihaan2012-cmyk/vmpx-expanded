@@ -174,7 +174,7 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
                 };
                 Term::Return(vec![("rax".to_owned(), rax)])
             }
-            Terminator::Call { .. } => {
+            Terminator::Call { .. } | Terminator::TailCall { .. } => {
                 return Err(format!("block {addr:#x}: calls are not lifted by the decompiler"));
             }
             Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),
