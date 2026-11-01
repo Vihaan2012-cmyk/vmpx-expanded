@@ -7,8 +7,8 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic,
 };
 use vmpx_disasm::{
-    Algebra, AlgebraError, BinOp, BlockSemantics, LiftError, LiftOptions, Resize, UnOp, Width,
-    lift_block_with, lift_bytes_with,
+    Algebra, AlgebraError, BinOp, BlockSemantics, Gpr, LiftError, LiftOptions, Resize, UnOp,
+    Width, lift_block_with, lift_bytes_with,
 };
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, ResizeOp, UnaryOp};
@@ -208,8 +208,13 @@ pub enum Terminator {
     /// A direct or import call (only with [`CfgOptions::model_calls`]); execution
     /// continues at `next`. The callee is not analysed.
     Call { target: CallTarget, next: u64 },
-    /// Indirect/computed branch, call, out-of-range target, undecodable bytes or a
-    /// body the lifter refuses. No successor edges are recorded.
+    /// `jmp` that leaves the function through a call target (only with
+    /// [`CfgOptions::model_calls`]): the callee returns straight to the caller, so
+    /// the block has no successors. Whether the stack is balanced is the consumer's
+    /// check.
+    TailCall { target: CallTarget },
+    /// Other indirect/computed branch or call, out-of-range target, undecodable
+    /// bytes or a body the lifter refuses. No successor edges are recorded.
     Unsupported(String),
 }
 
@@ -220,6 +225,23 @@ pub enum CallTarget {
     Direct(u64),
     /// `call qword ptr [rip+disp]` through the import slot at this virtual address.
     Import(u64),
+    /// A register or memory operand whose value the consumer must evaluate. The
+    /// CFG records no successor for it, so it is never a jump-table resolution.
+    Indirect(IndirectTarget),
+}
+
+/// The operand of an indirect `call`/`jmp` (64-bit, flat segment).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndirectTarget {
+    /// `call reg` / `jmp reg`.
+    Reg(Gpr),
+    /// `qword ptr [base + index*scale + disp]`. A RIP-relative operand has no
+    /// base and an absolute `disp`.
+    Mem {
+        base: Option<Gpr>,
+        index: Option<(Gpr, u8)>,
+        disp: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,7 +332,64 @@ enum Flow {
     Jcc(String, u64, u64),
     Ret,
     Call(CallTarget, u64),
+    TailCall(CallTarget),
     Other(String),
+}
+
+fn gpr64(reg: iced_x86::Register) -> Option<Gpr> {
+    use iced_x86::Register as R;
+    Some(match reg {
+        R::RAX => Gpr::Rax,
+        R::RCX => Gpr::Rcx,
+        R::RDX => Gpr::Rdx,
+        R::RBX => Gpr::Rbx,
+        R::RSP => Gpr::Rsp,
+        R::RBP => Gpr::Rbp,
+        R::RSI => Gpr::Rsi,
+        R::RDI => Gpr::Rdi,
+        R::R8 => Gpr::R8,
+        R::R9 => Gpr::R9,
+        R::R10 => Gpr::R10,
+        R::R11 => Gpr::R11,
+        R::R12 => Gpr::R12,
+        R::R13 => Gpr::R13,
+        R::R14 => Gpr::R14,
+        R::R15 => Gpr::R15,
+        _ => return None,
+    })
+}
+
+/// The operand of a near indirect `call`/`jmp`, or `None` for anything but a
+/// 64-bit register or a flat 64-bit-addressed qword memory operand.
+fn indirect_target(ins: &Instruction) -> Option<IndirectTarget> {
+    match ins.op0_kind() {
+        iced_x86::OpKind::Register => gpr64(ins.op0_register()).map(IndirectTarget::Reg),
+        iced_x86::OpKind::Memory if ins.memory_size().size() == 8 => {
+            if matches!(ins.segment_prefix(), iced_x86::Register::FS | iced_x86::Register::GS) {
+                return None;
+            }
+            let base = match ins.memory_base() {
+                iced_x86::Register::None | iced_x86::Register::RIP => None,
+                b => Some(gpr64(b)?),
+            };
+            let index = match ins.memory_index() {
+                iced_x86::Register::None => None,
+                i => Some((gpr64(i)?, u8::try_from(ins.memory_index_scale()).ok()?)),
+            };
+            Some(IndirectTarget::Mem {
+                base,
+                index,
+                disp: ins.memory_displacement64().cast_signed(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_ip_rel_qword(ins: &Instruction) -> bool {
+    ins.op0_kind() == iced_x86::OpKind::Memory
+        && ins.is_ip_rel_memory_operand()
+        && ins.memory_size().size() == 8
 }
 
 fn classify(ins: &Instruction, model_calls: bool) -> Flow {
@@ -319,16 +398,32 @@ fn classify(ins: &Instruction, model_calls: bool) -> Flow {
             if ins.is_call_near() {
                 return Flow::Call(CallTarget::Direct(ins.near_branch_target()), ins.next_ip());
             }
-            if ins.is_call_near_indirect()
-                && ins.op0_kind() == iced_x86::OpKind::Memory
-                && ins.is_ip_rel_memory_operand()
-                && ins.memory_size().size() == 8
-            {
-                return Flow::Call(CallTarget::Import(ins.ip_rel_memory_address()), ins.next_ip());
+            if ins.is_call_near_indirect() {
+                if is_ip_rel_qword(ins) {
+                    return Flow::Call(CallTarget::Import(ins.ip_rel_memory_address()), ins.next_ip());
+                }
+                if let Some(t) = indirect_target(ins) {
+                    return Flow::Call(CallTarget::Indirect(t), ins.next_ip());
+                }
             }
             let mut text = String::new();
             IntelFormatter::new().format(ins, &mut text);
             Flow::Other(format!("Call `{text}`"))
+        }
+        FlowControl::IndirectBranch if model_calls && ins.is_jmp_near_indirect() => {
+            let target = if is_ip_rel_qword(ins) {
+                Some(CallTarget::Import(ins.ip_rel_memory_address()))
+            } else {
+                indirect_target(ins).map(CallTarget::Indirect)
+            };
+            target.map_or_else(
+                || {
+                    let mut text = String::new();
+                    IntelFormatter::new().format(ins, &mut text);
+                    Flow::Other(format!("IndirectBranch `{text}`"))
+                },
+                Flow::TailCall,
+            )
         }
         FlowControl::Next => Flow::Next,
         FlowControl::UnconditionalBranch if ins.is_jmp_short_or_near() => {
@@ -454,7 +549,7 @@ pub fn recover_native_cfg_opts(
                 Flow::Call(_, next) => targets[0] = Some(next),
                 Flow::Jmp(t) => targets[0] = Some(t),
                 Flow::Jcc(_, t, f) => targets = [Some(t), Some(f)],
-                Flow::Ret | Flow::Other(_) => {}
+                Flow::Ret | Flow::TailCall(_) | Flow::Other(_) => {}
             }
             for t in targets.into_iter().flatten() {
                 if in_range(t) && leaders.insert(t) {
@@ -510,6 +605,10 @@ pub fn recover_native_cfg_opts(
                     ip = ins.next_ip();
                     break Terminator::Return;
                 }
+                Flow::TailCall(target) => {
+                    ip = ins.next_ip();
+                    break Terminator::TailCall { target };
+                }
                 Flow::Jmp(_) | Flow::Jcc(..) => {
                     ip = ins.next_ip();
                     break Terminator::Unsupported("direct branch target outside code".to_owned());
@@ -537,7 +636,7 @@ pub fn recover_native_cfg_opts(
                 edges.push((start, *not_taken, EdgeKind::NotTaken));
             }
             Terminator::Call { next, .. } => edges.push((start, *next, EdgeKind::FallThrough)),
-            Terminator::Return | Terminator::Unsupported(_) => {}
+            Terminator::Return | Terminator::TailCall { .. } | Terminator::Unsupported(_) => {}
         }
         blocks.insert(
             start,

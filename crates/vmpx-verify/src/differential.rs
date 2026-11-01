@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use vmpx_disasm::{Flag, FlagState, Gpr};
-use vmpx_mutation::cfg_recovery::{CallTarget, NativeCfg, Terminator};
+use vmpx_mutation::cfg_recovery::{CallTarget, IndirectTarget, NativeCfg, Terminator};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, NativeExitState, X64NativeRegister};
 use vmpx_vmlift::{CollectedCall, CollectedEffects, CollectedStore, ExitSemantics};
 
@@ -464,32 +464,45 @@ pub fn execute_native_function_in(
                 decided += 1;
             }
             Terminator::Call { target, next } => {
-                if native_env.image_base == 0 {
-                    return Err(format!("block {ip:#x} calls, but the image base is unknown"));
-                }
-                let (label, iat_rva) = match *target {
-                    CallTarget::Import(slot) => {
-                        let rva = u32::try_from(slot.wrapping_sub(native_env.image_base))
-                            .map_err(|_| format!("import slot {slot:#x} outside the image"))?;
-                        (format!("iat_{rva:#x}"), rva)
-                    }
-                    CallTarget::Direct(va) => {
-                        let rva = u32::try_from(va.wrapping_sub(native_env.image_base))
-                            .map_err(|_| format!("call target {va:#x} outside the image"))?;
-                        (format!("sub_{rva:#x}"), rva | 0x8000_0000)
-                    }
-                };
-                frame_escaped |= exposes_frame(&regs, &xmm);
-                apply_call(&mut regs, &mut xmm, &mut flags, &mut calls, &label, iat_rva);
-                if calls.len() == 1 {
-                    assumptions.push(
-                        "callee memory effects are not modeled; later loads are limited to read-only image bytes, the caller frame and the function's own stores".to_owned(),
-                    );
-                    assumptions.push(
-                        "no pointer into the function's frame or the caller frame escapes to a callee".to_owned(),
-                    );
-                }
+                model_call(
+                    ip,
+                    *target,
+                    native_env,
+                    &mut CallState {
+                        regs: &mut regs,
+                        xmm: &mut xmm,
+                        flags: &mut flags,
+                        calls: &mut calls,
+                        assumptions: &mut assumptions,
+                        frame_escaped: &mut frame_escaped,
+                    },
+                    &stores,
+                )?;
                 ip = *next;
+            }
+            Terminator::TailCall { target } => {
+                model_call(
+                    ip,
+                    *target,
+                    native_env,
+                    &mut CallState {
+                        regs: &mut regs,
+                        xmm: &mut xmm,
+                        flags: &mut flags,
+                        calls: &mut calls,
+                        assumptions: &mut assumptions,
+                        frame_escaped: &mut frame_escaped,
+                    },
+                    &stores,
+                )?;
+                // The callee returns to our caller, so the stack must be exactly as at entry.
+                let rsp = regs[&Gpr::Rsp].simplify();
+                if rsp != entry_symbol(Gpr::Rsp) {
+                    return Err(format!(
+                        "block {ip:#x}: a tail jump with the frame still allocated (rsp = {rsp:?}) is intra-function dispatch, which is not resolved"
+                    ));
+                }
+                return Ok(finish(&regs, xmm, stores, calls, assumptions, executed, decided));
             }
             Terminator::Return => {
                 let rsp = regs[&Gpr::Rsp].simplify();
@@ -502,6 +515,125 @@ pub fn execute_native_function_in(
         }
     }
     Err(format!("did not return within {max_blocks} blocks"))
+}
+
+/// `iat_rva` of a call through a computed target (no import slot names it).
+pub const INDIRECT_CALL_RVA: u32 = u32::MAX;
+
+struct CallState<'a> {
+    regs: &'a mut BTreeMap<Gpr, Expr>,
+    xmm: &'a mut BTreeMap<u8, (Expr, Expr)>,
+    flags: &'a mut BTreeMap<Flag, Expr>,
+    calls: &'a mut Vec<CollectedCall>,
+    assumptions: &'a mut Vec<String>,
+    frame_escaped: &'a mut bool,
+}
+
+/// True when a `Load` address mentions a constant inside a read-only image
+/// range: the shape of a jump-table fetch, which is never treated as a call.
+fn loads_from_image_constant(e: &Expr, readonly: &[(u64, u64)], in_load: bool) -> bool {
+    let rec = |x: &Expr, l: bool| loads_from_image_constant(x, readonly, l);
+    match &e.kind {
+        ExprKind::Const { value } => in_load && readonly.iter().any(|(lo, hi)| value >= lo && value < hi),
+        ExprKind::Register { .. } => false,
+        ExprKind::Unary { value, .. } | ExprKind::Extract { value, .. } | ExprKind::Resize { value, .. } => {
+            rec(value, in_load)
+        }
+        ExprKind::Binary { left, right, .. } => rec(left, in_load) || rec(right, in_load),
+        ExprKind::Concat { high, low } => rec(high, in_load) || rec(low, in_load),
+        ExprKind::Intrinsic { arguments, .. } => arguments.iter().any(|a| rec(a, in_load)),
+        ExprKind::Load { address } => rec(address, true),
+    }
+}
+
+/// The value of a computed call/jump target over the function-entry state.
+/// A memory operand is a load resolved against every store so far; a target
+/// that fetches from a constant read-only image address (a jump table, or a
+/// slot read into a register) is refused rather than guessed.
+fn indirect_target_value(
+    t: IndirectTarget,
+    regs: &BTreeMap<Gpr, Expr>,
+    stores: &[Store],
+    ctx: &LoadCtx,
+    native_env: &NativeEnv,
+) -> Result<Expr, String> {
+    let value = match t {
+        IndirectTarget::Reg(g) => regs[&g].simplify(),
+        IndirectTarget::Mem { base, index, disp } => {
+            let mut address = c64(disp.cast_unsigned());
+            if let Some(b) = base {
+                address = bin(BinaryOp::Add, regs[&b].clone(), address)?;
+            }
+            if let Some((i, scale)) = index {
+                let scaled = bin(BinaryOp::Mul, regs[&i].clone(), c64(u64::from(scale)))?;
+                address = bin(BinaryOp::Add, address, scaled)?;
+            }
+            resolve_loads(&Expr::load(BitWidth::W64, address.simplify()), stores, ctx)?
+        }
+    };
+    if loads_from_image_constant(&value, &native_env.readonly, false) {
+        return Err(format!(
+            "indirect target {value:?} is fetched from a constant image address (jump table); its bound and entries are not proven"
+        ));
+    }
+    Ok(value)
+}
+
+/// Models one call (or the call a tail `jmp` makes) as the Win64 ABI defines it.
+fn model_call(
+    ip: u64,
+    target: CallTarget,
+    native_env: &NativeEnv,
+    st: &mut CallState<'_>,
+    stores: &[Store],
+) -> Result<(), String> {
+    if native_env.image_base == 0 {
+        return Err(format!("block {ip:#x} calls, but the image base is unknown"));
+    }
+    let (label, iat_rva, computed) = match target {
+        CallTarget::Import(slot) => {
+            let rva = u32::try_from(slot.wrapping_sub(native_env.image_base))
+                .map_err(|_| format!("import slot {slot:#x} outside the image"))?;
+            (format!("iat_{rva:#x}"), rva, None)
+        }
+        CallTarget::Direct(va) => {
+            let rva = u32::try_from(va.wrapping_sub(native_env.image_base))
+                .map_err(|_| format!("call target {va:#x} outside the image"))?;
+            (format!("sub_{rva:#x}"), rva | 0x8000_0000, None)
+        }
+        CallTarget::Indirect(t) => {
+            let ctx = LoadCtx {
+                after_call: (!st.calls.is_empty()).then_some(native_env),
+                private_frame: !*st.frame_escaped,
+                used_frame_rule: std::cell::Cell::new(false),
+            };
+            let value = indirect_target_value(t, st.regs, stores, &ctx, native_env)
+                .map_err(|e| format!("block {ip:#x}: {e}"))?;
+            if ctx.used_frame_rule.get() && !st.assumptions.iter().any(|a| a == FRAME_PRIVATE) {
+                st.assumptions.push(FRAME_PRIVATE.to_owned());
+            }
+            if mentions_frame(&value) {
+                *st.frame_escaped = true;
+            }
+            if st.calls.iter().all(|c| c.iat_rva != INDIRECT_CALL_RVA) {
+                st.assumptions.push(
+                    "an indirect call target is a data-derived pointer; the callee is an uninterpreted function of that target and the argument registers (callee identity by address, as for direct calls)".to_owned(),
+                );
+            }
+            ("indirect".to_owned(), INDIRECT_CALL_RVA, Some(value))
+        }
+    };
+    *st.frame_escaped |= exposes_frame(st.regs, st.xmm);
+    apply_call(st.regs, st.xmm, st.flags, st.calls, &label, iat_rva, computed);
+    if st.calls.len() == 1 {
+        st.assumptions.push(
+            "callee memory effects are not modeled; later loads are limited to read-only image bytes, the caller frame and the function's own stores".to_owned(),
+        );
+        st.assumptions.push(
+            "no pointer into the function's frame or the caller frame escapes to a callee".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn finish(
@@ -583,8 +715,10 @@ fn apply_call(
     calls: &mut Vec<CollectedCall>,
     label: &str,
     iat_rva: u32,
+    computed_target: Option<Expr>,
 ) {
-    let args = call_arguments(regs, xmm);
+    let mut args = call_arguments(regs, xmm);
+    args.extend(computed_target);
     let site = format!("{label}_c{}", calls.len());
     let f64_result = format!("fp_call_{site}_f64");
     calls.push(CollectedCall {
