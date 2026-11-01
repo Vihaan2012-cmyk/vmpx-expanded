@@ -166,6 +166,10 @@ impl SymbolicMemorySource for ObservedImage<'_, '_> {
         self.image.read_only_byte(address)
     }
 
+    fn is_read_only_address(&self, address: Va) -> bool {
+        self.image.is_read_only_address(address)
+    }
+
     fn protection_stability_proven(&self) -> bool {
         self.image.protection_stability_proven()
     }
@@ -336,6 +340,19 @@ pub struct ReadOnlyImage<'a, 'data>(pub &'a PeImage<'data>);
 impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
     fn read_only_byte(&self, address: Va) -> Option<u8> {
         self.read_byte(address)
+    }
+
+    fn is_read_only_address(&self, address: Va) -> bool {
+        let pe = self.0;
+        let Some(rva) = pe.optional.image_base.checked_rva_of(address) else {
+            return false;
+        };
+        if rva.0 < pe.optional.size_of_headers {
+            return true;
+        }
+        pe.sections.iter().find(|section| section.contains_mapped_rva(rva)).is_some_and(|section| {
+            section.characteristics & SCN_MEM_READ != 0 && section.characteristics & SCN_MEM_WRITE == 0
+        })
     }
 
     fn protection_stability_proven(&self) -> bool {

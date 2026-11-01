@@ -28,7 +28,13 @@ pub struct ReportOptions {
     pub instruction_limit: usize,
     pub dynamic: bool,
     pub serve_ro: bool,
+    /// OBSERVED tier: serve withheld (volatile) read-only image bytes from the
+    /// post-init snapshot. Needs `--volatility-snapshot`; labeled, never proven.
+    pub serve_observed_ro: bool,
 }
+
+/// Snapshot bytes of the volatile, non-writable image ranges (observed seed).
+static SNAPSHOT_SEED: std::sync::OnceLock<vmpx_vm::ObservedMemory> = std::sync::OnceLock::new();
 
 impl ReportOptions {
     pub fn new(sample: Option<usize>, all: bool, threads: usize, dynamic: bool) -> Self {
@@ -42,6 +48,7 @@ impl ReportOptions {
             instruction_limit: 512,
             dynamic,
             serve_ro: false,
+            serve_observed_ro: false,
         }
     }
 }
@@ -135,12 +142,13 @@ enum Outcome {
     Panic,
 }
 
-fn cfg_limits(instruction_limit: usize, serve_ro: bool) -> VmCfgLimits {
+fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) -> VmCfgLimits {
     VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
             instruction_limit,
             symbolic: vmpx_vm::SymbolicExecutionLimits {
                 serve_read_only_when_suppressed: serve_ro,
+                serve_observed_when_suppressed: serve_observed,
                 ..vmpx_vm::SymbolicExecutionLimits::default()
             },
             ..EntryProfileRecoveryLimits::default()
@@ -170,7 +178,7 @@ fn recover_all(
         return Vec::new();
     }
     let chunk = entries.len().div_ceil(opts.threads).max(1);
-    let limits = cfg_limits(opts.instruction_limit, opts.serve_ro);
+    let limits = cfg_limits(opts.instruction_limit, opts.serve_ro, opts.serve_observed_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
     let out = std::thread::scope(|scope| {
@@ -310,7 +318,11 @@ fn run_dynamic(
 /// # Errors
 ///
 /// Fails when the image is not a PE or the snapshot cannot be read.
-pub fn install_volatility_veto(image: &[u8], snapshot: &std::path::Path) -> Result<(usize, u64)> {
+pub fn install_volatility_veto(
+    image: &[u8],
+    snapshot: &std::path::Path,
+    capture_seed: bool,
+) -> Result<(usize, u64)> {
     use vmpx_pe::Va;
     use vmpx_vm::SymbolicMemorySource;
     let pe = PeImage::parse(image).context("volatility veto: image is not a PE")?;
@@ -325,6 +337,10 @@ pub fn install_volatility_veto(image: &[u8], snapshot: &std::path::Path) -> Resu
         .collect();
     pages.sort_by_key(|(base, _)| *base);
     let mut ranges: Vec<(u64, u64)> = Vec::new();
+    // Observed seed: the snapshot byte of each volatile byte that lies in a
+    // readable, NON-writable section (never a writable section or the stack).
+    let read_only = vmpx_vm::ReadOnlyImage(&pe);
+    let mut seed: Vec<(u64, Vec<u8>)> = Vec::new();
     for (base, data) in pages {
         for (offset, &runtime) in data.iter().enumerate() {
             let address = base + offset as u64;
@@ -334,8 +350,26 @@ pub fn install_volatility_veto(image: &[u8], snapshot: &std::path::Path) -> Resu
                     Some((_, end)) if *end + 1 == address => *end = address,
                     _ => ranges.push((address, address)),
                 }
+                if capture_seed && SymbolicMemorySource::is_read_only_address(&read_only, Va(address)) {
+                    match seed.last_mut() {
+                        Some((start, bytes)) if *start + bytes.len() as u64 == address => bytes.push(runtime),
+                        _ => seed.push((address, vec![runtime])),
+                    }
+                }
             }
         }
+    }
+    if capture_seed {
+        eprintln!(
+            "[report] observed seed: {} byte(s) in {} read-only range(s) from the snapshot",
+            seed.iter().map(|(_, b)| b.len()).sum::<usize>(),
+            seed.len()
+        );
+        let _ = SNAPSHOT_SEED.set(vmpx_vm::ObservedMemory::from_slots(seed));
+    }
+    if let Some(path) = std::env::var_os("VMPX_DUMP_VOLATILE") {
+        let text: String = ranges.iter().map(|(a, b)| format!("{a:x} {b:x}\n")).collect();
+        let _ = std::fs::write(path, text);
     }
     let bytes = ranges.iter().map(|(s, e)| e - s + 1).sum();
     let count = ranges.len();
@@ -373,7 +407,38 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
         "[report] {discovered} entries discovered; sweeping {}",
         entries.len()
     );
-    let outcomes = recover_all(&pe, &entries, opts, None);
+    let snapshot_run = if opts.serve_observed_ro {
+        SNAPSHOT_SEED.get().map(|memory| {
+            ObservedRun::new(memory.clone(), vmpx_vm::ObservedLoopDepths::from_depths(std::iter::empty()))
+        })
+    } else {
+        None
+    };
+    if opts.serve_observed_ro && snapshot_run.is_none() {
+        eprintln!("[report] --serve-observed-ro needs --volatility-snapshot; no snapshot seed was captured");
+    }
+    let mut outcomes = recover_all(&pe, &entries, opts, None);
+    if let Some(run) = &snapshot_run {
+        // Second pass only over entries the sound/labeled pass left incomplete, so
+        // the snapshot can only ADD observed-tier completions and never relabel an
+        // entry the first pass already completed.
+        let indices: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| matches!(o, Outcome::Incomplete))
+            .map(|(i, _)| i)
+            .collect();
+        let pending: Vec<VmEntryCandidate> = indices.iter().map(|&i| entries[i].clone()).collect();
+        let rerun = recover_all(&pe, &pending, opts, Some(run));
+        let mut gained = 0_usize;
+        for (i, outcome) in indices.into_iter().zip(rerun) {
+            if matches!(outcome, Outcome::Complete(_)) {
+                outcomes[i] = outcome;
+                gained += 1;
+            }
+        }
+        eprintln!("[report] snapshot-served second pass completed {gained} additional entr(ies)");
+    }
     let sweep = tally(&outcomes, discovered, sampled);
 
     let dynamic = if opts.dynamic {

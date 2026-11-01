@@ -120,6 +120,11 @@ enum Command {
         /// count toward N2 PROVEN.
         #[arg(long)]
         serve_ro: bool,
+        /// OBSERVED tier: with --volatility-snapshot, serve the volatile
+        /// read-only image bytes the veto withholds from the post-init snapshot.
+        /// Such entries carry ObservedGlobal and never count toward N2 PROVEN.
+        #[arg(long)]
+        serve_observed_ro: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -1177,14 +1182,16 @@ fn main() -> Result<()> {
             dynamic,
             volatility_snapshot,
             serve_ro,
+            serve_observed_ro,
         } => {
             let data = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             if let Some(snapshot) = &volatility_snapshot {
-                let (ranges, bytes) = report_cmd::install_volatility_veto(&data, snapshot)?;
+                let (ranges, bytes) = report_cmd::install_volatility_veto(&data, snapshot, serve_observed_ro)?;
                 eprintln!("[report] volatility veto: {bytes} byte(s) in {ranges} range(s) differ from the post-init snapshot");
             }
             let mut opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
             opts.serve_ro = serve_ro;
+            opts.serve_observed_ro = serve_observed_ro;
             let report = report_cmd::build_report(&input.display().to_string(), &data, &opts)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

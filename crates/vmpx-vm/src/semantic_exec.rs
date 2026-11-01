@@ -67,6 +67,12 @@ pub struct SymbolicExecutionLimits {
     /// no call that may change page protection has run on the path (a proof,
     /// no assumption). Off only to A/B the baseline.
     pub prove_read_only_when_suppressed: bool,
+    /// OBSERVED TIER: after an external store suppressed image reads, serve a
+    /// constant read of a non-writable image address from the observed seed (a
+    /// post-init snapshot) when the file byte is withheld. Valid for the captured
+    /// state only; consulting the seed labels the block `ObservedGlobal`, so it
+    /// never reaches the proven tier.
+    pub serve_observed_when_suppressed: bool,
 }
 
 impl Default for SymbolicExecutionLimits {
@@ -77,6 +83,7 @@ impl Default for SymbolicExecutionLimits {
             max_expression_nodes: 200_000,
             serve_read_only_when_suppressed: false,
             prove_read_only_when_suppressed: true,
+            serve_observed_when_suppressed: false,
         }
     }
 }
@@ -349,6 +356,12 @@ pub trait SymbolicMemorySource {
         None
     }
 
+    /// True when `address` lies in a readable, non-writable image section (or the
+    /// headers), regardless of any volatility veto on its bytes.
+    fn is_read_only_address(&self, _address: Va) -> bool {
+        false
+    }
+
     /// PROOF that nothing in the analyzed image can change page protection (see
     /// `image_cannot_reprotect`). While true and no call on the path can either,
     /// a non-writable page keeps its loader protection, so no store can alter
@@ -493,6 +506,7 @@ struct SymbolicMachine<'a> {
     assumed_external_disjoint_from_vm_stack: bool,
     serve_read_only_when_suppressed: bool,
     prove_read_only_when_suppressed: bool,
+    serve_observed_when_suppressed: bool,
     served_read_only_image: bool,
     protection_may_have_changed: bool,
     image_protection_stable_cache: Option<bool>,
@@ -584,6 +598,7 @@ impl<'a> SymbolicMachine<'a> {
             assumed_external_disjoint_from_vm_stack: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
             prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
+            serve_observed_when_suppressed: limits.serve_observed_when_suppressed,
             served_read_only_image: false,
             protection_may_have_changed: initial.protection_may_have_changed,
             image_protection_stable_cache: None,
@@ -722,6 +737,21 @@ impl<'a> SymbolicMachine<'a> {
                 all_unknown = false;
                 self.served_read_only_image = true;
                 note_served_read(value, SERVED_LABELED_SUPPRESSED);
+                self.resolved_image_addresses.insert(Va(value));
+                bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value } = byte_address.kind
+                && self.serve_observed_when_suppressed
+                && self.image_reads_suppressed
+                && !self.memory_tainted
+                && let Some(source) = self.memory_source
+                && source.is_read_only_address(Va(value))
+                && let Some(byte) = source.observed_byte(Va(value))
+            {
+                // OBSERVED: a non-writable image address whose file byte is withheld
+                // (volatile) read from the post-init snapshot. `observed_byte`
+                // flips the source's seeded flag, which labels the CFG
+                // `ObservedGlobal` (observed tier, never proven).
+                all_unknown = false;
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else {
