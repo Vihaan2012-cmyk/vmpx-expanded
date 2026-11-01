@@ -10,9 +10,8 @@ use anyhow::{Context, Result};
 use iced_x86::{Code, Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind};
 use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
-use vmpx_verify::differential::{
-    AbiPolicy, DiffOutcome, NativeEnv, diff_against_original, execute_native_function_in,
-};
+use vmpx_verify::branch_paths::diff_against_original_paths;
+use vmpx_verify::differential::{AbiPolicy, DiffOutcome, ForkLimits, NativeEnv, execute_native_paths};
 use vmpx_verify::equiv::{Budget, CellVerdict, EquivVerdict, Method, Verifier};
 
 pub(crate) struct DiffOptions {
@@ -223,7 +222,7 @@ fn compare_one(
             })
             .collect(),
     };
-    let native = match execute_native_function_in(&cfg, o.max_blocks, &native_env) {
+    let natives = match execute_native_paths(&cfg, o.max_blocks, &native_env, ForkLimits::DEFAULT) {
         Ok(n) => n,
         Err(e) => return timeout(format!("original not modelable: {e}")),
     };
@@ -237,22 +236,25 @@ fn compare_one(
         Ok(r) => r,
         Err(e) => return timeout(format!("protected recovery/unroll: {e}")),
     };
-    for assumption in &native.assumptions {
+    let assumptions: std::collections::BTreeSet<&String> =
+        natives.iter().flat_map(|n| &n.function.assumptions).collect();
+    for assumption in assumptions {
         println!("  assumption: {assumption}");
     }
     for note in &recovered.notes {
         println!("  note: {note}");
     }
     println!(
-        "  [{stub:#x}] original: {} blocks executed ({} branches decided, {} dead-frame stores dropped); recovered: {} paths ({} forks, {} counted-loop branches decided)",
-        native.blocks_executed,
-        native.branches_decided,
-        native.frame_stores_dropped,
+        "  [{stub:#x}] original: {} path(s), {} blocks executed ({} branches decided, {} dead-frame stores dropped); recovered: {} paths ({} forks, {} counted-loop branches decided)",
+        natives.len(),
+        natives.iter().map(|n| n.function.blocks_executed).sum::<usize>(),
+        natives.iter().map(|n| n.function.branches_decided).sum::<usize>(),
+        natives.iter().map(|n| n.function.frame_stores_dropped).sum::<usize>(),
         recovered.paths.len(),
         recovered.forks,
         recovered.branches_decided
     );
-    diff_against_original(&native.semantics, &recovered, verifier, policy, o.strict_gates)
+    diff_against_original_paths(&natives, &recovered, verifier, policy, o.strict_gates)
 }
 
 fn print_outcome(name: &str, stub: u32, o: &DiffOutcome) {

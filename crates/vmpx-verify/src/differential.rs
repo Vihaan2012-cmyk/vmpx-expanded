@@ -269,6 +269,11 @@ fn flag_value(e: &Expr) -> Option<u64> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn eval_flag_for_tests(name: &str, args: &[(BitWidth, u64)]) -> Option<u64> {
+    eval_flag_intrinsic(name, args)
+}
+
 fn truncate(width: BitWidth, v: u64) -> u64 {
     width.truncate(v)
 }
@@ -300,12 +305,47 @@ fn eval_flag_intrinsic(name: &str, args: &[(BitWidth, u64)]) -> Option<u64> {
     }
 }
 
+const INPUT_DEPENDENT: &str = "depends on the function's inputs";
+
+/// A branch the flags cannot decide, as a `W8` 0/1 predicate and the polarity at
+/// which the branch is taken (`taken` iff `predicate == polarity`).
+fn branch_literal(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Result<(Expr, bool), String> {
+    let get = |f: Flag| -> Result<Expr, String> {
+        let e = flags
+            .get(&f)
+            .ok_or_else(|| format!("branch `{cc}` reads flag {} that is not defined", f.name()))?;
+        crate::branch_paths::expand_flags(e)
+    };
+    let bin = |op: BinaryOp, a: Expr, b: Expr| Expr::binary(op, a, b).map_err(|e| e.to_string());
+    let lt = || bin(BinaryOp::Xor, get(Flag::Sf)?, get(Flag::Of)?);
+    let (predicate, positive) = match cc {
+        "o" => (get(Flag::Of)?, true),
+        "no" => (get(Flag::Of)?, false),
+        "b" => (get(Flag::Cf)?, true),
+        "ae" => (get(Flag::Cf)?, false),
+        "e" => (get(Flag::Zf)?, true),
+        "ne" => (get(Flag::Zf)?, false),
+        "be" => (bin(BinaryOp::Or, get(Flag::Cf)?, get(Flag::Zf)?)?, true),
+        "a" => (bin(BinaryOp::Or, get(Flag::Cf)?, get(Flag::Zf)?)?, false),
+        "s" => (get(Flag::Sf)?, true),
+        "ns" => (get(Flag::Sf)?, false),
+        "p" => (get(Flag::Pf)?, true),
+        "np" => (get(Flag::Pf)?, false),
+        "l" => (lt()?, true),
+        "ge" => (lt()?, false),
+        "le" => (bin(BinaryOp::Or, get(Flag::Zf)?, lt()?)?, true),
+        "g" => (bin(BinaryOp::Or, get(Flag::Zf)?, lt()?)?, false),
+        other => return Err(format!("unmodeled condition code `{other}`")),
+    };
+    Ok((predicate.simplify(), positive))
+}
+
 fn condition(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Result<bool, String> {
     let get = |f: Flag| -> Result<u64, String> {
         let e = flags
             .get(&f)
             .ok_or_else(|| format!("branch `{cc}` reads flag {} that is not defined", f.name()))?;
-        flag_value(e).ok_or_else(|| format!("branch `{cc}` depends on the function's inputs"))
+        flag_value(e).ok_or_else(|| format!("branch `{cc}` {INPUT_DEPENDENT}"))
     };
     Ok(match cc {
         "o" => get(Flag::Of)? == 1,
@@ -339,6 +379,51 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
     execute_native_function_in(cfg, max_blocks, &NativeEnv::default())
 }
 
+/// Bounds on the original's path family. Exceeding any of them is an error:
+/// a path is never guessed or dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct ForkLimits {
+    /// Input-dependent branches one path may take (0: none, the legacy mode).
+    pub max_forks_per_path: usize,
+    /// Leaf paths the function may have.
+    pub max_paths: usize,
+}
+
+impl ForkLimits {
+    pub const NONE: Self = Self { max_forks_per_path: 0, max_paths: 1 };
+    pub const DEFAULT: Self = Self { max_forks_per_path: 10, max_paths: 32 };
+}
+
+/// One leaf path of the original: the input-dependent branch literals it took
+/// (`predicate == polarity`, predicates are `W8` 0/1 bit-vector expressions over
+/// the entry symbols) and the exit it reaches. The leaves of one function
+/// partition the input space.
+#[derive(Clone, Debug)]
+pub struct NativePath {
+    pub literals: Vec<(Expr, bool)>,
+    pub function: NativeFunction,
+}
+
+impl NativePath {
+    /// The conjunction of the path's literals as a `W8` 0/1 expression.
+    ///
+    /// # Errors
+    /// An expression that cannot be rebuilt.
+    pub fn condition(&self) -> Result<Expr, String> {
+        let mut all = Expr::constant(BitWidth::W8, 1);
+        for (predicate, polarity) in &self.literals {
+            let one = Expr::constant(BitWidth::W8, 1);
+            let lit = if *polarity {
+                predicate.clone()
+            } else {
+                bin(BinaryOp::Xor, predicate.clone(), one)?
+            };
+            all = bin(BinaryOp::And, all, lit)?;
+        }
+        Ok(all)
+    }
+}
+
 /// [`execute_native_function`] with the image environment that call blocks need.
 ///
 /// A call is modeled as the Win64 ABI defines it and nothing more: the result
@@ -350,171 +435,267 @@ pub fn execute_native_function(cfg: &NativeCfg, max_blocks: usize) -> Result<Nat
 ///
 /// # Errors
 /// As [`execute_native_function`], plus a call block without the image base.
-#[allow(clippy::too_many_lines)]
 pub fn execute_native_function_in(
     cfg: &NativeCfg,
     max_blocks: usize,
     native_env: &NativeEnv,
 ) -> Result<NativeFunction, String> {
-    let mut calls: Vec<CollectedCall> = Vec::new();
-    let mut assumptions: Vec<String> = Vec::new();
-    let mut regs: BTreeMap<Gpr, Expr> = Gpr::ALL.iter().map(|g| (*g, entry_symbol(*g))).collect();
-    let mut xmm: BTreeMap<u8, (Expr, Expr)> = (0..16u8)
-        .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
-        .collect();
-    let mut flags: BTreeMap<Flag, Expr> = BTreeMap::new();
-    let mut stores: Vec<Store> = Vec::new();
-    let mut ip = cfg.entry;
-    let mut decided = 0;
-    let mut frame_escaped = false;
-    for executed in 1..=max_blocks {
-        let block = cfg
-            .blocks
-            .get(&ip)
-            .ok_or_else(|| format!("block {ip:#x} is not in the native CFG"))?;
-        let sem = block
-            .semantics
-            .as_ref()
-            .ok_or_else(|| format!("block {ip:#x} was not lifted ({:?})", block.terminator))?;
-        let mut env: BTreeMap<String, Expr> = Gpr::ALL
-            .iter()
-            .map(|g| (g.input_name(), regs[g].clone()))
-            .collect();
-        for (f, e) in &flags {
-            env.insert(format!("{}_in", f.name()), e.clone());
-        }
-        for (n, (lo, hi)) in &xmm {
-            env.insert(format!("xmm{n}_lo_in"), lo.clone());
-            env.insert(format!("xmm{n}_hi_in"), hi.clone());
-        }
-        let ctx = LoadCtx {
-            after_call: (!calls.is_empty()).then_some(native_env),
-            private_frame: !frame_escaped,
-            used_frame_rule: std::cell::Cell::new(false),
-        };
-        let subst = |e: &Expr| -> Result<Expr, String> {
-            let substituted = e.substitute(&env).map_err(|x| x.to_string())?.simplify();
-            if let Some(stray) = substituted
-                .dependencies()
-                .into_iter()
-                .find(|d| !d.starts_with("native_"))
-            {
-                return Err(format!("block {ip:#x} reads `{stray}` before it is defined"));
+    let mut paths = execute_native_paths(cfg, max_blocks, native_env, ForkLimits::NONE)?;
+    Ok(paths.remove(0).function)
+}
+
+/// The state of one path being executed.
+#[derive(Clone)]
+struct Run {
+    calls: Vec<CollectedCall>,
+    assumptions: Vec<String>,
+    regs: BTreeMap<Gpr, Expr>,
+    xmm: BTreeMap<u8, (Expr, Expr)>,
+    flags: BTreeMap<Flag, Expr>,
+    stores: Vec<Store>,
+    literals: Vec<(Expr, bool)>,
+    ip: u64,
+    executed: usize,
+    decided: usize,
+    /// A frame address has been stored to memory or exposed to a call on this path.
+    frame_escaped: bool,
+}
+
+/// [`execute_native_function_in`] that, at a branch the flags cannot decide, forks:
+/// the taken arm and the fall-through arm are both executed, each carrying the
+/// branch literal, so the leaves partition the inputs. A branch whose predicate
+/// repeats a literal already on the path follows the one consistent arm.
+/// `max_blocks` bounds the blocks executed over all paths.
+///
+/// # Errors
+/// As [`execute_native_function_in`], plus exceeding `limits` (fork depth or
+/// leaf count) on any path, which fails the whole function.
+#[allow(clippy::too_many_lines)]
+pub fn execute_native_paths(
+    cfg: &NativeCfg,
+    max_blocks: usize,
+    native_env: &NativeEnv,
+    limits: ForkLimits,
+) -> Result<Vec<NativePath>, String> {
+    let first = Run {
+        calls: Vec::new(),
+        assumptions: Vec::new(),
+        regs: Gpr::ALL.iter().map(|g| (*g, entry_symbol(*g))).collect(),
+        xmm: (0..16u8)
+            .map(|n| (n, (xmm_entry_symbol(n, false), xmm_entry_symbol(n, true))))
+            .collect(),
+        flags: BTreeMap::new(),
+        stores: Vec::new(),
+        literals: Vec::new(),
+        ip: cfg.entry,
+        executed: 0,
+        decided: 0,
+        frame_escaped: false,
+    };
+    let mut pending = vec![first];
+    let mut leaves: Vec<NativePath> = Vec::new();
+    let mut total_blocks = 0_usize;
+    'paths: while let Some(mut run) = pending.pop() {
+        loop {
+            total_blocks += 1;
+            if total_blocks > max_blocks {
+                return Err(format!("did not return within {max_blocks} blocks"));
             }
-            resolve_loads(&substituted, &stores, &ctx)
-        };
-        let mut next_regs = BTreeMap::new();
-        for (g, e) in &sem.regs {
-            next_regs.insert(*g, subst(e)?);
-        }
-        let mut next_xmm = xmm.clone();
-        for (n, (lo, hi)) in &sem.xmm {
-            if sem.xmm_written.contains(n) {
-                next_xmm.insert(*n, (subst(lo)?, subst(hi)?));
+            run.executed += 1;
+            let ip = run.ip;
+            let block = cfg
+                .blocks
+                .get(&ip)
+                .ok_or_else(|| format!("block {ip:#x} is not in the native CFG"))?;
+            let sem = block
+                .semantics
+                .as_ref()
+                .ok_or_else(|| format!("block {ip:#x} was not lifted ({:?})", block.terminator))?;
+            let mut env: BTreeMap<String, Expr> = Gpr::ALL
+                .iter()
+                .map(|g| (g.input_name(), run.regs[g].clone()))
+                .collect();
+            for (f, e) in &run.flags {
+                env.insert(format!("{}_in", f.name()), e.clone());
             }
-        }
-        let mut next_flags = flags.clone();
-        for (f, st) in &sem.flags {
-            match st {
-                FlagState::Value(e) => {
-                    next_flags.insert(*f, subst(e)?);
-                }
-                FlagState::Clobbered => {
-                    next_flags.remove(f);
-                }
+            for (n, (lo, hi)) in &run.xmm {
+                env.insert(format!("xmm{n}_lo_in"), lo.clone());
+                env.insert(format!("xmm{n}_hi_in"), hi.clone());
             }
-        }
-        let mut new_stores = Vec::new();
-        for w in &sem.writes {
-            let width = match w.width {
-                vmpx_disasm::Width::W8 => BitWidth::W8,
-                vmpx_disasm::Width::W16 => BitWidth::W16,
-                vmpx_disasm::Width::W32 => BitWidth::W32,
-                vmpx_disasm::Width::W64 => BitWidth::W64,
+            let ctx = LoadCtx {
+                after_call: (!run.calls.is_empty()).then_some(native_env),
+                private_frame: !run.frame_escaped,
+                used_frame_rule: std::cell::Cell::new(false),
             };
-            new_stores.push((subst(&w.address)?, subst(&w.value)?, width));
-        }
-        let escaping = new_stores.iter().any(|(_, value, _)| mentions_frame(value));
-        for d in &sem.deferred_alias {
-            let (la, sa) = (subst(&d.load_address)?, subst(&d.store_address)?);
-            let ok = ctx.private_frame
-                && !escaping
-                && frame_vs_entry_pointer(&la, d.load_width.bytes(), &sa, d.store_width.bytes());
-            if !ok {
-                return Err(format!(
-                    "block {ip:#x}: a load may alias an earlier store ({} bytes at {:?}); not a frame slot against an entry-time pointer",
-                    d.load_width.bytes(),
-                    la
-                ));
+            let stores = &run.stores;
+            let subst = |e: &Expr| -> Result<Expr, String> {
+                let substituted = e.substitute(&env).map_err(|x| x.to_string())?.simplify();
+                if let Some(stray) = substituted
+                    .dependencies()
+                    .into_iter()
+                    .find(|d| !d.starts_with("native_"))
+                {
+                    return Err(format!("block {ip:#x} reads `{stray}` before it is defined"));
+                }
+                resolve_loads(&substituted, stores, &ctx)
+            };
+            let mut next_regs = BTreeMap::new();
+            for (g, e) in &sem.regs {
+                next_regs.insert(*g, subst(e)?);
             }
-            ctx.used_frame_rule.set(true);
-        }
-        if ctx.used_frame_rule.get() && !assumptions.iter().any(|a| a == FRAME_PRIVATE) {
-            assumptions.push(FRAME_PRIVATE.to_owned());
-        }
-        frame_escaped |= escaping;
-        stores.extend(new_stores);
-        regs = next_regs;
-        xmm = next_xmm;
-        flags = next_flags;
-        match &block.terminator {
-            Terminator::FallThrough(t) | Terminator::Jump(t) => ip = *t,
-            Terminator::CondJump { cc, taken, not_taken } => {
-                ip = if condition(cc, &flags)? { *taken } else { *not_taken };
-                decided += 1;
+            let mut next_xmm = run.xmm.clone();
+            for (n, (lo, hi)) in &sem.xmm {
+                if sem.xmm_written.contains(n) {
+                    next_xmm.insert(*n, (subst(lo)?, subst(hi)?));
+                }
             }
-            Terminator::Call { target, next } => {
-                model_call(
-                    ip,
-                    *target,
-                    native_env,
-                    &mut CallState {
-                        regs: &mut regs,
-                        xmm: &mut xmm,
-                        flags: &mut flags,
-                        calls: &mut calls,
-                        assumptions: &mut assumptions,
-                        frame_escaped: &mut frame_escaped,
-                    },
-                    &stores,
-                )?;
-                ip = *next;
+            let mut next_flags = run.flags.clone();
+            for (f, st) in &sem.flags {
+                match st {
+                    FlagState::Value(e) => {
+                        next_flags.insert(*f, subst(e)?);
+                    }
+                    FlagState::Clobbered => {
+                        next_flags.remove(f);
+                    }
+                }
             }
-            Terminator::TailCall { target } => {
-                model_call(
-                    ip,
-                    *target,
-                    native_env,
-                    &mut CallState {
-                        regs: &mut regs,
-                        xmm: &mut xmm,
-                        flags: &mut flags,
-                        calls: &mut calls,
-                        assumptions: &mut assumptions,
-                        frame_escaped: &mut frame_escaped,
-                    },
-                    &stores,
-                )?;
-                // The callee returns to our caller, so the stack must be exactly as at entry.
-                let rsp = regs[&Gpr::Rsp].simplify();
-                if rsp != entry_symbol(Gpr::Rsp) {
+            let mut new_stores = Vec::new();
+            for w in &sem.writes {
+                let width = match w.width {
+                    vmpx_disasm::Width::W8 => BitWidth::W8,
+                    vmpx_disasm::Width::W16 => BitWidth::W16,
+                    vmpx_disasm::Width::W32 => BitWidth::W32,
+                    vmpx_disasm::Width::W64 => BitWidth::W64,
+                };
+                new_stores.push((subst(&w.address)?, subst(&w.value)?, width));
+            }
+            let escaping = new_stores.iter().any(|(_, value, _)| mentions_frame(value));
+            for d in &sem.deferred_alias {
+                let (la, sa) = (subst(&d.load_address)?, subst(&d.store_address)?);
+                let ok = ctx.private_frame
+                    && !escaping
+                    && frame_vs_entry_pointer(&la, d.load_width.bytes(), &sa, d.store_width.bytes());
+                if !ok {
                     return Err(format!(
-                        "block {ip:#x}: a tail jump with the frame still allocated (rsp = {rsp:?}) is intra-function dispatch, which is not resolved"
+                        "block {ip:#x}: a load may alias an earlier store ({} bytes at {:?}); not a frame slot against an entry-time pointer",
+                        d.load_width.bytes(),
+                        la
                     ));
                 }
-                return Ok(finish(&regs, xmm, stores, calls, assumptions, executed, decided));
+                ctx.used_frame_rule.set(true);
             }
-            Terminator::Return => {
-                let rsp = regs[&Gpr::Rsp].simplify();
-                if rsp != entry_symbol(Gpr::Rsp) {
-                    return Err(format!("stack is unbalanced at the return: rsp = {rsp:?}"));
+            if ctx.used_frame_rule.get() && !run.assumptions.iter().any(|a| a == FRAME_PRIVATE) {
+                run.assumptions.push(FRAME_PRIVATE.to_owned());
+            }
+            run.frame_escaped |= escaping;
+            run.stores.extend(new_stores);
+            run.regs = next_regs;
+            run.xmm = next_xmm;
+            run.flags = next_flags;
+            match &block.terminator {
+                Terminator::FallThrough(t) | Terminator::Jump(t) => run.ip = *t,
+                Terminator::CondJump { cc, taken, not_taken } => {
+                    let decision = match condition(cc, &run.flags) {
+                        Ok(b) => Some(b),
+                        Err(e) if limits.max_forks_per_path > 0 && e.ends_with(INPUT_DEPENDENT) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(b) = decision {
+                        run.ip = if b { *taken } else { *not_taken };
+                        run.decided += 1;
+                        continue;
+                    }
+                    let (predicate, polarity) = branch_literal(cc, &run.flags)?;
+                    let held = match predicate.kind {
+                        ExprKind::Const { value } => Some(value & 1 == 1),
+                        _ => run.literals.iter().find(|(p, _)| *p == predicate).map(|(_, h)| *h),
+                    };
+                    if let Some(held) = held {
+                        run.ip = if held == polarity { *taken } else { *not_taken };
+                        run.decided += 1;
+                        continue;
+                    }
+                    if run.literals.len() >= limits.max_forks_per_path {
+                        return Err(format!(
+                            "branch `{cc}` at block {ip:#x} exceeds the fork depth {}",
+                            limits.max_forks_per_path
+                        ));
+                    }
+                    if leaves.len() + pending.len() + 2 > limits.max_paths {
+                        return Err(format!("the function has more than {} paths", limits.max_paths));
+                    }
+                    let mut other = run.clone();
+                    other.literals.push((predicate.clone(), !polarity));
+                    other.ip = *not_taken;
+                    pending.push(other);
+                    run.literals.push((predicate, polarity));
+                    run.ip = *taken;
                 }
-                return Ok(finish(&regs, xmm, stores, calls, assumptions, executed, decided));
+                Terminator::Call { target, next } => {
+                    model_run_call(&mut run, ip, *target, native_env)?;
+                    run.ip = *next;
+                }
+                Terminator::TailCall { target } => {
+                    model_run_call(&mut run, ip, *target, native_env)?;
+                    // The callee returns to our caller, so the stack must be exactly as at entry.
+                    let rsp = run.regs[&Gpr::Rsp].simplify();
+                    if rsp != entry_symbol(Gpr::Rsp) {
+                        return Err(format!(
+                            "block {ip:#x}: a tail jump with the frame still allocated (rsp = {rsp:?}) is intra-function dispatch, which is not resolved"
+                        ));
+                    }
+                    let function = finish(
+                        &run.regs,
+                        run.xmm,
+                        run.stores,
+                        run.calls,
+                        run.assumptions,
+                        run.executed,
+                        run.decided,
+                    );
+                    leaves.push(NativePath { literals: run.literals, function });
+                    continue 'paths;
+                }
+                Terminator::Return => {
+                    let rsp = run.regs[&Gpr::Rsp].simplify();
+                    if rsp != entry_symbol(Gpr::Rsp) {
+                        return Err(format!("stack is unbalanced at the return: rsp = {rsp:?}"));
+                    }
+                    let function = finish(
+                        &run.regs,
+                        run.xmm,
+                        run.stores,
+                        run.calls,
+                        run.assumptions,
+                        run.executed,
+                        run.decided,
+                    );
+                    leaves.push(NativePath { literals: run.literals, function });
+                    continue 'paths;
+                }
+                Terminator::Unsupported(why) => return Err(format!("block {ip:#x}: {why}")),
             }
-            Terminator::Unsupported(why) => return Err(format!("block {ip:#x}: {why}")),
         }
     }
-    Err(format!("did not return within {max_blocks} blocks"))
+    Ok(leaves)
+}
+
+fn model_run_call(run: &mut Run, ip: u64, target: CallTarget, native_env: &NativeEnv) -> Result<(), String> {
+    model_call(
+        ip,
+        target,
+        native_env,
+        &mut CallState {
+            regs: &mut run.regs,
+            xmm: &mut run.xmm,
+            flags: &mut run.flags,
+            calls: &mut run.calls,
+            assumptions: &mut run.assumptions,
+            frame_escaped: &mut run.frame_escaped,
+        },
+        &run.stores,
+    )
 }
 
 /// `iat_rva` of a call through a computed target (no import slot names it).
@@ -1029,6 +1210,26 @@ pub struct PrepareNotes {
     pub reads_resolved: usize,
 }
 
+fn prepare_expr(e: &Expr, resolved: &mut usize) -> Result<Expr, String> {
+    let rewritten = e
+        .rewrite_intrinsics(&mut |width, name, arguments| {
+            name.strip_prefix("memory_load_epoch_")?.parse::<u64>().ok()?;
+            let [address] = arguments else { return None };
+            *resolved += 1;
+            Some(Expr::load(width, address.clone()))
+        })
+        .map_err(|x| x.to_string())?;
+    canonicalize_recovered(&rewritten)
+}
+
+/// [`prepare_recovered`]'s rewrite of one expression (a recovered branch selector).
+///
+/// # Errors
+/// An expression the rewrite cannot rebuild.
+pub fn prepare_condition(e: &Expr) -> Result<Expr, String> {
+    prepare_expr(e, &mut 0)
+}
+
 /// Brings a recovered path into the original's vocabulary:
 /// stores into the VM's own dead frame (`vsp_initial`-relative, below the entry
 /// stack pointer) are dropped, on the labeled assumption that no caller pointer
@@ -1058,17 +1259,7 @@ pub fn prepare_recovered(
         }
     }
     let mut resolved = 0_usize;
-    let mut fix = |e: &Expr| -> Result<Expr, String> {
-        let rewritten = e
-            .rewrite_intrinsics(&mut |width, name, arguments| {
-                name.strip_prefix("memory_load_epoch_")?.parse::<u64>().ok()?;
-                let [address] = arguments else { return None };
-                resolved += 1;
-                Some(Expr::load(width, address.clone()))
-            })
-            .map_err(|x| x.to_string())?;
-        canonicalize_recovered(&rewritten)
-    };
+    let mut fix = |e: &Expr| prepare_expr(e, &mut resolved);
     let mut out = semantics.clone();
     for v in out.exit.registers.values_mut() {
         *v = fix(v)?;
@@ -1111,7 +1302,7 @@ pub struct DiffOutcome {
 }
 
 impl DiffOutcome {
-    fn timeout(reason: impl Into<String>) -> Self {
+    pub(crate) fn unproven(reason: impl Into<String>) -> Self {
         Self {
             verdict: EquivVerdict::Timeout,
             reason: reason.into(),
@@ -1161,7 +1352,7 @@ pub fn diff_against_original(
             Err(reason) => why.push(format!("path {index}: {reason}")),
         }
     }
-    let mut out = DiffOutcome::timeout("");
+    let mut out = DiffOutcome::unproven("");
     out.region_paths = region;
     out.spin_pruned = recovered.spin_arms_pruned;
     out.frame_stores_dropped = dropped;
@@ -1186,20 +1377,31 @@ pub fn diff_against_original(
             }
         }
     }
-    let report = verifier.check_function(&obligations, true);
+    conclude(out, &obligations, verifier, strict_gates, true)
+}
+
+/// Runs the gate over the path obligations and folds the result into `out`.
+pub(crate) fn conclude(
+    mut out: DiffOutcome,
+    obligations: &[Obligation],
+    verifier: &Verifier,
+    strict_gates: bool,
+    with_fidelity: bool,
+) -> DiffOutcome {
+    let report = verifier.check_function(obligations, true);
     out.paths_compared = obligations.len();
     out.verdict = report.verdict.clone();
     if report.verdict == EquivVerdict::Proven && strict_gates && out.modulo_env_gates() {
         out.verdict = EquivVerdict::Timeout;
         out.reason = format!(
             "strict gates: {} gate-failure arm(s) and {} spin arm(s) are not modeled",
-            region, recovered.spin_arms_pruned
+            out.region_paths, out.spin_pruned
         );
     } else if report.verdict == EquivVerdict::Timeout {
         out.reason = classify(&report);
     }
-    if out.verdict == EquivVerdict::Proven {
-        out.fidelity = crate::fidelity::assess(&obligations, &report);
+    if with_fidelity && out.verdict == EquivVerdict::Proven {
+        out.fidelity = crate::fidelity::assess(obligations, &report);
     }
     out.report = Some(report);
     out
