@@ -148,6 +148,13 @@ fn region_of(
             continue;
         }
         let Some(target) = region_target(path) else {
+            if std::env::var_os("VMPX_DIFF_TRACE").is_some() {
+                eprintln!(
+                    "[chain] region exit {index} not followable: region={:?} stores={}",
+                    path.region.as_ref().map(|r| (r.staged_words, format!("{:?}", r.target.simplify()))),
+                    path.semantics.effects.stores.len()
+                );
+            }
             tally.gate_arms += 1;
             continue;
         };

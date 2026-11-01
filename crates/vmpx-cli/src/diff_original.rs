@@ -256,7 +256,16 @@ fn compare_one(
                 println!("  assumption: {assumption}");
             }
             let segmented = match crate::decoded_splice::with_entry_input(protected, Rva(stub), o.instruction_limit, |input| {
-                vmpx_vmlift::segment_decoded_cfg(input, o.max_blocks, o.max_paths.max(256))
+                {
+                    let resolver = vmpx_vmlift::PeNestedEntries {
+                        pe: protected,
+                        limits: vmpx_vm::EntryProfileRecoveryLimits {
+                            instruction_limit: o.instruction_limit,
+                            ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                        },
+                    };
+                    vmpx_vmlift::segment_decoded_cfg(input, Some(&resolver), o.max_blocks, o.max_paths.max(256))
+                }
             }) {
                 Ok(Ok(s)) => s,
                 Ok(Err(x)) => return timeout(format!("{e}; protected side not segmentable: {x}")),

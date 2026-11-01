@@ -349,7 +349,10 @@ pub fn recover_exit(
         // stack. Popping it is byte-identical to popping the untouched caller
         // slot, so this is a clean callee return.
         Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
-        Ok(_) => {
+        Ok(value) => {
+            if std::env::var_os("VMPX_SEG_TRACE").is_some() {
+                eprintln!("[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} value {value:?}");
+            }
             return Err(DecodedLiftError::NotCalleeReturn(
                 "the return address was written by the VM, not read from caller stack".to_owned(),
             ));

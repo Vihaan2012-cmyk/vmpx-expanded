@@ -6,8 +6,7 @@
 
 use vmpx_pe::{PeImage, Va};
 use vmpx_vm::{
-    EntryProfileRecoveryLimits, ExprKind, NativeFrameSource, VmDiscoveryLimits,
-    analyze_vm_entry_at, recover_entry_stream,
+    EntryProfileRecoveryLimits, ExprKind, NativeFrameSource, nested_entry_stub, recover_entry_stream,
 };
 
 use crate::recover_entry_frame;
@@ -42,15 +41,11 @@ impl NestedEntryResolver for PeNestedEntries<'_, '_> {
             return None;
         };
         let base = self.pe.optional.image_base;
-        let candidate = analyze_vm_entry_at(
-            self.pe,
-            base.checked_rva_of(Va(value))?,
-            VmDiscoveryLimits::default(),
-        )?;
+        let (frame_entry, candidate) = nested_entry_stub(self.pe, base.checked_rva_of(Va(value))?)?;
         let stream = recover_entry_stream(self.pe, &candidate, self.limits).ok()?;
         let (frame, top_offset) = recover_entry_frame(
             self.pe,
-            candidate.rva,
+            frame_entry,
             stream.profile.effect_roles.vsp,
             self.limits.trace,
         )

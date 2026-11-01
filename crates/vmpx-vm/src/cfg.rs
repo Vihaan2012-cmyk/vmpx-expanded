@@ -532,6 +532,26 @@ fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
     })
 }
 
+/// The VM entry a nested VM exit returns into at `target`: the stub itself, or
+/// the stub behind the entry flag-save (`pushfq`, then `push imm; call`). Returns
+/// the RVA frame recovery must start from (the flag-save included) and the
+/// candidate at the `push imm`.
+#[must_use]
+pub fn nested_entry_stub(pe: &PeImage<'_>, target: Rva) -> Option<(Rva, VmEntryCandidate)> {
+    if let Some(candidate) = analyze_vm_entry_at(pe, target, VmDiscoveryLimits::default())
+        .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)
+    {
+        return Some((target, candidate));
+    }
+    let first = vmpx_disasm::decode_one(pe, target).ok()?;
+    if first.instruction.mnemonic() != Mnemonic::Pushfq {
+        return None;
+    }
+    let candidate = analyze_vm_entry_at(pe, first.next_rva()?, VmDiscoveryLimits::default())
+        .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)?;
+    Some((target, candidate))
+}
+
 /// Proven contents of the VM stack at VM start, top first, recovered by
 /// stepping the native entry up to the VSP capture. Returns the cells, the
 /// byte offset from VSP to the top cell (nonzero when a `lea` capture places VSP
@@ -561,17 +581,31 @@ pub fn recover_entry_frame(
     // Bottom-first model of the native stack.
     let mut stack: Vec<NativeFrameSource> = Vec::new();
     let mut exposed = false;
+    let mut flags_clean = true;
     for decoded in caller_instructions.iter().copied().take(call_index) {
         let instruction = &decoded.instruction;
         exposed |= exposes_stack_pointer(instruction);
         if instruction.mnemonic() == Mnemonic::Push {
             let ordinal = u32::try_from(stack.len()).unwrap_or(u32::MAX);
             stack.push(caller_push_source(decoded, ordinal));
+        } else if instruction.mnemonic() == Mnemonic::Pushfq {
+            // The entry flag-save: the word is the flags the stub was entered with
+            // (`native_rflags_initial`), provided nothing before it set them.
+            stack.push(if flags_clean {
+                NativeFrameSource::Rflags
+            } else {
+                NativeFrameSource::Unknown {
+                    description: format!("RFLAGS modified before PUSHFQ at {}", decoded.rva),
+                }
+            });
         } else if instruction.stack_pointer_increment() != 0 {
             return Err(format!(
                 "unproven pre-call stack mutation at {}",
                 decoded.rva
             ));
+        }
+        if defines_flags(instruction) {
+            flags_clean = false;
         }
     }
     stack.push(NativeFrameSource::ReturnAddress {
@@ -584,7 +618,7 @@ pub fn recover_entry_frame(
     let mut state = StubState {
         stack,
         provenance: initial_provenance(),
-        original_flags: true,
+        original_flags: flags_clean,
         factory: InstructionInfoFactory::new(),
     };
     let mut remaining = target.instructions();
@@ -2879,8 +2913,14 @@ impl Walker<'_, '_> {
         else {
             return;
         };
-        let Ok(exit) = recover_native_exit_state(symbolic, &layout) else {
-            return;
+        let exit = match recover_native_exit_state(symbolic, &layout) {
+            Ok(exit) => exit,
+            Err(error) => {
+                if std::env::var_os("VMPX_NESTED_TRACE").is_some() {
+                    eprintln!("[nested] {key}: exit state unrecovered: {error}");
+                }
+                return;
+            }
         };
         let simplified = exit.return_address.simplify();
         let target = if let ExprKind::Const { value } = simplified.kind {
@@ -2895,9 +2935,7 @@ impl Walker<'_, '_> {
             .filter(|report| report.complete && report.targets.len() == 1)
             .and_then(|report| report.targets[0].rva)
         };
-        let Some(candidate) = target
-            .and_then(|rva| analyze_vm_entry_at(self.pe, rva, VmDiscoveryLimits::default()))
-            .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)
+        let Some((frame_entry, candidate)) = target.and_then(|rva| nested_entry_stub(self.pe, rva))
         else {
             return;
         };
@@ -2948,7 +2986,7 @@ impl Walker<'_, '_> {
         };
         let (cells, top_offset, _) = match recover_entry_frame(
             self.pe,
-            candidate.rva,
+            frame_entry,
             setup.profile.effect_roles.vsp,
             self.limits.entry.trace,
         ) {

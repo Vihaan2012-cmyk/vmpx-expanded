@@ -1770,7 +1770,7 @@ impl Builder<'_> {
 /// Re-bases the nested entry's frame onto the exact state the exit left: its
 /// stack sits where the exit's `ret` leaves the stack pointer, its registers and
 /// flags are what the exit restored, and the outer memory carries over.
-fn compose_nested_state(
+pub(crate) fn compose_nested_state(
     prior: &SymbolicVmExecutionReport,
     exit: &NativeExitState,
     entry: &NestedEntry,

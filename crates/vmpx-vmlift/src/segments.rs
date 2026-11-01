@@ -27,17 +27,19 @@ use vmpx_pe::Va;
 use vmpx_vm::{
     BinaryOp, BitWidth, BlockExit, CfgEdgeKind, Expr, ExprKind, NativeExitState,
     SymbolicExecutionLimits, SymbolicVmInitialState, VmHandlerSemantic,
-    execute_symbolic_linear_block_with_initial_state, symbolic_pointer_offset,
+    execute_symbolic_linear_block_with_initial_state, recover_native_exit_state, symbolic_pointer_offset,
 };
 
 use crate::decoded_lift::{RecoveredExit, StubExit, first_unliftable, recover_exit};
+use crate::cfg_lift::compose_nested_state;
 use crate::entry_frame::frame_initial_state;
+use crate::nested_entry::NestedEntryResolver;
 use crate::rolled::loop_headers;
 use crate::unroll::{RegionTarget, UnrolledPath, is_environment_probe};
 use crate::{CollectedEffects, CollectedStore, DecodedCfgInput, ExitSemantics, PathCondition};
 
 /// Most restarts while the cut cell sets shrink to a fixed point.
-const MAX_ATTEMPTS: usize = 64;
+const MAX_ATTEMPTS: usize = 200;
 
 /// One phi of a cut.
 #[derive(Clone, Debug)]
@@ -193,10 +195,9 @@ fn group(bytes: &BTreeMap<i64, Expr>) -> Vec<(i64, u32)> {
         let mut take = 1_u32;
         for n in [8_u32, 4, 2] {
             let end = i + n as usize;
-            if end <= offsets.len()
-                && (0..n).all(|k| offsets[i + k as usize] == offset + i64::from(k))
-                && whole_value(bytes, offset, n).is_some()
-            {
+            let contiguous = end <= offsets.len() && (0..n).all(|k| offsets[i + k as usize] == offset + i64::from(k));
+            let aligned_word = n == 8 && offset.rem_euclid(8) == 0;
+            if contiguous && (aligned_word || whole_value(bytes, offset, n).is_some()) {
                 take = n;
                 break;
             }
@@ -216,8 +217,12 @@ fn read_cell(snap: &Snap, cell: CellId) -> Option<Expr> {
 }
 
 struct Template {
+    /// The carried cells (each a phi), in `phis` order.
     cells: Vec<CellId>,
-    /// The state a segment from this cut starts in (every cell a phi).
+    /// Cells assumed to hold the same value at every arrival (the value of the
+    /// first arrival); verified by the arrival check, dropped when any disagrees.
+    invariants: Vec<(CellId, Expr)>,
+    /// The state a segment from this cut starts in.
     base: SymbolicVmInitialState,
     phis: Vec<SegPhi>,
 }
@@ -251,8 +256,12 @@ struct Walk {
 
 struct Walker<'a, 'b> {
     input: &'a DecodedCfgInput<'b>,
+    nested: Option<&'a dyn NestedEntryResolver>,
     cuts: &'a BTreeSet<Va>,
     allowed: &'a mut HashMap<Va, HashSet<CellId>>,
+    /// Cells found not invariant at a cut (they become phis).
+    varying: &'a mut HashMap<Va, HashSet<CellId>>,
+    broken: Vec<(Va, CellId)>,
     templates: HashMap<Va, Template>,
     queue: Vec<Va>,
     max_blocks: usize,
@@ -310,6 +319,7 @@ fn cuts_break_every_cycle(input: &DecodedCfgInput<'_>, cuts: &BTreeSet<Va>) -> b
 /// allocations differ between arrivals at a cut, or a budget is hit.
 pub fn segment_decoded_cfg(
     input: &DecodedCfgInput<'_>,
+    nested: Option<&dyn NestedEntryResolver>,
     max_blocks: usize,
     max_paths: usize,
 ) -> Result<SegmentedFunction, String> {
@@ -332,11 +342,15 @@ pub fn segment_decoded_cfg(
         .unwrap_or(i64::MAX)
         .saturating_add(i64::try_from(input.frame.len() * 8).unwrap_or(i64::MAX));
     let mut allowed: HashMap<Va, HashSet<CellId>> = HashMap::new();
+    let mut varying: HashMap<Va, HashSet<CellId>> = HashMap::new();
     for _ in 0..MAX_ATTEMPTS {
         let mut walker = Walker {
             input,
+            nested,
             cuts: &cuts,
             allowed: &mut allowed,
+            varying: &mut varying,
+            broken: Vec::new(),
             templates: HashMap::new(),
             queue: Vec::new(),
             max_blocks,
@@ -371,6 +385,12 @@ impl Walker<'_, '_> {
             let mut paths = Vec::new();
             self.walk(header, fresh(base), true, &mut paths)?;
             loops.insert(header, Segment { phis, paths });
+        }
+        if !self.broken.is_empty() {
+            for (header, cell) in std::mem::take(&mut self.broken) {
+                self.varying.entry(header).or_default().insert(cell);
+            }
+            return Err(Fail::Restart);
         }
         Ok(SegmentedFunction {
             entry,
@@ -416,23 +436,34 @@ impl Walker<'_, '_> {
             let mut base = state.clone();
             base.context_values.clear();
             base.memory_values.clear();
-            let mut phis = Vec::with_capacity(cells.len());
-            let mut values = Vec::with_capacity(cells.len());
-            for (i, cell) in cells.iter().enumerate() {
+            let varying = self.varying.get(&header);
+            let mut phi_cells = Vec::new();
+            let mut invariants = Vec::new();
+            let mut phis = Vec::new();
+            let mut values = Vec::new();
+            for cell in &cells {
                 let value = read_cell(&snap, *cell).expect("retained readable");
-                let name = format!("vmphi{:x}_{i}", header.0);
-                let phi = Expr::register(value.width, name.clone());
+                let is_phi = varying.is_some_and(|v| v.contains(cell));
+                let symbol = if is_phi {
+                    let name = format!("vmphi{:x}_{}", header.0, phis.len());
+                    let phi = Expr::register(value.width, name.clone());
+                    phis.push(SegPhi { name, width: value.width });
+                    phi_cells.push(*cell);
+                    values.push(value.clone());
+                    phi
+                } else {
+                    invariants.push((*cell, value.clone()));
+                    value
+                };
                 match *cell {
-                    CellId::Flags => base.flags = phi,
+                    CellId::Flags => base.flags = symbol,
                     CellId::Ctx(k) => {
-                        base.context_values.insert(k, phi);
+                        base.context_values.insert(k, symbol);
                     }
-                    CellId::Mem(offset, _) => base.memory_values.push((at_offset(offset)?, phi)),
+                    CellId::Mem(offset, _) => base.memory_values.push((at_offset(offset)?, symbol)),
                 }
-                phis.push(SegPhi { name, width: value.width });
-                values.push(value);
             }
-            self.templates.insert(header, Template { cells, base, phis });
+            self.templates.insert(header, Template { cells: phi_cells, invariants, base, phis });
             self.queue.push(header);
             return Ok(values);
         };
@@ -457,11 +488,26 @@ impl Walker<'_, '_> {
                 None => missing.push(*cell),
             }
         }
+        let mut broken: Vec<(Va, CellId)> = Vec::new();
+        for (cell, expected) in &template.invariants {
+            match read_cell(&snap, *cell) {
+                Some(v) if v == *expected || v.simplify() == expected.simplify() => {}
+                Some(_) => broken.push((header, *cell)),
+                None => missing.push(*cell),
+            }
+        }
         if !missing.is_empty() {
-            let keep: HashSet<CellId> = template.cells.iter().copied().filter(|c| !missing.contains(c)).collect();
+            let keep: HashSet<CellId> = template
+                .cells
+                .iter()
+                .copied()
+                .chain(template.invariants.iter().map(|(c, _)| *c))
+                .filter(|c| !missing.contains(c))
+                .collect();
             self.allowed.insert(header, keep);
             return Err(Fail::Restart);
         }
+        self.broken.extend(broken);
         Ok(values)
     }
 
@@ -523,15 +569,31 @@ impl Walker<'_, '_> {
             }
             match block.exit {
                 BlockExit::VmExit => {
-                    if cfg.edges.iter().any(|e| e.from == key && e.kind == CfgEdgeKind::NestedEntry) {
-                        return Err("exit re-enters a nested VM entry".into());
-                    }
                     let handler = block.instructions.last().map_or(block.start.handler, |last| last.state_after.handler);
                     let layout = block
                         .vm_exit
                         .as_ref()
                         .or_else(|| input.exits.get(&handler))
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
+                    let nested_to = cfg
+                        .edges
+                        .iter()
+                        .find_map(|e| (e.from == key && e.kind == CfgEdgeKind::NestedEntry).then_some(e.to));
+                    if let Some(to) = nested_to {
+                        let resolver = self.nested.ok_or("exit re-enters a nested VM entry")?;
+                        let exit = recover_native_exit_state(&report, layout)
+                            .map_err(|e| format!("nested exit state unrecovered: {e}"))?;
+                        let entry = resolver
+                            .resolve(&exit.return_address)
+                            .ok_or("the nested VM entry is not provably resolved")?;
+                        if cfg.blocks.get(&to).and_then(|b| b.address) != Some(entry.bytecode_start) {
+                            return Err("the resolved nested entry is not the CFG's nested block".into());
+                        }
+                        walk.state = compose_nested_state(&report, &exit, &entry)
+                            .map_err(|e| format!("nested entry composition failed: {e}"))?;
+                        key = to;
+                        continue;
+                    }
                     let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset)
                         .map_err(|e| e.to_string())?;
                     let mut region_target = None;
@@ -595,6 +657,13 @@ impl Walker<'_, '_> {
                         continue;
                     }
                     if successors.len() < 2 {
+                        if std::env::var_os("VMPX_SEG_TRACE").is_some() {
+                            eprintln!(
+                                "[seg] block {key} target {:?}; edges {:?}",
+                                target,
+                                cfg.edges.iter().filter(|e| e.from == key).collect::<Vec<_>>()
+                            );
+                        }
                         return Err(format!(
                             "block {key} branch target depends on inputs but has {} recovered successor(s)",
                             successors.len()
@@ -638,4 +707,38 @@ impl Walker<'_, '_> {
 
 fn fresh(state: SymbolicVmInitialState) -> Walk {
     Walk { state, stores: Vec::new(), conditions: Vec::new(), executed: 0, env_trail: Vec::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn byte(name: &str, k: u32) -> Expr {
+        Expr::extract(BitWidth::W8, k * 8, Expr::register(BitWidth::W64, name)).unwrap()
+    }
+
+    #[test]
+    fn bytes_of_one_word_group_into_that_word() {
+        let bytes: BTreeMap<i64, Expr> = (0..8).map(|k| (16 + i64::from(k), byte("v", k))).collect();
+        assert_eq!(group(&bytes), vec![(16, 8)]);
+        assert_eq!(read_mem(&bytes, 16, 8), Some(Expr::register(BitWidth::W64, "v")));
+    }
+
+    #[test]
+    fn an_aligned_word_of_unrelated_bytes_is_still_one_cell() {
+        let bytes: BTreeMap<i64, Expr> =
+            (0..8).map(|k| (i64::from(k), Expr::register(BitWidth::W8, format!("b{k}")))).collect();
+        assert_eq!(group(&bytes), vec![(0, 8)]);
+        assert_eq!(read_mem(&bytes, 0, 8).expect("all bytes live").width, BitWidth::W64);
+    }
+
+    #[test]
+    fn misaligned_unrelated_bytes_stay_bytes_and_a_gap_breaks_a_cell() {
+        let bytes: BTreeMap<i64, Expr> =
+            (0..8).map(|k| (4 + i64::from(k), Expr::register(BitWidth::W8, format!("b{k}")))).collect();
+        assert!(group(&bytes).iter().all(|(_, n)| *n == 1));
+        let gap: BTreeMap<i64, Expr> =
+            (0..7).map(|k| (i64::from(k), Expr::register(BitWidth::W8, format!("c{k}")))).collect();
+        assert_eq!(read_mem(&gap, 0, 8), None);
+    }
 }
