@@ -8,10 +8,29 @@ No rustfilt available (no network to install it) -> approximate demangling:
 best-effort identifier-chunk extraction from the v0 string, not a full parser.
 Crate classification instead uses the mangling's own length-prefixed identifier
 encoding (every path segment is "<decimal length><chars>"), which is exact.
+
+Export-safety filters (added after the first rebuild attempt surfaced real
+link failures): only 'T' (global/COFF-external) symbols are candidates --
+'t' (local) symbols have no cross-object identity and can never be exported,
+by any mechanism. Symbols whose exact mangled name maps to more than one
+address (unmerged per-translation-unit local duplicates) and compiler-
+internal ".llvm.<hash>" thunks are excluded too. With these three filters, a
+.def file listing the full candidate pool linked clean on the first try
+(0 "symbol not defined" errors across 24,718 names).
 """
 import json, os, random, re, sys
 
-SYMS_PATH = r"E:\VMPX\a380_src\syms_all.txt"
+SYMS_PATH = sys.argv[1] if len(sys.argv) > 1 else r"E:\VMPX\a380_src\syms_all.txt"
+# Optional: a plain-text list of names actually present in the DLL's real PE
+# export table (one per line). GNU ld's --export-all-symbols, empirically,
+# does NOT export every global ('T') symbol in a project this size with many
+# dependency rlibs (~26% export rate observed) -- the exact cause wasn't
+# pinned down (both exported and non-exported symbols are IMAGE_SYM_CLASS_
+# EXTERNAL at the COFF level, so it isn't a weak-vs-strong linkage split).
+# Rather than depend on understanding that ld heuristic, filter candidates
+# to names confirmed present in the real export table, so selection can only
+# ever pick names that are already guaranteed export-safe.
+REAL_EXPORTS_PATH = sys.argv[2] if len(sys.argv) > 2 else None
 OUT_DIR = r"E:\VMPX\testcorpus\a380"
 SEED = 20261101
 TARGET_TOTAL = 3500
@@ -129,11 +148,46 @@ def main():
     rows.sort(key=lambda r: r[0])
     print(f"total symbols: {len(rows)}", file=sys.stderr)
 
+    # Local ('t') symbols aren't required to be name-unique across object
+    # files -- the same monomorphization can get an independent, unmerged
+    # local copy per translation unit, same exact mangled name at two
+    # different addresses. A linker .def EXPORTS entry needs one address per
+    # name, so any name that isn't globally unique here can't be a safe
+    # export target regardless of which bucket picked it.
+    name_addrs = {}
+    for addr, typ, mangled in rows:
+        name_addrs.setdefault(mangled, set()).add(addr)
+    ambiguous_names = {m for m, a in name_addrs.items() if len(a) > 1}
+    print(f"ambiguous (non-unique-address) names: {len(ambiguous_names)}", file=sys.stderr)
+
     # size = gap to next DISTINCT address (handles ICF-merged duplicate addresses)
     addrs = [r[0] for r in rows]
     n = len(rows)
+    real_exports = None
+    if REAL_EXPORTS_PATH:
+        with open(REAL_EXPORTS_PATH, encoding="utf-8") as f:
+            real_exports = {line.strip() for line in f if line.strip()}
+        print(f"real export filter: {len(real_exports)} names", file=sys.stderr)
+
     candidates = []
     for i, (addr, typ, mangled) in enumerate(rows):
+        if real_exports is not None and mangled not in real_exports:
+            continue
+        if typ != "T":
+            # 't' (lowercase) is local/file-scope linkage at the COFF level --
+            # it has no external symbol identity to export, with or without
+            # --export-all-symbols or a .def entry. Only 'T' (global) is
+            # ever export-able.
+            continue
+        if mangled in ambiguous_names:
+            continue
+        if "." in mangled:
+            # compiler-internal thunks (drop_glue.llvm.<hash> etc.) -- not
+            # meaningful devirt targets, and "." is awkward/unsafe in a
+            # linker .def EXPORTS entry. A handful also duplicate verbatim
+            # across translation units pre-link, which a .def can't export
+            # twice either way.
+            continue
         crate = classify_user_crate(mangled)
         if crate is None:
             continue
@@ -236,6 +290,7 @@ def main():
         manifest.append({
             "symbol": c["mangled"],
             "demangled": approx_demangle(c["mangled"]),
+            "typ": c["typ"],
             "addr": f"0x{c['addr']:x}",
             "size": c["size"],
             "crate": c["crate"],

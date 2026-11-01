@@ -2,17 +2,22 @@
 """Protect the selected A380 functions with VMProtect (Ultra + confirmed-strongest
 protections). Mirrors bigcorpus/protect_all.py's drop-overlap-and-retry loop.
 
-*** KNOWN BLOCKER (see the de-risk report) ***
-VMProtect_Con's <Procedure MapAddress="..."> resolves ONLY against names the
-tool already recognizes at load time (confirmed: the file's real PE exports).
-Patching in NEW export entries (add_exports.py) produces a structurally valid
-export table (verified with llvm-readobj) but VMProtect still reports those
-names "not found" -- even when reusing an address that resolves correctly
-under its original export name. So, as built today, this script will mark
-0 of the ~3500 selected internal functions; it runs the full batch anyway so
-the attempt, timing, and output are on record. It is otherwise ready to use
-once the input DLL has a real export table covering the selection (e.g. a
-rebuild with the mingw linker's --export-all-symbols).
+*** STILL BLOCKED, DIFFERENT (deeper) CAUSE -- see the de-risk report ***
+The DLL has been rebuilt with a surgical .def file so every selected function
+IS a confirmed-real PE export (llvm-readobj: 3500/3500 present) -- the
+originally diagnosed blocker (no export at all) is fixed. VMProtect_Con
+STILL reports every one of them "not found", including a short plain-ASCII
+.def alias pointing at the exact same RVA an export-table entry resolves
+under its real name. Isolated control experiments (tiny synthetic C and
+Rust DLLs, up to ~58MB and 3000 exports) show dllexport-attribute exports,
+.def exports, long/short names, and export-table scale all work fine in
+general -- so this is specific to these functions inside this particular
+binary, not the export mechanism. Leading unconfirmed hypothesis: VMProtect
+cross-references .pdata (x64 unwind-info) to find safe function boundaries,
+and something about this binary's .pdata (huge, heavily templated/
+monomorphized Rust code) defeats that lookup for everything except the 5
+original FFI entry points. This script runs as designed; it will mark 0
+until that is resolved.
 """
 import json, os, re, subprocess, sys, time
 
@@ -27,20 +32,6 @@ ORIG_DLL = r"E:\VMPX\a380_src\source\plugin\target\release\fbw_a380_systems.dll"
 # access to confirm) -- they are left OUT here rather than guessed.
 OPTIONS_ALL_CONFIRMED = 0x40000 | 0x100 | 0x200 | 0x400  # 263936
 COMPILATION_ULTRA = 2
-
-
-def build_export_patched_dll(manifest, out_dll):
-    sys.path.insert(0, os.path.dirname(__file__))
-    import add_exports
-    list_path = out_dll + ".explist.txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for m in manifest:
-            # export name must be unique+identifier-safe; the mangled symbol
-            # itself always is (v0 mangling is ASCII letters/digits/underscore).
-            f.write(f"{m['addr'][2:]} {m['symbol']}\n")
-    sys.argv = ["add_exports.py", ORIG_DLL, out_dll, list_path]
-    add_exports.main()
-    return out_dll
 
 
 def make_project(dll, manifest, proj_path, out_dll, options, batch_tag):
@@ -94,12 +85,8 @@ def main():
     tag = sys.argv[2] if len(sys.argv) > 2 else f"derisk{batch_size}"
     batch = manifest[:batch_size]
 
-    exp_dll = os.path.join(ROOT, "protected", f"fbw_a380_systems.{tag}.exports.dll")
-    print(f"patching exports for {len(batch)} functions -> {exp_dll}")
-    build_export_patched_dll(batch, exp_dll)
-
     print(f"protecting batch '{tag}' ({len(batch)} functions, Ultra, Options={OPTIONS_ALL_CONFIRMED})")
-    result = protect(exp_dll, batch, tag)
+    result = protect(ORIG_DLL, batch, tag)
     print(json.dumps(result, indent=1))
 
     status_path = os.path.join(ROOT, "protect_status.json")
