@@ -1984,6 +1984,20 @@ mod tests {
         );
         let (_, reason) = unsupported_reason(&opaque, limits);
         assert!(reason.contains("other than add flags"), "{reason}");
+        // A double shift of a wide read is not affine (the bit it carries across
+        // the operands breaks any cell cover): it stays refused, not guessed.
+        let read = stack_load(1, 8);
+        let shrd = Expr::intrinsic(
+            BitWidth::W32,
+            "x86_double_shift_right_w32_1",
+            vec![
+                Expr::resize(ResizeOp::Truncate, BitWidth::W32, read.clone()).expect("t"),
+                Expr::resize(ResizeOp::Truncate, BitWidth::W32, read).expect("t"),
+                Expr::constant(BitWidth::W32, 1),
+            ],
+        );
+        let (_, reason) = unsupported_reason(&shrd, limits);
+        assert!(reason.contains("other than add flags"), "{reason}");
         // Flags observed at two widths on one register.
         let mixed = Expr::binary(
             BinaryOp::Add,
