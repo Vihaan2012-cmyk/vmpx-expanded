@@ -33,6 +33,8 @@ use crate::smt::{fold, free_registers};
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CellId {
     Register(X64NativeRegister),
+    /// One 64-bit lane of an XMM register.
+    Xmm { reg: u8, hi: bool },
     Rflags,
     ReturnAddress,
     StoreAddress(usize),
@@ -82,6 +84,16 @@ impl Obligation {
                 (Some(x), Some(y)) => o.add(CellId::Register(r), x.clone(), y.clone()),
                 (None, None) => {}
                 _ => o.gap(format!("register {r:?} present on one side only")),
+            }
+        }
+        for n in 0..16u8 {
+            match (a.xmm.get(&n), b.xmm.get(&n)) {
+                (Some((alo, ahi)), Some((blo, bhi))) => {
+                    o.add(CellId::Xmm { reg: n, hi: false }, alo.clone(), blo.clone());
+                    o.add(CellId::Xmm { reg: n, hi: true }, ahi.clone(), bhi.clone());
+                }
+                (None, None) => {}
+                _ => o.gap(format!("xmm{n} present on one side only")),
             }
         }
         o.add(CellId::Rflags, a.rflags.clone(), b.rflags.clone());
@@ -689,6 +701,7 @@ mod tests {
     fn exit(rax: Expr, store_value: Expr) -> ExitSemantics {
         ExitSemantics {
             exit: NativeExitState {
+                xmm: std::collections::BTreeMap::new(),
                 schema_version: 1,
                 registers: X64NativeRegister::ALL
                     .into_iter()

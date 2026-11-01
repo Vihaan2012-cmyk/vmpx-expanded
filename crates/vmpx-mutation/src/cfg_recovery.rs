@@ -109,16 +109,26 @@ pub struct CfgOptions {
     /// [`vmpx_disasm::LiftOptions::assume_stack_disjoint`]). Blocks that used it carry
     /// [`NativeBlock::assumes_stack_disjoint`].
     pub assume_stack_disjoint: bool,
+    /// Model the SSE/SSE2 scalar floating-point slice (XMM lanes in the block
+    /// semantics). Only set it where the consumer compares the XMM state.
+    pub model_xmm: bool,
 }
 
 impl CfgOptions {
     /// Only proven lifts; no modeling assumption.
     pub const PROVEN: Self = Self {
         assume_stack_disjoint: false,
+        model_xmm: false,
+    };
+    /// [`Self::PROVEN`] plus the SSE scalar floating-point slice.
+    pub const PROVEN_FP: Self = Self {
+        assume_stack_disjoint: false,
+        model_xmm: true,
     };
     /// Stack-disjoint relaxation on (the default of the recovery entry points).
     pub const ASSUME_STACK_DISJOINT: Self = Self {
         assume_stack_disjoint: true,
+        model_xmm: false,
     };
 }
 
@@ -132,6 +142,7 @@ impl From<CfgOptions> for LiftOptions {
     fn from(o: CfgOptions) -> Self {
         Self {
             assume_stack_disjoint: o.assume_stack_disjoint,
+            model_xmm: o.model_xmm,
             ..Self::default()
         }
     }

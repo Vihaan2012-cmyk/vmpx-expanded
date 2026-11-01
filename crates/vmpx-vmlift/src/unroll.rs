@@ -222,14 +222,24 @@ impl Walker<'_, '_> {
                         .map_err(|e| e.to_string())?;
                     let (exit, region_exit) = match recovered {
                         RecoveredExit::Callee(exit) => (exit, false),
-                        RecoveredExit::Region(region) => (
+                        RecoveredExit::Region(region) => {
+                            if std::env::var_os("VMPX_DIFF_TRACE").is_some() {
+                                eprintln!(
+                                    "[region exit] block {key} slot_offset={} staged={} target={:?}",
+                                    region.slot_offset,
+                                    region.staged.len(),
+                                    region.staged.first().map(|e| e.simplify())
+                                );
+                            }
+                            (
                             crate::decoded_lift::StubExit {
                                 registers: region.registers,
                                 rflags: region.rflags,
                                 return_pop: 0,
                             },
                             true,
-                        ),
+                            )
+                        }
                     };
                     let rflags_is_entry_flags = matches!(
                         &exit.rflags.simplify().kind,
@@ -244,6 +254,7 @@ impl Walker<'_, '_> {
                         conditions: walk.conditions,
                         semantics: ExitSemantics {
                             exit: NativeExitState {
+                                xmm: std::collections::BTreeMap::new(),
                                 schema_version: 1,
                                 registers: exit.registers,
                                 rflags: exit.rflags,

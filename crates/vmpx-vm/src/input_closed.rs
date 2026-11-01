@@ -81,6 +81,7 @@ mod tests {
 
     fn exit_with(rax: Expr) -> NativeExitState {
         NativeExitState {
+            xmm: std::collections::BTreeMap::new(),
             schema_version: 1,
             registers: BTreeMap::from([(X64NativeRegister::Rax, rax)]),
             rflags: Expr::constant(BitWidth::W64, 0x202),

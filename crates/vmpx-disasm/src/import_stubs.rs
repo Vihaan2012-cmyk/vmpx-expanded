@@ -24,6 +24,7 @@ const MAX_BUMP: u64 = 15;
 const STUB_LIFT: LiftOptions = LiftOptions {
     assume_stack_disjoint: false,
     absolute_disjoint_from_frame: true,
+    model_xmm: false,
 };
 const PRESERVED: [Gpr; 12] = [
     Gpr::Rcx,

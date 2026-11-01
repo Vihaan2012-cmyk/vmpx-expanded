@@ -2893,7 +2893,9 @@ dependencies = [
 name = "vmpx-verify"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "vmpx-disasm",
+ "vmpx-emulate",
  "vmpx-mutation",
  "vmpx-recompile",
  "vmpx-vm",
