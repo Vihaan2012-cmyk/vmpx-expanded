@@ -22,6 +22,8 @@ use crate::equiv::{Budget, SmtBackend, SolveOutcome};
 const TRIALS: usize = 48;
 const CANDIDATES_PER_NODE: usize = 4;
 const FULL_CONE_MS: u32 = 8_000;
+const MAX_CONE_NODES: usize = 450;
+const SWEEP_BUDGET_FACTOR: u64 = 6;
 
 pub struct SweepBackend {
     inner: Box<dyn SmtBackend>,
@@ -262,7 +264,10 @@ fn current(
 }
 
 fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOutcome {
-    let deadline = Instant::now() + Duration::from_millis(u64::from(budget.timeout_ms));
+    // One sweep makes many small queries; its overall allowance is a multiple of
+    // the per-cell budget.
+    let deadline = Instant::now()
+        + Duration::from_millis(u64::from(budget.timeout_ms) * SWEEP_BUDGET_FACTOR);
     let (nodes, root_a, root_b) = collect(a, b);
     if std::env::var_os("VMPX_SWEEP_TRACE").is_some() {
         eprintln!("[sweep] start: {} nodes, budget {} ms", nodes.len(), budget.timeout_ms);
@@ -318,7 +323,7 @@ fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOu
                 let remaining = u32::try_from((deadline - now).as_millis()).unwrap_or(u32::MAX);
                 let query = Budget {
                     exhaustive_bits: budget.exhaustive_bits,
-                    timeout_ms: remaining.max(1),
+                    timeout_ms: remaining.clamp(1, budget.timeout_ms),
                 };
                 let (shape_node, shape_kids) = &class_shape[c];
                 let mut other_kids = Vec::new();
@@ -352,6 +357,13 @@ fn sweep(inner: &dyn SmtBackend, a: &Expr, b: &Expr, budget: &Budget) -> SolveOu
                             let a_open = opened_form(&kid_classes, &node.expr, depth, &class_var, &class_shape, &nodes, &mut full);
                             let b_open = opened_form(shape_kids, &nodes[*shape_node].expr, depth, &class_var, &class_shape, &nodes, &mut full);
                             let (Some(x), Some(y)) = (a_open, b_open) else { break };
+                            // A cone too big for a one-shot query would only
+                            // exhaust the solver; keep sweeping instead.
+                            if x.node_count_bounded(MAX_CONE_NODES) > MAX_CONE_NODES
+                                || y.node_count_bounded(MAX_CONE_NODES) > MAX_CONE_NODES
+                            {
+                                break;
+                            }
                             let cap = Budget {
                                 exhaustive_bits: budget.exhaustive_bits,
                                 timeout_ms: query.timeout_ms.min(FULL_CONE_MS),
