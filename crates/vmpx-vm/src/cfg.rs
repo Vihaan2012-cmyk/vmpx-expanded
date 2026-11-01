@@ -9,6 +9,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use iced_x86::{FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
 use serde::Serialize;
@@ -44,6 +45,9 @@ use crate::{
 /// 1.5 GiB per entry: far above any entry that completes, yet small enough that
 /// several concurrent entries stay well inside a 10 GB machine.
 const DEFAULT_MAX_MEMORY_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Default per-entry wall-clock budget; bounds stragglers, never a finished entry.
+pub const DEFAULT_MAX_WALL_TIME: Duration = Duration::from_secs(60);
 
 /// Over-estimate of the bytes one distinct hash-consed `Expr` node costs: the
 /// node, its `Arc` header, the interner's weak slot and bucket, and allocator
@@ -101,6 +105,10 @@ pub struct VmCfgLimits {
     /// with [`CfgLimitHit::Memory`] before real memory can be exhausted. The
     /// estimate only over-counts, so an entry under the cap is unaffected.
     pub max_memory_bytes: usize,
+    /// Per-entry wall-clock budget, checked between block visits. Exceeding it
+    /// stops the walk and records [`CfgLimitHit::WallClock`] (never complete).
+    /// `None` is unbounded. A single block visit is not interrupted.
+    pub max_wall_time: Option<Duration>,
 }
 
 impl Default for VmCfgLimits {
@@ -120,6 +128,7 @@ impl Default for VmCfgLimits {
             max_transition_instructions: 6_000,
             max_loop_unrolls: 4,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            max_wall_time: Some(DEFAULT_MAX_WALL_TIME),
         }
     }
 }
@@ -199,6 +208,9 @@ pub enum CfgLimitHit {
     /// The byte-accounted per-entry memory cap was exceeded (see
     /// `VmCfgLimits::max_memory_bytes`). The entry fails closed.
     Memory,
+    /// The per-entry wall-clock budget (`VmCfgLimits::max_wall_time`) expired.
+    /// The entry fails closed as incomplete.
+    WallClock,
 }
 
 /// DIAGNOSTIC ONLY: every offending leaf of one unresolved branch target.
@@ -3119,7 +3131,17 @@ pub fn recover_vm_cfg_with_observed(
         path: None,
         profile: None,
     }];
+    let deadline = limits.max_wall_time.map(|budget| (Instant::now(), budget));
     while let Some(item) = pending.pop() {
+        if deadline.is_some_and(|(start, budget)| start.elapsed() >= budget) {
+            walker.cfg.limit_hit.get_or_insert(CfgLimitHit::WallClock);
+            walker.stall(
+                item.start.vip,
+                item.start.vip,
+                "per-entry wall-clock budget exceeded",
+            );
+            break;
+        }
         walker.live_bytes = walker.live_bytes.saturating_sub(item.bytes);
         let queued = pending.len();
         walker.visit(&item, &mut pending);
