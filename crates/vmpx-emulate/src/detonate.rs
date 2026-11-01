@@ -95,6 +95,9 @@ pub struct DetonateOptions {
     /// After the entry returns, drive the X-Plane plugin lifecycle in the same emulator
     /// (see [`LifecycleOptions`]). Implies `xplm`, and an OEP no longer stops the run.
     pub lifecycle: Option<LifecycleOptions>,
+    /// Restore CPU+memory from this snapshot instead of running the entry/init
+    /// (skips the ~27B-step `.xpl` startup); init is then treated as `Reached`.
+    pub start_from_snapshot: Option<std::path::PathBuf>,
 }
 
 /// Bounds for the in-model plugin lifecycle (all offline, step-capped).
@@ -136,6 +139,7 @@ impl Default for DetonateOptions {
             resolve_undefined_flags: true,
             iat_region: IatRegion::Auto,
             lifecycle: None,
+            start_from_snapshot: None,
         }
     }
 }
@@ -190,6 +194,8 @@ pub enum DetonateError {
     Load(LoadError),
     /// The image declares no entry point to run from.
     NoEntry,
+    /// `start_from_snapshot` was set but the snapshot could not be read.
+    Snapshot(std::io::ErrorKind),
 }
 
 impl From<LoadError> for DetonateError {
@@ -450,7 +456,14 @@ fn detonate_with(
     emu.resolve_undefined_flags = opts.resolve_undefined_flags;
     // Only the retired count is consumed; skip the per-step trace allocation.
     emu.record_trace = false;
-    let stop = emu.run_until(sentinel, opts.max_steps);
+    let stop = if let Some(snap) = &opts.start_from_snapshot {
+        let (c, m) = crate::snapshot::load(snap).map_err(|e| DetonateError::Snapshot(e.kind()))?;
+        emu.cpu = c;
+        emu.mem = m;
+        Stop::Reached
+    } else {
+        emu.run_until(sentinel, opts.max_steps)
+    };
     if let Stop::Fault { addr, access, rip } = &stop {
         let perm = emu.mem.perm_at(*addr);
         audit.borrow_mut().insert(
