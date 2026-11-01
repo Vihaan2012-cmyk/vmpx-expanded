@@ -120,6 +120,10 @@ fn parse_hex_after(reason: &str, marker: &str) -> Option<u64> {
     u64::from_str_radix(&hex[..end], 16).ok()
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn recover_one(
     pe: &PeImage<'_>,
     entry: &vmpx_vm::VmEntryCandidate,
@@ -144,6 +148,9 @@ fn recover_one(
             ..EntryProfileRecoveryLimits::default()
         },
         max_wall_time,
+        max_profile_transitions: env_usize("XPL_MAX_TRANS", VmCfgLimits::default().max_profile_transitions),
+        max_transition_visits: env_usize("XPL_TRANS_VISITS", VmCfgLimits::default().max_transition_visits),
+        max_transition_instructions: env_usize("XPL_TRANS_INSTR", VmCfgLimits::default().max_transition_instructions),
         ..VmCfgLimits::default()
     };
     set_branch_refusal_diagnostics(true);
@@ -1172,6 +1179,18 @@ fn main() {
             println!("  {n:>5}  {k}");
         }
         let _ = fn_has_nonx;
+    }
+
+    if let Ok(path) = std::env::var("XPL_RAW_DUMP") {
+        let mut out = String::new();
+        for r in &results {
+            if let Outcome::Incomplete { raw, .. } = &r.outcome {
+                for (i, x) in raw.iter().enumerate() {
+                    out.push_str(&format!("{:#x}\t{}\t{}\t{}\n", r.rva, i, categorize(x), x.replace('\n', " ")));
+                }
+            }
+        }
+        std::fs::write(path, out).expect("write raw dump");
     }
 
     if let Some(path) = args.get(6) {

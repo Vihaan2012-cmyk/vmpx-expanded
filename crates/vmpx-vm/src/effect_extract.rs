@@ -4070,6 +4070,42 @@ mod tests {
         assert_unknown(pop_flags(rcx));
     }
 
+    fn pop_flags_memory_push(clobber: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.push(qword_ptr(r11)).expect("push the top VM-stack qword");
+            a.add(r11, 8).expect("pop");
+            if clobber {
+                a.mov(qword_ptr(rsp), rax).expect("clobber the native stack top");
+            }
+            a.popfq().expect("restore flags");
+        }
+    }
+
+    #[test]
+    fn classifies_popfq_through_a_memory_operand_push() {
+        let analysis = assert_class(
+            pop_flags_memory_push(false),
+            VmHandlerSemantic::PopFlags,
+            BitWidth::W64,
+        );
+        assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
+        assert_unknown(pop_flags_memory_push(true));
+    }
+
+    #[test]
+    fn rejects_popfq_through_a_memory_push_of_a_non_top_cell() {
+        assert_unknown(|a| {
+            a.push(qword_ptr(r11 + 8)).expect("push the second VM-stack qword");
+            a.add(r11, 8).expect("pop");
+            a.popfq().expect("restore flags");
+        });
+        assert_unknown(|a| {
+            a.add(r11, 8).expect("pop first");
+            a.push(qword_ptr(r11)).expect("push the cell above the popped one");
+            a.popfq().expect("restore flags");
+        });
+    }
+
     #[test]
     fn classifies_only_gs_relative_pointer_loads() {
         let load = |use_gs: bool| {

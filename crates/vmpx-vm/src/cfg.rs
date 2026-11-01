@@ -127,7 +127,7 @@ impl Default for VmCfgLimits {
             max_total_instructions: 200_000,
             max_targets: 16,
             max_nested_entries: 8,
-            max_profile_transitions: 8,
+            max_profile_transitions: 32,
             max_transition_visits: 64,
             max_transition_instructions: 6_000,
             max_loop_unrolls: 4,
@@ -2241,7 +2241,7 @@ impl Walker<'_, '_> {
                         recovery.map_or(String::new(), |r| r
                             .diagnostics
                             .iter()
-                            .take(4)
+                            .take(8)
                             .cloned()
                             .collect::<Vec<_>>()
                             .join("; ")),
