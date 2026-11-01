@@ -11,6 +11,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(feature = "smt-z3")]
+use crate::equiv::{Budget, SmtBackend, SolveOutcome};
 use crate::{Gate, Verdict};
 use vmpx_vm::{BitWidth, Expr, ExprKind, ExprRef};
 
@@ -64,6 +66,24 @@ impl Gate for SmtGate {
     }
 }
 
+/// Z3 as an [`SmtBackend`] for the end-to-end gate: UNSAT proves, a SAT model
+/// over plain registers is offered as a candidate counterexample (the gate
+/// replays it before believing it).
+#[cfg(feature = "smt-z3")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Z3Backend;
+
+#[cfg(feature = "smt-z3")]
+impl SmtBackend for Z3Backend {
+    fn name(&self) -> String {
+        "z3".to_owned()
+    }
+
+    fn check_distinct(&self, a: &Expr, b: &Expr, budget: &Budget) -> SolveOutcome {
+        z3_backend::check_model(a, b, budget.timeout_ms)
+    }
+}
+
 #[cfg(not(feature = "smt-z3"))]
 fn smt_check(_a: &Expr, _b: &Expr) -> Verdict {
     Verdict::Unknown
@@ -81,12 +101,12 @@ mod z3_backend {
     //! SMT-LIB shifts (count >= width gives 0 / sign fill); rotates use the
     //! masked count modulo the width. Unencodable shapes yield `None`.
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use z3::ast::{BV, Bool};
     use z3::{Params, SatResult, Solver};
 
-    use super::{Expr, ExprKind, ExprRef, Verdict};
+    use super::{Expr, ExprKind, ExprRef, SolveOutcome, Verdict};
     use vmpx_vm::{BinaryOp, ResizeOp, UnaryOp};
 
     const TIMEOUT_MS: u32 = 10_000;
@@ -121,6 +141,52 @@ mod z3_backend {
             // functionally dependent, so only plain-register models are trusted.
             SatResult::Sat if enc.uninterpreted.is_empty() => Verdict::Refuted,
             _ => Verdict::Unknown,
+        }
+    }
+
+    pub(super) fn check_model(a: &Expr, b: &Expr, timeout_ms: u32) -> SolveOutcome {
+        let mut enc = Encoder {
+            memo: HashMap::new(),
+            uninterpreted: HashMap::new(),
+        };
+        let (Some(x), Some(y)) = (enc.encode(a, 0), enc.encode(b, 0)) else {
+            return SolveOutcome::Unknown("term not encodable as a bit-vector".to_owned());
+        };
+        if x.get_size() != y.get_size() {
+            return SolveOutcome::Unknown("width mismatch".to_owned());
+        }
+        let solver = Solver::new();
+        let mut params = Params::new();
+        params.set_u32("timeout", timeout_ms);
+        solver.set_params(&params);
+        let differ: Bool = x.eq(&y).not();
+        solver.assert(&differ);
+        match solver.check() {
+            SatResult::Unsat => SolveOutcome::Unsat,
+            SatResult::Sat if enc.uninterpreted.is_empty() => {
+                let Some(vars) = super::free_registers(a, b) else {
+                    return SolveOutcome::Unknown("register width clash".to_owned());
+                };
+                let Some(model) = solver.get_model() else {
+                    return SolveOutcome::Unknown("sat without a model".to_owned());
+                };
+                let mut out = BTreeMap::new();
+                for (name, width) in vars {
+                    let var = BV::new_const(format!("r!{name}"), width.bits());
+                    let value = model.eval(&var, true).and_then(|v| v.as_u64()).unwrap_or(0);
+                    out.insert(name, value);
+                }
+                SolveOutcome::Sat(out)
+            }
+            SatResult::Sat => SolveOutcome::Unknown("sat model involves uninterpreted loads/intrinsics".to_owned()),
+            SatResult::Unknown => {
+                let why = solver.get_reason_unknown().unwrap_or_default();
+                if why.contains("timeout") || why.contains("canceled") {
+                    SolveOutcome::Timeout
+                } else {
+                    SolveOutcome::Unknown(why)
+                }
+            }
         }
     }
 

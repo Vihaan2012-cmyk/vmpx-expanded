@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+vmpx-disasm = { path = "../vmpx-disasm" }
 vmpx-mutation = { path = "../vmpx-mutation" }
 vmpx-vm = { path = "../vmpx-vm" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }

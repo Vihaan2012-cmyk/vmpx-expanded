@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+iced-x86.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -25,6 +26,11 @@ vmpx-rebuild = { path = "../vmpx-rebuild" }
 vmpx-recompile = { path = "../vmpx-recompile" }
 vmpx-vmlift = { path = "../vmpx-vmlift" }
 vmpx-verify = { path = "../vmpx-verify" }
+vmpx-mutation = { path = "../vmpx-mutation" }
+
+[features]
+smt-z3 = ["vmpx-verify/smt-z3"]
+smt-z3-bundled = ["smt-z3", "vmpx-verify/smt-z3-bundled"]
 
 [lints]
 workspace = true

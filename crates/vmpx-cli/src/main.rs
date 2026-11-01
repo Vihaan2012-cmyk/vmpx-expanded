@@ -22,6 +22,7 @@ mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
+mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
 mod input_closed_functions;
@@ -147,6 +148,38 @@ enum Command {
         /// Print one line per function.
         #[arg(long)]
         verbose: bool,
+    },
+    /// Ground-truth differential: lift each virtualized user function from the
+    /// protected binary and the same function from the unprotected original
+    /// (both statically, into the IR) and run the equivalence gate.
+    DiffOriginal {
+        protected: PathBuf,
+        original: PathBuf,
+        /// Restrict to these export names; repeatable.
+        #[arg(long = "function")]
+        function: Vec<String>,
+        /// Total free input bits up to which the built-in backend enumerates.
+        #[arg(long, default_value_t = 16)]
+        exhaustive_bits: u32,
+        /// Per-cell wall-clock limit per backend.
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u32,
+        /// VM instruction budget for entry-stream recovery.
+        #[arg(long, default_value_t = 100_000)]
+        instruction_limit: usize,
+        /// Treat excluded environment-gate arms as unproven instead of noting them.
+        #[arg(long)]
+        strict_gates: bool,
+        /// Block-execution budget per side.
+        #[arg(long, default_value_t = 200_000)]
+        max_blocks: usize,
+        /// Path budget for the recovered side.
+        #[arg(long, default_value_t = 64)]
+        max_paths: usize,
+        /// Negative control: compare each function against the next export's
+        /// original; every verdict must then be REFUTED.
+        #[arg(long)]
+        control: bool,
     },
     /// Perform structural validation without executing the input.
     Verify {
@@ -1154,6 +1187,29 @@ fn main() -> Result<()> {
             instruction_limit,
             strict_memory,
             verbose,
+        })?,
+        Command::DiffOriginal {
+            protected,
+            original,
+            function,
+            exhaustive_bits,
+            timeout_ms,
+            instruction_limit,
+            strict_gates,
+            max_blocks,
+            max_paths,
+            control,
+        } => diff_original::run(diff_original::DiffOptions {
+            protected,
+            original,
+            only: function,
+            exhaustive_bits,
+            timeout_ms,
+            instruction_limit,
+            strict_gates,
+            max_blocks,
+            max_paths,
+            control,
         })?,
         Command::Verify { input, json } => {
             let (data, report) = inspect(&input)?;

@@ -71,7 +71,7 @@ pub(crate) fn obligation_for(pair: &RecompiledPair) -> Obligation {
     obligation
 }
 
-fn load_pe(bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn load_pe(bytes: &[u8]) -> Result<Vec<u8>> {
     let input = PeImage::parse(bytes).context("input is not a supported PE")?;
     let protection = detect_vmprotect(&input);
     Ok(match protection.image_layout {

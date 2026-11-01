@@ -279,6 +279,31 @@ pub(crate) fn lift_entry_cfg(
     rva: Rva,
     instruction_limit: usize,
 ) -> Result<vmpx_vmlift::LiftedCfgFunction, String> {
+    with_entry_input(pe, rva, instruction_limit, |input| {
+        lift_decoded_cfg(input, CodeAddress(0x1_8000_0000)).map_err(|error| error.to_string())
+    })?
+}
+
+/// Recovers `rva`'s CFG and executes its single input-independent path (a
+/// counted loop is unrolled), for the ground-truth differential.
+pub(crate) fn unroll_entry_cfg(
+    pe: &PeImage<'_>,
+    rva: Rva,
+    instruction_limit: usize,
+    max_blocks: usize,
+    max_paths: usize,
+) -> Result<vmpx_vmlift::UnrolledFunction, String> {
+    with_entry_input(pe, rva, instruction_limit, |input| {
+        vmpx_vmlift::unroll_decoded_cfg(input, max_blocks, max_paths)
+    })?
+}
+
+fn with_entry_input<R>(
+    pe: &PeImage<'_>,
+    rva: Rva,
+    instruction_limit: usize,
+    f: impl FnOnce(&DecodedCfgInput<'_>) -> R,
+) -> Result<R, String> {
     let candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
         .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
     let entry_limits = EntryProfileRecoveryLimits {
@@ -322,7 +347,7 @@ pub(crate) fn lift_entry_cfg(
         target_limits: limits,
         max_expanded_blocks: 256,
     };
-    lift_decoded_cfg(&input, CodeAddress(0x1_8000_0000)).map_err(|error| error.to_string())
+    Ok(f(&input))
 }
 
 #[cfg(test)]

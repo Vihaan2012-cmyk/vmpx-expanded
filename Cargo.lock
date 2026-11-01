@@ -2730,12 +2730,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "iced-x86",
  "serde",
  "serde_json",
  "sha2",
  "vmpx-detect",
  "vmpx-disasm",
  "vmpx-emulate",
+ "vmpx-mutation",
  "vmpx-pe",
  "vmpx-rebuild",
  "vmpx-recompile",
@@ -2866,6 +2868,7 @@ dependencies = [
 name = "vmpx-verify"
 version = "0.1.0"
 dependencies = [
+ "vmpx-disasm",
  "vmpx-mutation",
  "vmpx-recompile",
  "vmpx-vm",

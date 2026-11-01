@@ -4,9 +4,11 @@
 //! upgrades an eligible candidate to proven. [`equiv`] is the per-function
 //! end-to-end gate (PROVEN / REFUTED / TIMEOUT) over whole exit states.
 
+pub mod differential;
 pub mod equiv;
 pub mod input_testing;
 pub mod smt;
+pub mod sweep;
 pub mod smtlib;
 
 use vmpx_mutation::{Candidate, Score};
