@@ -204,6 +204,7 @@ fn compare_one(
         region_paths: 0,
         spin_pruned: 0,
         frame_stores_dropped: 0,
+        fidelity: None,
     };
     let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::PROVEN_FP) {
         Ok(cfg) => cfg,
@@ -272,6 +273,24 @@ fn print_outcome(name: &str, stub: u32, o: &DiffOutcome) {
     );
     if !o.reason.is_empty() {
         println!("    reason: {}", o.reason);
+    }
+    if let Some(f) = &o.fidelity {
+        println!(
+            "    fidelity: {} (coarse-by-method: {}) | cells exact {} idiom {} different {}{}",
+            f.refined.label(),
+            f.coarse.label(),
+            f.cells[0],
+            f.cells[1],
+            f.cells[2],
+            if f.truncated { " | diff budget exhausted (lower bound)" } else { "" }
+        );
+        if !f.divergences.is_empty() {
+            let list: Vec<String> = f.divergences.iter().map(|(d, n)| format!("{}:{n}", d.label())).collect();
+            println!("    divergences: {}", list.join(" "));
+            for (d, ex) in &f.examples {
+                println!("      e.g. {}: {ex}", d.label());
+            }
+        }
     }
     if let Some(report) = &o.report {
         for (i, path) in report.paths.iter().enumerate() {

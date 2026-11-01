@@ -891,6 +891,8 @@ pub struct DiffOutcome {
     /// Arms pruned as retry/spin on a failed environment probe.
     pub spin_pruned: usize,
     pub frame_stores_dropped: usize,
+    /// Structural fidelity of a PROVEN function (descriptive, not a proof).
+    pub fidelity: Option<crate::fidelity::FunctionFidelity>,
 }
 
 impl DiffOutcome {
@@ -903,6 +905,7 @@ impl DiffOutcome {
             region_paths: 0,
             spin_pruned: 0,
             frame_stores_dropped: 0,
+            fidelity: None,
         }
     }
 
@@ -979,6 +982,9 @@ pub fn diff_against_original(
         );
     } else if report.verdict == EquivVerdict::Timeout {
         out.reason = classify(&report);
+    }
+    if out.verdict == EquivVerdict::Proven {
+        out.fidelity = crate::fidelity::assess(&obligations, &report);
     }
     out.report = Some(report);
     out

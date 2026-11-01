@@ -19,6 +19,21 @@ from concurrent.futures import ThreadPoolExecutor
 VERDICT_RE = re.compile(r"^(\S.*?) \[0x([0-9a-f]+)\]: (PROVEN|REFUTED|TIMEOUT)(.*)$")
 SUMMARY_RE = re.compile(r"PROVEN (\d+) \| REFUTED (\d+) \| TIMEOUT (\d+)")
 CEX_RE = re.compile(r"^\s+COUNTEREXAMPLE .*$")
+FIDELITY_RE = re.compile(r"^\s+fidelity: (EXACT|IDIOM-DIVERGENT|EQUIVALENT-DIFFERENT) \(coarse-by-method: (EXACT|IDIOM-DIVERGENT|EQUIVALENT-DIFFERENT)\)")
+DIVERGENCES_RE = re.compile(r"^\s+divergences: (.*)$")
+EXAMPLE_RE = re.compile(r"^\s+e\.g\. ([a-z-]+): (.*)$")
+FIDELITY_ORDER = ["EXACT", "IDIOM-DIVERGENT", "EQUIVALENT-DIFFERENT"]
+# divergence type -> what to change in the lifter/simplifier to make it exact
+DIVERGENCE_HINTS = {
+    "rotate-idiom": "recognise shift-pair <-> Rol/Ror (one canonical rotate form on both sides)",
+    "lea-idiom": "canonicalise shl/mul/add-self scale chains (lea address forms)",
+    "commutation": "canonical operand order for commutative ops",
+    "reassociation": "canonical association for add/xor/and/or/mul chains",
+    "width": "canonical resize/extract/low-mask spelling",
+    "negation-idiom": "canonical sub/neg/not spelling",
+    "boolean-idiom": "fold nand/De Morgan-expanded and/or/xor/not back to the plain operator (VMProtect has only nand)",
+    "different-structure": "no recognised idiom: inspect examples, may need a new rewrite",
+}
 REASON_RE = re.compile(r"^\s+reason: (.*)$")
 
 # (class, regex on reason) in priority order; hint = what to fix next.
@@ -117,6 +132,15 @@ def run_one(args, entry, control):
                 r = REASON_RE.match(nxt)
                 if r:
                     res["reason"] = r.group(1)
+                f = FIDELITY_RE.match(nxt)
+                if f:
+                    res["fidelity"], res["fidelity_coarse"] = f.group(1), f.group(2)
+                dv = DIVERGENCES_RE.match(nxt)
+                if dv:
+                    res["divergences"] = {k: int(v) for k, v in (t.rsplit(":", 1) for t in dv.group(1).split())}
+                ex = EXAMPLE_RE.match(nxt)
+                if ex:
+                    res.setdefault("divergence_examples", {})[ex.group(1)] = ex.group(2)
                 if CEX_RE.match(nxt) and not res["counterexample"]:
                     res["counterexample"] = nxt.strip()
             break
@@ -144,6 +168,51 @@ def run_one(args, entry, control):
         f.write("$ " + " ".join(cmd) + "\n" + out + ("\n--- stderr ---\n" + err if err else ""))
     print(f"[{tag}] {res['verdict']:8} {res['seconds']:7.1f}s {entry.get('bucket','')}/{sym} {res['cls']}", flush=True)
     return res
+
+
+def fidelity_section(results):
+    """Structural fidelity of PROVEN functions. Descriptive, orthogonal to the verdict:
+    PROVEN says the recovery behaves like the original; fidelity says how close its IR tree is."""
+    proven = [r for r in results if r["verdict"] == "PROVEN"]
+    scored = [r for r in proven if r.get("fidelity")]
+    L = ["## Structural fidelity (PROVEN functions only; descriptive, not a proof)", "",
+         "EXACT = recovered and original trees identical after the shared simplifier; IDIOM-DIVERGENT = equal "
+         "modulo commutation/reassociation/rotate/lea/width/negation idioms; EQUIVALENT-DIFFERENT = only a solver "
+         "relates them. `coarse` classifies by proof method alone (structural / FP-canonical / solver); "
+         "`refined` also reclassifies solver-proven cells whose tree diff is fully explained by known idioms.", ""]
+    if not proven:
+        return L + ["No PROVEN functions.", ""]
+    if len(scored) < len(proven):
+        L += [f"{len(proven) - len(scored)} of {len(proven)} PROVEN functions printed no `fidelity:` line "
+              "(older vmpx binary?).", ""]
+    if not scored:
+        return L
+    L += ["| bucket | " + " | ".join(FIDELITY_ORDER) + " | total |", "|---|---:|---:|---:|---:|"]
+    for view, key in (("refined", "fidelity"), ("coarse", "fidelity_coarse")):
+        for b in sorted({r.get("bucket", "") for r in scored}):
+            c = collections.Counter(r[key] for r in scored if r.get("bucket", "") == b)
+            L.append(f"| {b or '(none)'} ({view}) | " + " | ".join(str(c[k]) for k in FIDELITY_ORDER) + f" | {sum(c.values())} |")
+        c = collections.Counter(r[key] for r in scored)
+        L.append(f"| **all ({view})** | " + " | ".join(str(c[k]) for k in FIDELITY_ORDER) + f" | {sum(c.values())} |")
+    exact = sum(r["fidelity"] == "EXACT" for r in scored)
+    L += ["", f"**{exact} of {len(scored)} PROVEN functions are structurally EXACT; "
+          f"{len(scored) - exact} are merely equivalent.**", ""]
+    nfn, ntot, ex = collections.Counter(), collections.Counter(), {}
+    for r in scored:
+        for d, n in r.get("divergences", {}).items():
+            nfn[d] += 1
+            ntot[d] += n
+            ex.setdefault(d, (r["symbol"], r.get("divergence_examples", {}).get(d, "")))
+    L += ["### Divergence-type fix-list (where the lifter diverges from exact), ranked by functions affected", ""]
+    if not nfn:
+        L += ["No divergences recorded.", ""]
+    for rank, d in enumerate(sorted(nfn, key=lambda k: (-nfn[k], -ntot[k], k)), 1):
+        L.append(f"{rank}. **{d}**: {nfn[d]} fn, {ntot[d]} node pairs - {DIVERGENCE_HINTS.get(d, '')}")
+        sym, text = ex[d]
+        if text:
+            L.append(f"   - e.g. `{sym}`: `{text[:200]}`")
+    L.append("")
+    return L
 
 
 def report(args, results, mode_control):
@@ -181,7 +250,8 @@ def report(args, results, mode_control):
     L.append(f"| **all** | {tot['PROVEN']} | {tot['REFUTED']} | {tot['TIMEOUT']} | {tot['SKIPPED']} | {sum(tot.values())} |")
     L.append("")
     if not mode_control:
-        bad = [r for r in results if r["cls"] != "PROVEN"]
+        L += fidelity_section(results)
+        bad =[r for r in results if r["cls"] != "PROVEN"]
         groups = collections.defaultdict(list)
         for r in bad:
             groups[r["cls"]].append(r)

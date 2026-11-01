@@ -6,6 +6,7 @@
 
 pub mod differential;
 pub mod equiv;
+pub mod fidelity;
 pub mod fp;
 pub mod input_testing;
 pub mod smt;
