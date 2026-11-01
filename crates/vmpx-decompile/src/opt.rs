@@ -407,7 +407,7 @@ pub fn narrow(func: &mut Func, live_in: &BTreeSet<String>) -> BTreeMap<String, B
             }
             None
         });
-        cleanup(&out)
+        cleanup(&crate::xu::mba_fold(&cleanup(&out)))
     };
     for b in f.blocks.values_mut() {
         for (v, d) in &mut b.assigns {

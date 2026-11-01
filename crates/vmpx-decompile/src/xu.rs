@@ -263,16 +263,16 @@ fn b_ops(b: &B) -> usize {
     }
 }
 
-fn b_collect(e: &Expr, atoms: &mut Vec<Expr>, budget: &mut usize) -> B {
-    if *budget == 0 {
+fn b_collect(e: &Expr, atoms: &mut Vec<Expr>, budget: &mut usize, depth: usize) -> B {
+    if *budget == 0 || depth == 0 {
         return b_atom(e, atoms);
     }
     *budget -= 1;
     match &e.kind {
-        ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, value } => B::Not(Box::new(b_collect(value, atoms, budget))),
+        ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, value } => B::Not(Box::new(b_collect(value, atoms, budget, depth - 1))),
         ExprKind::Binary { op: op @ (BinaryOp::And | BinaryOp::Or | BinaryOp::Xor), left, right } => {
-            let l = b_collect(left, atoms, budget);
-            let r = b_collect(right, atoms, budget);
+            let l = b_collect(left, atoms, budget, depth - 1);
+            let r = b_collect(right, atoms, budget, depth - 1);
             B::Bin(*op, Box::new(l), Box::new(r))
         }
         ExprKind::Const { value } if *value == 0 => B::Const(false),
@@ -388,9 +388,18 @@ pub fn mba_fold(e: &Expr) -> Expr {
             return None;
         }
         let mut atoms = Vec::new();
-        let mut budget = 96;
-        let tree = b_collect(n, &mut atoms, &mut budget);
-        if atoms.len() > 4 || atoms.iter().any(|a| a.width != n.width) {
+        let mut tree = B::Const(false);
+        let mut fits = false;
+        for depth in (2..=10).rev() {
+            atoms.clear();
+            let mut budget = 96;
+            tree = b_collect(n, &mut atoms, &mut budget, depth);
+            if atoms.len() <= 4 {
+                fits = true;
+                break;
+            }
+        }
+        if !fits || atoms.iter().any(|a| a.width != n.width) {
             return None;
         }
         if atoms.is_empty() {
