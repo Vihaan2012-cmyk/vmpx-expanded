@@ -202,6 +202,10 @@ impl Hook for OepHook {
             None => HookAction::Continue,
         }
     }
+
+    fn on_syscall(&mut self, cpu: &mut Cpu, mem: &mut Memory) -> Option<HookAction> {
+        self.inner.as_mut().and_then(|h| h.on_syscall(cpu, mem))
+    }
 }
 
 /// A contiguous run of mapped guest pages sharing one permission.

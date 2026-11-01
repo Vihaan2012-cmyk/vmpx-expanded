@@ -84,6 +84,32 @@ impl SysDllDb {
         exports
     }
 
+    /// Syscall numbers of the local `module`'s `Nt*`/`Zw*` export stubs, read from
+    /// each stub's canonical `mov r10, rcx; mov eax, imm32` prologue. Exports that
+    /// do not start with that prologue are omitted. `None` if the module is absent
+    /// or unparseable.
+    #[must_use]
+    pub fn syscall_numbers(&self, module: &str) -> Option<BTreeMap<String, u32>> {
+        let bytes = self.resolve_file(&module.to_lowercase()).and_then(|p| std::fs::read(p).ok())?;
+        let pe = PeImage::parse(&bytes).ok()?;
+        let exports = pe.report().exports?;
+        let mut out = BTreeMap::new();
+        for sym in &exports.symbols {
+            let Some(name) = sym.name.as_ref() else { continue };
+            if sym.forwarder.is_some() || !(name.starts_with("Nt") || name.starts_with("Zw")) {
+                continue;
+            }
+            let Ok(off) = pe.rva_to_file_offset(sym.rva) else { continue };
+            let Some(code) = usize::try_from(off.0).ok().and_then(|o| bytes.get(o..o + 8)) else {
+                continue;
+            };
+            if code[..4] == [0x4C, 0x8B, 0xD1, 0xB8] {
+                out.insert(name.clone(), u32::from_le_bytes([code[4], code[5], code[6], code[7]]));
+            }
+        }
+        Some(out)
+    }
+
     /// Locate the real file for `module` under System32 (case-insensitive).
     fn resolve_file(&self, module: &str) -> Option<PathBuf> {
         let direct = self.system32.join(module);
@@ -156,5 +182,18 @@ mod tests {
         assert!(has("RtlAllocateHeap"), "known ntdll export present");
         // Cached: a second lookup returns the same set.
         assert_eq!(db.exports("ntdll.dll").map(|v| v.len()), Some(exports.len()));
+    }
+
+    /// Real ntdll stubs yield syscall numbers; `Nt`/`Zw` twins agree.
+    #[test]
+    #[cfg(windows)]
+    fn reads_ntdll_syscall_numbers() {
+        let Some(n) = SysDllDb::new().syscall_numbers("ntdll.dll") else {
+            eprintln!("[skip] local System32 ntdll.dll unavailable");
+            return;
+        };
+        let nt = n["NtProtectVirtualMemory"];
+        assert_eq!(nt, n["ZwProtectVirtualMemory"]);
+        assert!(nt < 0x1000);
     }
 }

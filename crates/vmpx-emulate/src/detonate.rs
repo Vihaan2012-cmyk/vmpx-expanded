@@ -308,6 +308,10 @@ impl Hook for MultiHook {
         }
         acc
     }
+
+    fn on_syscall(&mut self, cpu: &mut Cpu, mem: &mut Memory) -> Option<HookAction> {
+        self.hooks.iter_mut().find_map(|h| h.on_syscall(cpu, mem))
+    }
 }
 
 /// Load `pe`, install a composite hook (import emulation + OEP detection, and VM
@@ -375,6 +379,12 @@ fn detonate_with(
     // Import emulation + OEP detection share one ObservedFacts.
     let mut winapi =
         WinApiHook::from_image(&img).with_export_reference(opts.export_reference.clone());
+    // Offline System32 ntdll supplies the real syscall numbers behind the stub bytes.
+    if opts.export_reference.keys().any(|k| k.eq_ignore_ascii_case("ntdll.dll")) {
+        if let Some(n) = crate::SysDllDb::new().syscall_numbers("ntdll.dll") {
+            winapi = winapi.with_syscall_numbers(n);
+        }
+    }
     let xplm = (opts.xplm || opts.lifecycle.is_some()).then(|| Rc::new(RefCell::new(Xplm::new())));
     if let Some(x) = &xplm {
         winapi = winapi.with_xplm(Rc::clone(x));
