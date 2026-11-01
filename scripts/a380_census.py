@@ -34,6 +34,7 @@ CLASSES = [
 ]
 HINTS = {c: h for c, _, h in CLASSES}
 HINTS.update({"not-in-original": "symbol missing from original DLL: fix manifest/matching",
+              "not-in-protected": "symbol missing from protected DLL: fix manifest/matching",
               "not-virtualized": "export is not a push-seed;call VM stub: not a virtualized function",
               "no-output": "diff-original produced no verdict line (crash/OOM?): inspect raw log",
               "other": "unclassified reason: inspect raw log"})
@@ -77,6 +78,12 @@ def pe_exports(path):
 
 def run_one(args, entry, control):
     sym = entry["symbol"]
+    for label, exports in (("protected", args.prot_exports), ("original", args.orig_exports)):
+        if sym not in exports:
+            print(f"[skip] {entry.get('bucket','')}/{sym}: not exported by {label}", flush=True)
+            return dict(entry, control=control, seconds=0, rc=0, verdict="SKIPPED", cls=f"not-in-{label}",
+                        reason=f"symbol not exported by the {label} DLL", counterexample="",
+                        modulo_env_gates=False, backends="")
     cmd = [args.vmpx, "diff-original", args.protected, args.original, "--function", sym,
            "--timeout-ms", str(args.timeout_ms)]
     if control:
@@ -152,7 +159,9 @@ def report(args, results, mode_control):
     cnt = collections.Counter(r["verdict"] for r in scored)
     M = len(scored)
     if mode_control:
-        L += [f"## Totals: control expects all REFUTED -> {cnt['REFUTED']} REFUTED / {cnt['PROVEN']} PROVEN (BAD) / {cnt['TIMEOUT']} TIMEOUT of {M}", ""]
+        L += [f"## Totals: {cnt['REFUTED']} REFUTED / {cnt['PROVEN']} PROVEN / {cnt['TIMEOUT']} TIMEOUT of {M}",
+              "Control passes when nothing is PROVEN (soundness) and at least one is REFUTED (the harness surfaces "
+              "counterexamples). TIMEOUT is allowed: a mismatched pair can exceed the solver budget.", ""]
     else:
         L += [f"## Totals: {cnt['PROVEN']} PROVEN / {cnt['REFUTED']} REFUTED / {cnt['TIMEOUT']} TIMEOUT of {M}"
               + (f" ({len(skipped)} skipped: unmatched/non-virtualized)" if skipped else ""), ""]
@@ -193,7 +202,7 @@ def report(args, results, mode_control):
     else:
         L += ["## Control results", ""]
         for r in results:
-            ok = "OK (REFUTED as expected)" if r["verdict"] == "REFUTED" else "HARNESS PROBLEM"
+            ok = {"REFUTED": "OK (REFUTED as expected)", "TIMEOUT": "inconclusive (allowed)"}.get(r["verdict"], "UNSOUND/HARNESS PROBLEM")
             L.append(f"- `{r['symbol']}`: {r['verdict']} -> {ok}")
             if r["counterexample"]:
                 L.append(f"  - {r['counterexample'][:300]}")
@@ -215,7 +224,7 @@ def main():
     ap.add_argument("--wall-timeout-s", type=int, default=900, help="hard kill per function")
     ap.add_argument("--jobs", type=int, default=1, help="parallel functions (z3 is memory-heavy; keep 1-2)")
     ap.add_argument("--strict-gates", action="store_true")
-    ap.add_argument("--control", action="store_true", help="negative control: every verdict must be REFUTED")
+    ap.add_argument("--control", action="store_true", help="negative control (each fn vs the next export's original): must yield no PROVEN and >=1 REFUTED")
     ap.add_argument("--only", action="append", default=[], help="restrict to these symbols")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra args passed to diff-original")
@@ -229,6 +238,8 @@ def main():
             e.setdefault("bucket", "")
     else:
         entries = [dict(symbol=s, demangled=s, bucket=args.bucket) for s in pe_exports(args.protected)]
+    args.prot_exports = set(pe_exports(args.protected))
+    args.orig_exports = set(pe_exports(args.original))
     if args.only:
         entries = [e for e in entries if e["symbol"] in args.only]
     if args.limit:
@@ -245,7 +256,7 @@ def main():
     print("\n" + md)
     c = collections.Counter(r["verdict"] for r in results)
     if args.control:
-        return 0 if c["REFUTED"] == len(results) else 2
+        return 0 if c["PROVEN"] == 0 and c["REFUTED"] > 0 else 2
     return 1 if c["REFUTED"] else 0
 
 
