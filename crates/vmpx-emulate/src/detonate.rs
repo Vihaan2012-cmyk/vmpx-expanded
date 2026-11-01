@@ -224,6 +224,8 @@ pub struct DetonationResult {
     pub iat_fill: IatFill,
     /// What the plugin-lifecycle driver did, when `opts.lifecycle` was set.
     pub lifecycle: Option<LifecycleReport>,
+    /// Anti-analysis / unmodeled-API audit from the API model: probe or stop -> count.
+    pub audit: BTreeMap<String, u64>,
 }
 
 /// What the recording host-SDK model captured during the run.
@@ -379,6 +381,7 @@ fn detonate_with(
     }
     let facts = winapi.facts();
     let book = winapi.address_book();
+    let audit = winapi.audit();
     let mut oep = OepHook::wrapping(winapi, Rc::clone(&facts));
     if opts.lifecycle.is_some() {
         oep = oep.keep_running();
@@ -495,6 +498,7 @@ fn detonate_with(
         discovered: Vec::new(),
         iat_fill,
         lifecycle,
+        audit: audit.borrow().clone(),
     })
 }
 
@@ -1113,6 +1117,9 @@ mod tests {
             for e in vm.edges.iter().take(12) {
                 eprintln!("    {e:?}");
             }
+        }
+        for (k, n) in res.audit.iter().filter(|(k, _)| k.contains("UNMODELED") || k.contains("BLOCKED")) {
+            eprintln!("  audit stop: {k} x{n}");
         }
         if let Some(lc) = &res.lifecycle {
             let c = |v: VmCounts| {
