@@ -203,6 +203,7 @@ pub struct WinApiHook {
     /// Half-open span of the backed ntdll stubs; guest reads/writes of it are audited.
     nt_mem_span: (u64, u64),
     nt_stub_audited: u32,
+    memcalls: u32,
     /// Most recent dispatched calls, dumped when a probe stops the run.
     recent: std::collections::VecDeque<String>,
     /// Recording host-SDK model; XPLM/XPWidgets imports route here (never forwarded).
@@ -327,6 +328,7 @@ impl WinApiHook {
             nt_stub_nr: BTreeMap::new(),
             nt_mem_span: (0, 0),
             nt_stub_audited: 0,
+            memcalls: 0,
             recent: std::collections::VecDeque::new(),
             xplm: None,
             addr_book,
@@ -596,6 +598,14 @@ impl WinApiHook {
 
     /// Record an anti-analysis probe and the clean answer it received.
     fn log_call(&mut self, what: String) {
+        if self.memcalls < 400
+            && ["Protect", "VirtualAlloc", "VirtualFree", "Free", "Allocate", "WriteProcess", "Query"]
+                .iter()
+                .any(|k| what.contains(k))
+        {
+            self.note(&format!("MEMCALL {:04} {what}", self.memcalls));
+            self.memcalls += 1;
+        }
         if self.recent.len() >= 48 {
             self.recent.pop_front();
         }
@@ -1106,7 +1116,11 @@ impl WinApiHook {
             // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
             (_, "VirtualAlloc") => {
                 let (addr, size) = (Self::arg(cpu, 0), Self::arg(cpu, 1));
-                let perm = page_to_perm(Self::arg(cpu, 3));
+                // An absent/zero protection keeps the historical read-write default.
+                let perm = match Self::arg(cpu, 3) & 0xff {
+                    0 => Perm::RW,
+                    p => page_to_perm(p),
+                };
                 if addr == 0 {
                     let va = self.alloc(mem, size);
                     if va != 0 && perm != Perm::RW && mem.protect(va, round_up(size.max(1)), perm).is_err() {
@@ -2040,10 +2054,11 @@ impl Hook for WinApiHook {
                     }
                 }
                 let sab = Self::stack_arg_base(ev, cpu);
+                let a0 = [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)];
                 return match self.nt.dispatch(&func, cpu, mem, sab) {
                     NtDispatch::Status(s) => {
                         self.note_nt(&func, cpu, s);
-                        self.log_call(format!("{func}(name-keyed) from={:#x} -> {s:#x}", ev.from));
+                        self.log_call(format!("{func}(name-keyed,{:#x},{:#x},{:#x},{:#x}) from={:#x} -> {s:#x}", a0[0], a0[1], a0[2], a0[3], ev.from));
                         cpu.regs[RAX] = s;
                         Self::resume(ev, cpu, mem)
                     }
@@ -2068,11 +2083,12 @@ impl Hook for WinApiHook {
         };
         // Kernel ABI: arg0 is in R10; stack args start above ret + shadow space.
         cpu.regs[ARG[0]] = cpu.regs[R10];
+        let a0 = [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)];
         let sab = cpu.regs[RSP].wrapping_add(0x28);
         Some(match self.nt.dispatch(&func, cpu, mem, sab) {
             NtDispatch::Status(s) => {
                 self.note_nt(&func, cpu, s);
-                self.log_call(format!("{func}(syscall) rip={:#x} -> {s:#x}", cpu.rip));
+                self.log_call(format!("{func}(syscall,{:#x},{:#x},{:#x},{:#x}) rip={:#x} -> {s:#x}", a0[0], a0[1], a0[2], a0[3], cpu.rip));
                 cpu.regs[RAX] = s;
                 cpu.regs[ARG[0]] = cpu.rip.wrapping_add(2);
                 cpu.regs[R11] = cpu.rflags;
