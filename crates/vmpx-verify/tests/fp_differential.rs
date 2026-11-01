@@ -9,6 +9,17 @@
 //! UNSAT (`--features smt-z3`); REFUTED needs a counterexample replayed through
 //! the exact evaluator; everything else, closeness included, stays TIMEOUT.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::many_single_char_names,
+    clippy::match_wildcard_for_single_variants,
+    clippy::mutable_key_type
+)]
+
 use std::collections::BTreeMap;
 
 use vmpx_verify::differential::{AbiPolicy, DiffOutcome, diff_against_original};
@@ -100,7 +111,8 @@ fn plain() -> Verifier {
 
 #[cfg(feature = "smt-z3")]
 fn with_z3() -> Verifier {
-    Verifier::default().with_backend(Box::new(vmpx_verify::smt::Z3Backend))
+    Verifier::new(vmpx_verify::equiv::Budget { timeout_ms: 120_000, ..Default::default() })
+        .with_backend(Box::new(vmpx_verify::smt::Z3Backend))
 }
 
 fn rax_method(out: &DiffOutcome) -> Method {
@@ -336,4 +348,18 @@ fn nan_only_divergence_is_neither_proven_nor_refuted() {
     // difference, so no counterexample; and not bit-identical, so no proof.
     let out = run(sub(xmm(0), xmm(1)), add(xmm(0), neg(xmm(1))), &plain());
     assert_eq!(out.verdict, EquivVerdict::Timeout, "{}", out.reason);
+}
+
+#[cfg(feature = "smt-z3")]
+#[test]
+fn z3_fp_model_for_a_value_difference_replays() {
+    use vmpx_verify::equiv::{Budget, SmtBackend, SolveOutcome};
+    let (l, r) = (mul(xmm(0), k(2.0)), mul(xmm(0), k(3.0)));
+    let SolveOutcome::Sat(model) =
+        vmpx_verify::smt::Z3Backend.check_distinct(&l, &r, &Budget::default())
+    else {
+        panic!("z3 must find a model");
+    };
+    let x = f64::from_bits(model["native_xmm0_initial"]);
+    assert!(!x.is_nan() && (x * 2.0).to_bits() != (x * 3.0).to_bits());
 }

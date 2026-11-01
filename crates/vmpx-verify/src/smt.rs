@@ -405,16 +405,13 @@ mod z3_backend {
                                     .collect::<Vec<_>>()
                                     .join(",")
                             );
-                            let decl = self
-                                .calls
-                                .entry(key.clone())
-                                .or_insert_with(|| {
-                                    FuncDecl::new(key, &domain.iter().collect::<Vec<_>>(), &sort(f))
-                                })
-                                .clone();
-                            self.called = true;
+                            let decl = self.calls.entry(key.clone()).or_insert_with(|| {
+                                FuncDecl::new(key, &domain.iter().collect::<Vec<_>>(), &sort(f))
+                            });
                             let refs: Vec<&dyn Ast> = args.iter().map(|a| a as &dyn Ast).collect();
-                            decl.apply(&refs).as_float()?
+                            let applied = decl.apply(&refs).as_float()?;
+                            self.called = true;
+                            applied
                         }
                         _ => self.fp_free(e, format),
                     }

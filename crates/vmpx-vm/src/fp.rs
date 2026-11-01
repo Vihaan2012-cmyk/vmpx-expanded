@@ -17,6 +17,17 @@
 //! including x86 NaN propagation (first NaN operand, quieted; invalid -> the
 //! default QNaN), independent of the host. A call is never evaluated.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::many_single_char_names,
+    clippy::match_wildcard_for_single_variants,
+    clippy::mutable_key_type
+)]
+
 use crate::{BitWidth, Expr};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

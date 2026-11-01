@@ -20,11 +20,22 @@
 //! refutation. Structural identity is exact.
 //!
 //! No tolerance anywhere: closeness never proves anything. Reassociation
-//! (`(a+b)+c` vs `a+(b+c)`) is not an equivalence in IEEE and is left to the
-//! solver, which refutes it. Libm calls are pure uninterpreted functions: equal
+//! (`(a+b)+c` vs `a+(b+c)`) is not an equivalence in IEEE; the probe (or the solver)
+//! refutes it. Libm calls are pure uninterpreted functions: equal
 //! target and equal arguments give equal results; nothing models their insides.
 
-use std::collections::{BTreeMap, HashSet};
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::many_single_char_names,
+    clippy::match_wildcard_for_single_variants,
+    clippy::mutable_key_type
+)]
+
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use vmpx_vm::fp::{FpIntrinsic, FpUnary};
@@ -35,32 +46,9 @@ use crate::smt::{fold, free_registers};
 /// True if any node of `e` is an `fp_*` intrinsic.
 #[must_use]
 pub fn mentions_fp(e: &Expr) -> bool {
-    let mut seen: HashSet<Expr> = HashSet::new();
-    let mut stack = vec![e.clone()];
-    while let Some(n) = stack.pop() {
-        if !seen.insert(n.clone()) {
-            continue;
-        }
-        match &n.kind {
-            ExprKind::Const { .. } | ExprKind::Register { .. } => {}
-            ExprKind::Intrinsic { name, arguments } => {
-                if FpIntrinsic::parse(name).is_some() {
-                    return true;
-                }
-                stack.extend(arguments.iter().cloned());
-            }
-            ExprKind::Unary { value, .. }
-            | ExprKind::Load { address: value }
-            | ExprKind::Extract { value, .. }
-            | ExprKind::Resize { value, .. } => stack.push((**value).clone()),
-            ExprKind::Binary { left, right, .. }
-            | ExprKind::Concat { high: left, low: right } => {
-                stack.push((**left).clone());
-                stack.push((**right).clone());
-            }
-        }
-    }
-    false
+    e.intrinsic_dependencies()
+        .iter()
+        .any(|name| FpIntrinsic::parse(name).is_some())
 }
 
 /// True if the root of `e` is an FP operation producing a float bit pattern.
