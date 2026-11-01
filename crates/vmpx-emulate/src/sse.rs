@@ -6,6 +6,8 @@
 //! `punpck{l,h}{bw,wd,dq,qdq}`, `pshufd`, `psrl/psll{w,d,q}`, `psra{w,d}`,
 //! `psrldq/pslldq`, `pmovmskb`, `ldmxcsr/stmxcsr`.
 //!
+//! Scalar/packed float, conversions and the remaining shuffles live in `sse_fp.rs`.
+//!
 //! Anything else touching a vector register (VEX/EVEX, MMX, scalar float, ...)
 //! stops with [`Stop::UnmodeledSse`].
 
@@ -27,7 +29,7 @@ pub(super) fn is_vector(ins: &Instruction) -> bool {
 }
 
 /// Apply `f` to each `bits`-wide lane pair.
-fn lanes(a: u128, b: u128, bits: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
+pub(super) fn lanes(a: u128, b: u128, bits: u32, f: impl Fn(u64, u64) -> u64) -> u128 {
     let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut out = 0u128;
     for i in 0..128 / bits {
@@ -44,7 +46,7 @@ fn sext(v: u64, bits: u32) -> i64 {
 }
 
 /// Interleave the low (`hi == false`) or high 64-bit halves in `bits` lanes.
-fn unpack(a: u128, b: u128, bits: u32, hi: bool) -> u128 {
+pub(super) fn unpack(a: u128, b: u128, bits: u32, hi: bool) -> u128 {
     let m = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let base = if hi { 64 } else { 0 };
     let mut out = 0u128;
@@ -76,11 +78,11 @@ fn shift(v: u128, bits: u32, count: u64, kind: Sh) -> u128 {
 }
 
 impl Emulator {
-    fn unmodeled(&self) -> Stop {
+    pub(super) fn unmodeled(&self) -> Stop {
         Stop::UnmodeledSse { rip: self.cur.0, mnemonic: self.cur.1 }
     }
 
-    fn xmm_idx(&self, r: Register) -> Result<usize, Stop> {
+    pub(super) fn xmm_idx(&self, r: Register) -> Result<usize, Stop> {
         if r.is_xmm() && r.number() < 16 { Ok(r.number()) } else { Err(self.unmodeled()) }
     }
 
@@ -115,7 +117,7 @@ impl Emulator {
     }
 
     /// Read operand `i` as a vector value of `bytes` (4/8/16) zero-extended to 128 bits.
-    fn xsrc(&mut self, ins: &Instruction, i: u32, bytes: u32, aligned: bool) -> Result<u128, Stop> {
+    pub(super) fn xsrc(&mut self, ins: &Instruction, i: u32, bytes: u32, aligned: bool) -> Result<u128, Stop> {
         match ins.op_kind(i) {
             OpKind::Register => {
                 let r = ins.op_register(i);
@@ -138,7 +140,7 @@ impl Emulator {
 
     /// Write `v` to operand `i`. A register destination takes `v` whole (callers
     /// zero-extend); a memory destination stores the low `bytes`.
-    fn xdst(&mut self, ins: &Instruction, i: u32, bytes: u32, aligned: bool, v: u128) -> Result<(), Stop> {
+    pub(super) fn xdst(&mut self, ins: &Instruction, i: u32, bytes: u32, aligned: bool, v: u128) -> Result<(), Stop> {
         match ins.op_kind(i) {
             OpKind::Register => {
                 let r = ins.op_register(i);
@@ -260,12 +262,12 @@ impl Emulator {
                 let a = self.ea(ins)?;
                 Ok(self.store(a, 4, u64::from(self.cpu.mxcsr))?)
             }
-            _ => Err(self.unmodeled()),
+            _ => self.exec_fp(ins, mn),
         }
     }
 
     /// `dst = f(dst, src)` for a 128-bit xmm destination and xmm/m128 source.
-    fn bin(&mut self, ins: &Instruction, align: bool, f: impl Fn(u128, u128) -> u128) -> Result<(), Stop> {
+    pub(super) fn bin(&mut self, ins: &Instruction, align: bool, f: impl Fn(u128, u128) -> u128) -> Result<(), Stop> {
         if ins.op_count() != 2 || ins.op_kind(0) != OpKind::Register {
             return Err(self.unmodeled());
         }

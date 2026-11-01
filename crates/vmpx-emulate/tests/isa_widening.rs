@@ -412,9 +412,9 @@ fn undefined_flag_consumer_still_stops() {
 
 #[test]
 fn xmm_move_fails_closed() {
-    // addss xmm0, xmm1 (F3 0F 58 C1): scalar float is unmodeled, so it must
-    // stop cleanly rather than guess.
-    let mut e = emu_bytes(&[0xf3, 0x0f, 0x58, 0xc1]);
+    // cvtdq2ps xmm0, xmm1 (0F 5B C1) is outside the modeled SSE subset, so it
+    // must stop cleanly rather than guess.
+    let mut e = emu_bytes(&[0x0f, 0x5b, 0xc1]);
     let before = e.cpu.clone();
     let s = e.step().unwrap_err();
     assert!(matches!(s, Stop::UnmodeledSse { .. }), "{s:?}");

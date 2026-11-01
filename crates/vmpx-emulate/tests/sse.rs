@@ -129,11 +129,11 @@ fn addr32_override_wraps_to_32_bits() {
 
 #[test]
 fn unmodeled_sse_fails_closed() {
-    // addss xmm0, xmm1
-    let mut e = emu(&[0xf3, 0x0f, 0x58, 0xc1]);
+    // cvtdq2ps xmm0, xmm1
+    let mut e = emu(&[0x0f, 0x5b, 0xc1]);
     let s = e.step().unwrap_err();
-    assert_eq!(s, Stop::UnmodeledSse { rip: CODE, mnemonic: M::Addss });
-    assert_eq!(s.to_string(), "unmodeled SSE: addss at 0x1000");
+    assert_eq!(s, Stop::UnmodeledSse { rip: CODE, mnemonic: M::Cvtdq2ps });
+    assert_eq!(s.to_string(), "unmodeled SSE: cvtdq2ps at 0x1000");
     // vpxor xmm0, xmm1, xmm2 (VEX) is not silently treated as pxor.
     let mut e = emu(&[0xc5, 0xf1, 0xef, 0xc2]);
     assert!(matches!(e.step(), Err(Stop::UnmodeledSse { .. })));

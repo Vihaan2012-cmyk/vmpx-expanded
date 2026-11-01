@@ -10,6 +10,8 @@ use crate::predecode::{self, K, Opnd, Pre, T_MEM, T_REG};
 
 #[path = "sse.rs"]
 mod sse;
+#[path = "sse_fp.rs"]
+mod sse_fp;
 
 // GPR indices into `Cpu::regs` (RSP lives in cpu.rs).
 const RAX: usize = 0;
@@ -2346,6 +2348,10 @@ const TSC_AUX: u64 = 0;
 ///
 /// - leaf 0: max standard leaf + vendor string `GenuineIntel`.
 /// - leaf 1: version `0x000606A7`; EDX = FPU|TSC|MSR|CMOV|MMX|FXSR|SSE|SSE2.
+///   SSE/SSE2 stay advertised (the x86-64 baseline; code gates on them) while
+///   only the `sse.rs`/`sse_fp.rs` subset is modeled: everything else stops with
+///   `Stop::UnmodeledSse`. MMX/FXSR are likewise baseline bits that fail closed
+///   if used. ECX=0, so SSE3+/AVX/AES/PCLMUL paths are never selected.
 /// - leaf `0x8000_0000`: max extended leaf.
 /// - leaf `0x8000_0001`: EDX = SYSCALL | Long-Mode (64-bit capable).
 /// - any other leaf/subleaf: all zero.

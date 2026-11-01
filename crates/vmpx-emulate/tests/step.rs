@@ -106,11 +106,11 @@ fn partial_register_writes() {
 
 #[test]
 fn unsupported_stops_cleanly() {
-    // addss xmm0, xmm1 (F3 0F 58 C1): scalar float is unmodeled, so it stops cleanly.
-    let mut e = emu(&[0xf3, 0x0f, 0x58, 0xc1]);
+    // cvtdq2ps xmm0, xmm1 (0F 5B C1) is outside the modeled SSE subset, so it stops cleanly.
+    let mut e = emu(&[0x0f, 0x5b, 0xc1]);
     e.cpu.regs[0] = 7;
     let before = e.cpu.clone();
-    assert_eq!(e.step(), Err(Stop::UnmodeledSse { rip: CODE, mnemonic: M::Addss }));
+    assert_eq!(e.step(), Err(Stop::UnmodeledSse { rip: CODE, mnemonic: M::Cvtdq2ps }));
     assert_eq!(e.cpu, before);
     assert!(e.trace.is_empty());
 }
