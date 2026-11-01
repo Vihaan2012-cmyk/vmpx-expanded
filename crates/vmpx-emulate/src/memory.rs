@@ -95,6 +95,38 @@ impl Memory {
         Self::default()
     }
 
+    /// Serialize every mapped page (base, perm byte, 4096 data bytes) for a
+    /// snapshot. Pages are written in address order.
+    pub fn save(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        w.write_all(&(self.index.len() as u64).to_le_bytes())?;
+        for (&base, &slot) in &self.index {
+            let page = &self.slab[slot as usize];
+            w.write_all(&base.to_le_bytes())?;
+            w.write_all(&[page.perm.0])?;
+            w.write_all(&page.data)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild paged memory from a [`Memory::save`] stream.
+    pub fn load(r: &mut impl std::io::Read) -> std::io::Result<Memory> {
+        let mut m = Memory::new();
+        let mut b8 = [0u8; 8];
+        r.read_exact(&mut b8)?;
+        let n = u64::from_le_bytes(b8);
+        for _ in 0..n {
+            r.read_exact(&mut b8)?;
+            let base = u64::from_le_bytes(b8);
+            let mut pb = [0u8; 1];
+            r.read_exact(&mut pb)?;
+            let mut data = vec![0u8; PAGE_SIZE as usize];
+            r.read_exact(&mut data)?;
+            m.index.insert(base, m.slab.len() as u32);
+            m.slab.push(Page { data: data.into_boxed_slice(), perm: Perm(pb[0]), code: false });
+        }
+        Ok(m)
+    }
+
     #[inline(always)]
     fn slot(&self, base: u64) -> Option<usize> {
         let (tag, idx) = self.tlb[(base >> 12) as usize & (TLB_SIZE - 1)].get();

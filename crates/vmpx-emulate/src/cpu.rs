@@ -33,6 +33,53 @@ pub struct Cpu {
     pub mxcsr: u32,
 }
 
+impl Cpu {
+    /// Serialize full CPU state for a snapshot.
+    pub fn save(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        for &r in &self.regs {
+            w.write_all(&r.to_le_bytes())?;
+        }
+        for v in [self.rip, self.rflags, self.undef_flags, self.gs_base] {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        for &x in &self.xmm {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        w.write_all(&self.mxcsr.to_le_bytes())
+    }
+
+    /// Reconstruct CPU state written by [`Cpu::save`].
+    pub fn load(r: &mut impl std::io::Read) -> std::io::Result<Cpu> {
+        let mut c = Cpu {
+            regs: [0; 16],
+            rip: 0,
+            rflags: 0,
+            undef_flags: 0,
+            gs_base: 0,
+            xmm: [0; 16],
+            mxcsr: 0,
+        };
+        let mut b8 = [0u8; 8];
+        for r8 in &mut c.regs {
+            r.read_exact(&mut b8)?;
+            *r8 = u64::from_le_bytes(b8);
+        }
+        for v in [&mut c.rip, &mut c.rflags, &mut c.undef_flags, &mut c.gs_base] {
+            r.read_exact(&mut b8)?;
+            *v = u64::from_le_bytes(b8);
+        }
+        let mut b16 = [0u8; 16];
+        for x in &mut c.xmm {
+            r.read_exact(&mut b16)?;
+            *x = u128::from_le_bytes(b16);
+        }
+        let mut b4 = [0u8; 4];
+        r.read_exact(&mut b4)?;
+        c.mxcsr = u32::from_le_bytes(b4);
+        Ok(c)
+    }
+}
+
 enum Loc {
     Full(usize, u32),
     High8(usize),

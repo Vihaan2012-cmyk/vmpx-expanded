@@ -62,6 +62,7 @@ mod memory;
 mod ntdll;
 mod observe;
 mod predecode;
+pub mod snapshot;
 mod sysdll;
 mod vm_discover;
 mod vm_observe;

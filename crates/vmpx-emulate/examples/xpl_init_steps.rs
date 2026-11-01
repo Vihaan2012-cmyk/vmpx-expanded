@@ -115,6 +115,23 @@ fn main() {
     emu.resolve_undefined_flags = true;
     emu.record_trace = false;
 
+    if let Ok(inp) = std::env::var("XPL_SNAPSHOT_IN") {
+        let (c, m) = vmpx_emulate::snapshot::load(std::path::Path::new(&inp)).expect("snapshot load");
+        println!("restored from {inp}: rip={:#x}", c.rip);
+        emu.cpu = c;
+        emu.mem = m;
+        let t = Instant::now();
+        let before = emu.steps();
+        let s = emu.run_until(sentinel, max_total);
+        let ran = emu.steps() - before;
+        let b = sh.borrow();
+        println!(
+            "resumed: ran {ran} steps stop={s:?} rip={:#x} rax={:#x} api_calls={} wall={:.1}s",
+            emu.cpu.rip, emu.cpu.regs[0], b.calls.values().sum::<u64>(), t.elapsed().as_secs_f64()
+        );
+        return;
+    }
+
     let mut phases: Vec<(String, u64, Vec<u64>)> = Vec::new();
     for (i, cb) in tls.iter().enumerate() {
         phases.push((format!("tls{i}"), *cb, vec![base, 1, 0]));
@@ -172,6 +189,12 @@ fn main() {
             println!("   rsp={:#x} stack=[{:#x},{:#x})", emu.cpu.regs[4], img_stack.0, img_stack.1);
             break 'outer;
         }
+    }
+    if let Ok(path) = std::env::var("XPL_SNAPSHOT_OUT") {
+        let p = std::path::Path::new(&path);
+        vmpx_emulate::snapshot::save(&emu.cpu, &emu.mem, p).expect("snapshot save");
+        let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        println!("snapshot saved -> {path} ({sz} bytes) rip={:#x} total_steps={total} wall={:.0}s", emu.cpu.rip, t0.elapsed().as_secs_f64());
     }
     let s = sh.borrow();
     println!("idata writes={} first_at={:?} last_at={}", s.idata_writes, s.idata_first, s.idata_last);
