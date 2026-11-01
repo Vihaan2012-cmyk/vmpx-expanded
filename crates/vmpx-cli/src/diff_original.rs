@@ -14,6 +14,7 @@ use vmpx_verify::branch_paths::diff_against_original_paths;
 use vmpx_verify::differential::native_loops::execute_native_loops;
 use vmpx_verify::differential::{AbiPolicy, DiffOutcome, ForkLimits, NativeEnv, execute_native_paths};
 use vmpx_verify::equiv::{Budget, CellVerdict, EquivVerdict, Method, Verifier};
+use vmpx_verify::loops::{PairFamily, prove_loop_equivalence};
 
 pub(crate) struct DiffOptions {
     pub protected: PathBuf,
@@ -239,22 +240,48 @@ fn compare_one(
     let natives = match execute_native_paths(&cfg, o.max_blocks, &native_env, limits) {
         Ok(n) => n,
         Err(e) if e.starts_with("input-dependent loop") => {
-            return timeout(match execute_native_loops(&cfg, o.max_blocks, &native_env, limits) {
-                Ok(l) => {
-                    println!(
-                        "  native loops: {} cut(s) {:x?}; entry segment {} path(s); {} loop segment(s) with {} path(s)",
-                        l.cuts.len(),
-                        l.cuts,
-                        l.entry.len(),
-                        l.loops.len(),
-                        l.loops.values().map(|s| s.paths.len()).sum::<usize>()
-                    );
-                    format!(
-                        "{e}; the original is summarized as cut-point loop segments but the recovered side exposes no loop representation to pair them with"
-                    )
-                }
-                Err(x) => format!("{e}; not summarizable as cut-point segments: {x}"),
-            });
+            let l = match execute_native_loops(&cfg, o.max_blocks, &native_env, limits) {
+                Ok(l) => l,
+                Err(x) => return timeout(format!("{e}; not summarizable as cut-point segments: {x}")),
+            };
+            println!(
+                "  native loops: {} cut(s) {:x?}; entry segment {} path(s); {} loop segment(s) with {} path(s)",
+                l.cuts.len(),
+                l.cuts,
+                l.entry.len(),
+                l.loops.len(),
+                l.loops.values().map(|s| s.paths.len()).sum::<usize>()
+            );
+            for assumption in &l.assumptions {
+                println!("  assumption: {assumption}");
+            }
+            let segmented = match crate::decoded_splice::with_entry_input(protected, Rva(stub), o.instruction_limit, |input| {
+                vmpx_vmlift::segment_decoded_cfg(input, o.max_blocks, o.max_paths.max(256))
+            }) {
+                Ok(Ok(s)) => s,
+                Ok(Err(x)) => return timeout(format!("{e}; protected side not segmentable: {x}")),
+                Err(x) => return timeout(format!("{e}; protected recovery: {x}")),
+            };
+            println!(
+                "  recovered loops: {} cut(s); entry segment {} path(s); {} loop segment(s) with {} path(s) ({} forks, {} blocks)",
+                segmented.loops.len(),
+                segmented.entry.len(),
+                segmented.loops.len(),
+                segmented.loops.values().map(|s| s.paths.len()).sum::<usize>(),
+                segmented.forks,
+                segmented.blocks
+            );
+            let pair = PairFamily::from_native(&l).and_then(|n| Ok((n, PairFamily::from_segmented(&segmented)?)));
+            let (native_family, vm_family) = match pair {
+                Ok(p) => p,
+                Err(x) => return timeout(format!("{e}; the cut-point families cannot be paired: {x}")),
+            };
+            let mut out = prove_loop_equivalence(&native_family, &vm_family, verifier, policy);
+            if o.strict_gates && out.verdict == EquivVerdict::Proven && out.modulo_env_gates() {
+                out.verdict = EquivVerdict::Timeout;
+                out.reason = format!("{} environment-gate arm(s) excluded and --strict-gates is set", out.region_paths);
+            }
+            return out;
         }
         Err(e) => return timeout(format!("original not modelable: {e}")),
     };

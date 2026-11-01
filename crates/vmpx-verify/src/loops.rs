@@ -37,6 +37,12 @@
 //! the other does, with equal state, and both diverge together. Phis outside `I`
 //! stay free symbols in every query, so each query holds for all their values.
 //!
+//! A recovered path that is a protector gate-failure arm ([`PairEnd::Gate`]) is
+//! excluded from every comparison and counted; the verdict is then "modulo
+//! environment gates", the same labeled exclusion the straight-line differential
+//! makes. A gate arm is a path of its segment, so exhaustiveness is still checked
+//! over the segment's full path family.
+//!
 //! The Houdini search only chooses *which* equalities to assume; the assumed set is
 //! always the one verified, so a poor choice costs completeness, never soundness.
 //! A refutation inside an inductive step names a phi assignment that need not be
@@ -45,11 +51,13 @@
 use std::collections::BTreeMap;
 
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind};
-use vmpx_vmlift::ExitSemantics;
+use vmpx_vmlift::{ExitSemantics, SegEnd, SegPath, SegmentedFunction};
 
-use crate::branch_paths::{and, expand_flags, is_zero, map_exit, restrict};
+use crate::branch_paths::{and, conditions_expr, expand_flags, is_zero, map_exit, restrict};
 use crate::differential::native_loops::{NativeLoops, carried};
-use crate::differential::{AbiPolicy, DiffOutcome, SegmentEnd, differential_obligation};
+use crate::differential::{
+    AbiPolicy, DiffOutcome, SegmentEnd, differential_obligation, prepare_condition, prepare_recovered, xmm_entry_symbol,
+};
 use crate::equiv::{Cell, CellId, CellVerdict, EquivVerdict, Obligation, Verifier};
 
 /// Most Houdini rounds before the proof is abandoned.
@@ -65,6 +73,11 @@ pub enum PairEnd {
     Exit(ExitSemantics),
     /// A cut, with the values the destination's phis take, aligned with its `phis`.
     Cut { header: u64, next: Vec<Expr> },
+    /// A protector gate-failure arm (returns through staged stack). It is
+    /// excluded from the comparison and counted, so a verdict that excluded one is
+    /// "modulo environment gates", exactly as the straight-line differential.
+    /// Only a recovered (VM) side has these.
+    Gate,
 }
 
 /// One path: a `W8` 0/1 condition over the entry symbols and the segment's phis.
@@ -90,6 +103,8 @@ pub struct PairSegment {
 pub struct PairFamily {
     pub entry: Vec<PairPath>,
     pub loops: BTreeMap<u64, PairSegment>,
+    /// Gate arms in all segments.
+    pub gates: usize,
 }
 
 impl PairFamily {
@@ -118,7 +133,80 @@ impl PairFamily {
         for (h, seg) in &n.loops {
             loops.insert(*h, PairSegment { phis: seg.phis.clone(), paths: convert(&seg.paths)? });
         }
-        Ok(Self { entry: convert(&n.entry)?, loops })
+        Ok(Self { entry: convert(&n.entry)?, loops, gates: 0 })
+    }
+
+    /// The recovered VM function's cut-point family.
+    ///
+    /// Each VM cut carries, besides its state cells, the 32 XMM lanes as phis that
+    /// every iteration passes on unchanged: the integer VM cannot touch XMM state
+    /// (a handler that does fails closed), so an exit leaves each lane at the
+    /// cut's value, which the entry segment seeds with the entry symbol.
+    ///
+    /// # Errors
+    /// A path that cannot be brought into the original's vocabulary: a store
+    /// outside the VM's dead frame, an observable value that depends on the VM
+    /// stack root, a branch selector over anything but entry symbols and the
+    /// segment's own phis, a carried vector that does not match its cut.
+    pub fn from_segmented(f: &SegmentedFunction) -> Result<Self, String> {
+        let xmm_phis = |header: u64| -> Vec<Expr> {
+            (0..16u8)
+                .flat_map(|n| [false, true].map(|hi| {
+                    Expr::register(
+                        BitWidth::W64,
+                        format!("vmphi{header:x}_xmm{n}{}", if hi { "hi" } else { "lo" }),
+                    )
+                }))
+                .collect()
+        };
+        let mut gates = 0_usize;
+        let mut convert = |paths: &[SegPath], header: Option<u64>, phis: &[Expr]| -> Result<Vec<PairPath>, String> {
+            let names: std::collections::BTreeSet<String> = phis.iter().filter_map(register_name).collect();
+            let lanes: Vec<Expr> = match header {
+                Some(h) => xmm_phis(h),
+                None => (0..16u8).flat_map(|n| [false, true].map(|hi| xmm_entry_symbol(n, hi))).collect(),
+            };
+            paths
+                .iter()
+                .map(|p| {
+                    let cond = conditions_expr(&p.conditions, &|d: &str| d.starts_with("native_") || names.contains(d))?;
+                    let cond = expand_flags(&cond)?;
+                    let end = match &p.end {
+                        SegEnd::Exit(path) if path.region_exit => {
+                            gates += 1;
+                            PairEnd::Gate
+                        }
+                        SegEnd::Exit(path) => {
+                            let (mut sem, _) = prepare_recovered(&path.semantics, &path.store_epochs, f.entry_sp_offset)?;
+                            if header.is_some() {
+                                sem.exit.xmm = (0..16u8)
+                                    .map(|n| (n, (lanes[usize::from(n) * 2].clone(), lanes[usize::from(n) * 2 + 1].clone())))
+                                    .collect();
+                            }
+                            PairEnd::Exit(map_exit(&sem, &mut expand_flags)?)
+                        }
+                        SegEnd::Cut { header: dest, next } => {
+                            let mut vals = next
+                                .iter()
+                                .map(|e| prepare_condition(e).and_then(|e| expand_flags(&e)))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            vals.extend(lanes.iter().cloned());
+                            PairEnd::Cut { header: dest.0, next: vals }
+                        }
+                    };
+                    Ok(PairPath { cond, end })
+                })
+                .collect()
+        };
+        let entry = convert(&f.entry, None, &[])?;
+        let mut loops = BTreeMap::new();
+        for (h, seg) in &f.loops {
+            let mut phis: Vec<Expr> = seg.phis.iter().map(|p| Expr::register(p.width, p.name.clone())).collect();
+            phis.extend(xmm_phis(h.0));
+            let paths = convert(&seg.paths, Some(h.0), &phis)?;
+            loops.insert(h.0, PairSegment { phis, paths });
+        }
+        Ok(Self { entry, loops, gates })
     }
 
     fn phi_names(&self) -> Vec<String> {
@@ -233,6 +321,7 @@ pub fn prove_loop_equivalence(
                             return Ok(());
                         }
                         match (&np.end, &vp.end) {
+                            (_, PairEnd::Gate) => Ok(()),
                             (PairEnd::Exit(orig), PairEnd::Exit(rec)) => {
                                 let rec = map_exit(rec, &mut |e| e.substitute(&sigma).map_err(|x| x.to_string()))?;
                                 let mut o = differential_obligation(&rec, orig, policy);
@@ -320,6 +409,7 @@ pub fn prove_loop_equivalence(
     };
     let mut out = out;
     out.frame_stores_dropped = 0;
+    out.region_paths = recovered.gates;
     let mut out = crate::differential::conclude(out, &exits, verifier, false, false);
     if out.verdict == EquivVerdict::Refuted {
         out.verdict = EquivVerdict::Timeout;

@@ -213,13 +213,22 @@ pub(crate) fn and(a: &Expr, b: &Expr) -> Result<Expr, String> {
 /// # Errors
 /// A selector that is not a 64-bit value over entry symbols, or cannot be rebuilt.
 pub fn recovered_condition(path: &vmpx_vmlift::UnrolledPath) -> Result<Expr, String> {
+    conditions_expr(&path.conditions, &|d: &str| d.starts_with("native_"))
+}
+
+/// The `W8` 0/1 conjunction of a path's `selector == value` conditions; every
+/// selector may depend only on symbols `allowed` accepts.
+pub(crate) fn conditions_expr(
+    conditions: &[vmpx_vmlift::PathCondition],
+    allowed: &dyn Fn(&str) -> bool,
+) -> Result<Expr, String> {
     let mut all = c(BitWidth::W8, 1);
-    for cond in &path.conditions {
+    for cond in conditions {
         let selector = prepare_condition(&cond.selector)?;
         if selector.width != BitWidth::W64 {
             return Err("a recovered branch selector is not 64-bit".to_owned());
         }
-        if let Some(stray) = selector.dependencies().into_iter().find(|d| !d.starts_with("native_")) {
+        if let Some(stray) = selector.dependencies().into_iter().find(|d| !allowed(d)) {
             return Err(format!("a recovered branch selector depends on `{stray}`"));
         }
         let equal = is_zero(&bin(BinaryOp::Xor, &selector, &c(BitWidth::W64, cond.value))?)?;

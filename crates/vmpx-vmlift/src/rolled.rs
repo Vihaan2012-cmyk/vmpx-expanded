@@ -122,7 +122,7 @@ pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Resul
     Ok(RolledFunction { root, loops: w.loops, forks: w.forks, straight_blocks: w.blocks })
 }
 
-fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
+pub(crate) fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
     let cfg = input.cfg;
     let mut preds: BTreeMap<Va, Vec<Va>> = cfg.blocks.keys().map(|k| (*k, vec![])).collect();
     for e in &cfg.edges {

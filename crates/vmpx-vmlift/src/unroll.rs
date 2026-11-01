@@ -382,7 +382,7 @@ impl Walker<'_, '_> {
 /// A selector that reads only the environment: a cpuid/segment-base probe, or
 /// loads and flags with no dependence on the function's registers. These are the
 /// protector's own gates, not branches of the protected function.
-fn is_environment_probe(selector: &Expr) -> bool {
+pub(crate) fn is_environment_probe(selector: &Expr) -> bool {
     let intrinsics = selector.intrinsic_dependencies();
     let probes = intrinsics.iter().any(|n| {
         n.starts_with("x86_cpuid") || n.starts_with("x86_gs_load") || n.starts_with("x86_fs_load")
