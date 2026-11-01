@@ -2748,6 +2748,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmpx-decompile"
+version = "0.1.0"
+dependencies = [
+ "vmpx-disasm",
+ "vmpx-mutation",
+ "vmpx-pe",
+ "vmpx-verify",
+ "vmpx-vm",
+ "vmpx-vmlift",
+]
+
+[[package]]
 name = "vmpx-demutate"
 version = "0.1.0"
 dependencies = [

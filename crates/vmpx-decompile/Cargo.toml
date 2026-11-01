@@ -1,0 +1,17 @@
+[package]
+name = "vmpx-decompile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vmpx-disasm = { path = "../vmpx-disasm" }
+vmpx-mutation = { path = "../vmpx-mutation" }
+vmpx-pe = { path = "../vmpx-pe" }
+vmpx-vm = { path = "../vmpx-vm" }
+vmpx-vmlift = { path = "../vmpx-vmlift" }
+vmpx-verify = { path = "../vmpx-verify" }
+
+[lints]
+workspace = true
