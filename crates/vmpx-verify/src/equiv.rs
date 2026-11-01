@@ -231,6 +231,11 @@ impl SmtBackend for NativeBackend {
 pub enum Method {
     Structural,
     Solver(String),
+    /// FP trees equal after commuting `fadd`/`fmul` operands: bit-exact except
+    /// which NaN payload a commuted node returns when both operands are NaN.
+    FpCanonical,
+    /// Z3 floating-point theory UNSAT: equal modulo NaN payload/sign (Z3 has one NaN).
+    FpSolver(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,21 +351,36 @@ impl Verifier {
         if a == b {
             return CellVerdict::Proven(Method::Structural);
         }
+        let fp = crate::fp::mentions_fp(&a) || crate::fp::mentions_fp(&b);
+        if fp {
+            if crate::fp::canonicalize(&a) == crate::fp::canonicalize(&b) {
+                return CellVerdict::Proven(Method::FpCanonical);
+            }
+            if let Some(cex) = crate::fp::probe(&a, &b).and_then(|m| replay(&a, &b, &m)) {
+                return CellVerdict::Refuted(cex);
+            }
+        }
         let key = (a.clone(), b.clone());
         if let Some(done) = self.cache.borrow().get(&key) {
             return done.clone();
         }
-        let verdict = self.decide(&a, &b);
+        let verdict = self.decide(&a, &b, fp);
         self.cache.borrow_mut().insert(key, verdict.clone());
         verdict
     }
 
-    fn decide(&self, a: &Expr, b: &Expr) -> CellVerdict {
+    fn decide(&self, a: &Expr, b: &Expr, fp: bool) -> CellVerdict {
         let (a, b) = (a.clone(), b.clone());
         let mut worst = Unproven::Unknown("no backend decided".to_owned());
         for backend in &self.backends {
             match backend.check_distinct(&a, &b, &self.budget) {
-                SolveOutcome::Unsat => return CellVerdict::Proven(Method::Solver(backend.name())),
+                SolveOutcome::Unsat => {
+                    return CellVerdict::Proven(if fp {
+                        Method::FpSolver(backend.name())
+                    } else {
+                        Method::Solver(backend.name())
+                    });
+                }
                 SolveOutcome::Sat(model) => match replay(&a, &b, &model) {
                     Some(cex) => return CellVerdict::Refuted(cex),
                     None => {
@@ -458,7 +478,7 @@ fn replay(a: &Expr, b: &Expr, model: &BTreeMap<String, u64>) -> Option<Counterex
         })
         .collect();
     let (x, y) = (fold(a, &env)?, fold(b, &env)?);
-    (x != y).then(|| Counterexample {
+    (x != y && !crate::fp::both_nan(a, b, x, y)).then(|| Counterexample {
         assignment: vars
             .keys()
             .map(|n| (n.clone(), model.get(n).copied().unwrap_or(0)))

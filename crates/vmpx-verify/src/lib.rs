@@ -6,6 +6,7 @@
 
 pub mod differential;
 pub mod equiv;
+pub mod fp;
 pub mod input_testing;
 pub mod smt;
 pub mod sweep;

@@ -98,6 +98,8 @@ fn methods(o: &DiffOutcome) -> String {
                 let key = match m {
                     Method::Structural => "structural".to_owned(),
                     Method::Solver(n) => n.clone(),
+                    Method::FpCanonical => "fp-canonical".to_owned(),
+                    Method::FpSolver(n) => format!("{n}-fp"),
                 };
                 *counts.entry(key).or_default() += 1;
             }

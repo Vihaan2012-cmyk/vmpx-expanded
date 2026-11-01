@@ -187,11 +187,11 @@ fn account(tally: &mut Tally, rva: Rva, verdict: &Result<FunctionReport, String>
                         _ => None,
                     })
                     .collect();
-                if methods.iter().all(|m| **m == Method::Structural) {
+                if methods.iter().all(|m| matches!(m, Method::Structural | Method::FpCanonical)) {
                     tally.proven_structural += 1;
                 } else if methods
                     .iter()
-                    .any(|m| matches!(m, Method::Solver(n) if n != "native-bounded"))
+                    .any(|m| matches!(m, Method::Solver(n) if n != "native-bounded") || matches!(m, Method::FpSolver(_)))
                 {
                     tally.proven_solver += 1;
                 } else {

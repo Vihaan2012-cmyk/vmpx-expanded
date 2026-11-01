@@ -817,6 +817,11 @@ fn simplify_intrinsic(width: BitWidth, name: String, arguments: Vec<Expr>) -> Ex
         .iter()
         .map(constant_value)
         .collect::<Option<Vec<_>>>();
+    if name.starts_with("fp_")
+        && let Some(value) = crate::fp::fold_constant(&name, width, &arguments)
+    {
+        return Expr::constant(width, value);
+    }
     if width == BitWidth::W64
         && let Some(constants) = constants.as_deref()
         && let Some(flags) = evaluate_vm_flags(&name, constants)

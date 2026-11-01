@@ -101,10 +101,11 @@ mod z3_backend {
     //! SMT-LIB shifts (count >= width gives 0 / sign fill); rotates use the
     //! masked count modulo the width. Unencodable shapes yield `None`.
 
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use z3::ast::{BV, Bool};
-    use z3::{Params, SatResult, Solver};
+    use vmpx_vm::fp::{FpBinary, FpFormat, FpIntrinsic, FpPredicate, FpUnary};
+    use z3::ast::{Ast, BV, Bool, Float, RoundingMode};
+    use z3::{FuncDecl, Params, SatResult, Solver, Sort};
 
     use super::{Expr, ExprKind, ExprRef, SolveOutcome, Verdict};
     use vmpx_vm::{BinaryOp, ResizeOp, UnaryOp};
@@ -113,16 +114,19 @@ mod z3_backend {
     const MAX_DEPTH: u32 = 1000;
 
     #[allow(clippy::mutable_key_type)] // hash/eq are pointer-based; the atomic is a cache flag
+    #[derive(Default)]
     struct Encoder {
         memo: HashMap<ExprRef, BV>,
         uninterpreted: HashMap<Expr, BV>,
+        fp_uninterpreted: HashMap<Expr, Float>,
+        calls: HashMap<String, FuncDecl>,
+        called: bool,
+        fp_regs: BTreeSet<String>,
+        bv_regs: BTreeSet<String>,
     }
 
     pub(super) fn check(a: &Expr, b: &Expr) -> Verdict {
-        let mut enc = Encoder {
-            memo: HashMap::new(),
-            uninterpreted: HashMap::new(),
-        };
+        let mut enc = Encoder::default();
         let (Some(x), Some(y)) = (enc.encode(a, 0), enc.encode(b, 0)) else {
             return Verdict::Unknown;
         };
@@ -145,26 +149,38 @@ mod z3_backend {
     }
 
     pub(super) fn check_model(a: &Expr, b: &Expr, timeout_ms: u32) -> SolveOutcome {
-        let mut enc = Encoder {
-            memo: HashMap::new(),
-            uninterpreted: HashMap::new(),
+        let mut enc = Encoder::default();
+        let differ: Bool = if crate::fp::yields_float(a) || crate::fp::yields_float(b) {
+            let Some(format) = root_format(a, b) else {
+                return SolveOutcome::Unknown("float roots of different formats".to_owned());
+            };
+            let (Some(x), Some(y)) = (enc.fp(a, format, 0), enc.fp(b, format, 0)) else {
+                return SolveOutcome::Unknown("term not encodable as a float".to_owned());
+            };
+            x.eq(&y).not()
+        } else {
+            let (Some(x), Some(y)) = (enc.encode(a, 0), enc.encode(b, 0)) else {
+                return SolveOutcome::Unknown("term not encodable as a bit-vector".to_owned());
+            };
+            if x.get_size() != y.get_size() {
+                return SolveOutcome::Unknown("width mismatch".to_owned());
+            }
+            x.eq(&y).not()
         };
-        let (Some(x), Some(y)) = (enc.encode(a, 0), enc.encode(b, 0)) else {
-            return SolveOutcome::Unknown("term not encodable as a bit-vector".to_owned());
-        };
-        if x.get_size() != y.get_size() {
-            return SolveOutcome::Unknown("width mismatch".to_owned());
-        }
         z3::set_global_param("memory_max_size", "3072");
         let solver = Solver::new();
         let mut params = Params::new();
         params.set_u32("timeout", timeout_ms);
         solver.set_params(&params);
-        let differ: Bool = x.eq(&y).not();
         solver.assert(&differ);
         match solver.check() {
             SatResult::Unsat => SolveOutcome::Unsat,
-            SatResult::Sat if enc.uninterpreted.is_empty() => {
+            SatResult::Sat
+                if enc.uninterpreted.is_empty()
+                    && enc.fp_uninterpreted.is_empty()
+                    && !enc.called
+                    && enc.fp_regs.is_disjoint(&enc.bv_regs) =>
+            {
                 let Some(vars) = super::free_registers(a, b) else {
                     return SolveOutcome::Unknown("register width clash".to_owned());
                 };
@@ -173,13 +189,20 @@ mod z3_backend {
                 };
                 let mut out = BTreeMap::new();
                 for (name, width) in vars {
-                    let var = BV::new_const(format!("r!{name}"), width.bits());
-                    let value = model.eval(&var, true).and_then(|v| v.as_u64()).unwrap_or(0);
+                    let value = if enc.fp_regs.contains(&name) {
+                        let var = float_const(&name, width.bits());
+                        model.eval(&var, true).map_or(0, |v| float_bits(&v, width.bits()))
+                    } else {
+                        let var = BV::new_const(format!("r!{name}"), width.bits());
+                        model.eval(&var, true).and_then(|v| v.as_u64()).unwrap_or(0)
+                    };
                     out.insert(name, value);
                 }
                 SolveOutcome::Sat(out)
             }
-            SatResult::Sat => SolveOutcome::Unknown("sat model involves uninterpreted loads/intrinsics".to_owned()),
+            SatResult::Sat => SolveOutcome::Unknown(
+                "sat model involves uninterpreted loads/intrinsics/calls".to_owned(),
+            ),
             SatResult::Unknown => {
                 let why = solver.get_reason_unknown().unwrap_or_default();
                 if why.contains("timeout") || why.contains("canceled") {
@@ -216,7 +239,10 @@ mod z3_backend {
             let bits = e.width.bits();
             let bv = match &e.kind {
                 ExprKind::Const { value } => BV::from_u64(e.width.truncate(*value), bits),
-                ExprKind::Register { name } => BV::new_const(format!("r!{name}"), bits),
+                ExprKind::Register { name } => {
+                    self.bv_regs.insert(name.clone());
+                    BV::new_const(format!("r!{name}"), bits)
+                }
                 ExprKind::Unary { op, value } => {
                     let v = self.node(value, depth)?;
                     match op {
@@ -231,7 +257,13 @@ mod z3_backend {
                     }
                     binary(*op, bits, &l, &r)
                 }
-                ExprKind::Load { .. } | ExprKind::Intrinsic { .. } => self.uninterpreted(e),
+                ExprKind::Intrinsic { name, arguments } => match FpIntrinsic::parse(name) {
+                    Some(op @ (FpIntrinsic::Compare(..) | FpIntrinsic::ToInt { .. })) => {
+                        self.fp_to_bv(&op, arguments, depth)?
+                    }
+                    _ => self.uninterpreted(e),
+                },
+                ExprKind::Load { .. } => self.uninterpreted(e),
                 ExprKind::Extract { value, lsb } => {
                     let v = self.node(value, depth)?;
                     let end = lsb.checked_add(bits)?;
@@ -259,6 +291,184 @@ mod z3_backend {
                 }
             };
             (bv.get_size() == bits).then_some(bv)
+        }
+    }
+
+    fn root_format(a: &Expr, b: &Expr) -> Option<FpFormat> {
+        if a.width != b.width {
+            return None;
+        }
+        format_of(a.width.bits())
+    }
+
+    fn sort(format: FpFormat) -> Sort {
+        match format {
+            FpFormat::F32 => Sort::float32(),
+            FpFormat::F64 => Sort::double(),
+        }
+    }
+
+    fn format_of(bits: u32) -> Option<FpFormat> {
+        match bits {
+            32 => Some(FpFormat::F32),
+            64 => Some(FpFormat::F64),
+            _ => None,
+        }
+    }
+
+    fn float_const(name: &str, bits: u32) -> Float {
+        if bits == 32 {
+            Float::new_const_float32(format!("f!{name}"))
+        } else {
+            Float::new_const_double(format!("f!{name}"))
+        }
+    }
+
+    fn float_bits(value: &Float, bits: u32) -> u64 {
+        if bits == 32 {
+            u64::from((value.as_f64() as f32).to_bits())
+        } else {
+            value.as_f64().to_bits()
+        }
+    }
+
+    fn numeral(format: FpFormat, bits: u64) -> Float {
+        match format {
+            FpFormat::F32 => Float::from_f32(f32::from_bits(bits as u32)),
+            FpFormat::F64 => Float::from_f64(f64::from_bits(bits)),
+        }
+    }
+
+    impl Encoder {
+        /// Float encoding of an expression holding a `format` bit pattern.
+        /// Registers become float variables; a shape not modelled becomes an
+        /// unconstrained float (an over-approximation: UNSAT stays sound and a
+        /// SAT model is never trusted).
+        fn fp(&mut self, e: &Expr, format: FpFormat, depth: u32) -> Option<Float> {
+            if depth > MAX_DEPTH || e.width != format.width() {
+                return None;
+            }
+            let rm = RoundingMode::round_nearest_ties_to_even();
+            let out = match &e.kind {
+                ExprKind::Const { value } => numeral(format, e.width.truncate(*value)),
+                ExprKind::Register { name } => {
+                    self.fp_regs.insert(name.clone());
+                    float_const(name, e.width.bits())
+                }
+                ExprKind::Intrinsic { name, arguments } => {
+                    match FpIntrinsic::parse(name).filter(FpIntrinsic::yields_float) {
+                        Some(FpIntrinsic::Binary(op, f)) if f == format => {
+                            let [x, y] = arguments.as_slice() else { return None };
+                            let (x, y) = (self.fp(x, f, depth + 1)?, self.fp(y, f, depth + 1)?);
+                            match op {
+                                FpBinary::Add => x.add_with_rounding_mode(&y, &rm),
+                                FpBinary::Sub => x.sub_with_rounding_mode(&y, &rm),
+                                FpBinary::Mul => x.mul_with_rounding_mode(&y, &rm),
+                                FpBinary::Div => x.div_with_rounding_mode(&y, &rm),
+                                // minsd/maxsd: unordered or equal returns the second operand
+                                FpBinary::Min => x.lt(&y).ite(&x, &y),
+                                FpBinary::Max => x.gt(&y).ite(&x, &y),
+                            }
+                        }
+                        Some(FpIntrinsic::Unary(op, f)) if f == format => {
+                            let [x] = arguments.as_slice() else { return None };
+                            let x = self.fp(x, f, depth + 1)?;
+                            match op {
+                                FpUnary::Sqrt => x.sqrt_with_rounding_mode(&rm),
+                                FpUnary::Neg => x.unary_neg(),
+                                FpUnary::Abs => x.unary_abs(),
+                            }
+                        }
+                        Some(FpIntrinsic::Convert { from, to }) if to == format => {
+                            let [x] = arguments.as_slice() else { return None };
+                            let x = self.fp(x, from, depth + 1)?;
+                            if from == to {
+                                x
+                            } else {
+                                x.to_fp_with_rounding_mode(&rm, &sort(to))
+                            }
+                        }
+                        Some(FpIntrinsic::Call { target, format: f }) if f == format => {
+                            let mut args = Vec::new();
+                            let mut domain = Vec::new();
+                            for a in arguments {
+                                let af = format_of(a.width.bits())?;
+                                args.push(self.fp(a, af, depth + 1)?);
+                                domain.push(sort(af));
+                            }
+                            let key = format!(
+                                "fpcall!{target}!{}!{}",
+                                f.suffix(),
+                                arguments
+                                    .iter()
+                                    .map(|a| a.width.bits().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            );
+                            let decl = self
+                                .calls
+                                .entry(key.clone())
+                                .or_insert_with(|| {
+                                    FuncDecl::new(key, &domain.iter().collect::<Vec<_>>(), &sort(f))
+                                })
+                                .clone();
+                            self.called = true;
+                            let refs: Vec<&dyn Ast> = args.iter().map(|a| a as &dyn Ast).collect();
+                            decl.apply(&refs).as_float()?
+                        }
+                        _ => self.fp_free(e, format),
+                    }
+                }
+                _ => self.fp_free(e, format),
+            };
+            Some(out)
+        }
+
+        fn fp_free(&mut self, e: &Expr, format: FpFormat) -> Float {
+            let n = self.fp_uninterpreted.len();
+            self.fp_uninterpreted
+                .entry(e.clone())
+                .or_insert_with(|| match format {
+                    FpFormat::F32 => Float::new_const_float32(format!("ufp!{n}")),
+                    FpFormat::F64 => Float::new_const_double(format!("ufp!{n}")),
+                })
+                .clone()
+        }
+
+        /// `fp_cmp_*` and `fp_to_i*` as bit-vectors.
+        fn fp_to_bv(&mut self, op: &FpIntrinsic, arguments: &[Expr], depth: u32) -> Option<BV> {
+            match (op, arguments) {
+                (FpIntrinsic::Compare(p, f), [x, y]) => {
+                    let (x, y) = (self.fp(x, *f, depth + 1)?, self.fp(y, *f, depth + 1)?);
+                    let unordered = Bool::or(&[x.is_nan(), y.is_nan()]);
+                    let holds = match p {
+                        FpPredicate::Eq => x.eq_fpa(&y),
+                        FpPredicate::Ne => x.eq_fpa(&y).not(),
+                        FpPredicate::Lt => x.lt(&y),
+                        FpPredicate::Le => x.le(&y),
+                        FpPredicate::Gt => x.gt(&y),
+                        FpPredicate::Ge => x.ge(&y),
+                        FpPredicate::Unord => unordered,
+                        FpPredicate::Ord => unordered.not(),
+                    };
+                    Some(holds.ite(&BV::from_u64(1, 8), &BV::from_u64(0, 8)))
+                }
+                (FpIntrinsic::ToInt { from, int_bits }, [x]) => {
+                    let x = self.fp(x, *from, depth + 1)?;
+                    let limit = if *int_bits == 32 { 2_147_483_648.0 } else { 9_223_372_036_854_775_808.0 };
+                    let (hi, lo) = match from {
+                        FpFormat::F32 => (Float::from_f32(limit as f32), Float::from_f32(-limit as f32)),
+                        FpFormat::F64 => (Float::from_f64(limit), Float::from_f64(-limit)),
+                    };
+                    let in_range = Bool::and(&[x.ge(&lo), x.lt(&hi)]);
+                    let truncated =
+                        x.to_sbv_with_rounding_mode(&RoundingMode::round_towards_zero(), *int_bits);
+                    let indefinite = BV::from_u64(1_u64 << (int_bits - 1), *int_bits);
+                    // NaN fails both range compares, so it lands on the indefinite value
+                    Some(in_range.ite(&truncated, &indefinite))
+                }
+                _ => None,
+            }
         }
     }
 

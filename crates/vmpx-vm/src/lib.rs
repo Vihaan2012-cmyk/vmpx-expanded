@@ -13,6 +13,7 @@ mod entry_paths;
 mod entry_profile;
 mod exception_flow;
 mod expr;
+pub mod fp;
 mod handler_slice;
 mod image_concretize;
 mod immutable_image;
