@@ -317,6 +317,14 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(2);
+    // Optional dynamic-evidence veto: file of hex page numbers (VA >> 12), one per
+    // line, that a run showed to change after load; never served.
+    if let Some(path) = std::env::var_os("XPL_VOLATILE_PAGES") {
+        let text = std::fs::read_to_string(path).expect("read XPL_VOLATILE_PAGES");
+        vmpx_vm::set_volatile_image_pages(text.lines().filter_map(|line| {
+            u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).ok()
+        }));
+    }
     // Per-block decode budget (4th arg). Default 512 keeps a naive run memory-safe;
     // raise it deliberately (with memory headroom) to reclaim InstructionLimit stalls.
     let instruction_limit: usize = args.get(4).and_then(|a| a.parse().ok()).unwrap_or(512);

@@ -344,6 +344,14 @@ pub trait SymbolicMemorySource {
         None
     }
 
+    /// PROOF that nothing in the analyzed image can change page protection (see
+    /// `image_cannot_reprotect`). While true and no call on the path can either,
+    /// a non-writable page keeps its loader protection, so no store can alter
+    /// it. The default `false` keeps every serve a labeled assumption.
+    fn protection_stability_proven(&self) -> bool {
+        false
+    }
+
     fn resolve_native_call_import(&self, _target: u64) -> Option<NativeCallImportResolution> {
         None
     }
@@ -482,6 +490,7 @@ struct SymbolicMachine<'a> {
     prove_read_only_when_suppressed: bool,
     served_read_only_image: bool,
     protection_may_have_changed: bool,
+    image_protection_stable_cache: Option<bool>,
     vm_stack_address_escapes: bool,
     vm_stack_derived_escapes: bool,
     vm_stack_pointer_lost: bool,
@@ -572,6 +581,7 @@ impl<'a> SymbolicMachine<'a> {
             prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
             served_read_only_image: false,
             protection_may_have_changed: initial.protection_may_have_changed,
+            image_protection_stable_cache: None,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,
@@ -626,6 +636,13 @@ impl<'a> SymbolicMachine<'a> {
         self.store_memory(&address, value)
     }
 
+    fn image_protection_stable(&mut self) -> bool {
+        let source = self.memory_source;
+        *self.image_protection_stable_cache.get_or_insert_with(|| {
+            source.is_some_and(|source| source.protection_stability_proven())
+        })
+    }
+
     fn load_memory(&mut self, address: Expr, width: BitWidth) -> Result<Expr, String> {
         let address = canonicalize_pointer(address);
         let mut bytes = Vec::with_capacity(width.bytes() as usize);
@@ -677,6 +694,7 @@ impl<'a> SymbolicMachine<'a> {
                 && self.image_reads_suppressed
                 && !self.protection_may_have_changed
                 && !self.memory_tainted
+                && self.image_protection_stable()
                 && let Some(byte) = self
                     .memory_source
                     .and_then(|source| source.read_only_byte(Va(value)))
@@ -4178,6 +4196,45 @@ mod tests {
         let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
         assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
         assert!(machine.protection_may_have_changed && machine.image_reads_suppressed);
+    }
+
+    // Without a whole-image proof that protection cannot change, the in-path
+    // proof alone is not enough: nothing is served unless the labeled flag is on.
+    #[test]
+    fn unwitnessed_image_is_never_served_as_proven() {
+        struct Unwitnessed<'a, 'data>(crate::ReadOnlyImage<'a, 'data>);
+        impl SymbolicMemorySource for Unwitnessed<'_, '_> {
+            fn read_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_byte(address)
+            }
+            fn read_only_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_only_byte(address)
+            }
+        }
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = Unwitnessed(crate::ReadOnlyImage(&pe));
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let suppressed = SymbolicVmInitialState {
+            image_reads_suppressed: true,
+            ..SymbolicVmInitialState::default()
+        };
+        let mut machine = SymbolicMachine::new(
+            &suppressed,
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        let value = machine.load_memory(rdata.clone(), BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+        let labeled = SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let mut machine = SymbolicMachine::new(&suppressed, Some(&source), labeled).expect("state");
+        let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(machine.served_read_only_image, "served only as a labeled assumption");
     }
 
     #[test]

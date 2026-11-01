@@ -1,7 +1,7 @@
 //! Memory source that exposes only bytes the loader maps read-only.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vmpx_pe::{ImageBase, ImportModule, PeImage, Va};
 
@@ -166,6 +166,10 @@ impl SymbolicMemorySource for ObservedImage<'_, '_> {
         self.image.read_only_byte(address)
     }
 
+    fn protection_stability_proven(&self) -> bool {
+        self.image.protection_stability_proven()
+    }
+
     fn observed_byte(&self, address: Va) -> Option<u8> {
         let byte = self.observed.read_byte(address.get())?;
         self.seeded.set(true);
@@ -180,6 +184,126 @@ impl SymbolicMemorySource for ObservedImage<'_, '_> {
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+static VOLATILE_PAGES: std::sync::RwLock<BTreeSet<u64>> =
+    std::sync::RwLock::new(BTreeSet::new());
+
+/// DYNAMIC-EVIDENCE VETO: declares 4 KiB pages (virtual address >> 12) that a
+/// run showed to change after load. Such pages are never served by
+/// [`SymbolicMemorySource::read_only_byte`]. It can only REMOVE served bytes;
+/// it is never evidence that a page is stable.
+pub fn set_volatile_image_pages(pages: impl IntoIterator<Item = u64>) {
+    *VOLATILE_PAGES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pages.into_iter().collect();
+}
+
+fn is_volatile_page(address: Va) -> bool {
+    VOLATILE_PAGES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(address.get() >> 12))
+}
+
+const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const SCN_CNT_CODE: u32 = 0x0000_0020;
+
+/// An import whose name could change page protection, write another mapping's
+/// pages, or resolve such an API dynamically. Conservative: ordinals, any
+/// `ntdll` import and unnamed symbols count.
+fn import_may_reprotect(module: &str, name: Option<&str>) -> bool {
+    let Some(name) = name else { return true };
+    if module.to_ascii_lowercase().starts_with("ntdll") {
+        return true;
+    }
+    let native_api = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(char::is_uppercase)
+    };
+    if name.starts_with("Ldr") || native_api("Nt") || native_api("Zw") {
+        return true;
+    }
+    let name = name.to_ascii_lowercase();
+    [
+        "protect",
+        "writeprocessmemory",
+        "writevirtualmemory",
+        "mapviewof",
+        "unmapviewof",
+        "getprocaddress",
+        "loadlibrary",
+        "getmodulehandle",
+        "setprocessmitigation",
+        "setinformationvirtualmemory",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+/// Raw OS access that bypasses the import table: `syscall`, `sysenter`,
+/// `int 2e`, or a PEB/TEB fetch (`gs:[60h]`/`gs:[30h]`, `fs:[30h]`) from which
+/// a loader-style export walk could find a protection API.
+fn contains_raw_os_access(bytes: &[u8]) -> bool {
+    if bytes
+        .windows(2)
+        .any(|pair| matches!(pair, [0x0F, 0x05] | [0x0F, 0x34] | [0xCD, 0x2E]))
+    {
+        return true;
+    }
+    bytes.windows(4).enumerate().any(|(index, dword)| {
+        matches!(dword, [0x60 | 0x30, 0, 0, 0])
+            && bytes[index.saturating_sub(6)..index]
+                .iter()
+                .any(|byte| matches!(byte, 0x64 | 0x65))
+    })
+}
+
+static REPROTECT_CACHE: std::sync::Mutex<Vec<(usize, usize, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// PROOF that nothing in the image can change page protection, so every
+/// non-writable page keeps the loader's protection for the whole run: no import
+/// that could reprotect or resolve such an API, no section both writable and
+/// executable (self-modifying code could mint a raw system call), and no
+/// `syscall`/`sysenter`/`int 2e` byte pair or PEB/TEB fetch in any executable section. Over-
+/// approximate (false positives only withhold the proof). Says nothing about
+/// code outside this image.
+pub(crate) fn image_cannot_reprotect(pe: &PeImage<'_>) -> bool {
+    let data = pe.data();
+    let key = (data.as_ptr() as usize, data.len());
+    if let Some(&(_, _, cached)) = REPROTECT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|entry| (entry.0, entry.1) == key)
+    {
+        return cached;
+    }
+    let proven = !pe.report().imports.iter().any(|module| {
+        module
+            .entries
+            .iter()
+            .any(|symbol| import_may_reprotect(&module.name, symbol.name.as_deref()))
+    }) && pe.sections.iter().all(|section| {
+        let executable = section.characteristics & (SCN_MEM_EXECUTE | SCN_CNT_CODE) != 0;
+        if !executable {
+            return true;
+        }
+        if section.characteristics & SCN_MEM_WRITE != 0 {
+            return false;
+        }
+        let start = section.pointer_to_raw_data.0 as usize;
+        let end = start.saturating_add(section.size_of_raw_data as usize);
+        data.get(start..end.min(data.len()))
+            .is_some_and(|raw| !contains_raw_os_access(raw))
+    });
+    REPROTECT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((key.0, key.1, proven));
+    proven
+}
+
 /// Image bytes in headers and non-writable readable sections. Bytes in
 /// writable sections can change before the read, so they are never exposed.
 #[derive(Clone, Copy, Debug)]
@@ -187,7 +311,14 @@ pub struct ReadOnlyImage<'a, 'data>(pub &'a PeImage<'data>);
 
 impl SymbolicMemorySource for ReadOnlyImage<'_, '_> {
     fn read_only_byte(&self, address: Va) -> Option<u8> {
+        if is_volatile_page(address) {
+            return None;
+        }
         self.read_byte(address)
+    }
+
+    fn protection_stability_proven(&self) -> bool {
+        image_cannot_reprotect(self.0)
     }
 
     fn read_byte(&self, address: Va) -> Option<u8> {
@@ -316,6 +447,41 @@ pub(crate) mod tests {
         data[0x400..0x404].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes());
         data[0x600..0x604].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn reprotect_capability_is_detected_conservatively() {
+        assert!(import_may_reprotect("kernel32.dll", Some("VirtualProtect")));
+        assert!(import_may_reprotect("KERNEL32.dll", Some("GetProcAddress")));
+        assert!(import_may_reprotect("kernel32.dll", Some("WriteProcessMemory")));
+        assert!(import_may_reprotect("ntdll.dll", Some("RtlFoo")));
+        assert!(import_may_reprotect("kernel32.dll", Some("LdrGetDllHandle")));
+        assert!(import_may_reprotect("x.dll", Some("NtQueryInformationProcess")));
+        assert!(!import_may_reprotect("kernel32.dll", Some("Sleep")));
+        assert!(!import_may_reprotect("kernel32.dll", Some("GetCurrentThread")));
+        assert!(import_may_reprotect("kernel32.dll", None));
+        assert!(!import_may_reprotect("kernel32.dll", Some("GetTickCount")));
+        assert!(contains_raw_os_access(&[0x90, 0x0F, 0x05, 0xC3]));
+        assert!(contains_raw_os_access(&[0xCD, 0x2E]));
+        assert!(!contains_raw_os_access(&[0x90, 0x0F, 0x1F, 0x05]));
+        assert!(contains_raw_os_access(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0, 0, 0]));
+        assert!(!contains_raw_os_access(&[0x48, 0x8B, 0x04, 0x25, 0x60, 0, 0, 0]));
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        assert!(image_cannot_reprotect(&pe), "no imports, no executable section");
+        assert!(ReadOnlyImage(&pe).protection_stability_proven());
+    }
+
+    #[test]
+    fn volatile_pages_are_never_served() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = ReadOnlyImage(&pe);
+        assert_eq!(source.read_only_byte(Va(RDATA_VA)), Some(0xEF));
+        set_volatile_image_pages([RDATA_VA >> 12]);
+        assert_eq!(source.read_only_byte(Va(RDATA_VA)), None);
+        set_volatile_image_pages([]);
+        assert_eq!(source.read_only_byte(Va(RDATA_VA)), Some(0xEF));
     }
 
     #[test]
