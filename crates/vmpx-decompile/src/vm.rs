@@ -81,16 +81,29 @@ fn is_live(n: &RNode) -> bool {
     }
 }
 
+fn sub_epoch(e: &Expr, rename: &BTreeMap<String, String>) -> Expr {
+    rewrite(e, &mut |x| match &x.kind {
+        ExprKind::Register { name } => rename.get(name).map(|r| Expr::register(x.width, r.clone())),
+        ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
+            let [a] = arguments.as_slice() else { return None };
+            Some(Expr::intrinsic(x.width, "memory_load", vec![sub_epoch(a, rename)]))
+        }
+        _ => None,
+    })
+}
+
 /// Structure hash with phi names replaced by their position in the enclosing loop.
 fn signature(n: &RNode, rename: &BTreeMap<String, String>, h: &mut impl Hasher) {
     let sub = |e: &Expr| -> Expr {
-        if rename.is_empty() {
-            return e.clone();
-        }
+        // memory-epoch numbers differ between otherwise identical copies: drop them
         rewrite(e, &mut |x| match &x.kind {
             ExprKind::Register { name } => rename
                 .get(name)
                 .map(|r| Expr::register(x.width, r.clone())),
+            ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
+                let [a] = arguments.as_slice() else { return None };
+                Some(Expr::intrinsic(x.width, "memory_load", vec![sub_epoch(a, rename)]))
+            }
             _ => None,
         })
     };

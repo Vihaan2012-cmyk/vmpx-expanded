@@ -311,6 +311,24 @@ mod tests {
     }
 
     #[test]
+    fn mba_nested_xor_folds() {
+        use vmpx_vm::{BinaryOp as B, BitWidth, Expr, UnaryOp};
+        let r = |n: &str| Expr::register(BitWidth::W32, n);
+        let bin = |op, a: Expr, b: Expr| Expr::binary(op, a, b).unwrap();
+        let not = |a: Expr| Expr::unary(UnaryOp::Not, a);
+        let p = bin(B::Xor, bin(B::Xor, r("a"), r("b")), bin(B::And, r("c"), r("d")));
+        let k = r("k");
+        let e = bin(
+            B::Or,
+            not(bin(B::Or, p.clone(), not(k.clone()))),
+            not(bin(B::Or, not(p.clone()), k.clone())),
+        );
+        let f = crate::xu::mba_fold(&e);
+        let want = bin(B::Xor, p, k);
+        assert_eq!(f, want, "{f:?}");
+    }
+
+    #[test]
     fn mba_xor_folds() {
         use vmpx_vm::{BinaryOp, BitWidth, Expr, UnaryOp};
         let a = Expr::register(BitWidth::W32, "a");
