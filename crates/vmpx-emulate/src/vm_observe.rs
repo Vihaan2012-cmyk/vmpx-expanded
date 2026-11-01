@@ -152,9 +152,17 @@ pub struct VmObservations {
     pub unattributed: u64,
     /// New edges not recorded because the edge table hit its cap.
     pub edges_dropped: u64,
+    /// Bumped by [`VmObservations::break_chain`]; the hook then forgets every instance's
+    /// last VIP so no edge is recorded across two independent guest calls.
+    pub chain_breaks: u64,
 }
 
 impl VmObservations {
+    /// Mark an independent guest-call boundary (e.g. between lifecycle entry points).
+    pub fn break_chain(&mut self) {
+        self.chain_breaks += 1;
+    }
+
     /// Flush the observed concrete recursion depth into `facts` (one
     /// [`crate::Observed`]-stamped entry). No-op if no loop-head was configured.
     pub fn seed_loop_depth(&self, facts: &mut ObservedFacts) {
@@ -219,6 +227,7 @@ pub struct VmObserveHook {
     bt_seen: HashSet<(u64, u64)>,
     /// Flow spans covering every dispatcher and the loop head.
     spans: [(u64, u64); 2],
+    seen_breaks: u64,
 }
 
 /// Cover the points with at most two half-open spans, splitting at the largest
@@ -302,6 +311,7 @@ impl VmObserveHook {
             edge_ix: HashMap::new(),
             bt_seen: HashSet::new(),
             spans: cover(pts),
+            seen_breaks: 0,
         }
     }
 
@@ -373,6 +383,12 @@ impl Hook for VmObserveHook {
     fn on_flow(&mut self, ev: &FlowEvent, cpu: &mut Cpu, mem: &mut Memory) -> HookAction {
         let obs = Rc::clone(&self.obs);
         let mut o = obs.borrow_mut();
+
+        if o.chain_breaks != self.seen_breaks {
+            self.seen_breaks = o.chain_breaks;
+            self.armed = None;
+            self.walks.clear();
+        }
 
         // Concolic depth: every arrival at the loop head is a back-edge visit.
         if o.loop_head == Some(ev.to) {
