@@ -2508,13 +2508,29 @@ impl Walker<'_, '_> {
             let detail = match stop {
                 LinearDecodeStop::MissingHandlerSpec => {
                     let recovery = self.cache.recoveries.get(&final_state.handler);
+                    // Reaching here means follow_cross_profile_transition already
+                    // returned false, so record what the refusal had to work with:
+                    // the transition count against its cap (a saturated cap is a
+                    // budget refusal wearing a MissingHandlerSpec label), the roles
+                    // the codec recovery was given, and where the trace stopped.
+                    let roles = self.active.as_ref().map_or(&self.config, |c| &c.config);
                     format!(
-                        "undecodable opcode: handler {} has no recovered specification                          (status {:?}, semantic {:?}; {})",
+                        "undecodable opcode: handler {} has no recovered specification                          (status {:?}, semantic {:?}; \
+                         transitions {}/{}, vip {:?}, key {:?}, hreg {:?}, dir {:?}, \
+                         trace_stop {:?}, fragments {:?}; {})",
                         final_state.handler,
                         recovery.map(|r| r.status),
                         recovery
                             .and_then(|r| r.handler_analysis.as_ref())
                             .map(|a| a.semantic),
+                        self.profile_transitions,
+                        self.limits.max_profile_transitions,
+                        roles.roles.vip,
+                        roles.roles.rolling_key,
+                        roles.roles.handler,
+                        roles.bytecode_direction,
+                        recovery.map(|r| r.trace_stop),
+                        recovery.map(|r| r.trace_fragments),
                         recovery.map_or(String::new(), |r| r
                             .diagnostics
                             .iter()

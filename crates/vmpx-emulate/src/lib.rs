@@ -59,6 +59,7 @@ mod iat_fill;
 mod hostmodel;
 mod loader;
 mod memory;
+mod replay;
 mod ntdll;
 mod observe;
 mod predecode;

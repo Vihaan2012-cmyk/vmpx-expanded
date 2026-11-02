@@ -39,6 +39,11 @@ static LIMIT_HITS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex:
 /// Snapshot bytes of the volatile, non-writable image ranges (observed seed).
 static SNAPSHOT_SEED: std::sync::OnceLock<vmpx_vm::ObservedMemory> = std::sync::OnceLock::new();
 
+/// Path of the post-init snapshot, so the dynamic detonation can RESTORE it and
+/// drive the plugin lifecycle instead of detonating the ~27B-step init from
+/// scratch (which never reaches the virtualized functions, so observes nothing).
+static SNAPSHOT_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 impl ReportOptions {
     pub fn new(sample: Option<usize>, all: bool, threads: usize, dynamic: bool) -> Self {
         Self {
@@ -165,6 +170,12 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
         max_total_instructions: VmCfgLimits::default()
             .max_total_instructions
             .saturating_mul(env_scale("VMPX_TOTAL_INSTRUCTIONS")),
+        // Separate cap from the post-transition budget below: this one refuses the
+        // transition outright, and that refusal surfaces as a MissingHandlerSpec
+        // stall rather than a TransitionBudget limit hit.
+        max_profile_transitions: VmCfgLimits::default()
+            .max_profile_transitions
+            .saturating_mul(env_scale("VMPX_PROFILE_TRANSITIONS")),
         max_transition_visits: VmCfgLimits::default().max_transition_visits.saturating_mul(transition_scale()),
         max_transition_instructions: VmCfgLimits::default()
             .max_transition_instructions
@@ -189,6 +200,10 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
 /// instructions, per-block instruction limit]`, set by the budget-pass sweep.
 static SCALE_OVERRIDE: std::sync::Mutex<Option<[usize; 4]>> = std::sync::Mutex::new(None);
 
+/// Serializes stall-dump appends so concurrent worker threads cannot interleave
+/// partial JSON lines into the census file.
+static DUMP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn env_scale(name: &str) -> usize {
     if let Some(a) = *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return match name {
@@ -211,14 +226,11 @@ fn transition_scale() -> usize {
 }
 
 /// Diagnostic: with `VMPX_STALL_DUMP=<file>` set, appends one JSON line per
-/// incomplete entry (rva, limit hit, stalls in discovery order) while a budget
-/// pass is active.
+/// incomplete entry (rva, limit hit, stalls in discovery order), on the base
+/// sweep as well as during a budget pass.
 fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) {
     use std::io::Write;
     let Some(path) = std::env::var_os("VMPX_STALL_DUMP") else { return };
-    if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
-        return;
-    }
     let Ok(Ok(cfg)) = result else { return };
     if cfg.all_paths_reach_vm_exit() {
         return;
@@ -235,6 +247,7 @@ fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmC
         "n_stalls": cfg.stalls.len(),
         "stalls": stalls,
     });
+    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{line}");
     }
@@ -349,10 +362,33 @@ fn run_dynamic(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(base.max_steps);
-    let det = vmpx_emulate::DetonateOptions {
-        export_reference,
-        max_steps,
-        ..base
+    let lifecycle_budget: u64 = std::env::var("VMPX_LIFECYCLE_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5_000_000_000);
+    let det = if let Some(snap) = SNAPSHOT_PATH.get() {
+        // Restore the post-init snapshot and drive the XPLM plugin lifecycle so the
+        // observer actually reaches the virtualized functions and records their VM
+        // branch edges / loop depths. A from-scratch detonation never finishes the
+        // ~27B-step init, so it observes nothing.
+        vmpx_emulate::DetonateOptions {
+            export_reference,
+            max_steps,
+            start_from_snapshot: Some(snap.clone()),
+            lifecycle: Some(vmpx_emulate::LifecycleOptions {
+                max_steps: lifecycle_budget,
+                ..Default::default()
+            }),
+            xplm: true,
+            vm_discover: true,
+            ..base
+        }
+    } else {
+        vmpx_emulate::DetonateOptions {
+            export_reference,
+            max_steps,
+            ..base
+        }
     };
     let result = match vmpx_emulate::detonate(input_pe, &det) {
         Ok(r) => r,
@@ -422,6 +458,7 @@ pub fn install_volatility_veto(
 ) -> Result<(usize, u64)> {
     use vmpx_pe::Va;
     use vmpx_vm::SymbolicMemorySource;
+    let _ = SNAPSHOT_PATH.set(snapshot.to_path_buf());
     let pe = PeImage::parse(image).context("volatility veto: image is not a PE")?;
     let (_, memory) = vmpx_emulate::snapshot::load(snapshot)
         .with_context(|| format!("read snapshot {}", snapshot.display()))?;

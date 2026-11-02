@@ -394,6 +394,19 @@ fn detonate_with(
     let xplm = (opts.xplm || opts.lifecycle.is_some()).then(|| Rc::new(RefCell::new(Xplm::new())));
     if let Some(x) = &xplm {
         winapi = winapi.with_xplm(Rc::clone(x));
+        if let Some(path) = std::env::var_os("VMPX_REPLAY") {
+            match crate::replay::Replay::load(std::path::Path::new(&path)) {
+                Ok(r) => {
+                    eprintln!(
+                        "[replay] loaded {} frames / {} datarefs from VMPX_REPLAY",
+                        r.n_frames(),
+                        r.n_datarefs()
+                    );
+                    x.borrow_mut().set_replay(r);
+                }
+                Err(e) => eprintln!("[replay] could not load VMPX_REPLAY: {e}"),
+            }
+        }
     }
     let facts = winapi.facts();
     let book = winapi.address_book();
@@ -756,7 +769,23 @@ fn run_lifecycle(
     // Registered callbacks. A callback that fails to return is retired; a flight loop that
     // returns 0.0 asks not to be called again.
     let mut retired = Vec::new();
-    for it in 0..lc.iterations {
+    // With a recorded flight loaded, drive one iteration per captured frame (capped)
+    // and advance the recording each round, so callbacks read time-varying real sim
+    // state. Without a recording, behavior is unchanged (lc.iterations rounds).
+    let replay_frames = xplm.borrow().replay_frames();
+    let cap = std::env::var("VMPX_REPLAY_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000usize);
+    let iters: u32 = if replay_frames > 0 {
+        replay_frames.min(cap) as u32
+    } else {
+        lc.iterations
+    };
+    for it in 0..iters {
+        if replay_frames > 0 {
+            xplm.borrow_mut().replay_advance();
+        }
         let live: Vec<RecordedCallback> =
             xplm.borrow().callbacks().iter().filter(|c| c.active).cloned().collect();
         for cb in live {
