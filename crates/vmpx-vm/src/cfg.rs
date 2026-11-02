@@ -564,7 +564,7 @@ pub fn nested_entry_stub(pe: &PeImage<'_>, target: Rva) -> Option<(Rva, VmEntryC
         return Some((target, candidate));
     }
     let first = vmpx_disasm::decode_one(pe, target).ok()?;
-    if first.instruction.mnemonic() != Mnemonic::Pushfq {
+    if first.instruction.mnemonic() != Mnemonic::Pushfq || std::env::var_os("VMPX_NO_PUSHFQ_NESTED").is_some() {
         return None;
     }
     let candidate = analyze_vm_entry_at(pe, first.next_rva()?, VmDiscoveryLimits::default())

@@ -305,14 +305,31 @@ pub(crate) fn unroll_entry_cfg(
     })?
 }
 
+thread_local! {
+    /// Seed for the next entry analyzed when its stub pushes a register, not an
+    /// immediate (set by the native-chain follower from the proven exit state).
+    static SEED_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with `seed` as the seed of a register-pushing entry stub.
+pub(crate) fn with_seed_override<R>(seed: Option<u64>, f: impl FnOnce() -> R) -> R {
+    let previous = SEED_OVERRIDE.replace(seed);
+    let result = f();
+    SEED_OVERRIDE.set(previous);
+    result
+}
+
 pub(crate) fn with_entry_input<R>(
     pe: &PeImage<'_>,
     rva: Rva,
     instruction_limit: usize,
     f: impl FnOnce(&DecodedCfgInput<'_>) -> R,
 ) -> Result<R, String> {
-    let candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
+    let mut candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
         .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
+    if candidate.seed.is_none() {
+        candidate.seed = SEED_OVERRIDE.get();
+    }
     let entry_limits = EntryProfileRecoveryLimits {
         instruction_limit,
         ..EntryProfileRecoveryLimits::default()
