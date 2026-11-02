@@ -134,16 +134,27 @@ impl Default for VmCfgLimits {
             max_visits_per_block: 16,
             max_total_instructions: 200_000,
             max_targets: 16,
-            max_nested_entries: 8,
-            max_profile_transitions: 32,
+            // 8 refused 37 entries on systems.xpl once the earlier blockers
+            // cleared, 3 of them blocked by nothing else; 4x is worth +3 N1.
+            max_nested_entries: 32,
+            // Counts DISTINCT transition sites (see `transition_sites`), so this
+            // bounds how many profile regions one entry may reach, not how often
+            // it re-enters them. 32 still refused entries at that bound; 8x is
+            // worth a further +2 and is bounded by the per-region budget above
+            // plus the entry-global and memory caps.
+            max_profile_transitions: 256,
             // Per-region allowances (see `transition_budget_exhausted`). These were
             // 64 / 6000 when the budget was one flat grant for the whole walk; at
             // that size they refused 238 entries on systems.xpl and measured +3 N1
             // when scaled 8x, so the old values were simply too tight for a region
             // rather than load-bearing. Memory is bounded by `max_memory_bytes`,
             // not by these, and every one of them fails closed.
-            max_transition_visits: 512,
-            max_transition_instructions: 48_000,
+            // Raised again (8x) for a further +2: with the per-region scaling the
+            // entry-global `max_visits` / `max_total_instructions` and the hard
+            // `max_memory_bytes` cap bind before this sub-budget does, so it was
+            // constraining exploration without being the thing bounding memory.
+            max_transition_visits: 4_096,
+            max_transition_instructions: 384_000,
             max_loop_unrolls: 4,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_wall_time: Some(DEFAULT_MAX_WALL_TIME),

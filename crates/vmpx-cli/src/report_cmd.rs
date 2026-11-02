@@ -188,6 +188,11 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
             .max_profile_transitions
             .saturating_mul(env_scale("VMPX_PROFILE_TRANSITIONS"))
             .saturating_mul(transition_scale()),
+        // Became visible only once the earlier blockers cleared: the nested-entry
+        // limit now refuses 37 entries, 3 of them blocked by nothing else.
+        max_nested_entries: VmCfgLimits::default()
+            .max_nested_entries
+            .saturating_mul(env_scale("VMPX_NESTED_ENTRIES")),
         max_transition_visits: VmCfgLimits::default().max_transition_visits.saturating_mul(transition_scale()),
         max_transition_instructions: VmCfgLimits::default()
             .max_transition_instructions
