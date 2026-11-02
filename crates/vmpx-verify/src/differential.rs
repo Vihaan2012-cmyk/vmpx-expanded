@@ -86,16 +86,18 @@ fn split_offset(address: &Expr) -> (Expr, i64) {
 
 fn disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
     let ((ab, ao), (bb, bo)) = (split_offset(a), split_offset(b));
-    if ab == bb && (ao + i64::from(a_bytes) <= bo || bo + i64::from(b_bytes) <= ao) {
-        return true;
-    }
-    // Win64 stack discipline: the callee's own frame lies wholly below the entry stack
-    // pointer and is allocated after the call, so an incoming integer-argument pointer
-    // (rcx/rdx/r8/r9 entry value: fixed, and older than the frame) can never point into
-    // it. An arg-rooted address is therefore disjoint from any access that lies wholly
-    // in the own frame. A pointer loaded from memory is not arg-rooted and never
-    // qualifies; an arg pointer may point into the caller's frame, so an access that
-    // reaches the entry `rsp` or above is not own-frame.
+    ab == bb && (ao + i64::from(a_bytes) <= bo || bo + i64::from(b_bytes) <= ao)
+}
+
+/// An access based on an incoming argument register against an access wholly in the
+/// callee's own frame. Win64 stack discipline: the callee's own frame lies wholly below the entry stack
+/// pointer and is allocated after the call, so an incoming integer-argument pointer
+/// (rcx/rdx/r8/r9 entry value: fixed, and older than the frame) can never point into
+/// it. A pointer loaded from memory is not arg-rooted and never qualifies; an arg
+/// pointer may point into the caller's frame, so an access that reaches the entry
+/// `rsp` or above is not own-frame. Callers record the labeled frame assumption.
+fn arg_vs_own_frame(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
+    let ((ab, ao), (bb, bo)) = (split_offset(a), split_offset(b));
     (own_frame(&ab, ao, a_bytes) && arg_rooted(&bb)) || (own_frame(&bb, bo, b_bytes) && arg_rooted(&ab))
 }
 
@@ -127,25 +129,25 @@ mod disjoint_tests {
 
     #[test]
     fn arg_pointer_load_is_disjoint_from_an_own_frame_store() {
-        assert!(disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
-        assert!(disjoint(&at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8, &at("native_rcx_initial", 0), 8));
+        assert!(arg_vs_own_frame(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
+        assert!(arg_vs_own_frame(&at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8, &at("native_rcx_initial", 0), 8));
     }
 
     #[test]
     fn arg_pointer_load_is_not_disjoint_from_a_caller_frame_store() {
-        assert!(!disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", 0x10), 8));
+        assert!(!arg_vs_own_frame(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", 0x10), 8));
         // A store that straddles the entry rsp reaches the return slot.
-        assert!(!disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-4_i64).cast_unsigned()), 8));
+        assert!(!arg_vs_own_frame(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-4_i64).cast_unsigned()), 8));
     }
 
     #[test]
     fn a_non_argument_base_stays_conservative() {
-        assert!(!disjoint(&at("native_rax_initial", 0), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
+        assert!(!arg_vs_own_frame(&at("native_rax_initial", 0), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
     }
 
     #[test]
     fn a_store_through_a_non_frame_base_is_not_disjoint_from_an_arg_load() {
-        assert!(!disjoint(&at("native_rax_initial", 0), 8, &at("native_rdx_initial", 0), 8));
+        assert!(!arg_vs_own_frame(&at("native_rax_initial", 0), 8, &at("native_rdx_initial", 0), 8));
     }
 }
 
@@ -255,6 +257,10 @@ fn load_against(
             return Ok(value.clone());
         }
         if !disjoint(address, width.bytes(), store_address, store_width.bytes()) {
+            if arg_vs_own_frame(address, width.bytes(), store_address, store_width.bytes()) {
+                ctx.used_frame_rule.set(true);
+                continue;
+            }
             if ctx.private_frame
                 && frame_vs_entry_pointer(address, width.bytes(), store_address, store_width.bytes())
             {
