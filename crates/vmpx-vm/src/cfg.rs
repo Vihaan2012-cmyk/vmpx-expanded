@@ -2529,7 +2529,7 @@ impl Walker<'_, '_> {
                         roles.roles.rolling_key,
                         roles.roles.handler,
                         roles.bytecode_direction,
-                        recovery.map(|r| r.trace_stop),
+                        recovery.map(|r| &r.trace_stop),
                         recovery.map(|r| r.trace_fragments),
                         recovery.map_or(String::new(), |r| r
                             .diagnostics
