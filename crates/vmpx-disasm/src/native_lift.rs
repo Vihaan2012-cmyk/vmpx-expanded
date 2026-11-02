@@ -323,6 +323,14 @@ pub struct LiftOptions {
     /// Skip a store whose base differs from the load's when exactly one of the two is a
     /// tracked `rsp` frame slot, recording a [`DeferredAlias`] the consumer must prove.
     pub defer_frame_alias: bool,
+    /// The block is the first block of a function that nothing branches back to, so
+    /// each of `rcx`/`rdx`/`r8`/`r9` at block entry is the caller's incoming argument.
+    /// An address based directly on such an unmodified argument value is then
+    /// disjoint from every slot of the function's own frame below block-entry `rsp`
+    /// (Win64: the callee frame is allocated after the call, so no incoming pointer
+    /// names it). The relaxation is labeled: a block that used it carries
+    /// [`BlockSemantics::assumes_stack_disjoint`].
+    pub entry_args_disjoint_from_frame: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -456,6 +464,8 @@ struct MemKey<E> {
     frame: bool,
     /// Built only from constants and registers not derived from `rsp`.
     clean: bool,
+    /// Exactly the block-entry value of `rcx`/`rdx`/`r8`/`r9` plus a displacement.
+    arg_in: bool,
 }
 
 struct StoreRec<E> {
@@ -502,6 +512,11 @@ fn below_entry_rsp<E>(key: &MemKey<E>, width: Width) -> bool {
             .disp
             .checked_add(i64::from(width.bytes()))
             .is_some_and(|end| end <= 0)
+}
+
+/// Own-frame slot versus an address based on an unmodified incoming argument.
+fn frame_vs_entry_arg<E>(a: &MemKey<E>, aw: Width, b: &MemKey<E>, bw: Width) -> bool {
+    (below_entry_rsp(a, aw) && b.arg_in) || (below_entry_rsp(b, bw) && a.arg_in)
 }
 
 /// Stack-frame slot versus a pointer not derived from `rsp`.
@@ -752,6 +767,13 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             None => self.k(Width::W64, disp.cast_unsigned()),
         };
         let frame = frame && sym.is_some();
+        let arg_in = !frame
+            && inst.memory_index() == Register::None
+            && sym.as_ref().is_some_and(|s| {
+                [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9]
+                    .iter()
+                    .any(|g| *s == self.alg.input(Width::W64, &g.input_name()))
+            });
         Ok((
             address,
             MemKey {
@@ -759,6 +781,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 disp,
                 frame,
                 clean,
+                arg_in,
             },
         ))
     }
@@ -795,6 +818,7 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 disp: off,
                 frame: true,
                 clean: false,
+                arg_in: false,
             },
         ))
     }
@@ -836,6 +860,13 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             let rel = match relate(key, width, &store.key, store.write.width) {
                 Rel::Unknown
                     if assume && frame_vs_clean(key, width, &store.key, store.write.width) =>
+                {
+                    skipped_by_assumption = true;
+                    Rel::Disjoint
+                }
+                Rel::Unknown
+                    if self.options.entry_args_disjoint_from_frame
+                        && frame_vs_entry_arg(key, width, &store.key, store.write.width) =>
                 {
                     skipped_by_assumption = true;
                     Rel::Disjoint

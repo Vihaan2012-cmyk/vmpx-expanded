@@ -207,7 +207,7 @@ fn compare_one(
         frame_stores_dropped: 0,
         fidelity: None,
     };
-    let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::DIFFERENTIAL) {
+    let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::DIFFERENTIAL_ENTRY_ARGS) {
         Ok(cfg) => cfg,
         Err(e) => return timeout(format!("original CFG: {e}")),
     };
@@ -304,6 +304,11 @@ fn compare_one(
         Ok(r) => r,
         Err(e) => return timeout(format!("protected recovery/unroll: {e}")),
     };
+    if cfg.assumes_stack_disjoint {
+        println!(
+            "  assumption: an incoming argument pointer (rcx/rdx/r8/r9 at entry) does not address the function's own frame below the entry rsp (Win64 stack discipline)"
+        );
+    }
     let assumptions: std::collections::BTreeSet<&String> =
         natives.iter().flat_map(|n| &n.function.assumptions).collect();
     for assumption in assumptions {

@@ -26,6 +26,7 @@ const STUB_LIFT: LiftOptions = LiftOptions {
     absolute_disjoint_from_frame: true,
     model_xmm: false,
     defer_frame_alias: false,
+    entry_args_disjoint_from_frame: false,
 };
 const PRESERVED: [Gpr; 12] = [
     Gpr::Rcx,

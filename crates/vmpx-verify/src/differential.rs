@@ -86,7 +86,67 @@ fn split_offset(address: &Expr) -> (Expr, i64) {
 
 fn disjoint(a: &Expr, a_bytes: u32, b: &Expr, b_bytes: u32) -> bool {
     let ((ab, ao), (bb, bo)) = (split_offset(a), split_offset(b));
-    ab == bb && (ao + i64::from(a_bytes) <= bo || bo + i64::from(b_bytes) <= ao)
+    if ab == bb && (ao + i64::from(a_bytes) <= bo || bo + i64::from(b_bytes) <= ao) {
+        return true;
+    }
+    // Win64 stack discipline: the callee's own frame lies wholly below the entry stack
+    // pointer and is allocated after the call, so an incoming integer-argument pointer
+    // (rcx/rdx/r8/r9 entry value: fixed, and older than the frame) can never point into
+    // it. An arg-rooted address is therefore disjoint from any access that lies wholly
+    // in the own frame. A pointer loaded from memory is not arg-rooted and never
+    // qualifies; an arg pointer may point into the caller's frame, so an access that
+    // reaches the entry `rsp` or above is not own-frame.
+    (own_frame(&ab, ao, a_bytes) && arg_rooted(&bb)) || (own_frame(&bb, bo, b_bytes) && arg_rooted(&ab))
+}
+
+/// An access wholly inside the callee's own frame: `native_rsp_entry + offset` with
+/// every byte strictly below the entry stack pointer.
+fn own_frame(base: &Expr, offset: i64, bytes: u32) -> bool {
+    matches!(&base.kind, ExprKind::Register { name } if name == RSP_ENTRY)
+        && offset.checked_add(i64::from(bytes)).is_some_and(|end| end <= 0)
+}
+
+/// An address based directly on an incoming Win64 integer-argument register's entry value.
+fn arg_rooted(base: &Expr) -> bool {
+    matches!(&base.kind, ExprKind::Register { name }
+        if [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9].iter().any(|g| *name == entry_name(*g)))
+}
+
+#[cfg(test)]
+mod disjoint_tests {
+    use super::*;
+
+    fn at(reg: &str, off: u64) -> Expr {
+        Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, reg),
+            Expr::constant(BitWidth::W64, off),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn arg_pointer_load_is_disjoint_from_an_own_frame_store() {
+        assert!(disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
+        assert!(disjoint(&at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8, &at("native_rcx_initial", 0), 8));
+    }
+
+    #[test]
+    fn arg_pointer_load_is_not_disjoint_from_a_caller_frame_store() {
+        assert!(!disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", 0x10), 8));
+        // A store that straddles the entry rsp reaches the return slot.
+        assert!(!disjoint(&at("native_rdx_initial", 8), 8, &at("native_rsp_entry", (-4_i64).cast_unsigned()), 8));
+    }
+
+    #[test]
+    fn a_non_argument_base_stays_conservative() {
+        assert!(!disjoint(&at("native_rax_initial", 0), 8, &at("native_rsp_entry", (-0x20_i64).cast_unsigned()), 8));
+    }
+
+    #[test]
+    fn a_store_through_a_non_frame_base_is_not_disjoint_from_an_arg_load() {
+        assert!(!disjoint(&at("native_rax_initial", 0), 8, &at("native_rdx_initial", 0), 8));
+    }
 }
 
 /// The function's own frame: `native_rsp_entry + off` lying wholly below the entry `rsp`.

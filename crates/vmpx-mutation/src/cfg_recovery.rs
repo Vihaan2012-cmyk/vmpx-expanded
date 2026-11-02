@@ -120,6 +120,11 @@ pub struct CfgOptions {
     /// `BlockSemantics::deferred_alias` obligations instead of refusing the block.
     /// Only for a consumer that discharges every obligation (the differential executor).
     pub defer_frame_alias: bool,
+    /// Lift the function's entry block with
+    /// [`vmpx_disasm::LiftOptions::entry_args_disjoint_from_frame`] (only when
+    /// nothing branches back to the entry). Blocks that used it carry
+    /// [`NativeBlock::assumes_stack_disjoint`].
+    pub entry_args_disjoint: bool,
 }
 
 impl CfgOptions {
@@ -129,6 +134,7 @@ impl CfgOptions {
         model_xmm: false,
         model_calls: false,
         defer_frame_alias: false,
+        entry_args_disjoint: false,
     };
     /// [`Self::PROVEN`] plus the SSE scalar floating-point slice and call terminators.
     pub const PROVEN_FP: Self = Self {
@@ -136,6 +142,7 @@ impl CfgOptions {
         model_xmm: true,
         model_calls: true,
         defer_frame_alias: false,
+        entry_args_disjoint: false,
     };
     /// [`Self::PROVEN_FP`] plus deferred frame-alias obligations; the consumer must
     /// discharge `BlockSemantics::deferred_alias` for every block it executes.
@@ -143,12 +150,18 @@ impl CfgOptions {
         defer_frame_alias: true,
         ..Self::PROVEN_FP
     };
+    /// [`Self::DIFFERENTIAL`] plus the labeled entry-argument-vs-own-frame relaxation.
+    pub const DIFFERENTIAL_ENTRY_ARGS: Self = Self {
+        entry_args_disjoint: true,
+        ..Self::DIFFERENTIAL
+    };
     /// Stack-disjoint relaxation on (the default of the recovery entry points).
     pub const ASSUME_STACK_DISJOINT: Self = Self {
         assume_stack_disjoint: true,
         model_xmm: false,
         model_calls: false,
         defer_frame_alias: false,
+        entry_args_disjoint: false,
     };
 }
 
@@ -563,6 +576,11 @@ pub fn recover_native_cfg_opts(
         }
     }
 
+    let entry_is_branch_target = instrs.values().any(|ins| match classify(ins, options.model_calls) {
+        Flow::Jmp(t) => t == entry,
+        Flow::Jcc(_, t, f) => t == entry || f == entry,
+        _ => false,
+    });
     let mut blocks = BTreeMap::new();
     let mut edges = Vec::new();
     for &start in &leaders {
@@ -619,7 +637,10 @@ pub fn recover_native_cfg_opts(
                 }
             }
         };
-        let semantics = match lift_block_with(&VmAlgebra, &body, options.into()) {
+        let mut lift_options: LiftOptions = options.into();
+        lift_options.entry_args_disjoint_from_frame =
+            options.entry_args_disjoint && start == entry && !entry_is_branch_target;
+        let semantics = match lift_block_with(&VmAlgebra, &body, lift_options) {
             Ok(sem) => Some(sem),
             Err(e) => {
                 terminator = Terminator::Unsupported(e.to_string());

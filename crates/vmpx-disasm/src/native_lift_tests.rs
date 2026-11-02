@@ -1569,3 +1569,83 @@ fn rcl_rcr_rotate_the_operand_through_carry() {
         Err(LiftError::Unsupported { .. })
     ));
 }
+
+fn lift_entry_args(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftError> {
+    let mut asm = CodeAssembler::new(64).expect("assembler");
+    build(&mut asm);
+    let bytes = asm.assemble(0x1000).expect("assemble");
+    let options = LiftOptions {
+        entry_args_disjoint_from_frame: true,
+        ..LiftOptions::default()
+    };
+    lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, options)
+}
+
+#[test]
+fn an_incoming_argument_load_is_disjoint_from_an_own_frame_store_only_on_request() {
+    let build = |a: &mut CodeAssembler| {
+        a.push(rbx).unwrap();
+        a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+        a.mov(rax, qword_ptr(rdx + 8)).unwrap();
+        a.pop(rbx).unwrap();
+    };
+    assert!(matches!(lift_default(build), Err(LiftError::MemoryAliasing { .. })));
+    let sem = lift_entry_args(build).expect("lift");
+    assert!(sem.assumes_stack_disjoint);
+}
+
+#[test]
+fn the_entry_argument_relaxation_stays_closed_for_everything_else() {
+    type Build = Box<dyn Fn(&mut CodeAssembler)>;
+    let refused: Vec<(&str, Build)> = vec![
+        (
+            "argument register modified before the load",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rdx, rdi).unwrap();
+                a.mov(rax, qword_ptr(rdx + 8)).unwrap();
+            }),
+        ),
+        (
+            "non-argument base",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rax, qword_ptr(rbx + 8)).unwrap();
+            }),
+        ),
+        (
+            "indexed address",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx + rdi)).unwrap();
+            }),
+        ),
+        (
+            "store reaches the entry rsp",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 4), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+        (
+            "store through a non-argument base",
+            Box::new(|a| {
+                a.mov(qword_ptr(rbx), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+    ];
+    for (name, build) in refused {
+        assert!(
+            matches!(lift_entry_args(&build), Err(LiftError::MemoryAliasing { .. })),
+            "{name}"
+        );
+    }
+}
+
+fn lift_default(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftError> {
+    let mut asm = CodeAssembler::new(64).expect("assembler");
+    build(&mut asm);
+    let bytes = asm.assemble(0x1000).expect("assemble");
+    lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, LiftOptions::default())
+}
