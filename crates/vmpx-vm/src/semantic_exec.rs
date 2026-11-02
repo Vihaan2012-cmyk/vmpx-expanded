@@ -73,6 +73,11 @@ pub struct SymbolicExecutionLimits {
     /// state only; consulting the seed labels the block `ObservedGlobal`, so it
     /// never reaches the proven tier.
     pub serve_observed_when_suppressed: bool,
+    /// Treat an external store address that is data read from the VM frame (not a
+    /// frame pointer) like any other opaque pointer: the labeled
+    /// `AssumesExternalStoresDisjointFromVmStack` narrowing instead of the
+    /// tainting havoc. Only while no frame pointer has escaped or been lost.
+    pub assume_loaded_store_addresses_disjoint: bool,
 }
 
 impl Default for SymbolicExecutionLimits {
@@ -84,6 +89,7 @@ impl Default for SymbolicExecutionLimits {
             serve_read_only_when_suppressed: false,
             prove_read_only_when_suppressed: true,
             serve_observed_when_suppressed: false,
+            assume_loaded_store_addresses_disjoint: false,
         }
     }
 }
@@ -505,6 +511,7 @@ struct SymbolicMachine<'a> {
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
     serve_read_only_when_suppressed: bool,
+    assume_loaded_store_addresses_disjoint: bool,
     prove_read_only_when_suppressed: bool,
     serve_observed_when_suppressed: bool,
     served_read_only_image: bool,
@@ -597,6 +604,7 @@ impl<'a> SymbolicMachine<'a> {
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
+            assume_loaded_store_addresses_disjoint: limits.assume_loaded_store_addresses_disjoint,
             prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
             serve_observed_when_suppressed: limits.serve_observed_when_suppressed,
             served_read_only_image: false,
@@ -880,7 +888,13 @@ impl<'a> SymbolicMachine<'a> {
             });
             return Ok(());
         }
-        if address.dependencies().contains("vsp_initial") {
+        // A frame pointer can only be read back from a tracked cell, so with none
+        // lost or escaped an untracked read is caller data, not a frame pointer.
+        let loaded_data_address = self.assume_loaded_store_addresses_disjoint
+            && !is_frame_pointer_value(address)
+            && !self.vm_stack_address_escapes
+            && !self.vm_stack_pointer_lost;
+        if address.dependencies().contains("vsp_initial") && !loaded_data_address {
             // The address may alias the VM operand stack itself; keep the broad,
             // assumption-free havoc.
             self.retain_memory(|_| false);
@@ -1160,9 +1174,18 @@ impl std::fmt::Write for BoundedKey {
     }
 }
 
+/// `Debug` text of `expression`, or `None` when it renders past `limit` bytes.
+pub(crate) fn bounded_debug(expression: &Expr, limit: usize) -> Option<String> {
+    use std::fmt::Write;
+    let mut key = BoundedKey { text: String::new(), remaining: limit };
+    write!(key, "{expression:?}").ok()?;
+    Some(key.text)
+}
+
 /// Orders tracked memory by the rendered address. `Debug` prints a shared DAG
 /// as a tree, so a heavily shared address can render exponentially large; the
-/// rendering is bounded and the block fails closed rather than exhausting RAM.
+/// rendering is bounded and the set falls back to structural-hash order rather
+/// than exhausting RAM.
 ///
 /// The rendered order (or the over-budget failure) depends only on the address
 /// set, so it is memoized on the addresses in a canonical hash order: successive
@@ -1228,11 +1251,9 @@ fn sorted_memory_values(
         });
         order
     };
-    let Some(order) = order else {
-        return Err(format!(
-            "tracked memory addresses exceed {MAX_SORT_KEY_BYTES} rendered bytes"
-        ));
-    };
+    // Over-budget address text falls back to the structural-hash order the items
+    // are already in: the order is canonical either way and never semantic.
+    let order = order.unwrap_or_else(|| (0..items.len()).collect());
     Ok(order
         .into_iter()
         .map(|index| (items[index].1.clone(), items[index].2.clone()))
@@ -2704,10 +2725,10 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
 #[cfg(test)]
 mod tests {
     /// A heavily shared DAG has few distinct nodes but renders as an
-    /// exponentially large tree; sorting its address must fail closed instead of
-    /// allocating the tree.
+    /// exponentially large tree; sorting its address must fall back to hash order
+    /// instead of allocating the tree.
     #[test]
-    fn shared_dag_address_sort_key_fails_closed() {
+    fn shared_dag_address_sort_key_falls_back_to_hash_order() {
         let mut address = Expr::register(BitWidth::W64, "native_rax_initial");
         for round in 0..48_u64 {
             let mixed = Expr::binary(
@@ -2720,8 +2741,13 @@ mod tests {
         }
         assert!(address.node_count_bounded(1_000_000) < 10_000, "DAG stays small");
         let mut memory = HashMap::new();
-        memory.insert(address, Expr::constant(BitWidth::W8, 0));
-        assert!(sorted_memory_values(memory).is_err());
+        memory.insert(address.clone(), Expr::constant(BitWidth::W8, 0));
+        memory.insert(Expr::constant(BitWidth::W64, 7), Expr::constant(BitWidth::W8, 1));
+        let first = sorted_memory_values(memory.clone()).unwrap();
+        let second = sorted_memory_values(memory).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+        assert!(bounded_debug(&address, 1 << 20).is_none());
 
         let mut small = HashMap::new();
         small.insert(Expr::constant(BitWidth::W64, 2), Expr::constant(BitWidth::W8, 0));
@@ -3467,6 +3493,69 @@ mod tests {
             is_free_read(&reloaded),
             "stale pre-store value must not survive the havoc: {reloaded:?}"
         );
+    }
+
+    // A store whose address is data read from the VM frame (vsp_initial only
+    // inside an untracked load's address) is a frame pointer only if one was lost
+    // or escaped. Under the opt-in flag it takes the labeled narrowing instead of
+    // tainting; without the flag, or once a frame pointer is lost, it still taints.
+    #[test]
+    fn loaded_data_store_address_takes_labeled_narrowing_only_when_opted_in() {
+        let loaded = Expr::intrinsic(
+            BitWidth::W64,
+            "memory_load_epoch_3".to_owned(),
+            vec![stack_address(192)],
+        );
+        let address = Expr::binary(
+            BinaryOp::Add,
+            loaded,
+            Expr::register(BitWidth::W64, "native_rbx_initial"),
+        )
+        .expect("same-width pointer expression");
+        assert!(!is_frame_pointer_value(&address));
+        let limits = SymbolicExecutionLimits {
+            assume_loaded_store_addresses_disjoint: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let machine = |limits| {
+            SymbolicMachine::new(&SymbolicVmInitialState::default(), None, limits)
+                .expect("default state")
+        };
+
+        let mut off = machine(SymbolicExecutionLimits::default());
+        off.store_external(1, address.clone(), Expr::constant(BitWidth::W8, 1))
+            .expect("over-approximated");
+        assert!(off.memory_tainted);
+        assert!(!off.assumed_external_disjoint_from_vm_stack);
+
+        let mut on = machine(limits);
+        on.store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed");
+        on.store_external(1, address.clone(), Expr::constant(BitWidth::W8, 1))
+            .expect("narrowed");
+        assert!(!on.memory_tainted);
+        assert!(on.assumed_external_disjoint_from_vm_stack);
+        let kept = on.load_memory(stack_address(16), BitWidth::W64).expect("load");
+        assert!(matches!(kept.kind, ExprKind::Const { value: 9 }));
+
+        let mut lost = machine(limits);
+        lost.vm_stack_pointer_lost = true;
+        lost.store_external(1, address, Expr::constant(BitWidth::W8, 1))
+            .expect("over-approximated");
+        assert!(lost.memory_tainted);
+        assert!(!lost.assumed_external_disjoint_from_vm_stack);
+
+        let indexed = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "native_rbx_initial"),
+            stack_address(216),
+        )
+        .expect("same-width pointer expression");
+        let mut array = machine(limits);
+        array
+            .store_external(1, indexed, Expr::constant(BitWidth::W64, 1))
+            .expect("over-approximated");
+        assert!(array.memory_tainted, "a vsp-rooted indexed store stays refused");
     }
 
     // The frame address is non-escaping while it only flows into VM-stack cells

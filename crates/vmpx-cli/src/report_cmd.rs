@@ -258,6 +258,44 @@ fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmC
     }
 }
 
+/// Integrity audit: `all_paths_reach_vm_exit` requires no stall, no limit hit and
+/// SOME block exiting via `VmExit`. It does not check that each non-exit block's
+/// successors are actually present, so a graph truncated without a stall would
+/// still pass. With `VMPX_CFG_AUDIT=<file>` set, every entry counted complete is
+/// checked for exactly that and any violation is recorded.
+fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("VMPX_CFG_AUDIT") else { return };
+    let dangling: Vec<String> = cfg
+        .blocks
+        .iter()
+        .filter(|(_, block)| {
+            matches!(
+                block.exit,
+                vmpx_vm::BlockExit::Branch | vmpx_vm::BlockExit::NativeCall
+            )
+        })
+        .filter(|(key, _)| {
+            !cfg.edges
+                .iter()
+                .any(|edge| edge.from == **key && cfg.blocks.contains_key(&edge.to))
+        })
+        .map(|(key, block)| format!("{:#x}:{:?}", key.get(), block.exit))
+        .collect();
+    if dangling.is_empty() {
+        return;
+    }
+    let line = serde_json::json!({
+        "rva": format!("{:#x}", entry.rva.0),
+        "blocks": cfg.blocks.len(),
+        "dangling": dangling,
+    });
+    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Outcome {
     match result {
         Err(_) => Outcome::Panic,
@@ -314,6 +352,11 @@ fn recover_all(
                             None => recover_vm_cfg(pe, entry, limits),
                         }));
                         dump_stalls(entry, &result);
+                        if let Ok(Ok(cfg)) = &result {
+                            if cfg.all_paths_reach_vm_exit() {
+                                audit_complete(entry, cfg);
+                            }
+                        }
                         mine.push((index, classify(result)));
                     }
                     mine

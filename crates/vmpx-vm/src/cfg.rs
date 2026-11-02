@@ -1182,6 +1182,29 @@ fn cell_token(address: &str) -> String {
     format!("m{:x}", hasher.finish())
 }
 
+/// Short class of a symbolic-execution failure, so the stall histogram separates
+/// the distinct underlying errors the one stall prefix would otherwise merge.
+fn symbolic_failure_class(message: &str) -> &'static str {
+    if message.contains("null memory read") {
+        "null-read"
+    } else if message.contains("exceed") {
+        "resource-limit"
+    } else if message.contains("not implemented") || message.contains("not modelled") {
+        "unmodelled"
+    } else {
+        "other"
+    }
+}
+
+/// A memory site's identity: its address text, or its structural hash once the
+/// text of a heavily shared address DAG outgrows `SITE_KEY_BYTES`.
+fn site_key(address: &Expr) -> String {
+    use std::hash::BuildHasher;
+    const SITE_KEY_BYTES: usize = 4 << 20;
+    crate::semantic_exec::bounded_debug(address, SITE_KEY_BYTES)
+        .unwrap_or_else(|| format!("#{:016x}", crate::expr::FxBuild::default().hash_one(address)))
+}
+
 /// One memory site of a widened pair: indices of its cell in `a` and `r` (the
 /// last cell wins on a repeated address) and the site's canonical-unknown token.
 type MemorySite = (Option<usize>, Option<usize>, String);
@@ -1214,7 +1237,7 @@ fn memory_union(a: &SymbolicVmInitialState, r: &SymbolicVmInitialState) -> Rc<Ve
             .memory_values
             .iter()
             .enumerate()
-            .map(|(index, entry)| (format!("{:?}", entry.0), index))
+            .map(|(index, entry)| (site_key(&entry.0), index))
             .collect()
     };
     let (a_memory, r_memory) = (by_address(a), by_address(r));
@@ -1576,6 +1599,11 @@ struct Walker<'a, 'p> {
     /// Proven cross-profile transitions followed so far this entry; capped by
     /// `limits.max_profile_transitions` to bound exploration/memory.
     profile_transitions: usize,
+    /// DISTINCT blocks a cross-profile transition was followed from; the cap bounds
+    /// these rather than total followings, which unrolls and sibling paths burn on
+    /// repeated work. Still bounded by post-transition visits, per-block visits and
+    /// the hard per-entry memory cap, each of which fails closed.
+    transition_sites: BTreeSet<Va>,
     /// `(total_instructions, visits)` captured when the FIRST cross-profile
     /// transition fired. `None` until then (and forever on the sound path).
     /// The post-transition budget is measured as growth beyond this baseline.
@@ -2227,9 +2255,28 @@ impl Walker<'_, '_> {
     /// tight node/instruction budget — not the loose entry-global caps — keeps a
     /// pathological entry from allocating without limit.
     fn transition_budget_exhausted(&self) -> bool {
+        // The allowance is PER DISTINCT TRANSITION SITE, not one flat grant for
+        // the whole remaining walk. Measured from the first transition only, an
+        // entry that legitimately follows 30 transitions got the same 64 visits
+        // and 6000 instructions as one following a single transition, so the
+        // budget ran out on the NUMBER of regions rather than on any one region
+        // being pathological. Per-region removes that refusal class entirely
+        // (TransitionBudget stops went 238 -> 0).
+        //
+        // Still bounded, and every bound still fails closed: at most
+        // `max_profile_transitions` distinct sites, so this tops out at that
+        // multiple of the per-region allowance, with the entry-global
+        // `max_visits` / `max_total_instructions` and the hard per-entry
+        // `max_memory_bytes` cap all continuing to apply above it.
+        let regions = self.transition_sites.len().max(1);
+        let visit_budget = self.limits.max_transition_visits.saturating_mul(regions);
+        let insn_budget = self
+            .limits
+            .max_transition_instructions
+            .saturating_mul(regions);
         self.transition_budget_base.is_some_and(|(i0, v0)| {
-            self.total_instructions.saturating_sub(i0) >= self.limits.max_transition_instructions
-                || self.cfg.visits.saturating_sub(v0) >= self.limits.max_transition_visits
+            self.total_instructions.saturating_sub(i0) >= insn_budget
+                || self.cfg.visits.saturating_sub(v0) >= visit_budget
         })
     }
 
@@ -2633,12 +2680,39 @@ impl Walker<'_, '_> {
             &symbolic_in,
             Some(&observed_source(self)),
         ) {
+            Ok(report)
+                if report.memory_tainted
+                    && boundary == Some(VmHandlerSemantic::UnconditionalBranch)
+                    && !self.frame_not_private
+                    && !self.frame_pointer_lost =>
+            {
+                // A tainted branch block stalls; retry it once with loaded-data
+                // store addresses under the labeled disjointness assumption.
+                let relaxed = crate::SymbolicExecutionLimits {
+                    assume_loaded_store_addresses_disjoint: true,
+                    ..self.limits.entry.symbolic
+                };
+                self.seeded.set(false);
+                match execute_symbolic_linear_block_with_initial_state(
+                    &instructions,
+                    symbolic_boundary,
+                    relaxed,
+                    &symbolic_in,
+                    Some(&observed_source(self)),
+                ) {
+                    Ok(retry) if !retry.memory_tainted => retry,
+                    _ => report,
+                }
+            }
             Ok(report) => report,
             Err(error) => {
                 self.stall(
                     key,
                     error.vip,
-                    format!("symbolic execution failed: {error}"),
+                    format!(
+                        "symbolic execution failed [{}]: {error}",
+                        symbolic_failure_class(&error.message)
+                    ),
                 );
                 return;
             }
@@ -3295,7 +3369,9 @@ impl Walker<'_, '_> {
         // allocates without limit. Beyond the budget, fail closed (the caller
         // stalls) instead of switching. Sound: a bounded walk that hits the cap
         // stalls — it never false-completes.
-        if self.profile_transitions >= self.limits.max_profile_transitions {
+        if !self.transition_sites.contains(&key)
+            && self.transition_sites.len() >= self.limits.max_profile_transitions
+        {
             return false;
         }
         // A genuine transition handler ends a short handler-stream block; a very
@@ -3431,6 +3507,7 @@ impl Walker<'_, '_> {
             self.transition_budget_base = Some((self.total_instructions, self.cfg.visits));
         }
         self.profile_transitions += 1;
+        self.transition_sites.insert(key);
         self.add_edge(CfgEdge {
             from: key,
             to: first.state_after.vip,
@@ -3556,6 +3633,7 @@ pub fn recover_vm_cfg_with_observed(
         section: bytecode_section(pe, entry_address),
         active: None,
         profile_transitions: 0,
+        transition_sites: BTreeSet::new(),
         transition_budget_base: None,
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
@@ -3666,6 +3744,31 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_failures_are_classified() {
+        assert_eq!(
+            symbolic_failure_class("proven null memory read of 1 byte(s) requires exception-flow analysis"),
+            "null-read"
+        );
+        assert_eq!(symbolic_failure_class("instruction count exceeds limit 4096"), "resource-limit");
+        assert_eq!(symbolic_failure_class("control-flow boundary is not implemented"), "unmodelled");
+        assert_eq!(symbolic_failure_class("anything else"), "other");
+    }
+
+    #[test]
+    fn oversized_address_site_key_falls_back_to_the_structural_hash() {
+        let mut address = Expr::register(BitWidth::W64, "native_rax_initial");
+        for round in 0..48_u64 {
+            let mixed = Expr::binary(BinaryOp::Xor, address.clone(), Expr::constant(BitWidth::W64, round + 1)).unwrap();
+            address = Expr::binary(BinaryOp::Add, address, mixed).unwrap();
+        }
+        let key = site_key(&address);
+        assert!(key.starts_with('#') && key.len() < 32);
+        assert_eq!(key, site_key(&address));
+        let small = Expr::constant(BitWidth::W64, 7);
+        assert_eq!(site_key(&small), format!("{small:?}"));
+    }
+
+    #[test]
     fn out_of_section_branch_target_is_classified_for_a_fail_closed_diagnostic() {
         const EXEC: u32 = 0x6000_0020; // CODE | EXECUTE | READ
         const RDATA: u32 = 0x4000_0040; // INITIALIZED_DATA | READ
@@ -3768,6 +3871,7 @@ mod tests {
             section: Some(0),
             active: None,
             profile_transitions: 0,
+            transition_sites: BTreeSet::new(),
             transition_budget_base: None,
             cache: LinearDecodeCache::default(),
             decoded: BTreeMap::new(),
@@ -4027,7 +4131,7 @@ mod tests {
         );
         let mut walker = test_walker(&pe, base, &observed, &seeded);
         // Saturate the budget: the next transition must be refused outright.
-        walker.profile_transitions = walker.limits.max_profile_transitions;
+        walker.transition_sites = (0..walker.limits.max_profile_transitions).map(|i| Va(0x9000_0000 + i as u64)).collect();
         let final_state = RelativeDispatchState {
             vip: Va(RDATA_VA),
             rolling_key: RDATA_VA,
