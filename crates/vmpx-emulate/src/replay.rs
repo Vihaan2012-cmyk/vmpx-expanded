@@ -256,4 +256,75 @@ mod tests {
         assert!(!r.advance());
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Exercises a full recording against known values, including the array and
+    /// coercion paths the roundtrip test above does not reach. Set
+    /// `VMPX_REPLAY_FIXTURE` to a generated stream; skipped when unset.
+    #[test]
+    fn fixture_serves_every_payload_type() {
+        let Some(path) = std::env::var_os("VMPX_REPLAY_FIXTURE") else {
+            return;
+        };
+        let mut r = Replay::load(std::path::Path::new(&path)).expect("fixture loads");
+        assert_eq!(r.n_datarefs(), 33, "fixture dataref count");
+        assert_eq!(r.n_frames(), 900, "fixture frame count");
+
+        // Before the first advance every slot is still zero-initialised.
+        assert_eq!(r.get_f32("sim/flightmodel/position/indicated_airspeed"), Some(0.0));
+        assert!(r.advance(), "frame 0 applies");
+
+        let near = |got: Option<f32>, want: f32| {
+            let g = got.expect("value present");
+            assert!((g - want).abs() < 1e-3, "got {g}, want {want}");
+        };
+        // f64 slot read as f64 and coerced down to f32.
+        let elev = r.get_f64("sim/flightmodel/position/elevation").expect("f64");
+        assert!((elev - 300.0).abs() < 1e-9, "elevation {elev}");
+        near(r.get_f32("sim/flightmodel/position/elevation"), 300.0);
+        // f32 slot read as f32 and coerced up to f64.
+        near(r.get_f32("sim/flightmodel/position/indicated_airspeed"), 140.0);
+        assert!(
+            r.get_f64("sim/flightmodel/position/indicated_airspeed")
+                .is_some_and(|v| (v - 140.0).abs() < 1e-3)
+        );
+        // int slot, plus coercion to float.
+        assert_eq!(r.get_i32("sim/cockpit2/controls/gear_handle_down"), Some(1));
+        near(r.get_f32("sim/cockpit2/controls/gear_handle_down"), 1.0);
+
+        // float array: whole vector, and element 0 via the scalar accessor.
+        let mut buf = [0f32; 4];
+        let n = r.get_vf("sim/flightmodel/engine/ENGN_N1_", &mut buf);
+        assert_eq!(n, 2, "ENGN_N1_ is 2 elements");
+        assert!((buf[0] - 88.0).abs() < 1e-3, "N1[0] {}", buf[0]);
+        assert!((buf[1] - 88.5).abs() < 1e-3, "N1[1] {}", buf[1]);
+        near(r.get_f32("sim/flightmodel/engine/ENGN_N1_"), 88.0);
+
+        // int array read as floats.
+        let mut ib = [0f32; 4];
+        assert_eq!(r.get_vf("sim/cockpit2/electrical/battery_on", &mut ib), 2);
+        near(Some(ib[0]), 1.0);
+        assert_eq!(r.get_i32("sim/cockpit2/electrical/battery_on"), Some(1));
+
+        // A 4-element float array fills exactly 4 slots.
+        let mut vb = [0f32; 4];
+        assert_eq!(r.get_vf("sim/cockpit2/electrical/bus_volts", &mut vb), 4);
+        near(Some(vb[3]), 27.8);
+
+        // An absent name must stay None rather than reading a neighbour's bytes.
+        assert_eq!(r.get_f32("sim/does/not/exist"), None);
+        assert_eq!(r.get_vf("sim/does/not/exist", &mut buf), 0);
+
+        // Drive the whole stream: values must move and the cursor must exhaust.
+        let start = r.get_f32("sim/flightmodel/position/elevation").unwrap();
+        let mut steps = 1;
+        while r.advance() {
+            steps += 1;
+        }
+        assert_eq!(steps, 900, "every frame steps once");
+        let end = r.get_f32("sim/flightmodel/position/elevation").unwrap();
+        assert!(end > start + 100.0, "climb should be recorded: {start} -> {end}");
+        // Exhausted, but the last frame's state is retained.
+        assert!(!r.advance());
+        assert!(r.get_f32("sim/flightmodel/position/elevation").is_some());
+    }
 }
