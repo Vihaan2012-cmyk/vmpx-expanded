@@ -210,6 +210,36 @@ fn transition_scale() -> usize {
     env_scale("VMPX_TRANSITION_BUDGET")
 }
 
+/// Diagnostic: with `VMPX_STALL_DUMP=<file>` set, appends one JSON line per
+/// incomplete entry (rva, limit hit, stalls in discovery order) while a budget
+/// pass is active.
+fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("VMPX_STALL_DUMP") else { return };
+    if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() {
+        return;
+    }
+    let Ok(Ok(cfg)) = result else { return };
+    if cfg.all_paths_reach_vm_exit() {
+        return;
+    }
+    let stalls: Vec<serde_json::Value> = cfg
+        .stalls
+        .iter()
+        .take(12)
+        .map(|st| serde_json::json!({"block": format!("{:#x}", st.block.get()), "vip": format!("{:#x}", st.vip.get()), "reason": st.reason}))
+        .collect();
+    let line = serde_json::json!({
+        "rva": format!("{:#x}", entry.rva.0),
+        "limit": cfg.limit_hit.map(|h| format!("{h:?}")),
+        "n_stalls": cfg.stalls.len(),
+        "stalls": stalls,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Outcome {
     match result {
         Err(_) => Outcome::Panic,
@@ -254,10 +284,12 @@ fn recover_all(
                     slice
                         .iter()
                         .map(|entry| {
-                            classify(panic::catch_unwind(AssertUnwindSafe(|| match observed {
+                            let result = panic::catch_unwind(AssertUnwindSafe(|| match observed {
                                 Some(run) => recover_vm_cfg_with_observed(pe, entry, limits, run),
                                 None => recover_vm_cfg(pe, entry, limits),
-                            })))
+                            }));
+                            dump_stalls(entry, &result);
+                            classify(result)
                         })
                         .collect::<Vec<_>>()
                 })
