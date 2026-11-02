@@ -53,6 +53,13 @@ impl ReportOptions {
                 sample.unwrap_or(DEFAULT_SAMPLE)
             },
             threads: threads.max(1),
+            // NOT raised past 512, despite 55 entries being refused purely on this
+            // bound and 12 of them opening when it is doubled. Doubling it HANGS the
+            // sweep: one entry spins indefinitely (observed 62 minutes with no
+            // progress, around entry index 385-388, rva ~0xc82b466) and the
+            // per-entry wall-clock limit does not bound it. Raising the bound is
+            // worth +12 once that spin is found and fixed; until then it is
+            // available opt-in as VMPX_INSTRUCTION_LIMIT and must not be a default.
             instruction_limit: 512,
             dynamic,
             serve_ro: false,

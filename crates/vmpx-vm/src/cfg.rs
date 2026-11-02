@@ -136,8 +136,14 @@ impl Default for VmCfgLimits {
             max_targets: 16,
             max_nested_entries: 8,
             max_profile_transitions: 32,
-            max_transition_visits: 64,
-            max_transition_instructions: 6_000,
+            // Per-region allowances (see `transition_budget_exhausted`). These were
+            // 64 / 6000 when the budget was one flat grant for the whole walk; at
+            // that size they refused 238 entries on systems.xpl and measured +3 N1
+            // when scaled 8x, so the old values were simply too tight for a region
+            // rather than load-bearing. Memory is bounded by `max_memory_bytes`,
+            // not by these, and every one of them fails closed.
+            max_transition_visits: 512,
+            max_transition_instructions: 48_000,
             max_loop_unrolls: 4,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_wall_time: Some(DEFAULT_MAX_WALL_TIME),
@@ -542,8 +548,22 @@ fn vsp_capture_top_offset(instruction: &iced_x86::Instruction, vsp: Register) ->
 /// based on it. Plain loads and stores through RSP do not expose the address.
 fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
     let is_rsp = |register: Register| register.full_register() == Register::RSP;
+    // A 16-bit (or narrower) read of RSP as a source operand yields no usable
+    // frame address: user-mode addresses below 64K are never mapped. VMProtect
+    // emits junk like `bsr ax,sp` after the VSP capture, and counting that as
+    // exposure made the frame extension bail and left the image-base relocation
+    // delta cell unknown, which made the whole address chain unresolvable.
+    // A write to SP, a 32-bit ESP read, `lea` and `push rsp` all still expose.
+    let narrow_read = |operand: u32| {
+        operand >= 1
+            && instruction.op_register(operand).size() <= 2
+            && matches!(
+                instruction.mnemonic(),
+                Mnemonic::Bsr | Mnemonic::Bsf | Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx
+            )
+    };
     (0..instruction.op_count()).any(|operand| match instruction.op_kind(operand) {
-        OpKind::Register => is_rsp(instruction.op_register(operand)),
+        OpKind::Register => is_rsp(instruction.op_register(operand)) && !narrow_read(operand),
         OpKind::Memory => {
             instruction.mnemonic() == Mnemonic::Lea
                 && (is_rsp(instruction.memory_base()) || is_rsp(instruction.memory_index()))
