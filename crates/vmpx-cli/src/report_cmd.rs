@@ -284,33 +284,48 @@ fn recover_all(
     if entries.is_empty() {
         return Vec::new();
     }
-    let chunk = entries.len().div_ceil(opts.threads).max(1);
     let instruction_limit = opts.instruction_limit.saturating_mul(env_scale("VMPX_INSTRUCTION_LIMIT"));
     let limits = cfg_limits(instruction_limit, opts.serve_ro, opts.serve_observed_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
+    // Per-entry cost spans orders of magnitude (up to the 60s wall cap), so a
+    // static split finishes most threads early and waits on the slowest chunk's
+    // tail. Workers pull the next index instead. Each result is placed BY index:
+    // the caller's budget/observed rerun passes address entries positionally, so
+    // a dropped or reordered outcome would silently mispair them with entries.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = opts.threads.max(1).min(entries.len());
     let out = std::thread::scope(|scope| {
-        let handles: Vec<_> = entries
-            .chunks(chunk)
-            .map(|slice| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let next = &next;
                 scope.spawn(move || {
-                    slice
-                        .iter()
-                        .map(|entry| {
-                            let result = panic::catch_unwind(AssertUnwindSafe(|| match observed {
-                                Some(run) => recover_vm_cfg_with_observed(pe, entry, limits, run),
-                                None => recover_vm_cfg(pe, entry, limits),
-                            }));
-                            dump_stalls(entry, &result);
-                            classify(result)
-                        })
-                        .collect::<Vec<_>>()
+                    let mut mine: Vec<(usize, Outcome)> = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(entry) = entries.get(index) else { break };
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| match observed {
+                            Some(run) => recover_vm_cfg_with_observed(pe, entry, limits, run),
+                            None => recover_vm_cfg(pe, entry, limits),
+                        }));
+                        dump_stalls(entry, &result);
+                        mine.push((index, classify(result)));
+                    }
+                    mine
                 })
             })
             .collect();
-        handles
+        let mut slots: Vec<Option<Outcome>> = (0..entries.len()).map(|_| None).collect();
+        for handle in handles {
+            for (index, outcome) in handle.join().unwrap_or_default() {
+                slots[index] = Some(outcome);
+            }
+        }
+        // A slot can only still be None if a worker thread itself failed to
+        // join; count that as an error rather than shifting the rest.
+        slots
             .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
+            .map(|slot| slot.unwrap_or(Outcome::Error))
             .collect::<Vec<_>>()
     });
     panic::set_hook(prev_hook);

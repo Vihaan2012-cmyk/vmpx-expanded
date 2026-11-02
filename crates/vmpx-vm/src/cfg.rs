@@ -2043,6 +2043,18 @@ fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
     flag_fork_analysis(target, limits, DEFAULT_MAX_FLAGS).ok()
 }
 
+/// Whether a computed branch target leaving the entry's bytecode section may be
+/// followed. Section executability is NOT a criterion: the VM dispatcher reads
+/// bytecode as data, and this sample hides bytecode in sections marked
+/// non-executable (`.pdata` here carries 0 valid RUNTIME_FUNCTION entries in
+/// 66688 and is high-entropy throughout, so it is not real unwind data). An
+/// UNMAPPED target is still never followed, the lever is still off by default,
+/// and the carried rolling-key decode at the target remains the real guard: a
+/// wrong target decodes to garbage and stalls.
+fn cross_section_followable(follow: bool, target_characteristics: Option<u32>) -> bool {
+    follow && target_characteristics.is_some()
+}
+
 /// `flag_fork_targets` with the refusal reason retained.
 fn flag_fork_analysis(
     target: &Expr,
@@ -2081,8 +2093,27 @@ fn flag_fork_analysis(
     if flags.len() > max_flags {
         return Err(FlagForkRefusal::TooManyFlags(flags.len()));
     }
+    // A flag the range analysis proves constant must not be forked over {0, 1}:
+    // the other value is infeasible and seeds a spurious branch target (observed
+    // as VIP+-1 around the real target, which then decodes to a garbage handler).
+    // This only drops assignments `value_range` already proves cannot occur, so
+    // the over-approximation shrinks without any new assumption.
+    let ranges: Vec<(u64, u64)> = flags
+        .iter()
+        .map(|flag| {
+            let range = value_range(flag);
+            (range.min(), range.max())
+        })
+        .collect();
     let mut targets = BTreeSet::new();
     for combination in 0_u32..(1_u32 << flags.len()) {
+        let in_range = ranges.iter().enumerate().all(|(index, (lo, hi))| {
+            let bit = u64::from((combination >> index) & 1);
+            bit >= *lo && bit <= *hi
+        });
+        if !in_range {
+            continue;
+        }
         let assignment: Vec<(&Expr, u64)> = flags
             .iter()
             .enumerate()
@@ -2813,10 +2844,10 @@ impl Walker<'_, '_> {
                 // EXPERIMENTAL cross-VM-section continuation (see
                 // `VmCfgLimits::follow_cross_vm_section`). Labeled, so the entry
                 // never reaches the proven tier.
-                const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-                if self.limits.follow_cross_vm_section
-                    && target_characteristics.is_some_and(|flags| flags & IMAGE_SCN_MEM_EXECUTE != 0)
-                {
+                if cross_section_followable(
+                    self.limits.follow_cross_vm_section,
+                    target_characteristics,
+                ) {
                     if self.follow_bytecode_target(
                         key, vip, target_va, value, &dispatch, anchor, guarded, symbolic, pending,
                     ) {
@@ -3983,6 +4014,48 @@ mod tests {
         assert_eq!(
             resolve_targets(&target, VmCfgLimits::default()),
             Ok((vec![0x1800_1000, 0x1800_2000], true))
+        );
+    }
+
+    #[test]
+    fn cross_section_follow_needs_the_lever_and_a_mapped_target_not_executability() {
+        const EXEC: u32 = 0x2000_0000;
+        const DATA: u32 = 0xC000_0040;
+        // A non-executable target is followable: VM bytecode is read as data.
+        assert!(cross_section_followable(true, Some(EXEC)));
+        assert!(cross_section_followable(true, Some(DATA)));
+        // Unmapped is never followed, and the lever still gates everything.
+        assert!(!cross_section_followable(true, None));
+        assert!(!cross_section_followable(false, Some(EXEC)));
+        assert!(!cross_section_followable(false, Some(DATA)));
+    }
+
+    #[test]
+    fn flag_fork_does_not_fork_a_flag_proven_constant() {
+        // Bit 6 of `(~L & C1) & (L & C2)` is zero (C1 has bit 6 clear), but the
+        // simplifier keeps the expression. Forking it over {0, 1} would add the
+        // infeasible `+0x10` targets; only the real ZF fork may remain.
+        let load = Expr::intrinsic(
+            BitWidth::W64,
+            "memory_load_epoch_1",
+            vec![Expr::constant(BitWidth::W64, 0x148)],
+        );
+        let and = |a: Expr, b: Expr| Expr::binary(BinaryOp::And, a, b).unwrap();
+        let c = |v: u64| Expr::constant(BitWidth::W64, v);
+        let not_load = Expr::unary(UnaryOp::Not, load.clone());
+        let inner = and(and(not_load, c(0x924a_712f)), and(load, c(0x6db5_8ed0)));
+        let dead = Expr::binary(BinaryOp::Shr, and(c(0x40), inner), c(6)).unwrap();
+        assert_eq!(value_range(&dead).max(), 0);
+        let sum = Expr::binary(
+            BinaryOp::Add,
+            select(zf_bit(opaque_operand()), 0x1800_1000, 0x1800_2000),
+            Expr::binary(BinaryOp::Mul, dead, c(0x10)).unwrap(),
+        )
+        .unwrap()
+        .simplify();
+        assert_eq!(
+            flag_fork_targets(&sum, VmCfgLimits::default()),
+            Some(vec![0x1800_1000, 0x1800_2000])
         );
     }
 
