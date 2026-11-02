@@ -113,6 +113,14 @@ pub struct VmCfgLimits {
     /// stops the walk and records [`CfgLimitHit::WallClock`] (never complete).
     /// `None` is unbounded. A single block visit is not interrupted.
     pub max_wall_time: Option<Duration>,
+    /// EXPERIMENTAL. When true, a computed branch target that leaves the entry's
+    /// proven bytecode section but lands in ANOTHER EXECUTABLE image section is
+    /// followed as bytecode (labeled
+    /// [`VmCfgAssumption::AssumesCrossVmSectionContinuation`]) instead of failing
+    /// closed. The carried rolling-key decode at the target is the guard: a
+    /// non-continuation target decodes to an invalid dispatch and still stalls.
+    /// Default false: the sound path is byte-for-byte unchanged.
+    pub follow_cross_vm_section: bool,
 }
 
 impl Default for VmCfgLimits {
@@ -133,6 +141,7 @@ impl Default for VmCfgLimits {
             max_loop_unrolls: 4,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_wall_time: Some(DEFAULT_MAX_WALL_TIME),
+            follow_cross_vm_section: false,
         }
     }
 }
@@ -314,6 +323,17 @@ pub enum VmCfgAssumption {
     /// proven complete. Always present whenever an observed branch target was
     /// followed; marks the result experimental-tier.
     AssumesDynamicBranchTargetsComplete,
+    /// A computed VM branch target that left the entry's proven bytecode section
+    /// was followed into a DIFFERENT EXECUTABLE image section, under the premise
+    /// that a coherent key-driven dispatch decode at that address is a genuine
+    /// continuation of this VM's bytecode (VMProtect splits one function's
+    /// bytecode across executable protector sections such as `.vmp2`/`.vmp3`).
+    /// The follow is taken only when the target lands in an executable section and
+    /// the carried rolling key decodes a well-formed dispatch there; a wrong target
+    /// decodes to garbage and still fails closed. EXPERIMENTAL and unproven:
+    /// present only when `VmCfgLimits::follow_cross_vm_section` is enabled, and it
+    /// keeps the entry off the proven (N2) tier.
+    AssumesCrossVmSectionContinuation,
 }
 
 /// Observed back-edge trip counts per loop head, captured on ONE detonation: a
@@ -2774,6 +2794,22 @@ impl Walker<'_, '_> {
                             .find(|section| section.contains_mapped_rva(rva))
                     })
                     .map(|section| section.characteristics);
+                // EXPERIMENTAL cross-VM-section continuation (see
+                // `VmCfgLimits::follow_cross_vm_section`). Labeled, so the entry
+                // never reaches the proven tier.
+                const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+                if self.limits.follow_cross_vm_section
+                    && target_characteristics.is_some_and(|flags| flags & IMAGE_SCN_MEM_EXECUTE != 0)
+                {
+                    if self.follow_bytecode_target(
+                        key, vip, target_va, value, &dispatch, anchor, guarded, symbolic, pending,
+                    ) {
+                        self.cfg
+                            .assumptions
+                            .insert(VmCfgAssumption::AssumesCrossVmSectionContinuation);
+                    }
+                    continue;
+                }
                 self.stall(
                     key,
                     vip,

@@ -946,7 +946,8 @@ fn main() {
                     | VmCfgAssumption::ObservedBranchTarget
                     | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => "OBSERVED",
                     VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
-                    | VmCfgAssumption::AssumesImageProtectionStable => "UNPROVEN-ASSUMPTION",
+                    | VmCfgAssumption::AssumesImageProtectionStable
+                    | VmCfgAssumption::AssumesCrossVmSectionContinuation => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase
                     | VmCfgAssumption::OverApproximatedEnvironmentGate => "BENIGN-LABELED",
                 };

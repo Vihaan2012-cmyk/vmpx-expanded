@@ -33,6 +33,9 @@ pub struct ReportOptions {
     pub serve_observed_ro: bool,
 }
 
+/// Why incomplete entries stopped (limit hit, or `stall`), diagnostic only.
+static LIMIT_HITS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
 /// Snapshot bytes of the volatile, non-writable image ranges (observed seed).
 static SNAPSHOT_SEED: std::sync::OnceLock<vmpx_vm::ObservedMemory> = std::sync::OnceLock::new();
 
@@ -72,7 +75,8 @@ pub fn tier_of<'a>(assumptions: impl IntoIterator<Item = &'a VmCfgAssumption>) -
             | VmCfgAssumption::ObservedBranchTarget
             | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => Tier::Observed,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
-            | VmCfgAssumption::AssumesImageProtectionStable => Tier::UnprovenAssumption,
+            | VmCfgAssumption::AssumesImageProtectionStable
+            | VmCfgAssumption::AssumesCrossVmSectionContinuation => Tier::UnprovenAssumption,
             VmCfgAssumption::PreferredImageBase
             | VmCfgAssumption::OverApproximatedEnvironmentGate => Tier::BenignLabeled,
         };
@@ -153,8 +157,57 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
             },
             ..EntryProfileRecoveryLimits::default()
         },
+        // Post-transition exploration caps scale by VMPX_TRANSITION_BUDGET (integer
+        // multiplier, default 1). A larger cap only lets the walk explore further;
+        // completion still requires no stall and no limit hit.
+        max_visits: VmCfgLimits::default().max_visits.saturating_mul(env_scale("VMPX_VISITS")),
+        max_blocks: VmCfgLimits::default().max_blocks.saturating_mul(env_scale("VMPX_VISITS")),
+        max_total_instructions: VmCfgLimits::default()
+            .max_total_instructions
+            .saturating_mul(env_scale("VMPX_TOTAL_INSTRUCTIONS")),
+        max_transition_visits: VmCfgLimits::default().max_transition_visits.saturating_mul(transition_scale()),
+        max_transition_instructions: VmCfgLimits::default()
+            .max_transition_instructions
+            .saturating_mul(transition_scale()),
+        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
+        // A budget-pass sweep bounds each rerun entry by VMPX_PASS_WALL_SECS (a lower
+        // cap only stops an entry sooner, as WallClock, i.e. incomplete).
+        max_wall_time: if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+            std::env::var("VMPX_PASS_WALL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_secs)
+                .or(VmCfgLimits::default().max_wall_time)
+        } else {
+            VmCfgLimits::default().max_wall_time
+        },
         ..VmCfgLimits::default()
     }
+}
+
+/// Per-pass multiplier override `[transition budget, visits/blocks, total
+/// instructions, per-block instruction limit]`, set by the budget-pass sweep.
+static SCALE_OVERRIDE: std::sync::Mutex<Option<[usize; 4]>> = std::sync::Mutex::new(None);
+
+fn env_scale(name: &str) -> usize {
+    if let Some(a) = *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        return match name {
+            "VMPX_TRANSITION_BUDGET" => a[0],
+            "VMPX_VISITS" => a[1],
+            "VMPX_TOTAL_INSTRUCTIONS" => a[2],
+            "VMPX_INSTRUCTION_LIMIT" => a[3],
+            _ => 1,
+        };
+    }
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|k| *k >= 1)
+        .unwrap_or(1)
+}
+
+fn transition_scale() -> usize {
+    env_scale("VMPX_TRANSITION_BUDGET")
 }
 
 fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Outcome {
@@ -164,7 +217,18 @@ fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Ou
         Ok(Ok(cfg)) if cfg.all_paths_reach_vm_exit() => {
             Outcome::Complete(cfg.assumptions.iter().copied().collect())
         }
-        Ok(Ok(_)) => Outcome::Incomplete,
+        Ok(Ok(cfg)) => {
+            let label = cfg.limit_hit.map_or_else(
+                || "stall".to_owned(),
+                |hit| format!("{hit:?}"),
+            );
+            *LIMIT_HITS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(label)
+                .or_insert(0) += 1;
+            Outcome::Incomplete
+        }
     }
 }
 
@@ -178,7 +242,8 @@ fn recover_all(
         return Vec::new();
     }
     let chunk = entries.len().div_ceil(opts.threads).max(1);
-    let limits = cfg_limits(opts.instruction_limit, opts.serve_ro, opts.serve_observed_ro);
+    let instruction_limit = opts.instruction_limit.saturating_mul(env_scale("VMPX_INSTRUCTION_LIMIT"));
+    let limits = cfg_limits(instruction_limit, opts.serve_ro, opts.serve_observed_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
     let out = std::thread::scope(|scope| {
@@ -418,6 +483,50 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
         eprintln!("[report] --serve-observed-ro needs --volatility-snapshot; no snapshot seed was captured");
     }
     let mut outcomes = recover_all(&pe, &entries, opts, None);
+    eprintln!(
+        "[report] incomplete entries by stop reason: {:?}",
+        LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    );
+    if let Ok(spec) = std::env::var("VMPX_BUDGET_PASSES") {
+        // Sweep of the exploration caps. Each pass re-runs the entries the base pass
+        // left incomplete with larger caps (`tb,visits,total,instr` multipliers,
+        // passes separated by `;`). Raising a cap only lets the walk explore further:
+        // completion still requires no stall and no limit hit. Newly complete entries
+        // are merged, each keeping its own assumption set (so none can reach N2
+        // unless its set is empty).
+        let base_incomplete: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| matches!(o, Outcome::Incomplete))
+            .map(|(i, _)| i)
+            .collect();
+        let pending: Vec<VmEntryCandidate> = base_incomplete.iter().map(|&i| entries[i].clone()).collect();
+        for pass in spec.split(';') {
+            let k: Vec<usize> = pass.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            let [a, b, c, d] = k[..] else { continue };
+            *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some([a, b, c, d]);
+            LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            let t0 = std::time::Instant::now();
+            let rerun = recover_all(&pe, &pending, opts, None);
+            *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            let (mut done, mut n2) = (0_usize, 0_usize);
+            for (i, outcome) in base_incomplete.iter().zip(rerun) {
+                if let Outcome::Complete(assumptions) = &outcome {
+                    done += 1;
+                    if tier_of(assumptions) == Tier::Proven {
+                        n2 += 1;
+                    }
+                    outcomes[*i] = outcome;
+                }
+            }
+            eprintln!(
+                "[report] budget pass tb={a} visits={b} total={c} instr={d}: {done} of {} incomplete entries now complete ({n2} with empty assumptions), {:.0}s; still stopped by {:?}",
+                pending.len(),
+                t0.elapsed().as_secs_f64(),
+                LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            );
+        }
+    }
     if let Some(run) = &snapshot_run {
         // Second pass only over entries the sound/labeled pass left incomplete, so
         // the snapshot can only ADD observed-tier completions and never relabel an
