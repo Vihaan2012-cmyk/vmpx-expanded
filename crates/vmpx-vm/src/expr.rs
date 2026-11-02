@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -98,25 +98,101 @@ struct Node {
 #[derive(Clone)]
 pub struct ExprRef(Arc<Node>);
 
-type SubMemo = HashMap<*const Node, Expr>;
-type RwMemo = HashMap<*const Node, Expr>;
+type SubMemo = HashMap<*const Node, Expr, FxBuild>;
+type RwMemo = HashMap<*const Node, Expr, FxBuild>;
+
+/// Fast non-cryptographic hasher for membership-only sets and memo maps keyed by
+/// pointers or already-mixed hashes (std's `SipHash` dominated the walk profile).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FxHasher(u64);
+
+pub(crate) type FxBuild = BuildHasherDefault<FxHasher>;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0_u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+const INTERNER_SHARDS: usize = 1024;
+
+/// The interner keys are already hashes, so the bucket map passes them through.
+#[derive(Default)]
+struct PassThroughHasher(u64);
+
+impl Hasher for PassThroughHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 << 8) | u64::from(*b);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
 
 #[derive(Default)]
 struct Interner {
-    buckets: HashMap<u64, Vec<Weak<Node>>>,
+    buckets: HashMap<u64, Vec<Weak<Node>>, BuildHasherDefault<PassThroughHasher>>,
     inserted: usize,
     sweep_at: usize,
 }
 
-static INTERNER: LazyLock<Mutex<Interner>> = LazyLock::new(|| Mutex::new(Interner::default()));
+/// Sharded by hash so concurrent entry walks do not serialize on one lock.
+static INTERNER: LazyLock<Vec<Mutex<Interner>>> =
+    LazyLock::new(|| (0..INTERNER_SHARDS).map(|_| Mutex::new(Interner::default())).collect());
 
 impl ExprRef {
     #[must_use]
     pub fn new(expr: Expr) -> Self {
-        let mut hasher = std::hash::DefaultHasher::new();
-        expr.hash(&mut hasher);
-        let hash = hasher.finish();
-        let mut guard = INTERNER.lock().unwrap_or_else(|e| e.into_inner());
+        let hash = FxBuild::default().hash_one(&expr);
+        let mut guard = INTERNER[(hash >> 32) as usize % INTERNER_SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let interner = &mut *guard;
         let bucket = interner.buckets.entry(hash).or_default();
         let mut index = 0;
@@ -136,7 +212,7 @@ impl ExprRef {
         });
         bucket.push(Arc::downgrade(&node));
         interner.inserted += 1;
-        if interner.inserted >= interner.sweep_at.max(1 << 16) {
+        if interner.inserted >= interner.sweep_at.max((1 << 16) / INTERNER_SHARDS) {
             interner.buckets.retain(|_, bucket| {
                 bucket.retain(|weak| weak.strong_count() > 0);
                 !bucket.is_empty()
@@ -439,7 +515,7 @@ impl Expr {
         register: &str,
         opaque: impl Fn(&str) -> bool,
     ) -> bool {
-        let mut seen: HashSet<*const Node> = HashSet::new();
+        let mut seen: HashSet<*const Node, FxBuild> = HashSet::default();
         let mut pending = vec![self];
         while let Some(expression) = pending.pop() {
             let mut push = |child: &'a ExprRef, pending: &mut Vec<&'a Self>| {
@@ -478,7 +554,7 @@ impl Expr {
 
     /// Visits this expression and every distinct shared descendant once.
     pub(crate) fn walk_distinct<'a>(&'a self, visit: &mut impl FnMut(&'a Self)) {
-        let mut seen: HashSet<*const Node> = HashSet::new();
+        let mut seen: HashSet<*const Node, FxBuild> = HashSet::default();
         let mut pending = vec![self];
         while let Some(expression) = pending.pop() {
             visit(expression);
@@ -512,7 +588,7 @@ impl Expr {
     ///
     /// A replacement must have the same width as the register it replaces.
     pub fn substitute(&self, replacements: &BTreeMap<String, Self>) -> Result<Self, ExprError> {
-        self.sub_memo(replacements, &mut HashMap::new())
+        self.sub_memo(replacements, &mut HashMap::default())
     }
 
     /// Rebuilds an expression bottom-up and permits a caller to replace opaque
@@ -528,7 +604,7 @@ impl Expr {
     where
         F: FnMut(BitWidth, &str, &[Self]) -> Option<Self>,
     {
-        self.rw_memo(rewrite, &mut HashMap::new())
+        self.rw_memo(rewrite, &mut HashMap::default())
     }
 
     fn sub_memo(
@@ -671,6 +747,10 @@ impl Expr {
     }
 }
 
+thread_local! {
+    static COUNT_HINT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Counts distinct nodes reachable from all `roots` together, so a subtree shared
 /// between expressions is counted once. Saturates at `limit + 1`.
 pub fn distinct_node_count_bounded<'a>(
@@ -678,16 +758,22 @@ pub fn distinct_node_count_bounded<'a>(
     limit: usize,
 ) -> usize {
     let overflow = limit.saturating_add(1);
-    let mut seen: HashSet<*const Node> = HashSet::new();
+    // The previous call's sizes pre-size the sets (the walk re-counts a slowly
+    // growing state after every instruction), avoiding repeated rehash growth.
+    let (seen_hint, roots_hint) = COUNT_HINT.with(std::cell::Cell::get);
+    let mut seen: HashSet<*const Node, FxBuild> =
+        HashSet::with_capacity_and_hasher(seen_hint, FxBuild::default());
     let mut count = 0_usize;
     let mut pending: Vec<&Expr> = Vec::new();
-    let mut seen_roots: HashSet<&Expr> = HashSet::new();
+    let mut seen_roots: HashSet<&Expr, FxBuild> =
+        HashSet::with_capacity_and_hasher(roots_hint, FxBuild::default());
     for root in roots {
         if !seen_roots.insert(root) {
             continue;
         }
         count += 1;
         if count > limit {
+            COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
             return overflow;
         }
         pending.push(root);
@@ -720,10 +806,12 @@ pub fn distinct_node_count_bounded<'a>(
                 }
             }
             if count > limit {
+                COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
                 return overflow;
             }
         }
     }
+    COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
     count
 }
 

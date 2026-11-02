@@ -40,7 +40,46 @@ fn main() {
 
     if let Ok(v) = std::env::var("HDIAG_RVA") {
         let rva = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+        // Roles are per-VM-profile. The hardcoded ones above belong to one
+        // profile, so pointing this at another profile's handler reports zero
+        // dispatch candidates for the wrong reason. HDIAG_ROLES overrides them:
+        // HDIAG_ROLES="vip,key,handler,A|D".
+        let mut config = config;
+        if let Ok(roles) = std::env::var("HDIAG_ROLES") {
+            let p: Vec<&str> = roles.split(',').collect();
+            let reg = |s: &str| {
+                iced_x86::Register::values()
+                    .find(|r| format!("{r:?}").eq_ignore_ascii_case(s))
+                    .unwrap_or_else(|| panic!("unknown register {s}"))
+            };
+            config.roles = HandlerRegisterRoles {
+                vip: reg(p[0]),
+                rolling_key: reg(p[1]),
+                handler: reg(p[2]),
+            };
+            config.bytecode_direction = if p[3] == "D" {
+                vmpx_vm::BytecodeDirection::Descending
+            } else {
+                vmpx_vm::BytecodeDirection::Ascending
+            };
+        }
+        if std::env::var("HDIAG_TRACE").is_ok() {
+            use iced_x86::Formatter;
+            let trace =
+                vmpx_disasm::trace_direct_jump_fragments(&pe, Rva(rva), config.trace_limits)
+                    .unwrap();
+            let mut fmt = iced_x86::IntelFormatter::new();
+            for d in trace.instructions() {
+                let mut s = String::new();
+                fmt.format(&d.instruction, &mut s);
+                println!("  {:#x} {s}", d.rva.0);
+            }
+            println!("trace stop {:?}", trace.stop);
+        }
         let r = recover_handler_codecs(&pe, Rva(rva), &config).unwrap();
+        println!("dispatch candidates {}", r.dispatch_analysis.candidates.len());
+        println!("rejected {:#?}", r.dispatch_analysis.rejected_sources);
+        println!("postlude proof {:#?}", r.dispatch_analysis.postlude_proof);
         println!("status {:?}", r.status);
         println!("diagnostics {:#?}", r.diagnostics);
         println!("operand {:#?}", r.operand_analysis);

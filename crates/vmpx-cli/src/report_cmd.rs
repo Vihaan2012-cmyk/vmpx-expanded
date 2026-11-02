@@ -173,9 +173,14 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
         // Separate cap from the post-transition budget below: this one refuses the
         // transition outright, and that refusal surfaces as a MissingHandlerSpec
         // stall rather than a TransitionBudget limit hit.
+        // Also scaled by the transition budget: during a VMPX_BUDGET_PASSES pass
+        // the SCALE_OVERRIDE branch of env_scale returns 1 for this name, so the
+        // cap stayed put however high the budget went and capped the walk out
+        // before the budget could be spent. Unchanged at the default budget.
         max_profile_transitions: VmCfgLimits::default()
             .max_profile_transitions
-            .saturating_mul(env_scale("VMPX_PROFILE_TRANSITIONS")),
+            .saturating_mul(env_scale("VMPX_PROFILE_TRANSITIONS"))
+            .saturating_mul(transition_scale()),
         max_transition_visits: VmCfgLimits::default().max_transition_visits.saturating_mul(transition_scale()),
         max_transition_instructions: VmCfgLimits::default()
             .max_transition_instructions

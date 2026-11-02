@@ -1182,12 +1182,63 @@ fn cell_token(address: &str) -> String {
     format!("m{:x}", hasher.finish())
 }
 
-fn memory_by_address(state: &SymbolicVmInitialState) -> BTreeMap<String, &(Expr, Expr)> {
-    state
-        .memory_values
-        .iter()
-        .map(|entry| (format!("{:?}", entry.0), entry))
-        .collect()
+/// One memory site of a widened pair: indices of its cell in `a` and `r` (the
+/// last cell wins on a repeated address) and the site's canonical-unknown token.
+type MemorySite = (Option<usize>, Option<usize>, String);
+
+/// The widened memory sites of `a` and `r` in rendered-address order. A site's
+/// identity is its address's `Debug` text, which for shared address DAGs runs to
+/// hundreds of KB, so the union is memoized on the two address sequences (the
+/// loop fixpoints re-widen the same sites over and over).
+fn memory_union(a: &SymbolicVmInitialState, r: &SymbolicVmInitialState) -> Rc<Vec<MemorySite>> {
+    type Entry = (Vec<Expr>, Vec<Expr>, Rc<Vec<MemorySite>>);
+    thread_local! {
+        static UNIONS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    const CACHED_UNIONS: usize = 32;
+    let same = |cached: &[Expr], state: &SymbolicVmInitialState| {
+        cached.len() == state.memory_values.len()
+            && cached.iter().zip(&state.memory_values).all(|(c, (address, _))| c == address)
+    };
+    if let Some(hit) = UNIONS.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(ka, kr, _)| same(ka, a) && same(kr, r))
+            .map(|(_, _, union)| Rc::clone(union))
+    }) {
+        return hit;
+    }
+    let by_address = |state: &SymbolicVmInitialState| -> std::collections::HashMap<String, usize, crate::expr::FxBuild> {
+        state
+            .memory_values
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (format!("{:?}", entry.0), index))
+            .collect()
+    };
+    let (a_memory, r_memory) = (by_address(a), by_address(r));
+    let mut addresses: Vec<&String> = a_memory.keys().chain(r_memory.keys()).collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let union = Rc::new(
+        addresses
+            .into_iter()
+            .map(|address| (a_memory.get(address).copied(), r_memory.get(address).copied(), cell_token(address)))
+            .collect::<Vec<_>>(),
+    );
+    UNIONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHED_UNIONS {
+            cache.remove(0);
+        }
+        cache.push((
+            a.memory_values.iter().map(|(address, _)| address.clone()).collect(),
+            r.memory_values.iter().map(|(address, _)| address.clone()).collect(),
+            Rc::clone(&union),
+        ));
+    });
+    union
 }
 
 /// The state covering both `a` and `r`, or `None` when `a` already covers `r`.
@@ -1230,20 +1281,16 @@ fn widen_state(
             context_values.insert(offset, cell);
         }
     }
-    let (a_memory, r_memory) = (memory_by_address(a), memory_by_address(r));
     let mut memory_values = Vec::new();
-    for address in a_memory
-        .keys()
-        .chain(r_memory.keys())
-        .collect::<BTreeSet<_>>()
-    {
-        let (a_entry, r_entry) = (a_memory.get(address), r_memory.get(address));
+    for (a_index, r_index, token) in memory_union(a, r).iter() {
+        let a_entry = a_index.map(|index| &a.memory_values[index]);
+        let r_entry = r_index.map(|index| &r.memory_values[index]);
         let location = a_entry.or(r_entry).map(|entry| entry.0.clone());
         let cell = generalize(
             a_entry.map(|entry| &entry.1),
             r_entry.map(|entry| &entry.1),
             key,
-            &cell_token(address),
+            token,
             &mut changed,
         )?;
         if let (Some(location), Some(cell)) = (location, cell) {
@@ -2560,7 +2607,7 @@ impl Walker<'_, '_> {
                         roles.roles.rolling_key,
                         roles.roles.handler,
                         roles.bytecode_direction,
-                        recovery.map(|r| &r.trace_stop),
+                        recovery.map(|r| r.trace_stop.clone()),
                         recovery.map(|r| r.trace_fragments),
                         recovery.map_or(String::new(), |r| r
                             .diagnostics

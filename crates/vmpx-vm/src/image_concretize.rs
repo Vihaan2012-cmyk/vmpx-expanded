@@ -121,6 +121,72 @@ fn read_image_value(pe: &PeImage<'_>, address: u64, width: BitWidth) -> Option<u
     Some(width.truncate(value))
 }
 
+/// `PeImage::rva_to_file_offset` with the last-hit section cached for tight read
+/// loops. The cache is only used for a section no earlier section overlaps, where
+/// the method's first-match scan can only land on that section, so every answer
+/// equals the uncached one.
+struct ImageReader<'a, 'p> {
+    pe: &'a PeImage<'p>,
+    disjoint: Vec<bool>,
+    hint: usize,
+}
+
+impl<'a, 'p> ImageReader<'a, 'p> {
+    fn new(pe: &'a PeImage<'p>) -> Self {
+        let range = |i: usize| {
+            let section = &pe.sections[i];
+            let start = u64::from(section.virtual_address.0);
+            (start, start + u64::from(section.mapped_span()))
+        };
+        let disjoint = (0..pe.sections.len())
+            .map(|i| {
+                let (start, end) = range(i);
+                (0..i).all(|j| {
+                    let (other_start, other_end) = range(j);
+                    other_start >= end || start >= other_end
+                })
+            })
+            .collect();
+        Self { pe, disjoint, hint: 0 }
+    }
+
+    fn file_offset(&mut self, rva: Rva) -> Option<usize> {
+        let pe = self.pe;
+        if rva.0 >= pe.optional.size_of_headers {
+            if let Some(section) = pe.sections.get(self.hint)
+                && self.disjoint[self.hint]
+                && let Some(delta) = rva.0.checked_sub(section.virtual_address.0)
+                && delta < section.mapped_span()
+            {
+                if delta >= section.size_of_raw_data || section.pointer_to_raw_data.get() == 0 {
+                    return None;
+                }
+                let raw = section.pointer_to_raw_data.get().checked_add(u64::from(delta))?;
+                if raw >= u64::try_from(pe.data().len()).unwrap_or(u64::MAX) {
+                    return None;
+                }
+                return usize::try_from(raw).ok();
+            }
+            if let Some(index) = pe.sections.iter().position(|s| s.contains_mapped_rva(rva)) {
+                self.hint = index;
+            }
+        }
+        usize::try_from(pe.rva_to_file_offset(rva).ok()?.get()).ok()
+    }
+
+    fn read(&mut self, address: u64, width: BitWidth) -> Option<u64> {
+        let rva = self.pe.optional.image_base.checked_rva_of(Va(address))?;
+        let mut value = 0_u64;
+        for byte in 0..width.bytes() {
+            let rva = rva.checked_add(byte)?;
+            let offset = self.file_offset(rva)?;
+            let input = *self.pe.data().get(offset)?;
+            value |= u64::from(input) << (byte * 8);
+        }
+        Some(width.truncate(value))
+    }
+}
+
 fn checked_pointer_add(address: u64, stride: i8, index: usize) -> Option<u64> {
     let index = i64::try_from(index).ok()?;
     let delta = index.checked_mul(i64::from(stride))?;
@@ -157,13 +223,14 @@ fn resolve_checksum(pe: &PeImage<'_>, arguments: &[Expr], byte_limit: usize) -> 
     if length > byte_limit || shift_bits >= 32 {
         return None;
     }
+    let mut reader = ImageReader::new(pe);
     for index in 0..length {
         let input_address = checked_pointer_add(pointer, pointer_stride, index)?;
-        let input = u8::try_from(read_image_value(pe, input_address, BitWidth::W8)?).ok()?;
+        let input = u8::try_from(reader.read(input_address, BitWidth::W8)?).ok()?;
         let table_index = usize::from(accumulator.to_le_bytes()[0] ^ input);
         let table_offset = u64::try_from(table_index.checked_mul(4)?).ok()?;
         let entry_address = table.checked_add(table_offset)?;
-        let entry = u32::try_from(read_image_value(pe, entry_address, BitWidth::W32)?).ok()?;
+        let entry = u32::try_from(reader.read(entry_address, BitWidth::W32)?).ok()?;
         let shifted = if shift_right {
             accumulator.wrapping_shr(shift_bits)
         } else {
@@ -865,5 +932,21 @@ mod table_tests {
         let error = recover_image_table_targets(&pe, &load, ImageTableBranchLimits::default())
             .expect_err("an unproven index must fail closed");
         assert!(matches!(error, ImageTableBranchError::Domain(_)));
+    }
+
+    #[test]
+    fn image_reader_offsets_match_the_uncached_mapping() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let mut reader = ImageReader::new(&pe);
+        for raw in (0..pe.optional.size_of_image + 0x400).chain([u32::MAX - 1, u32::MAX]) {
+            let rva = Rva(raw);
+            let expected = pe
+                .rva_to_file_offset(rva)
+                .ok()
+                .and_then(|o| usize::try_from(o.get()).ok());
+            assert_eq!(reader.file_offset(rva), expected, "rva {raw:#x}");
+            assert_eq!(reader.file_offset(Rva(raw / 2)), pe.rva_to_file_offset(Rva(raw / 2)).ok().and_then(|o| usize::try_from(o.get()).ok()));
+        }
     }
 }

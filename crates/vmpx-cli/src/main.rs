@@ -102,8 +102,8 @@ enum Command {
         /// Sweep every discovered VM entry (can be slow and memory-heavy).
         #[arg(long)]
         all: bool,
-        /// Worker threads for the CFG sweep.
-        #[arg(long, default_value_t = 2)]
+        /// Worker threads for the CFG sweep (default: logical CPUs, capped at 16).
+        #[arg(long, default_value_t = default_sweep_threads())]
         threads: usize,
         /// Also run the contained emulator detonation and an OBSERVED-tier
         /// re-sweep of the incomplete entries (can take very long).
@@ -916,6 +916,12 @@ fn analyze_oep(pe: &PeImage<'_>) -> Result<OepAnalysis> {
         evidence,
         warnings,
     })
+}
+
+/// Sweep workers scale well to ~16; peak memory is far below the per-entry cap
+/// times workers in practice.
+fn default_sweep_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 16))
 }
 
 #[allow(clippy::too_many_lines)]

@@ -1163,29 +1163,79 @@ impl std::fmt::Write for BoundedKey {
 /// Orders tracked memory by the rendered address. `Debug` prints a shared DAG
 /// as a tree, so a heavily shared address can render exponentially large; the
 /// rendering is bounded and the block fails closed rather than exhausting RAM.
+///
+/// The rendered order (or the over-budget failure) depends only on the address
+/// set, so it is memoized on the addresses in a canonical hash order: successive
+/// blocks mostly track the same addresses and would otherwise re-render and
+/// re-sort hundreds of KB of text per address each time.
 fn sorted_memory_values(
     memory: HashMap<Expr, Expr>,
 ) -> Result<Vec<(Expr, Expr)>, String> {
     use std::fmt::Write;
-    let mut remaining = MAX_SORT_KEY_BYTES;
-    let mut keyed = Vec::with_capacity(memory.len());
-    for (address, value) in memory {
-        let mut key = BoundedKey {
-            text: String::new(),
-            remaining,
-        };
-        if write!(key, "{address:?}").is_err() {
-            return Err(format!(
-                "tracked memory addresses exceed {MAX_SORT_KEY_BYTES} rendered bytes"
-            ));
-        }
-        remaining = key.remaining;
-        keyed.push((key.text, address, value));
+    use std::hash::BuildHasher;
+    type Order = Option<Vec<usize>>;
+    thread_local! {
+        static ORDERS: std::cell::RefCell<Vec<(Vec<Expr>, Order)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
-    keyed.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(keyed
+    const CACHED_ORDERS: usize = 64;
+    let hasher = crate::expr::FxBuild::default();
+    let mut items: Vec<(u64, Expr, Expr)> = memory
         .into_iter()
-        .map(|(_, address, value)| (address, value))
+        .map(|(address, value)| (hasher.hash_one(&address), address, value))
+        .collect();
+    items.sort_by_key(|item| item.0);
+    let cached = ORDERS.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(addresses, _)| {
+                addresses.len() == items.len()
+                    && addresses.iter().zip(&items).all(|(cached, item)| *cached == item.1)
+            })
+            .map(|(_, order)| order.clone())
+    });
+    let order = if let Some(order) = cached {
+        order
+    } else {
+        let mut remaining = MAX_SORT_KEY_BYTES;
+        let mut keyed = Vec::with_capacity(items.len());
+        let mut failed = false;
+        for (index, (_, address, _)) in items.iter().enumerate() {
+            let mut key = BoundedKey {
+                text: String::new(),
+                remaining,
+            };
+            if write!(key, "{address:?}").is_err() {
+                failed = true;
+                break;
+            }
+            remaining = key.remaining;
+            keyed.push((key.text, index));
+        }
+        let order = if failed {
+            None
+        } else {
+            keyed.sort_by(|left, right| left.0.cmp(&right.0));
+            Some(keyed.into_iter().map(|(_, index)| index).collect())
+        };
+        ORDERS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= CACHED_ORDERS {
+                cache.remove(0);
+            }
+            cache.push((items.iter().map(|item| item.1.clone()).collect(), order.clone()));
+        });
+        order
+    };
+    let Some(order) = order else {
+        return Err(format!(
+            "tracked memory addresses exceed {MAX_SORT_KEY_BYTES} rendered bytes"
+        ));
+    };
+    Ok(order
+        .into_iter()
+        .map(|index| (items[index].1.clone(), items[index].2.clone()))
         .collect())
 }
 
