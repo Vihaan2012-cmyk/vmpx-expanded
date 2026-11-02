@@ -294,7 +294,14 @@ pub(crate) fn unroll_entry_cfg(
     max_paths: usize,
 ) -> Result<vmpx_vmlift::UnrolledFunction, String> {
     with_entry_input(pe, rva, instruction_limit, |input| {
-        vmpx_vmlift::unroll_decoded_cfg(input, max_blocks, max_paths)
+        let resolver = vmpx_vmlift::PeNestedEntries {
+            pe,
+            limits: vmpx_vm::EntryProfileRecoveryLimits {
+                instruction_limit,
+                ..vmpx_vm::EntryProfileRecoveryLimits::default()
+            },
+        };
+        vmpx_vmlift::unroll_decoded_cfg_with_nested(input, Some(&resolver), max_blocks, max_paths)
     })?
 }
 

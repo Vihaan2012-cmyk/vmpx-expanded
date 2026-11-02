@@ -18,7 +18,9 @@ use vmpx_vm::{
 };
 use vmpx_pe::Va;
 
+use crate::cfg_lift::compose_nested_state;
 use crate::decoded_lift::{RecoveredExit, first_unliftable, recover_exit};
+use crate::nested_entry::NestedEntryResolver;
 use crate::entry_frame::frame_initial_state;
 use crate::{CollectedEffects, CollectedStore, DecodedCfgInput, ExitSemantics, PathCondition};
 
@@ -73,6 +75,7 @@ pub struct UnrolledFunction {
 
 struct Walker<'a, 'b> {
     input: &'a DecodedCfgInput<'b>,
+    nested: Option<&'a dyn NestedEntryResolver>,
     max_blocks: usize,
     max_paths: usize,
     blocks: usize,
@@ -102,6 +105,23 @@ pub fn unroll_decoded_cfg(
     max_blocks: usize,
     max_paths: usize,
 ) -> Result<UnrolledFunction, String> {
+    unroll_decoded_cfg_with_nested(input, None, max_blocks, max_paths)
+}
+
+/// [`unroll_decoded_cfg`] that also follows `NestedEntry` edges the resolver
+/// proves: the exit's native state is composed into the nested entry's frame
+/// (as the CFG lift does) and the walk continues inline. An edge the resolver
+/// cannot prove keeps the old refusal.
+///
+/// # Errors
+/// As [`unroll_decoded_cfg`]; additionally a nested entry that does not match the
+/// CFG's nested block or whose state cannot be composed.
+pub fn unroll_decoded_cfg_with_nested(
+    input: &DecodedCfgInput<'_>,
+    nested: Option<&dyn NestedEntryResolver>,
+    max_blocks: usize,
+    max_paths: usize,
+) -> Result<UnrolledFunction, String> {
     if !input.cfg.is_complete() {
         let why = input
             .cfg
@@ -113,6 +133,7 @@ pub fn unroll_decoded_cfg(
     let (state, _) = frame_initial_state(input.frame, input.top_offset);
     let mut walker = Walker {
         input,
+        nested,
         max_blocks,
         max_paths,
         blocks: 0,
@@ -234,13 +255,6 @@ impl Walker<'_, '_> {
             }
             match block.exit {
                 BlockExit::VmExit => {
-                    if cfg
-                        .edges
-                        .iter()
-                        .any(|e| e.from == key && e.kind == CfgEdgeKind::NestedEntry)
-                    {
-                        return Err("exit re-enters a nested VM entry".to_owned());
-                    }
                     let handler = block
                         .instructions
                         .last()
@@ -250,6 +264,25 @@ impl Walker<'_, '_> {
                         .as_ref()
                         .or_else(|| input.exits.get(&handler))
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
+                    if let Some(to) = cfg
+                        .edges
+                        .iter()
+                        .find_map(|e| (e.from == key && e.kind == CfgEdgeKind::NestedEntry).then_some(e.to))
+                    {
+                        let resolver = self.nested.ok_or("exit re-enters a nested VM entry")?;
+                        let exit = vmpx_vm::recover_native_exit_state(&report, layout)
+                            .map_err(|e| format!("nested exit state unrecovered: {e}"))?;
+                        let entry = resolver
+                            .resolve(&exit.return_address)
+                            .ok_or("the nested VM entry is not provably resolved")?;
+                        if cfg.blocks.get(&to).and_then(|b| b.address) != Some(entry.bytecode_start) {
+                            return Err("the resolved nested entry is not the CFG's nested block".to_owned());
+                        }
+                        walk.state = compose_nested_state(&report, &exit, &entry)
+                            .map_err(|e| format!("nested entry composition failed: {e}"))?;
+                        key = to;
+                        continue;
+                    }
                     let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset)
                         .map_err(|e| e.to_string())?;
                     let mut region_target = None;

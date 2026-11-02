@@ -22,7 +22,7 @@ mod segments;
 mod unroll;
 
 pub use segments::{SegEnd, SegPath, SegPhi, Segment, SegmentedFunction, segment_decoded_cfg};
-pub use unroll::{RegionTarget, UnrolledFunction, UnrolledPath, unroll_decoded_cfg};
+pub use unroll::{RegionTarget, UnrolledFunction, UnrolledPath, unroll_decoded_cfg, unroll_decoded_cfg_with_nested};
 pub use rolled::{RExit, RNode, RPhi, RolledFunction, roll_decoded_cfg};
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
