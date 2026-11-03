@@ -1516,6 +1516,15 @@ fn proven_constant_vsp_delta(
 enum LoopStep {
     /// An enclosing entry state covers the re-entry state: a back edge.
     Close,
+    /// An enclosing entry state IS the re-entry state with the VM stack base
+    /// shifted by one constant, so the back edge closes — but the VM stack grows
+    /// per level without a bound this walk can see, so the walker must concede
+    /// frame privacy. Every bound it measured on the frame extent came from the
+    /// finitely many stores it happened to observe, and an unbounded push-down
+    /// writes below all of them; letting the proven tier discharge the
+    /// external-store assumption on such an entry is exactly the error this
+    /// variant exists to prevent. See [`closes_under_vm_stack_shift`].
+    CloseShifted,
     /// Still within the exact-unroll budget.
     Unroll,
     /// Continue from this generalization of every enclosing entry at once.
@@ -1621,6 +1630,170 @@ enum GeneralizeAcross {
     Stall(String),
 }
 
+/// True when `reentry` is exactly `ancestor` with the VM stack base shifted by
+/// one constant: the same abstract state, re-reached some cells deeper.
+///
+/// A recursion that `VMProtect` inlines re-enters its loop head at a new VM stack
+/// depth every level, and `widen_state` refuses any pair whose VSPs differ, so
+/// the loop never closed and 110+ systems.xpl entries stopped here. But a state
+/// that is EXACTLY the enclosing one under the uniform renaming
+/// `vsp_initial := vsp_initial + delta` is bisimilar to it: a block's identity is
+/// a code address, which the renaming does not touch, so both re-entries reach
+/// the same blocks by the same edges, and an unresolved target stalls in both.
+/// That lets the back edge close, which is all CFG completeness asks for — a back
+/// edge is a path to an exit, and no trip count is involved. The VM stack still
+/// grows per level at runtime; a loop in the recovered graph is the correct
+/// description of that, not an approximation of it.
+///
+/// Deliberately an EQUALITY test and not a widening seed. Widening a shifted
+/// state against an unshifted one would have to cover both, and any part of the
+/// state that does NOT move with the stack would make the renamed state wrong
+/// rather than conservative. Equality needs no such judgement: either every part
+/// shifted by the same delta — in which case the renaming is the other state, not
+/// an approximation of it — or this returns false and the refusal stands. It is
+/// self-validating for the same reason: if the VSP is not rooted at
+/// `vsp_initial`, the substitution leaves it alone and the equality simply fails.
+fn closes_under_vm_stack_shift(
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> bool {
+    shift_ancestor_onto_reentry(ancestor, reentry)
+        .is_some_and(|shifted| simplified(&shifted) == simplified(reentry))
+}
+
+/// Every expression in `state` put through `simplify`. Substituting the stack
+/// base for `base + delta` leaves nested sums like `((base + delta) + c)` that
+/// are semantically the re-entry's `base + c'` but not structurally equal to it,
+/// and structural equality is all `==` on a state can do. Interning makes the
+/// simplified forms share, so comparing them is still a pointer walk.
+fn simplified(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
+    SymbolicVmInitialState {
+        vsp: state.vsp.simplify(),
+        flags: state.flags.simplify(),
+        context_values: state
+            .context_values
+            .iter()
+            .map(|(slot, value)| (*slot, value.simplify()))
+            .collect(),
+        memory_values: state
+            .memory_values
+            .iter()
+            .map(|(address, value)| (address.simplify(), value.simplify()))
+            .collect(),
+        fresh_allocations: state
+            .fresh_allocations
+            .iter()
+            .map(|allocation| crate::semantic_exec::SymbolicFreshAllocation {
+                allocation: allocation.allocation.simplify(),
+                size: allocation.size.simplify(),
+                zero_initialized: allocation.zero_initialized,
+            })
+            .collect(),
+        ..state.clone()
+    }
+}
+
+/// `ancestor` with its VM stack base advanced by the constant stride that
+/// separates it from `reentry`, or `None` when there is no single such base.
+///
+/// The base is whichever register the VSP is built from — NOT necessarily
+/// `vsp_initial`. Measured: on all 90 refusals of the eight sampled entries the
+/// VSP is rooted elsewhere (a cross-profile transition re-homes it), so
+/// hardcoding `vsp_initial` made this test refuse everything. The VSP must
+/// depend on exactly ONE register for the shift to be well defined; a VSP built
+/// from two unknowns has no single base to advance and is refused.
+fn shift_ancestor_onto_reentry(
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> Option<SymbolicVmInitialState> {
+    let delta = constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0)?;
+    let bases = ancestor.vsp.dependencies();
+    let [base] = &bases.iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let shifted_base = Expr::binary(
+        BinaryOp::Add,
+        Expr::register(ancestor.vsp.width, (*base).clone()),
+        Expr::constant(ancestor.vsp.width, delta),
+    )
+    .ok()?;
+    let replacements = BTreeMap::from([((*base).clone(), shifted_base)]);
+    ancestor.substitute(&replacements).ok()
+}
+
+/// Diagnostic: the first field in which `ancestor` shifted by its constant VM
+/// stack delta still differs from `reentry`. Names WHY a push-down level is not
+/// the renaming of the enclosing one, which is the only thing that stands
+/// between this stall family and a closed back edge.
+fn vm_stack_shift_mismatch(
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> String {
+    if constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0).is_none() {
+        return "no constant stride".to_owned();
+    }
+    let bases = ancestor.vsp.dependencies();
+    if bases.len() != 1 {
+        return format!("vsp has {} base registers", bases.len());
+    }
+    let Some(a) = shift_ancestor_onto_reentry(ancestor, reentry).map(|s| simplified(&s)) else {
+        return "substitution failed".to_owned();
+    };
+    let r = &simplified(reentry);
+    if a.vsp != r.vsp {
+        return "shifted vsp still differs".to_owned();
+    }
+    if a.flags != r.flags {
+        return "flags".to_owned();
+    }
+    if a.memory_epoch != r.memory_epoch {
+        return format!("memory_epoch {} vs {}", a.memory_epoch, r.memory_epoch);
+    }
+    if a.next_native_call_epoch != r.next_native_call_epoch {
+        return "native_call_epoch".to_owned();
+    }
+    if a.memory_tainted != r.memory_tainted
+        || a.image_reads_suppressed != r.image_reads_suppressed
+        || a.protection_may_have_changed != r.protection_may_have_changed
+    {
+        return "a precision flag".to_owned();
+    }
+    if a.fresh_allocations != r.fresh_allocations {
+        return "fresh_allocations".to_owned();
+    }
+    if a.context_values.len() != r.context_values.len() {
+        return format!(
+            "context cell count {} vs {}",
+            a.context_values.len(),
+            r.context_values.len()
+        );
+    }
+    if let Some(slot) = a
+        .context_values
+        .iter()
+        .find(|(slot, value)| r.context_values.get(slot) != Some(*value))
+        .map(|(slot, _)| *slot)
+    {
+        return format!("context cell {slot:#x}");
+    }
+    if a.memory_values.len() != r.memory_values.len() {
+        return format!(
+            "memory cell count {} vs {}",
+            a.memory_values.len(),
+            r.memory_values.len()
+        );
+    }
+    if a.memory_values != r.memory_values {
+        let same_set = a.memory_values.iter().all(|cell| r.memory_values.contains(cell));
+        return if same_set {
+            "memory cell ORDER only".to_owned()
+        } else {
+            "a memory cell".to_owned()
+        };
+    }
+    "nothing (would have closed)".to_owned()
+}
+
 /// Decides how a block re-entered while already on the path proceeds.
 /// `ancestors` are the entry states of the enclosing visits, nearest first.
 /// `observed_depth` is the recursion depth observed for this loop head on ONE
@@ -1705,10 +1878,16 @@ fn vsp_stride_note(
         return reason;
     }
     let proven = proven_constant_vsp_delta(ancestors, reentry).is_some();
+    // Why the nearest shifted ancestor is not the re-entry: see
+    // `vm_stack_shift_mismatch`.
+    let blocker = ancestors
+        .iter()
+        .find(|a| a.vsp != reentry.vsp)
+        .map_or_else(|| "none".to_owned(), |a| vm_stack_shift_mismatch(a, reentry));
     if strides.contains(&i64::MIN) {
-        format!("{reason} (vsp strides non-constant, proven={proven})")
+        format!("{reason} (vsp strides non-constant, proven={proven}, shift blocked by {blocker})")
     } else {
-        format!("{reason} (vsp strides {strides:#x?}, proven={proven})")
+        format!("{reason} (vsp strides {strides:#x?}, proven={proven}, shift blocked by {blocker})")
     }
 }
 
@@ -1725,11 +1904,24 @@ fn bounded_unroll_or_refuse(
     observed_depth: Option<u64>,
     reason: String,
 ) -> LoopStep {
+    // Checked only where the walk would otherwise refuse, and only AFTER the
+    // observed bridge below has had its chance: an exact unroll to an observed
+    // depth is strictly more precise output than a loop, so it must keep winning
+    // where a depth exists.
+    let refuse = |reason: String| -> LoopStep {
+        if ancestors
+            .iter()
+            .any(|ancestor| closes_under_vm_stack_shift(ancestor, reentry))
+        {
+            return LoopStep::CloseShifted;
+        }
+        LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason))
+    };
     let Some(depth) = observed_depth else {
-        return LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason));
+        return refuse(reason);
     };
     if proven_constant_vsp_delta(ancestors, reentry).is_none() {
-        return LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason));
+        return refuse(reason);
     }
     // `ancestors.len()` counts the enclosing iterations already on the path; one
     // more exact unroll per remaining level up to the observed depth.
@@ -2650,6 +2842,18 @@ impl Walker<'_, '_> {
             LoopStep::Widen(widened) => {
                 self.frame_not_private = true;
                 Some(widened)
+            }
+            // The back edge closes, but the VM stack grows a constant amount per
+            // level with no bound this walk can see. Concede frame privacy for
+            // the same reason `Widen` does, and more sharply: every bound on the
+            // frame extent came from the finitely many stores observed, and an
+            // unbounded push-down writes below all of them. The entry can reach
+            // N1 on the strength of a closed graph; it must not reach the proven
+            // tier on the strength of a frame bound that does not hold.
+            LoopStep::CloseShifted => {
+                self.frame_not_private = true;
+                self.record_loop_back(item, key);
+                None
             }
             LoopStep::Refuse(reason) => {
                 self.stall(key, key, format!("loop cannot be closed: {reason}"));
@@ -5023,6 +5227,8 @@ mod tests {
         observed_unrolls: usize,
         /// The bounded unroll's observed-depth close fired.
         closed_observed: bool,
+        /// The VM-stack-shift close fired (sound, but concedes frame privacy).
+        closed_shifted: bool,
     }
 
     /// Walks one loop whose body runs `step` on the state; returns how it closed,
@@ -5040,6 +5246,7 @@ mod tests {
             widened: 0,
             observed_unrolls: 0,
             closed_observed: false,
+            closed_shifted: false,
         };
         for iteration in 1..=64 {
             let reentry = step(ancestors.last().expect("entry"));
@@ -5062,6 +5269,11 @@ mod tests {
                 LoopStep::Widen(state) => {
                     walk.widened += 1;
                     ancestors.push(state);
+                }
+                LoopStep::CloseShifted => {
+                    walk.iterations = iteration;
+                    walk.closed_shifted = true;
+                    return Ok(walk);
                 }
                 LoopStep::Refuse(reason) => return Err(reason),
             }
@@ -5187,14 +5399,36 @@ mod tests {
     }
 
     #[test]
-    fn loop_that_moves_the_stack_pointer_is_refused() {
+    fn loop_that_only_moves_the_stack_pointer_closes_as_a_back_edge() {
+        // The VSP advances a constant 1 byte per iteration and NOTHING else
+        // changes, so each re-entry is the enclosing state under the uniform
+        // renaming of the stack base: bisimilar, and the back edge closes. It
+        // used to be refused, which cost 110+ systems.xpl entries for a loop the
+        // graph can describe exactly.
         let entry = loop_state(0, w64(0));
         let step = |state: &SymbolicVmInitialState| {
             let mut next = state.clone();
             next.vsp = increment(&state.vsp);
             next
         };
-        let reason = walk_loop(entry, step, 2).expect_err("never converges");
+        let walk = walk_loop_observed(entry, step, 2, None).expect("closes as a loop");
+        assert!(walk.closed_shifted, "closed through the stack-shift test");
+        assert_eq!(walk.widened, 0, "no widening is involved in an exact shift");
+    }
+
+    #[test]
+    fn stack_shift_close_is_refused_once_any_other_cell_also_moves() {
+        // Same constant VSP stride, but a context cell changes too, so the
+        // re-entry is NOT the renaming of the enclosing state. Nothing may be
+        // concluded from the shift and the fail-closed refusal stands.
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.vsp = increment(&state.vsp);
+            next.context_values.insert(0, increment(&state.context_values[&0]));
+            next
+        };
+        let reason = walk_loop_observed(loop_state(0, w64(0)), step, 2, None)
+            .expect_err("a drifting cell is not a pure stack shift");
         assert!(reason.contains("stack pointer"), "{reason}");
     }
 
@@ -5223,14 +5457,18 @@ mod tests {
     }
 
     #[test]
-    fn vsp_loop_without_observed_depth_still_fails_closed() {
-        // The same constant-delta VSP loop, but no observed depth: the sound path
-        // keeps the fail-closed stall. No depth is guessed.
+    fn vsp_loop_without_observed_depth_closes_as_a_loop_and_never_unrolls() {
+        // The same constant-delta VSP loop with no observed depth. The point this
+        // test has always guarded is that NO DEPTH IS GUESSED, and that still
+        // holds: the walk closes the back edge instead, which is depth-free, and
+        // takes neither of the observed-tier unroll paths.
         let entry = SymbolicVmInitialState::default();
         let minus_64 = (-64_i64) as u64;
-        let reason = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, None)
-            .expect_err("no depth means fail closed");
-        assert!(reason.contains("stack pointer"), "{reason}");
+        let walk = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, None)
+            .expect("closes as a loop");
+        assert!(walk.closed_shifted);
+        assert!(!walk.closed_observed, "no observed bridge without a depth");
+        assert_eq!(walk.observed_unrolls, 0, "no depth is ever guessed");
     }
 
     #[test]
@@ -5268,6 +5506,23 @@ mod tests {
             proven_constant_vsp_delta(&[&r1, &a], &reentry),
             Some((-64_i64) as u64)
         );
+        // A push-down level whose state is otherwise identical closes the back
+        // edge; one that differs in a cell does not, and the refusal stands.
+        let pushed = |offset: u64, cell: Expr| SymbolicVmInitialState {
+            vsp: shifted(offset),
+            memory_values: vec![(shifted(offset), cell)],
+            ..SymbolicVmInitialState::default()
+        };
+        let level1 = pushed((-8_i64) as u64, w64(7));
+        let level2 = pushed((-16_i64) as u64, w64(7));
+        assert!(closes_under_vm_stack_shift(&level1, &level2));
+        assert!(!closes_under_vm_stack_shift(
+            &level1,
+            &pushed((-16_i64) as u64, w64(9))
+        ));
+        // Equal VSPs are the ordinary case, handled by `widen_state`, not here.
+        assert!(!closes_under_vm_stack_shift(&level1, &level1));
+
         // Iterations that linger at one depth are not a stride violation: the
         // same chain with a repeat still proves −64.
         assert_eq!(
