@@ -40,8 +40,28 @@ pub struct RExit {
     pub region: bool,
 }
 
+/// One observable store: memory the caller can still see after the VM returns.
+#[derive(Clone, Debug)]
+pub struct RStore {
+    pub address: Expr,
+    pub value: Expr,
+    pub width: BitWidth,
+}
+
 #[derive(Clone, Debug)]
 pub enum RNode {
+    /// Stores performed before `next` runs.
+    ///
+    /// A store BELOW the VM's entry stack pointer lands in the frame the VM is
+    /// about to abandon, so nothing can observe it and it is dropped. A store
+    /// above it is observable and is carried here instead of refusing the whole
+    /// function, which is what this frontend used to do: measured on
+    /// systems.xpl, one such store cost 40 otherwise-liftable entries, and 39 of
+    /// those 40 have no loop at all.
+    Stores {
+        stores: Vec<RStore>,
+        next: Box<RNode>,
+    },
     Exit(RExit),
     /// `selector == value` picks the arm; arms are in ascending value order.
     Fork {
@@ -273,12 +293,23 @@ impl Walker<'_, '_> {
         out
     }
 
-    /// Executes one block; returns the report and its boundary kind.
+    /// Wraps `node` so the observable stores collected before it run first.
+    /// Empty is the common case and stays exactly the tree it was.
+    fn with_stores(stores: Vec<RStore>, node: RNode) -> RNode {
+        if stores.is_empty() {
+            node
+        } else {
+            RNode::Stores { stores, next: Box::new(node) }
+        }
+    }
+
+    /// Executes one block; returns the report, its boundary kind, and any
+    /// stores that escape the VM's dead frame (see [`RNode::Stores`]).
     fn exec(
         &mut self,
         key: Va,
         state: &SymbolicVmInitialState,
-    ) -> Result<(vmpx_vm::SymbolicVmExecutionReport, BlockExit), String> {
+    ) -> Result<(vmpx_vm::SymbolicVmExecutionReport, BlockExit, Vec<RStore>), String> {
         self.blocks += 1;
         if self.blocks > self.budget {
             return Err(format!("block budget {} exhausted", self.budget));
@@ -312,27 +343,32 @@ impl Walker<'_, '_> {
         let entry_sp = i64::try_from(self.input.top_offset)
             .unwrap_or(i64::MAX)
             .saturating_add(i64::try_from(self.input.frame.len() * 8).unwrap_or(i64::MAX));
+        // Partition rather than veto. Only a store proven to land in the dead
+        // frame may be dropped; everything else is carried out as observable.
+        // An address this matcher cannot read at all is NOT assumed observable
+        // and is not assumed dead either — it still refuses, because emitting a
+        // store to an address we cannot place would invent an effect.
+        let mut escaping = Vec::new();
         for w in &report.external_writes {
             match vsp_offset(&w.address) {
                 Some(off) if off + i64::from(w.value.width.bytes()) <= entry_sp => {}
-                other => {
-                    // Say WHICH it is: an offset that resolved but sits above the
-                    // frame is a correct refusal, while an address this matcher
-                    // simply cannot read is a gap in the matcher.
-                    let detail = match other {
-                        Some(off) => format!("offset {off} + {} > entry_sp {entry_sp}", w.value.width.bytes()),
-                        None => format!(
-                            "address not read as a vsp offset: {}",
-                            format!("{:?}", w.address.simplify()).chars().take(130).collect::<String>()
-                        ),
-                    };
+                Some(_) => escaping.push(RStore {
+                    address: w.address.clone(),
+                    value: w.value.clone(),
+                    width: w.value.width,
+                }),
+                None => {
                     return Err(format!(
-                        "block {key} stores outside the VM's dead frame ({detail})"
+                        "block {key} stores to an address that is not a vsp offset: {}",
+                        format!("{:?}", w.address.simplify())
+                            .chars()
+                            .take(130)
+                            .collect::<String>()
                     ));
                 }
             }
         }
-        Ok((report, block.exit))
+        Ok((report, block.exit, escaping))
     }
 
     /// One exact iteration from `header` over `state`; the state on re-entry.
@@ -340,7 +376,7 @@ impl Walker<'_, '_> {
         let mut key = header;
         let mut state = state.clone();
         for _ in 0..64 {
-            let (report, exit) = self.exec(key, &state)?;
+            let (report, exit, _) = self.exec(key, &state)?;
             if exit == BlockExit::VmExit {
                 return Ok(None);
             }
@@ -408,6 +444,9 @@ impl Walker<'_, '_> {
         mut trail: Vec<Va>,
         mut entering: bool,
     ) -> Result<RNode, String> {
+        // Observable stores seen on this straight-line run, in execution order;
+        // they wrap whichever node this walk ends up returning.
+        let mut pending_stores: Vec<RStore> = Vec::new();
         loop {
             if !entering {
                 if self.loop_stack.last().is_some_and(|c| c.header == key) {
@@ -427,14 +466,20 @@ impl Walker<'_, '_> {
                         .iter()
                         .map(|c| get_cell(&state, c).ok_or_else(|| "a carried cell vanished".to_owned()))
                         .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(RNode::BackEdge { next });
+                    return Ok(Self::with_stores(pending_stores, RNode::BackEdge { next }));
                 }
                 if trail.contains(&key) {
-                    return Ok(RNode::Dead(format!("block {key} repeats on one path (spin)")));
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Dead(format!("block {key} repeats on one path (spin)")),
+                    ));
                 }
                 if self.headers.contains(&key) {
                     match self.trial(key, &state) {
-                        Ok(Some(reentry)) => return self.summarize(key, state, reentry, trail),
+                        Ok(Some(reentry)) => {
+                            let body = self.summarize(key, state, reentry, trail)?;
+                            return Ok(Self::with_stores(pending_stores, body));
+                        }
                         Ok(None) => {}
                         Err(_) => {}
                     }
@@ -442,7 +487,8 @@ impl Walker<'_, '_> {
             }
             entering = false;
             trail.push(key);
-            let (report, exit) = self.exec(key, &state)?;
+            let (report, exit, escaping) = self.exec(key, &state)?;
+            pending_stores.extend(escaping);
             match exit {
                 BlockExit::VmExit => {
                     let cfg = self.input.cfg;
@@ -465,7 +511,10 @@ impl Walker<'_, '_> {
                         RecoveredExit::Callee(e) => (e.registers, false),
                         RecoveredExit::Region(r) => (r.registers, true),
                     };
-                    return Ok(RNode::Exit(RExit { registers, region }));
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Exit(RExit { registers, region }),
+                    ));
                 }
                 BlockExit::Branch => {
                     let target = report
@@ -496,7 +545,10 @@ impl Walker<'_, '_> {
                         let node = self.walk(*succ, state.clone(), trail.clone(), false)?;
                         arms.push((*value, node));
                     }
-                    return Ok(RNode::Fork { selector: target, env, block: key, arms });
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Fork { selector: target, env, block: key, arms },
+                    ));
                 }
                 BlockExit::NativeCall | BlockExit::Stalled => unreachable!("rejected in exec"),
             }
@@ -571,6 +623,7 @@ fn all_back_edges(n: &RNode, out: &mut Vec<Vec<Expr>>) {
     match n {
         RNode::BackEdge { next } => out.push(next.clone()),
         RNode::Fork { arms, .. } => arms.iter().for_each(|(_, a)| all_back_edges(a, out)),
+        RNode::Stores { next, .. } => all_back_edges(next, out),
         RNode::Loop { .. } | RNode::Exit(_) | RNode::Dead(_) => {}
     }
 }
@@ -588,6 +641,13 @@ fn collect_roots(n: &RNode, out: &mut Vec<Expr>) {
             out.extend(phis.iter().map(|p| p.init.clone()));
             collect_roots(body, out);
         }
+        RNode::Stores { stores, next } => {
+            for store in stores {
+                out.push(store.address.clone());
+                out.push(store.value.clone());
+            }
+            collect_roots(next, out);
+        }
         RNode::BackEdge { .. } | RNode::Dead(_) => {}
     }
 }
@@ -598,6 +658,7 @@ fn prune(n: &mut RNode, live: &[usize]) {
             *next = live.iter().filter_map(|&i| next.get(i).cloned()).collect();
         }
         RNode::Fork { arms, .. } => arms.iter_mut().for_each(|(_, a)| prune(a, live)),
+        RNode::Stores { next, .. } => prune(next, live),
         RNode::Loop { .. } | RNode::Exit(_) | RNode::Dead(_) => {}
     }
 }

@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, X64NativeRegister};
-use vmpx_vmlift::{RExit, RNode, RPhi, RolledFunction};
+use vmpx_vmlift::{RExit, RNode, RPhi, RStore, RolledFunction};
 
 use crate::exec::Rng;
-use crate::ir::{Block, Cmp, Cond, Func, NodeId, Term};
+use crate::ir::{Block, Cmp, Cond, Func, NodeId, Store, Term};
 use crate::xu::{cleanup, mba_fold, rewrite};
 
 pub struct VmLowered {
@@ -77,6 +77,7 @@ fn is_live(n: &RNode) -> bool {
         RNode::Fork { arms, .. } => arms.iter().any(|(_, a)| is_live(a)),
         RNode::Loop { body, .. } => is_live(body),
         RNode::BackEdge { .. } => true,
+        RNode::Stores { next, .. } => is_live(next),
         RNode::Dead(_) => false,
     }
 }
@@ -115,6 +116,16 @@ fn signature(n: &RNode, rename: &BTreeMap<String, String>, h: &mut impl Hasher) 
                 reg_name(*r).hash(h);
                 hash_expr(&sub(e), h);
             }
+        }
+        RNode::Stores { stores, next } => {
+            4_u8.hash(h);
+            stores.len().hash(h);
+            for store in stores {
+                hash_expr(&sub(&store.address), h);
+                hash_expr(&sub(&store.value), h);
+                store.width.bits().hash(h);
+            }
+            signature(next, rename, h);
         }
         RNode::Fork { selector, env, arms, .. } => {
             1_u8.hash(h);
@@ -570,6 +581,26 @@ impl Lower<'_> {
     fn lower(&mut self, n: &RNode, at: Option<NodeId>) -> Result<NodeId, String> {
         let id = at.unwrap_or_else(|| self.alloc());
         match n {
+            RNode::Stores { stores, next } => {
+                // `Block::stores` already lowers to `Stmt::Store` (opt.rs), so the
+                // observable writes become real statements ahead of whatever runs
+                // next. Dead-frame writes never reach here; they were dropped
+                // where they were proven unobservable.
+                let rest = self.lower(next, None)?;
+                self.blocks.insert(
+                    id,
+                    Block {
+                        id,
+                        assigns: vec![],
+                        stores: stores
+                            .iter()
+                            .map(|s| Store { address: fix(&s.address), value: fix(&s.value) })
+                            .collect(),
+                        term: Term::Goto(rest),
+                    },
+                );
+                return Ok(id);
+            }
             RNode::Exit(x) => {
                 let rax = x.registers.get(&X64NativeRegister::Rax).ok_or("exit has no rax")?;
                 for (r, e) in &x.registers {
@@ -685,6 +716,17 @@ fn rewrite_tree(
             registers: x.registers.iter().map(|(r, e)| (*r, f(e))).collect(),
             region: x.region,
         }),
+        RNode::Stores { stores, next } => RNode::Stores {
+            stores: stores
+                .iter()
+                .map(|s| RStore {
+                    address: f(&s.address),
+                    value: f(&s.value),
+                    width: s.width,
+                })
+                .collect(),
+            next: Box::new(rewrite_tree(next, f, keep, groups, phis)),
+        },
         RNode::Fork { selector, env, block, arms } => RNode::Fork {
             selector: f(selector),
             env: *env,
@@ -742,6 +784,17 @@ fn rewrite_exprs_only(n: &RNode, f: &dyn Fn(&Expr) -> Expr) -> RNode {
             registers: x.registers.iter().map(|(r, e)| (*r, f(e))).collect(),
             region: x.region,
         }),
+        RNode::Stores { stores, next } => RNode::Stores {
+            stores: stores
+                .iter()
+                .map(|s| RStore {
+                    address: f(&s.address),
+                    value: f(&s.value),
+                    width: s.width,
+                })
+                .collect(),
+            next: Box::new(rewrite_exprs_only(next, f)),
+        },
         RNode::Fork { selector, env, block, arms } => RNode::Fork {
             selector: f(selector),
             env: *env,

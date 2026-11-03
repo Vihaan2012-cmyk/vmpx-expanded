@@ -76,6 +76,31 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         print_tree(&rolled.root, 0);
         return Ok(());
     }
+    if std::env::var_os("VMPX_PROBE_UNROLLED").is_some() {
+        // The rolled frontend refuses a store outside the VM's dead frame; the
+        // unrolled one has no such guard. Reports which of the two can reach this
+        // entry at all, so the size of an unrolled fallback is measurable before
+        // anyone builds the lowering it would need.
+        let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+            vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+        })
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+        let unrolled =
+            crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64);
+        println!(
+            "// probe-unrolled {name}: rolled={} unrolled={}",
+            match &rolled {
+                Ok(_) => "ok".to_owned(),
+                Err(e) => format!("ERR({})", e.chars().take(60).collect::<String>()),
+            },
+            match &unrolled {
+                Ok(u) => format!("ok({} paths)", u.paths.len()),
+                Err(e) => format!("ERR({})", e.chars().take(60).collect::<String>()),
+            }
+        );
+        return Ok(());
+    }
     let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
         vmpx_vmlift::roll_decoded_cfg(input, 200_000)
     })??;
@@ -136,6 +161,13 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
             for (r, e) in &x.registers {
                 println!("// {pad}  {r:?} = {}", p(e, 7));
             }
+        }
+        RNode::Stores { stores, next } => {
+            println!("// {pad}STORES ({})", stores.len());
+            for st in stores {
+                println!("// {pad}  [{}] <- {} ({:?})", p(&st.address, 7), p(&st.value, 7), st.width);
+            }
+            print_tree(next, depth);
         }
         RNode::Fork { selector, env, block, arms } => {
             println!("// {pad}FORK at {block} env={env} selector={}", p(selector, 9));

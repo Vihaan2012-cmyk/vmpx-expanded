@@ -289,15 +289,14 @@ fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmC
 fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
     use std::io::Write;
     let Some(path) = std::env::var_os("VMPX_CFG_AUDIT") else { return };
+    // Every block that is not itself a VM exit has to lead somewhere. The earlier
+    // form of this check listed only Branch and NativeCall, so a block whose exit
+    // was never classified at all — `BlockExit::Stalled`, the case the lifter
+    // rejects as "did not reach a boundary" — was the one shape it could not see.
     let dangling: Vec<String> = cfg
         .blocks
         .iter()
-        .filter(|(_, block)| {
-            matches!(
-                block.exit,
-                vmpx_vm::BlockExit::Branch | vmpx_vm::BlockExit::NativeCall
-            )
-        })
+        .filter(|(_, block)| block.exit != vmpx_vm::BlockExit::VmExit)
         .filter(|(key, _)| {
             !cfg.edges
                 .iter()
