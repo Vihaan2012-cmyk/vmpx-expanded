@@ -301,8 +301,12 @@ pub fn recover_exit(
     {
         return Err(fail("exit does not restore every register exactly once".to_owned()));
     }
-    let final_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial")
-        .ok_or_else(|| fail("final VSP is not an affine offset of the entry frame".to_owned()))?;
+    let final_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial").ok_or_else(|| {
+        fail(format!(
+            "final VSP is not an affine offset of the entry frame (roots {:?})",
+            symbolic.final_vsp.dependencies()
+        ))
+    })?;
     let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
         symbolic
             .read_tracked_memory(add_offset(&symbolic.final_vsp, offset)?, BitWidth::W64)

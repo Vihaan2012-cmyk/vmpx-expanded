@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
-use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, X64NativeRegister};
+use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, UnaryOp, X64NativeRegister};
 use vmpx_vmlift::{RExit, RNode, RPhi, RStore, RolledFunction};
 
 use crate::exec::Rng;
@@ -478,9 +478,16 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
         return opaque("several different flag words");
     }
     let w = x.width;
+    // The sampling below is generic over the flag intrinsic; only the shape of
+    // the value it compares against is per-family. `nor` and `nand` are the VM's
+    // own bitwise handlers and their flags come from `~(a|b)` and `~(a&b)`
+    // exactly as `and`'s come from `a&b`. Measured over the opaque conditions
+    // that blocked a round-trip here: nor 21, nand 2.
     let is_sub = name.starts_with("vm_flags_sub_");
     let is_and = name.starts_with("vm_flags_and_");
-    if !is_sub && !is_and {
+    let is_nor = name.starts_with("vm_flags_nor_");
+    let is_nand = name.starts_with("vm_flags_nand_");
+    if !is_sub && !is_and && !is_nor && !is_nand {
         return opaque(name);
     }
     // crafted operand pairs
@@ -537,19 +544,37 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
         }
     };
     for op in ops {
+        // The value the flags were set from, per family.
+        let flagged = |a: u64, b: u64| -> u64 {
+            if is_nor {
+                w.mask() & !(a | b)
+            } else if is_nand {
+                w.mask() & !(a & b)
+            } else {
+                a & b
+            }
+        };
         let ok = if is_sub {
             samples.iter().all(|(a, b, t)| truth(op, *a, *b) == *t)
         } else {
-            samples.iter().all(|(a, b, t)| truth(op, a & b, 0) == *t)
+            samples.iter().all(|(a, b, t)| truth(op, flagged(*a, *b), 0) == *t)
         };
         if ok {
             let (a, b) = if is_sub {
                 (x.clone(), y.clone())
             } else {
-                (
-                    Expr::binary(BinaryOp::And, x.clone(), y.clone()).unwrap_or(x.clone()),
-                    Expr::constant(w, 0),
-                )
+                let joined = if is_nor {
+                    Expr::binary(BinaryOp::Or, x.clone(), y.clone())
+                        .map(|or| Expr::unary(UnaryOp::Not, or))
+                        .unwrap_or_else(|_| x.clone())
+                } else if is_nand {
+                    Expr::binary(BinaryOp::And, x.clone(), y.clone())
+                        .map(|and| Expr::unary(UnaryOp::Not, and))
+                        .unwrap_or_else(|_| x.clone())
+                } else {
+                    Expr::binary(BinaryOp::And, x.clone(), y.clone()).unwrap_or(x.clone())
+                };
+                (joined, Expr::constant(w, 0))
             };
             notes.push(format!(
                 "branch predicate decoded from flag word {name}: {} samples agree",
