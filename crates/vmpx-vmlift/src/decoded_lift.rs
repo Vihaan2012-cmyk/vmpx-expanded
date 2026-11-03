@@ -84,7 +84,13 @@ pub fn semantic_lowering(semantic: VmHandlerSemantic) -> SemanticLowering {
         // double-width results and their flag words; `expr_codegen` lowers each by
         // re-emitting the real `mul`/`imul`/`div` (see those lowerings).
         S::Mul | S::SignedMultiply | S::UnsignedDivide => L::Computed,
-        S::TableChecksum => L::Refused("table checksum has no lowering"),
+        // The executor folds the checksum concretely when its pointer, length and
+        // table bytes are all constant (`execute_table_checksum`), which on a
+        // static image is the usual case — the result is then a plain constant
+        // the backend materializes. When any input byte is symbolic it yields the
+        // recurrence intrinsic instead, which the backend cannot compute, so that
+        // case still fails closed rather than inventing a value.
+        S::TableChecksum => L::Computed,
         S::ConditionalBranch | S::UnconditionalBranch | S::NativeCall => {
             L::Refused("control transfer needs the CFG lift")
         }
@@ -384,13 +390,46 @@ pub fn recover_exit(
 pub fn first_unliftable(
     instructions: &[DecodedVmInstruction],
 ) -> Option<(usize, VmHandlerSemantic, &'static str)> {
-    instructions
+    let found = instructions
         .iter()
         .enumerate()
         .find_map(|(index, instruction)| match semantic_lowering(instruction.semantic) {
             SemanticLowering::Refused(reason) => Some((index, instruction.semantic, reason)),
             _ => None,
-        })
+        });
+    if found.is_some() {
+        report_all_gaps(instructions);
+    }
+    found
+}
+
+/// Diagnostic: with `VMPX_LIFT_ALL_GAPS` set, reports EVERY distinct semantic in
+/// the stream that has no lowering, not just the first.
+///
+/// A refusal names one semantic, so fixing it and re-measuring is the only way
+/// to learn whether a second and a third sit behind it in the same block. That
+/// loop costs a build each time and has already been walked once here (rdtsc ->
+/// table checksum). This answers the depth in one run instead.
+fn report_all_gaps(instructions: &[DecodedVmInstruction]) {
+    if std::env::var_os("VMPX_LIFT_ALL_GAPS").is_none() {
+        return;
+    }
+    let mut gaps: BTreeMap<String, usize> = BTreeMap::new();
+    for instruction in instructions {
+        if let SemanticLowering::Refused(_) = semantic_lowering(instruction.semantic) {
+            *gaps.entry(format!("{:?}", instruction.semantic)).or_default() += 1;
+        }
+    }
+    let rendered: Vec<String> = gaps
+        .iter()
+        .map(|(semantic, count)| format!("{semantic}x{count}"))
+        .collect();
+    eprintln!(
+        "[liftgaps] instructions={} distinct_unliftable={} {}",
+        instructions.len(),
+        gaps.len(),
+        rendered.join(" ")
+    );
 }
 
 fn only_entry_registers(expression: &Expr, what: &str, uses_root: &mut bool) -> Result<(), DecodedLiftError> {
