@@ -198,19 +198,30 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
             .max_transition_instructions
             .saturating_mul(transition_scale()),
         follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
-        // A budget-pass sweep bounds each rerun entry by VMPX_PASS_WALL_SECS (a lower
-        // cap only stops an entry sooner, as WallClock, i.e. incomplete).
-        max_wall_time: if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
-            std::env::var("VMPX_PASS_WALL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs)
-                .or(VmCfgLimits::default().max_wall_time)
-        } else {
-            VmCfgLimits::default().max_wall_time
-        },
+        // VMPX_WALL_SECS sets the per-entry budget, and a budget-pass sweep bounds
+        // each rerun entry by VMPX_PASS_WALL_SECS instead. A lower cap only stops
+        // an entry sooner, as WallClock, i.e. incomplete — so this knob is
+        // soundness-neutral in both directions, and it sizes how much of the
+        // incomplete set is blocked by TIME rather than by a stall.
+        max_wall_time: wall_secs(
+            if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                "VMPX_PASS_WALL_SECS"
+            } else {
+                "VMPX_WALL_SECS"
+            },
+        ),
         ..VmCfgLimits::default()
     }
+}
+
+/// The per-entry wall-clock budget named by `var`, else the default.
+fn wall_secs(var: &str) -> Option<std::time::Duration> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs >= 1)
+        .map(std::time::Duration::from_secs)
+        .or(VmCfgLimits::default().max_wall_time)
 }
 
 /// Per-pass multiplier override `[transition budget, visits/blocks, total

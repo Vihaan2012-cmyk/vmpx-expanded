@@ -1023,7 +1023,11 @@ fn frame_initial_state(
 }
 
 struct DecodedBlock {
-    instructions: Vec<DecodedVmInstruction>,
+    /// Shared, not owned: `visit` needs the decoded buffer while it mutates the
+    /// walker, and it took a full copy of it on EVERY re-visit of the block to
+    /// release the borrow. Up to `max_visits_per_block` copies of a buffer that
+    /// can hold `instruction_limit` instructions, per block, for nothing.
+    instructions: Rc<[DecodedVmInstruction]>,
     final_state: RelativeDispatchState,
     stop: LinearDecodeStop,
     boundary: Option<VmHandlerSemantic>,
@@ -1549,9 +1553,9 @@ fn widen_to_fixpoint(
 /// single enclosing path), which converges a block re-reached through sibling
 /// paths. `Err` when the states cannot be generalized (stack/allocation/taint
 /// drift), which fails the re-entry closed.
-fn fold_states(
+fn fold_states<'s>(
     key: Va,
-    states: &[SymbolicVmInitialState],
+    states: impl IntoIterator<Item = &'s SymbolicVmInitialState>,
     incoming: &SymbolicVmInitialState,
 ) -> Result<SymbolicVmInitialState, String> {
     let mut acc = incoming.clone();
@@ -1598,23 +1602,6 @@ enum GeneralizeAcross {
     /// refusal reason so the census can tell a drifting VM stack pointer apart
     /// from every other reason a fold is refused.
     Stall(String),
-}
-
-/// Appends the VSP difference to a fold refusal, as a constant delta when the
-/// two stack pointers differ by one, else as the two expressions.
-fn with_vsp_drift(
-    reason: String,
-    a: &SymbolicVmInitialState,
-    b: &SymbolicVmInitialState,
-) -> String {
-    if a.vsp == b.vsp {
-        return reason;
-    }
-    let shown = |e: &Expr| format!("{e:?}").chars().take(160).collect::<String>();
-    match constant_vsp_delta(&a.vsp, &b.vsp) {
-        Some(delta) => format!("{reason} (constant vsp delta {delta:#x})"),
-        None => format!("{reason} (vsp {} vs {})", shown(&a.vsp), shown(&b.vsp)),
-    }
 }
 
 /// Decides how a block re-entered while already on the path proceeds.
@@ -2557,7 +2544,7 @@ impl Walker<'_, '_> {
                     .and_then(|recovery| recovery.handler_analysis.as_ref())
                     .map(|analysis| analysis.semantic);
                 DecodedBlock {
-                    instructions: decode.instructions,
+                    instructions: decode.instructions.into(),
                     final_state: decode.final_state,
                     stop: decode.stop_reason,
                     boundary,
@@ -2567,7 +2554,7 @@ impl Walker<'_, '_> {
             Err(error) => {
                 let partial = error.partial_report().decode.clone();
                 DecodedBlock {
-                    instructions: partial.instructions,
+                    instructions: partial.instructions.into(),
                     final_state: partial.final_state,
                     stop: partial.stop_reason,
                     boundary: None,
@@ -2576,13 +2563,13 @@ impl Walker<'_, '_> {
             }
         };
         self.total_instructions += block.instructions.len();
-        // Decoded buffers live in `decoded`, in `cfg.blocks`, and as a transient
-        // clone in `visit`.
+        // Decoded buffers live in `decoded` and in `cfg.blocks`. `visit` used to
+        // hold a third, transient copy; it now shares the one in `decoded`.
         let decoded_bytes = block
             .instructions
             .len()
             .saturating_mul(DECODED_INSTRUCTION_BYTES)
-            .saturating_mul(3);
+            .saturating_mul(2);
         if !self.charge(decoded_bytes, key, item.start.vip) {
             return false;
         }
@@ -2606,7 +2593,7 @@ impl Walker<'_, '_> {
             VmBasicBlock {
                 start: item.start,
                 address: item.address,
-                instructions: block.instructions.clone(),
+                instructions: block.instructions.to_vec(),
                 exit,
                 boundary_handler,
                 native_call: None,
@@ -2681,11 +2668,6 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Generalizes a re-entry at a saturated block against its running
-    /// over-approximation (seeded from every state recorded there). A cell the
-    /// generalization already holds at TOP is covered, so once the varying cells
-    /// saturate the block closes on every further re-entry. Pure over-approximation
-    /// (cells only ever broaden to TOP), so no reachable state is dropped.
     /// Replaces the canonical for `state`'s VM-stack phase at `key`, leaving the
     /// other phases' canonicals in place.
     fn record_canonical(&mut self, key: Va, state: SymbolicVmInitialState) {
@@ -2696,50 +2678,69 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// Generalizes a re-entry at a saturated block against its running
+    /// over-approximation (seeded from every state recorded there). A cell the
+    /// generalization already holds at TOP is covered, so once the varying cells
+    /// saturate the block closes on every further re-entry. Pure over-approximation
+    /// (cells only ever broaden to TOP), so no reachable state is dropped.
     fn generalize_across(
         &mut self,
         key: Va,
         incoming: &SymbolicVmInitialState,
     ) -> GeneralizeAcross {
-        // Phase-local, for the reason recorded on `Walker::widened`: fold and
-        // widen only against states at the same VM stack depth.
+        // Phase-local, for the reason recorded on `Walker::widened`: fold and widen
+        // only against states at the re-entry's VM stack depth. Both lookups borrow
+        // in place and hold only the owned outcome across the mutation, so a
+        // saturated block no longer clones its whole recorded state set on every
+        // re-entry — the cost that matters now that partitioning lets the walk
+        // explore much deeper.
         let canonical = self
             .widened
             .get(&key)
-            .and_then(|phases| phases.iter().find(|c| c.vsp == incoming.vsp))
-            .cloned();
+            .and_then(|phases| phases.iter().find(|c| c.vsp == incoming.vsp));
         if let Some(canonical) = canonical {
-            return match widen_state(key, &canonical, incoming) {
-                Ok(None) => GeneralizeAcross::Closed,
+            let folded = match widen_state(key, canonical, incoming) {
+                Ok(None) => return GeneralizeAcross::Closed,
                 Ok(Some(widened)) => {
                     let hid_frame_pointer =
-                        fold_hid_frame_pointer([&canonical, incoming].into_iter(), &widened);
-                    let bytes = self.state_bytes(&widened);
-                    self.charge(bytes, key, key);
-                    self.record_canonical(key, widened.clone());
-                    GeneralizeAcross::Continue {
-                        state: widened,
-                        hid_frame_pointer,
-                    }
+                        fold_hid_frame_pointer([canonical, incoming].into_iter(), &widened);
+                    Ok((widened, hid_frame_pointer))
                 }
-                Err(reason) => GeneralizeAcross::Stall(with_vsp_drift(reason, &canonical, incoming)),
+                Err(reason) => Err(reason),
             };
+            return self.continue_from(key, folded);
         }
-        let states: Vec<SymbolicVmInitialState> = self
+        let states: Vec<&SymbolicVmInitialState> = self
             .explored
             .get(&key)
             .map(|states| {
                 states
                     .iter()
                     .filter(|state| state.vsp == incoming.vsp)
-                    .cloned()
                     .collect()
             })
             .unwrap_or_default();
-        match fold_states(key, &states, incoming) {
+        let folded = match fold_states(key, states.iter().copied(), incoming) {
             Ok(widened) => {
                 let hid_frame_pointer =
-                    fold_hid_frame_pointer(states.iter().chain([incoming]), &widened);
+                    fold_hid_frame_pointer(states.iter().copied().chain([incoming]), &widened);
+                Ok((widened, hid_frame_pointer))
+            }
+            Err(reason) => Err(reason),
+        };
+        self.continue_from(key, folded)
+    }
+
+    /// Charges a generalization and records it as its phase's canonical. Split
+    /// out so the lookups above can borrow `explored`/`widened` in place and end
+    /// that borrow before this mutates.
+    fn continue_from(
+        &mut self,
+        key: Va,
+        folded: Result<(SymbolicVmInitialState, bool), String>,
+    ) -> GeneralizeAcross {
+        match folded {
+            Ok((widened, hid_frame_pointer)) => {
                 let bytes = self.state_bytes(&widened);
                 self.charge(bytes, key, key);
                 self.record_canonical(key, widened.clone());
@@ -2748,28 +2749,11 @@ impl Walker<'_, '_> {
                     hid_frame_pointer,
                 }
             }
-            Err(reason) => {
-                // Every distinct stride, not just the first: one repeated delta is
-                // a two-phase join of sibling paths, while {8, 16, 24, ...} is a
-                // VM stack that really grows per iteration. The two need different
-                // treatments, and only the stride set tells them apart.
-                let deltas: BTreeSet<i64> = states
-                    .iter()
-                    .filter(|state| state.vsp != incoming.vsp)
-                    .map(|state| {
-                        constant_vsp_delta(&state.vsp, &incoming.vsp).map_or(i64::MIN, |d| d as i64)
-                    })
-                    .collect();
-                let rendered = if deltas.is_empty() {
-                    reason.clone()
-                } else if deltas.contains(&i64::MIN) {
-                    let state = states.iter().find(|s| s.vsp != incoming.vsp).expect("present");
-                    with_vsp_drift(reason, state, incoming)
-                } else {
-                    format!("{reason} (vsp strides {deltas:#x?})")
-                };
-                GeneralizeAcross::Stall(rendered)
-            }
+            // Never a VM-stack drift any more: both paths above are restricted to
+            // the re-entry's own depth, so `widen_state` cannot refuse on the VSP
+            // here. Only the loop head still sees cross-depth re-entries, and it
+            // renders the strides itself.
+            Err(reason) => GeneralizeAcross::Stall(reason),
         }
     }
 
@@ -2858,7 +2842,7 @@ impl Walker<'_, '_> {
                 block.stop,
                 block.boundary,
                 block.error.clone(),
-                block.instructions.clone(),
+                Rc::clone(&block.instructions),
             )
         };
         if let Some(error) = error {
@@ -5370,11 +5354,12 @@ mod tests {
         let incoming = loop_state(8, w64(0));
         let refusal = fold_states(Va(0x1000), &states, &incoming).expect_err("moves the VSP");
         assert!(refusal.contains("stack pointer"), "{refusal}");
-        // The census needs the drift itself, not just the refusal: one VM stack
-        // cell of constant stride is a different lever from an unbounded VSP.
-        assert!(
-            with_vsp_drift(refusal, &states[0], &incoming).contains("constant vsp delta 0x8")
-        );
+        // The census needs the drift itself, not just the refusal: a growing VM
+        // stack is a different lever from one that merely oscillates, and only
+        // the stride set tells them apart.
+        let noted = vsp_stride_note(&[&states[0]], &incoming, refusal);
+        assert!(noted.contains("0x8,"), "{noted}");
+        assert!(noted.contains("proven=true"), "{noted}");
     }
 
     fn byte_cell_state(cell: Expr) -> SymbolicVmInitialState {
