@@ -280,7 +280,12 @@ impl Walker<'_, '_> {
         let cfg = self.input.cfg;
         let mut out: Vec<(u64, Va)> = Vec::new();
         for edge in &cfg.edges {
-            if edge.from != key || !matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch) {
+            if edge.from != key
+            || !matches!(
+                edge.kind,
+                CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch | CfgEdgeKind::ProfileTransition
+            )
+        {
                 continue;
             }
             if let Some(address) = cfg.blocks.get(&edge.to).and_then(|b| b.address)
@@ -319,7 +324,21 @@ impl Walker<'_, '_> {
         if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
             return Err(format!("block {key} instruction {index} ({semantic:?}): {reason}"));
         }
-        let boundary = match block.exit {
+        // `BlockExit` has no variant for a cross-profile transition, so such a
+        // block records as `Stalled` even though the CFG carries its outgoing
+        // `ProfileTransition` edge and the graph is complete through it. That
+        // single missing case refused 158 of 462 CFG-complete entries here. The
+        // edge's own documentation says what it is: "an unconditional-branch
+        // handler pops a target off the VM stack and the VM continues under a
+        // PROVEN-DIFFERENT register profile" — so it is executed as exactly that,
+        // and the successor block is already decoded under the new profile.
+        let transition = block.exit == BlockExit::Stalled
+            && cfg
+                .edges
+                .iter()
+                .any(|e| e.from == key && e.kind == CfgEdgeKind::ProfileTransition);
+        let exit = if transition { BlockExit::Branch } else { block.exit };
+        let boundary = match exit {
             BlockExit::VmExit => VmHandlerSemantic::VmExit,
             BlockExit::Branch => VmHandlerSemantic::UnconditionalBranch,
             BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
@@ -368,7 +387,7 @@ impl Walker<'_, '_> {
                 }
             }
         }
-        Ok((report, block.exit, escaping))
+        Ok((report, exit, escaping))
     }
 
     /// One exact iteration from `header` over `state`; the state on re-entry.

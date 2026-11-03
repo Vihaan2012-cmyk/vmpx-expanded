@@ -362,7 +362,10 @@ pub fn recover_exit(
         Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
         Ok(value) => {
             if std::env::var_os("VMPX_SEG_TRACE").is_some() {
-                eprintln!("[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} value {value:?}");
+                eprintln!(
+                    "[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} deps {:?}",
+                    value.dependencies()
+                );
             }
             return Err(DecodedLiftError::NotCalleeReturn(
                 "the return address was written by the VM, not read from caller stack".to_owned(),
