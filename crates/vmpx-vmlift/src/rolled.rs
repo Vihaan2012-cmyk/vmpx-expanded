@@ -352,12 +352,27 @@ impl Walker<'_, '_> {
             self.input.memory,
         )
         .map_err(|e| format!("block {key} symbolic execution failed: {e}"))?;
+        // Four different causes wore one message, which hid which of them is
+        // worth building for. Named separately so the census can rank them.
         if !report.native_calls.is_empty()
             || !report.fresh_allocations.is_empty()
             || report.memory_tainted
             || !report.memory_havocs.is_empty()
         {
-            return Err(format!("block {key} havocs memory, calls natively or allocates"));
+            let mut causes = Vec::new();
+            if !report.native_calls.is_empty() {
+                causes.push(format!("{} native call(s)", report.native_calls.len()));
+            }
+            if !report.memory_havocs.is_empty() {
+                causes.push(format!("{} memory havoc(s)", report.memory_havocs.len()));
+            }
+            if report.memory_tainted {
+                causes.push("memory tainted".to_owned());
+            }
+            if !report.fresh_allocations.is_empty() {
+                causes.push(format!("{} allocation(s)", report.fresh_allocations.len()));
+            }
+            return Err(format!("block {key} is not pure: {}", causes.join(", ")));
         }
         let entry_sp = i64::try_from(self.input.top_offset)
             .unwrap_or(i64::MAX)

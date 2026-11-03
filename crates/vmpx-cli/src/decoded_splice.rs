@@ -336,6 +336,16 @@ pub(crate) fn with_entry_input<R>(
     }
     let entry_limits = EntryProfileRecoveryLimits {
         instruction_limit,
+        // Parity with `report --serve-ro`, which is the mode the lift census is
+        // measured against: without it an entry counted CFG-complete there is
+        // refused here as "the CFG is incomplete" purely because the image reads
+        // it needs are withheld. Labeled exactly as `report` labels it — the CFG
+        // carries `AssumesImageProtectionStable` — so this widens what can be
+        // decompiled, never what is claimed proven.
+        symbolic: vmpx_vm::SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            ..vmpx_vm::SymbolicExecutionLimits::default()
+        },
         ..EntryProfileRecoveryLimits::default()
     };
     let stream = recover_entry_stream(pe, &candidate, entry_limits)
