@@ -1465,12 +1465,20 @@ fn proven_constant_vsp_delta(
     reentry: &SymbolicVmInitialState,
 ) -> Option<u64> {
     // Oldest -> newest: reverse the nearest-first ancestors, then the re-entry.
-    let chain: Vec<&Expr> = ancestors
+    // Consecutive repeats are dropped: several iterations at one VM stack depth
+    // are not a stride violation, and keeping them mixed a step of 0 into the
+    // chain so a clean one-cell push-down read as non-constant.
+    let mut chain: Vec<&Expr> = Vec::new();
+    for vsp in ancestors
         .iter()
         .rev()
         .map(|state| &state.vsp)
         .chain(std::iter::once(&reentry.vsp))
-        .collect();
+    {
+        if chain.last() != Some(&vsp) {
+            chain.push(vsp);
+        }
+    }
     let mut delta: Option<u64> = None;
     for pair in chain.windows(2) {
         let step = constant_vsp_delta(pair[0], pair[1])?;
@@ -1629,10 +1637,74 @@ fn loop_step(
     if ancestors.len() < unrolls {
         return LoopStep::Unroll;
     }
-    match widen_to_fixpoint(key, ancestors, reentry) {
+    // Widen only within the re-entry's own VM-stack phase. The VSP is part of a
+    // state's identity, not a dimension to join over: `widen_state` refuses any
+    // pair whose VSPs differ, so one enclosing iteration sitting at a different
+    // VM stack depth failed the whole re-entry closed even when the phase itself
+    // converges. Measured across eight such entries: every refusal showed a
+    // SINGLETON stride set of one cell (-8 or +8), never a growing
+    // {8, 16, 24, ...}, so the VM stack oscillates between a bounded number of
+    // depths rather than drifting. With no same-phase ancestor this is unchanged.
+    let phase: Vec<&SymbolicVmInitialState> = ancestors
+        .iter()
+        .copied()
+        .filter(|a| a.vsp == reentry.vsp)
+        .collect();
+    if phase.is_empty() {
+        // No enclosing iteration sits at this VM stack depth, so there is nothing
+        // to widen against and widening across depths only reproduces the VSP
+        // refusal. Explore ONE more depth exactly instead, which assumes nothing
+        // (an unroll is plain exploration) and still fails closed right after.
+        //
+        // Two distinct depths is the whole point: it is the least that lets
+        // `proven_constant_vsp_delta` see a stride at all, and a loop that merely
+        // oscillates would already have closed at the top of this function
+        // against the ancestor it returned to. So reaching the refusal with two
+        // depths and a constant stride is itself the proof that the VM stack
+        // grows per iteration. Measured on eight such entries: the strides read
+        // {-0x8, -0x10, -0x18, -0x20} from one re-entry, a clean one-cell
+        // push-down recursion, which no sound widening closes without a trip
+        // count — only the observed-depth bridge below can.
+        let mut depths: Vec<&Expr> = Vec::new();
+        for state in ancestors {
+            if !depths.contains(&&state.vsp) {
+                depths.push(&state.vsp);
+            }
+        }
+        if depths.len() < 2 {
+            return LoopStep::Unroll;
+        }
+    }
+    let enclosing = if phase.is_empty() { ancestors } else { &phase };
+    match widen_to_fixpoint(key, enclosing, reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
         Err(reason) => bounded_unroll_or_refuse(ancestors, reentry, observed_depth, reason),
+    }
+}
+
+/// Diagnostic: appends the per-iteration VM-stack strides a refused loop shows,
+/// and whether the stride is a PROVEN constant. A proven constant stride is the
+/// only shape a sound stride summarization could ever close; an unproven or
+/// mixed stride set cannot be closed without an assumption.
+fn vsp_stride_note(
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+    reason: String,
+) -> String {
+    let strides: BTreeSet<i64> = ancestors
+        .iter()
+        .filter(|a| a.vsp != reentry.vsp)
+        .map(|a| constant_vsp_delta(&a.vsp, &reentry.vsp).map_or(i64::MIN, |d| d as i64))
+        .collect();
+    if strides.is_empty() {
+        return reason;
+    }
+    let proven = proven_constant_vsp_delta(ancestors, reentry).is_some();
+    if strides.contains(&i64::MIN) {
+        format!("{reason} (vsp strides non-constant, proven={proven})")
+    } else {
+        format!("{reason} (vsp strides {strides:#x?}, proven={proven})")
     }
 }
 
@@ -1650,10 +1722,10 @@ fn bounded_unroll_or_refuse(
     reason: String,
 ) -> LoopStep {
     let Some(depth) = observed_depth else {
-        return LoopStep::Refuse(reason);
+        return LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason));
     };
     if proven_constant_vsp_delta(ancestors, reentry).is_none() {
-        return LoopStep::Refuse(reason);
+        return LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason));
     }
     // `ancestors.len()` counts the enclosing iterations already on the path; one
     // more exact unroll per remaining level up to the observed depth.
@@ -1721,7 +1793,10 @@ struct Walker<'a, 'p> {
     /// generalizes (blocks re-reached through many sibling paths, whose only drift
     /// is fresh-name bookkeeping). Incoming states fold into it so the block
     /// converges to a sound fixpoint instead of stalling at the cap.
-    widened: BTreeMap<Va, SymbolicVmInitialState>,
+    /// One canonical over-approximation PER VM-STACK PHASE per block. Keeping a
+    /// single canonical made a re-entry at another VM stack depth hit the VSP
+    /// refusal in `widen_state` and fail closed; phases converge separately.
+    widened: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
     cfg: VmCfg,
     total_instructions: usize,
     /// Running over-estimate of live walker bytes; see `VmCfgLimits::max_memory_bytes`.
@@ -2611,46 +2686,89 @@ impl Walker<'_, '_> {
     /// generalization already holds at TOP is covered, so once the varying cells
     /// saturate the block closes on every further re-entry. Pure over-approximation
     /// (cells only ever broaden to TOP), so no reachable state is dropped.
+    /// Replaces the canonical for `state`'s VM-stack phase at `key`, leaving the
+    /// other phases' canonicals in place.
+    fn record_canonical(&mut self, key: Va, state: SymbolicVmInitialState) {
+        let phases = self.widened.entry(key).or_default();
+        match phases.iter_mut().find(|held| held.vsp == state.vsp) {
+            Some(slot) => *slot = state,
+            None => phases.push(state),
+        }
+    }
+
     fn generalize_across(
         &mut self,
         key: Va,
         incoming: &SymbolicVmInitialState,
     ) -> GeneralizeAcross {
-        if let Some(canonical) = self.widened.get(&key) {
-            return match widen_state(key, canonical, incoming) {
+        // Phase-local, for the reason recorded on `Walker::widened`: fold and
+        // widen only against states at the same VM stack depth.
+        let canonical = self
+            .widened
+            .get(&key)
+            .and_then(|phases| phases.iter().find(|c| c.vsp == incoming.vsp))
+            .cloned();
+        if let Some(canonical) = canonical {
+            return match widen_state(key, &canonical, incoming) {
                 Ok(None) => GeneralizeAcross::Closed,
                 Ok(Some(widened)) => {
                     let hid_frame_pointer =
-                        fold_hid_frame_pointer([canonical, incoming].into_iter(), &widened);
+                        fold_hid_frame_pointer([&canonical, incoming].into_iter(), &widened);
                     let bytes = self.state_bytes(&widened);
                     self.charge(bytes, key, key);
-                    self.widened.insert(key, widened.clone());
+                    self.record_canonical(key, widened.clone());
                     GeneralizeAcross::Continue {
                         state: widened,
                         hid_frame_pointer,
                     }
                 }
-                Err(reason) => GeneralizeAcross::Stall(with_vsp_drift(reason, canonical, incoming)),
+                Err(reason) => GeneralizeAcross::Stall(with_vsp_drift(reason, &canonical, incoming)),
             };
         }
-        let states = self.explored.get(&key).cloned().unwrap_or_default();
+        let states: Vec<SymbolicVmInitialState> = self
+            .explored
+            .get(&key)
+            .map(|states| {
+                states
+                    .iter()
+                    .filter(|state| state.vsp == incoming.vsp)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         match fold_states(key, &states, incoming) {
             Ok(widened) => {
                 let hid_frame_pointer =
                     fold_hid_frame_pointer(states.iter().chain([incoming]), &widened);
                 let bytes = self.state_bytes(&widened);
                 self.charge(bytes, key, key);
-                self.widened.insert(key, widened.clone());
+                self.record_canonical(key, widened.clone());
                 GeneralizeAcross::Continue {
                     state: widened,
                     hid_frame_pointer,
                 }
             }
             Err(reason) => {
-                let drift = states.iter().find(|state| state.vsp != incoming.vsp);
-                GeneralizeAcross::Stall(drift.map_or(reason.clone(), |state| {
+                // Every distinct stride, not just the first: one repeated delta is
+                // a two-phase join of sibling paths, while {8, 16, 24, ...} is a
+                // VM stack that really grows per iteration. The two need different
+                // treatments, and only the stride set tells them apart.
+                let deltas: BTreeSet<i64> = states
+                    .iter()
+                    .filter(|state| state.vsp != incoming.vsp)
+                    .map(|state| {
+                        constant_vsp_delta(&state.vsp, &incoming.vsp).map_or(i64::MIN, |d| d as i64)
+                    })
+                    .collect();
+                let rendered = if deltas.is_empty() {
+                    reason.clone()
+                } else if deltas.contains(&i64::MIN) {
+                    let state = states.iter().find(|s| s.vsp != incoming.vsp).expect("present");
                     with_vsp_drift(reason, state, incoming)
-                }))
+                } else {
+                    format!("{reason} (vsp strides {deltas:#x?})")
+                };
+                GeneralizeAcross::Stall(rendered)
             }
         }
     }
@@ -5147,6 +5265,12 @@ mod tests {
         let reentry = s(shifted((-128_i64) as u64));
         assert_eq!(
             proven_constant_vsp_delta(&[&r1, &a], &reentry),
+            Some((-64_i64) as u64)
+        );
+        // Iterations that linger at one depth are not a stride violation: the
+        // same chain with a repeat still proves −64.
+        assert_eq!(
+            proven_constant_vsp_delta(&[&r1, &r1, &a, &a], &reentry),
             Some((-64_i64) as u64)
         );
         // A non-constant step (doubling) has no proven constant delta.
