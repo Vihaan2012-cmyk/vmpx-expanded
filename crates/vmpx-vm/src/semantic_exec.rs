@@ -1423,7 +1423,7 @@ fn depends_on_vsp_root(expression: &Expr) -> bool {
 
 /// True unless `vsp_initial` occurs only as (part of) the address of an untracked
 /// memory read, i.e. the value is data read from the frame, not a frame pointer.
-fn is_frame_pointer_value(expression: &Expr) -> bool {
+pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
     expression.register_outside_intrinsic_args("vsp_initial", |name| {
         name.starts_with("memory_load_epoch_")
     })

@@ -308,6 +308,28 @@ fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
     }
 }
 
+/// With `VMPX_DISCHARGE_DUMP=<file>`, records why each CFG-complete entry that
+/// still carries the VM-stack assumption could not discharge it. Those entries
+/// are the candidates for the proven tier: raising N2 means discharging here,
+/// not completing more CFGs.
+fn dump_discharge(entry: &VmEntryCandidate, cfg: &VmCfg) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("VMPX_DISCHARGE_DUMP") else { return };
+    let Some(reason) = cfg.discharge_refusal.as_ref() else { return };
+    if !cfg.all_paths_reach_vm_exit() {
+        return;
+    }
+    let line = serde_json::json!({
+        "rva": format!("{:#x}", entry.rva.0),
+        "why": reason,
+        "assumptions": cfg.assumptions.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
+    });
+    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Outcome {
     match result {
         Err(_) => Outcome::Panic,
@@ -365,6 +387,7 @@ fn recover_all(
                         }));
                         dump_stalls(entry, &result);
                         if let Ok(Ok(cfg)) = &result {
+                            dump_discharge(entry, cfg);
                             if cfg.all_paths_reach_vm_exit() {
                                 audit_complete(entry, cfg);
                             }

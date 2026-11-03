@@ -442,6 +442,10 @@ pub struct VmCfg {
     pub frame_note: Option<String>,
     /// Labeled assumptions relied on during recovery.
     pub assumptions: BTreeSet<VmCfgAssumption>,
+    /// Why the VM-stack assumption could not be discharged, when it could not.
+    /// Diagnostic only. Such an entry is CFG-complete but not proven, so this
+    /// names the condition standing between it and the proven tier.
+    pub discharge_refusal: Option<String>,
 }
 
 impl VmCfg {
@@ -573,11 +577,21 @@ fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
     // delta cell unknown, which made the whole address chain unresolvable.
     // A write to SP, a 32-bit ESP read, `lea` and `push rsp` all still expose.
     let narrow_read = |operand: u32| {
-        operand >= 1
+        // `cmp`/`test` write no register, so operand 0 is a READ too: a 16-bit
+        // `cmp sp,r15w` only sets flags and yields no address. Every other
+        // mnemonic here writes operand 0, so only its sources are exempt.
+        let reads_operand_zero = matches!(instruction.mnemonic(), Mnemonic::Cmp | Mnemonic::Test);
+        (operand >= 1 || reads_operand_zero)
             && instruction.op_register(operand).size() <= 2
             && matches!(
                 instruction.mnemonic(),
-                Mnemonic::Bsr | Mnemonic::Bsf | Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx
+                Mnemonic::Bsr
+                    | Mnemonic::Bsf
+                    | Mnemonic::Mov
+                    | Mnemonic::Movzx
+                    | Mnemonic::Movsx
+                    | Mnemonic::Cmp
+                    | Mnemonic::Test
             )
     };
     (0..instruction.op_count()).any(|operand| match instruction.op_kind(operand) {
@@ -1541,12 +1555,37 @@ fn fold_states(
     Ok(acc)
 }
 
+/// True when the fold HID a frame pointer: some pre-fold cell held a
+/// frame-pointer value that the folded state no longer holds at that address.
+/// Such a pointer could later be produced by an untracked load, so frame privacy
+/// really is conceded. When no frame-pointer cell was altered, privacy survives
+/// the fold and the VM-stack assumption can still be discharged — conceding it
+/// unconditionally kept 115 CFG-complete entries out of the proven tier.
+fn fold_hid_frame_pointer<'s>(
+    before: impl Iterator<Item = &'s SymbolicVmInitialState>,
+    after: &SymbolicVmInitialState,
+) -> bool {
+    before.into_iter().any(|state| {
+        state.memory_values.iter().any(|(address, value)| {
+            crate::semantic_exec::is_frame_pointer_value(value)
+                && !after
+                    .memory_values
+                    .iter()
+                    .any(|(kept, held)| kept == address && held == value)
+        })
+    })
+}
+
 /// Outcome of generalizing a re-entry against a block's accumulated states.
 enum GeneralizeAcross {
     /// The running over-approximation already covers this re-entry: it closes.
     Closed,
-    /// Continue exploring from this broadened state.
-    Continue(SymbolicVmInitialState),
+    /// Continue exploring from this broadened state. `hid_frame_pointer` says
+    /// whether the fold discarded a frame-pointer-bearing cell.
+    Continue {
+        state: SymbolicVmInitialState,
+        hid_frame_pointer: bool,
+    },
     /// The states cannot be generalized soundly: fail closed.
     Stall,
 }
@@ -1691,6 +1730,10 @@ struct Walker<'a, 'p> {
     frame_not_private: bool,
     /// Some report let a value derived from the frame (possibly mere data) leave it.
     frame_derived_escape: bool,
+    /// Diagnostic: a report reported the frame ADDRESS escaping.
+    frame_escape_seen: bool,
+    /// Diagnostic: (frame_hi, written) of a store above the proven frame bound.
+    frame_store_past: Option<(i64, i64)>,
     /// Some report discarded tracked memory holding a frame-pointer value.
     frame_pointer_lost: bool,
 }
@@ -2558,10 +2601,15 @@ impl Walker<'_, '_> {
             return match widen_state(key, canonical, incoming) {
                 Ok(None) => GeneralizeAcross::Closed,
                 Ok(Some(widened)) => {
+                    let hid_frame_pointer =
+                        fold_hid_frame_pointer([canonical, incoming].into_iter(), &widened);
                     let bytes = self.state_bytes(&widened);
                     self.charge(bytes, key, key);
                     self.widened.insert(key, widened.clone());
-                    GeneralizeAcross::Continue(widened)
+                    GeneralizeAcross::Continue {
+                        state: widened,
+                        hid_frame_pointer,
+                    }
                 }
                 Err(_) => GeneralizeAcross::Stall,
             };
@@ -2569,10 +2617,15 @@ impl Walker<'_, '_> {
         let states = self.explored.get(&key).cloned().unwrap_or_default();
         match fold_states(key, &states, incoming) {
             Ok(widened) => {
+                let hid_frame_pointer =
+                    fold_hid_frame_pointer(states.iter().chain([incoming]), &widened);
                 let bytes = self.state_bytes(&widened);
                 self.charge(bytes, key, key);
                 self.widened.insert(key, widened.clone());
-                GeneralizeAcross::Continue(widened)
+                GeneralizeAcross::Continue {
+                    state: widened,
+                    hid_frame_pointer,
+                }
             }
             Err(_) => GeneralizeAcross::Stall,
         }
@@ -2621,8 +2674,15 @@ impl Walker<'_, '_> {
                     self.stall(key, key, "symbolic state keeps changing at this block");
                     return;
                 }
-                GeneralizeAcross::Continue(widened) => {
-                    self.frame_not_private = true;
+                GeneralizeAcross::Continue {
+                    state: widened,
+                    hid_frame_pointer,
+                } => {
+                    // Concede frame privacy only when the fold actually hid a
+                    // frame-pointer-bearing cell. Conceding on every fold cost
+                    // 115 CFG-complete entries the proven tier even though no
+                    // frame pointer had been lost (ptr_lost=false in all of them).
+                    self.frame_not_private |= hid_frame_pointer;
                     symbolic_in = widened;
                 }
             }
@@ -3309,7 +3369,24 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .remove(&VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+            return;
         }
+        // Record WHICH condition refused the discharge. These entries are already
+        // CFG-complete, so each one is a candidate for the proven tier and the
+        // blocking condition is the lever: raising N2 means discharging here, not
+        // completing more CFGs.
+        self.cfg.discharge_refusal = Some(format!(
+            "no_private_frame={} frame_not_private={} [addr_escape={} store_past={}] derived_leak={} (ptr_lost={} ptr_escape={}) nested={}",
+            self.private_frame_hi.is_none(),
+            self.frame_not_private,
+            self.frame_escape_seen,
+            self.frame_store_past
+                .map_or_else(|| "no".to_owned(), |(hi, w)| format!("hi={hi:#x}<written={w:#x}")),
+            derived_leak,
+            self.frame_pointer_lost,
+            self.frame_derived_escape,
+            self.nested_followed,
+        ));
     }
 
     fn note_frame_use(&mut self, report: &SymbolicVmExecutionReport) {
@@ -3317,6 +3394,14 @@ impl Walker<'_, '_> {
             .private_frame_hi
             .zip(report.vm_stack_store_hi)
             .is_some_and(|(frame_hi, written)| written > frame_hi);
+        // Which of the two reasons fired, for the discharge diagnostic.
+        self.frame_escape_seen |= report.vm_stack_address_escapes;
+        if past_frame {
+            self.frame_store_past = self
+                .private_frame_hi
+                .zip(report.vm_stack_store_hi)
+                .map(|(frame_hi, written)| (frame_hi, written));
+        }
         self.frame_not_private |= report.vm_stack_address_escapes || past_frame;
         self.frame_derived_escape |= report.vm_stack_derived_escapes;
         self.frame_pointer_lost |= report.vm_stack_pointer_lost;
@@ -3700,6 +3785,7 @@ pub fn recover_vm_cfg_with_observed(
             frame_cells_known,
             frame_note,
             assumptions: BTreeSet::new(),
+            discharge_refusal: None,
         },
         total_instructions: 0,
         live_bytes: 0,
@@ -3711,6 +3797,8 @@ pub fn recover_vm_cfg_with_observed(
         frame_not_private: false,
         frame_derived_escape: false,
         frame_pointer_lost: false,
+        frame_escape_seen: false,
+        frame_store_past: None,
     };
     let mut pending = vec![Item {
         bytes: 0,
@@ -3939,6 +4027,7 @@ mod tests {
                 frame_cells_known: 0,
                 frame_note: None,
                 assumptions: BTreeSet::new(),
+            discharge_refusal: None,
             },
             total_instructions: 0,
             live_bytes: 0,
@@ -3950,6 +4039,8 @@ mod tests {
             frame_not_private: false,
             frame_derived_escape: false,
             frame_pointer_lost: false,
+            frame_escape_seen: false,
+            frame_store_past: None,
         }
     }
 
@@ -3962,6 +4053,22 @@ mod tests {
         assert!(!exposes(&[0x48, 0x89, 0x04, 0x24])); // mov [rsp],rax
         assert!(!exposes(&[0x48, 0x8B, 0x44, 0x24, 0x08])); // mov rax,[rsp+8]
         assert!(!exposes(&[0x53])); // push rbx
+        // A 16-bit or narrower READ of SP yields no usable address: user-mode
+        // addresses below 64K are never mapped. VMProtect emits such junk after
+        // the VSP capture.
+        assert!(!exposes(&[0x66, 0x0F, 0xBD, 0xC4])); // bsr ax,sp
+        assert!(!exposes(&[0x66, 0x89, 0xE0])); // mov ax,sp
+        assert!(!exposes(&[0x40, 0x88, 0xE0])); // mov al,spl
+        // cmp/test write nothing, so operand 0 is a read as well: flags only.
+        // REX.R (0x44) extends the reg field, which is where r15 sits here;
+        // 0x41 is REX.B and would name r12d in r/m instead, touching no RSP.
+        assert!(!exposes(&[0x66, 0x44, 0x39, 0xFC])); // cmp sp,r15w
+        assert!(!exposes(&[0x66, 0x85, 0xE4])); // test sp,sp
+        // Still exposure: a WRITE to SP, any 32-bit read, and the full pointer.
+        assert!(exposes(&[0x66, 0x89, 0xC4])); // mov sp,ax rewrites RSP
+        assert!(exposes(&[0x89, 0xE0])); // mov eax,esp keeps 32 bits
+        assert!(exposes(&[0x44, 0x39, 0xFC])); // cmp esp,r15d keeps 32 bits
+        assert!(exposes(&[0x4C, 0x39, 0xFC])); // cmp rsp,r15 is the full pointer
     }
 
     /// The assumption is discharged only for a private, un-leaked, in-frame,
@@ -4680,6 +4787,7 @@ mod tests {
             frame_cells_known: 0,
             frame_note: None,
             assumptions: BTreeSet::new(),
+            discharge_refusal: None,
         }
     }
 
@@ -4843,6 +4951,50 @@ mod tests {
         let (iterations, widened) = walk_loop(entry, step, 3).expect("converges");
         assert_eq!(widened, 1);
         assert_eq!(iterations, 4, "two exact unrolls, one widening, one close");
+    }
+
+    #[test]
+    fn folding_concedes_frame_privacy_only_when_it_hides_a_frame_pointer() {
+        let w = BitWidth::W64;
+        let addr = |n: u64| Expr::constant(w, n);
+        // A frame POINTER: vsp_initial occurs outside an untracked load's args.
+        let pointer = Expr::register(w, "vsp_initial");
+        // Frame DATA: vsp_initial occurs only inside the load's address.
+        let data = Expr::intrinsic(w, "memory_load_epoch_0", vec![pointer.clone()]);
+        assert!(crate::semantic_exec::is_frame_pointer_value(&pointer));
+        assert!(!crate::semantic_exec::is_frame_pointer_value(&data));
+
+        let state = |cells: Vec<(Expr, Expr)>| SymbolicVmInitialState {
+            memory_values: cells,
+            ..SymbolicVmInitialState::default()
+        };
+
+        // Pointer cell survives the fold unchanged: privacy is NOT conceded.
+        let before = state(vec![(addr(0x10), pointer.clone())]);
+        let after = state(vec![(addr(0x10), pointer.clone())]);
+        assert!(!fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell DROPPED by the fold: privacy IS conceded.
+        let after = state(vec![]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell BROADENED to an unknown: privacy IS conceded.
+        let after = state(vec![(addr(0x10), Expr::register(w, "havoc_1"))]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell kept, but re-homed to another address: conceded.
+        let after = state(vec![(addr(0x18), pointer.clone())]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Only a NON-pointer cell is dropped: privacy survives.
+        let before = state(vec![(addr(0x10), data.clone()), (addr(0x18), pointer.clone())]);
+        let after = state(vec![(addr(0x18), pointer)]);
+        assert!(!fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // A pointer in ANY pre-fold state counts, not just the first.
+        let other = state(vec![(addr(0x20), Expr::register(w, "vsp_initial"))]);
+        let after = state(vec![]);
+        assert!(fold_hid_frame_pointer([&other].into_iter(), &after));
     }
 
     #[test]
