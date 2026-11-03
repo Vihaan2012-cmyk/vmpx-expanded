@@ -131,6 +131,13 @@ impl Default for VmCfgLimits {
             domain: SymbolicDomainLimits::default(),
             max_blocks: 512,
             max_visits: 4_096,
+            // Do NOT raise. Unlike the transition and nesting caps, this one is
+            // load-bearing: `visited` already counts DISTINCT states (an exact
+            // repeat returns early), so a larger bound buys real exploration at
+            // real cost. Measured 16 -> 64: sweep 254s -> 627s, WallClock stops
+            // 12 -> 28, and N1 FELL 449 -> 442 as entries timed out against the
+            // per-entry wall clock. 16 converges via `generalize_across` sooner
+            // and wins.
             max_visits_per_block: 16,
             max_total_instructions: 200_000,
             max_targets: 16,
