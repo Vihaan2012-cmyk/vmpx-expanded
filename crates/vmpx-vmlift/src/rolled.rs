@@ -354,17 +354,22 @@ impl Walker<'_, '_> {
         .map_err(|e| format!("block {key} symbolic execution failed: {e}"))?;
         // Four different causes wore one message, which hid which of them is
         // worth building for. Named separately so the census can rank them.
+        // A memory havoc is a notification that address precision was lost, not
+        // an effect in itself: `SymbolicMemoryHavoc` carries only an instruction
+        // index and a cause. Loads after one come back as opaque
+        // `memory_load_epoch_N` intrinsics, which the decompiler already renders
+        // as a load, so the tree can carry them honestly.
+        //
+        // `memory_tainted` is NOT in the same class and still refuses: it means
+        // precise pre-store memory was DISCARDED, including VM-stack cells, and
+        // those are where the VIP and operands live.
         if !report.native_calls.is_empty()
             || !report.fresh_allocations.is_empty()
             || report.memory_tainted
-            || !report.memory_havocs.is_empty()
         {
             let mut causes = Vec::new();
             if !report.native_calls.is_empty() {
                 causes.push(format!("{} native call(s)", report.native_calls.len()));
-            }
-            if !report.memory_havocs.is_empty() {
-                causes.push(format!("{} memory havoc(s)", report.memory_havocs.len()));
             }
             if report.memory_tainted {
                 causes.push("memory tainted".to_owned());
@@ -391,15 +396,18 @@ impl Walker<'_, '_> {
                     value: w.value.clone(),
                     width: w.value.width,
                 }),
-                None => {
-                    return Err(format!(
-                        "block {key} stores to an address that is not a vsp offset: {}",
-                        format!("{:?}", w.address.simplify())
-                            .chars()
-                            .take(130)
-                            .collect::<String>()
-                    ));
-                }
+                // Not placeable against the dead frame, so it cannot be proven
+                // unobservable — and the conservative action for a store you
+                // cannot prove dead is to PERFORM it, not to refuse. Dropping it
+                // would change behaviour; emitting it is faithful whatever the
+                // address turns out to be. A constant address is a global, a
+                // register one an argument pointer, an intrinsic one a loaded
+                // pointer; all three are expressible.
+                None => escaping.push(RStore {
+                    address: w.address.clone(),
+                    value: w.value.clone(),
+                    width: w.value.width,
+                }),
             }
         }
         Ok((report, exit, escaping))
