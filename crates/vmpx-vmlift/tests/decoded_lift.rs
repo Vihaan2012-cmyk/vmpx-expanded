@@ -151,13 +151,48 @@ fn a_gs_load_lifts_as_a_passthrough_environment_boundary() {
 }
 
 #[test]
+fn a_timestamp_counter_lifts_as_a_passthrough_environment_boundary() {
+    let mut frame: Vec<_> = X64NativeRegister::ALL[1..]
+        .iter()
+        .map(|r| register_cell(*r))
+        .collect();
+    frame.push(NativeFrameSource::Rflags);
+    // The handler pushes the 64-bit counter, so its VSP delta is -8.
+    let stream = [instruction(
+        VmHandlerSemantic::ReadTimestampCounter,
+        None,
+        Some(-8),
+    )];
+    let lifted = lift(&stream, &frame).expect("rdtsc lifts by passthrough");
+    assert!(
+        lifted
+            .replacement
+            .function
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Rdtsc { .. })),
+        "the lift must re-emit a real rdtsc"
+    );
+    // Two reads of the counter are not the same value, so it can never be a
+    // proven value — only a trusted boundary.
+    assert!(
+        lifted
+            .replacement
+            .environment_boundaries
+            .contains("read_timestamp_counter_0")
+    );
+}
+
+#[test]
 fn an_unliftable_semantic_stops_the_lift_at_its_index() {
     let frame = [NativeFrameSource::Rflags];
     // UnsignedDivide is no longer here: it now lowers by re-emitting a real
-    // `div` (see `expr_codegen`).
+    // `div` (see `expr_codegen`). ReadTimestampCounter is no longer here for the
+    // same reason — it re-emits a real `rdtsc`, which was the largest single
+    // blocker on devirtualized output for systems.xpl (146 of 462 CFG-complete
+    // entries); see `a_timestamp_counter_lifts_as_a_passthrough` below.
     for semantic in [
         VmHandlerSemantic::TableChecksum,
-        VmHandlerSemantic::ReadTimestampCounter,
         VmHandlerSemantic::ConditionalBranch,
         VmHandlerSemantic::Xor,
     ] {

@@ -78,6 +78,7 @@ fn cfg(blocks: Vec<(Va, VmBasicBlock)>, edges: Vec<CfgEdge>, entry: u64) -> VmCf
         blocks: blocks.into_iter().collect(),
         edges,
         stalls: Vec::new(),
+        discharge_refusal: None,
         limit_hit: None,
         visits: 0,
         frame_cells_known: 17,

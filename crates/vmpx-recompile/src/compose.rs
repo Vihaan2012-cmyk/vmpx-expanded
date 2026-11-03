@@ -341,6 +341,9 @@ impl Renamer {
                 destination: self.register(destination)?,
                 address: self.address(at)?,
             },
+            Operation::Rdtsc { out } => Operation::Rdtsc {
+                out: self.slot(out)?,
+            },
             Operation::Cpuid {
                 leaf,
                 subleaf,

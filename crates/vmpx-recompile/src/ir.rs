@@ -291,6 +291,13 @@ pub enum Operation {
         destination: VirtualRegister,
         address: Address,
     },
+    /// `RDTSC` with the 64-bit counter written to a qword frame slot. It is
+    /// register-transparent in the same sense as [`Operation::Cpuid`]: `RAX` and
+    /// `RDX` carry the counter halves and are saved and restored around the
+    /// instruction.
+    Rdtsc {
+        out: SpillSlot,
+    },
     /// `CPUID` with the dword leaf and subleaf read from frame slots and the four
     /// dword results written to frame slots. It is register-transparent: every
     /// register it touches is saved and restored around the instruction.

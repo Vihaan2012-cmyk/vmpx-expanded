@@ -69,12 +69,17 @@ pub fn semantic_lowering(semantic: VmHandlerSemantic) -> SemanticLowering {
         | S::RotateRight
         | S::MemoryLoad
         | S::MemoryStore => L::Computed,
-        S::Cpuid | S::GsRelativeLoad => L::Passthrough { boundary: true },
+        // rdtsc joins cpuid and the gs load: the executor cannot compute it, so it
+        // names it with an opaque intrinsic and the replacement re-emits the real
+        // instruction. Behaviour-preserving by identity, and a trusted
+        // environment boundary rather than a proven value.
+        S::Cpuid | S::GsRelativeLoad | S::ReadTimestampCounter => {
+            L::Passthrough { boundary: true }
+        }
         S::ShiftLeftDouble | S::ShiftRightDouble | S::PopFlags => {
             L::Passthrough { boundary: false }
         }
         S::VmExit => L::BlockExit,
-        S::ReadTimestampCounter => L::Refused("rdtsc has no lowering yet"),
         // Wide multiply and unsigned divide are symbolically executed to packed
         // double-width results and their flag words; `expr_codegen` lowers each by
         // re-emitting the real `mul`/`imul`/`div` (see those lowerings).

@@ -1088,6 +1088,7 @@ impl Trust {
 pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
     match operation {
         Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot.0],
+        Operation::Rdtsc { out } => vec![out.0],
         Operation::Cpuid {
             leaf,
             subleaf,
@@ -1128,6 +1129,7 @@ pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
 fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
     match operation {
         Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot],
+        Operation::Rdtsc { out } => vec![out],
         Operation::Cpuid {
             leaf,
             subleaf,
@@ -1163,6 +1165,8 @@ fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>)
     };
     match *operation {
         Operation::Label(label) => Operation::Label(label),
+        // Register-transparent, so the virtual-register remap passes it through.
+        Operation::Rdtsc { out } => Operation::Rdtsc { out },
         Operation::MoveImmediate { destination, value } => Operation::MoveImmediate {
             destination: register(destination),
             value,

@@ -69,6 +69,9 @@ pub(crate) fn operation_register_accesses(
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        // Register-transparent: saves and restores every register it touches,
+        // so it reads and writes no virtual register.
+        | Operation::Rdtsc { .. }
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
@@ -305,6 +308,7 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        | Operation::Rdtsc { .. }
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
@@ -417,6 +421,11 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
                     }
                 })?;
                 state.insert(*slot, stored_bytes);
+            }
+            Operation::Rdtsc { out } => {
+                // Writes the whole qword; reads nothing.
+                let existing = state.get(out).copied().unwrap_or(0);
+                state.insert(*out, existing.max(8));
             }
             Operation::Cpuid {
                 leaf,
@@ -742,6 +751,9 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
         match operation {
             Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
                 let _ = spill_displacement(&function.frame, *slot)?;
+            }
+            Operation::Rdtsc { out } => {
+                let _ = spill_displacement(&function.frame, *out)?;
             }
             Operation::Cpuid {
                 leaf,

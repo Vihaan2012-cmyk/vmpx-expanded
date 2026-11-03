@@ -247,6 +247,18 @@ impl LoweringContext<'_> {
                     self.release_slot();
                 }
             }
+            Passthrough::Rdtsc => {
+                if !arguments.is_empty() || expression.width != BitWidth::W64 {
+                    return Err(malformed(name, "rdtsc takes no operands and yields 64 bits"));
+                }
+                let out = self.allocate_slot()?;
+                self.operations.push(Operation::Rdtsc { out });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(BitWidth::W64),
+                    slot: out,
+                });
+                self.release_slot();
+            }
             Passthrough::GsLoad => {
                 let [pointer] = arguments else {
                     return Err(malformed(name, "a gs load takes one pointer"));

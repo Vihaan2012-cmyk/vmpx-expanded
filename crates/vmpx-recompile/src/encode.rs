@@ -406,6 +406,24 @@ fn emit_double_shift(
 
 /// Emits `CPUID` without disturbing any general register. The four registers it
 /// uses are saved first, so the slot displacements are rebased by their size.
+/// Emits `RDTSC` and stores the 64-bit counter into `out`, without disturbing
+/// any general register. `RDTSC` writes `EDX:EAX`, so both are saved first and
+/// the slot displacement is rebased by the sixteen saved bytes. Writing a 32-bit
+/// register zero-extends it, so the two halves recompose exactly with a shift
+/// and an or — which is the same 64-bit value the symbolic executor models as
+/// `read_timestamp_counter_N`.
+fn emit_rdtsc(assembler: &mut CodeAssembler, out: i32) -> Result<(), iced_x86::IcedError> {
+    const SAVED: i32 = 16;
+    assembler.push(rax)?;
+    assembler.push(rdx)?;
+    assembler.rdtsc()?;
+    assembler.shl(rdx, 32i32)?;
+    assembler.or(rax, rdx)?;
+    assembler.mov(qword_ptr(rsp + (out + SAVED)), rax)?;
+    assembler.pop(rdx)?;
+    assembler.pop(rax)
+}
+
 fn emit_cpuid(
     assembler: &mut CodeAssembler,
     leaf: i32,
@@ -1191,6 +1209,12 @@ pub fn compile(
                 let base = assigned_qword(&validated, memory.base)?;
                 append_assembled(&mut output, address, operation_index, |assembler| {
                     emit_gs_load(assembler, destination, base, memory.displacement)
+                })?;
+            }
+            Operation::Rdtsc { out } => {
+                let out = spill_displacement(&function.frame, *out)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_rdtsc(assembler, out)
                 })?;
             }
             Operation::Cpuid {

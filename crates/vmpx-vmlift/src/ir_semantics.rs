@@ -415,6 +415,21 @@ impl Machine<'_> {
                 self.flags = FlagState::Known(v.clone());
                 self.rflags = Some(v);
             }
+            Operation::Rdtsc { out } => {
+                // The counter is opaque and differs on every execution, so the
+                // read-back value is an intrinsic, exactly as the executor's
+                // `read_timestamp_counter_N` is. Two reads are NOT the same
+                // value, which is why this is also a side effect below.
+                let value = Expr::intrinsic(BitWidth::W64, "x86_rdtsc", Vec::new());
+                self.slots.insert(
+                    out.0,
+                    Slot {
+                        width: BitWidth::W64,
+                        value,
+                        narrow: None,
+                    },
+                );
+            }
             Operation::Cpuid {
                 leaf,
                 subleaf,
@@ -844,6 +859,7 @@ fn volatile_indices(function: &Function) -> std::collections::BTreeSet<usize> {
                     | Operation::GsLoad { .. }
                     | Operation::Call { .. }
                     | Operation::RestoreFlags { .. }
+                    | Operation::Rdtsc { .. }
                     | Operation::Cpuid { .. }
                     | Operation::MultiplyFlags { .. }
                     | Operation::UnsignedDivide { .. }
