@@ -1586,8 +1586,27 @@ enum GeneralizeAcross {
         state: SymbolicVmInitialState,
         hid_frame_pointer: bool,
     },
-    /// The states cannot be generalized soundly: fail closed.
-    Stall,
+    /// The states cannot be generalized soundly: fail closed, carrying the
+    /// refusal reason so the census can tell a drifting VM stack pointer apart
+    /// from every other reason a fold is refused.
+    Stall(String),
+}
+
+/// Appends the VSP difference to a fold refusal, as a constant delta when the
+/// two stack pointers differ by one, else as the two expressions.
+fn with_vsp_drift(
+    reason: String,
+    a: &SymbolicVmInitialState,
+    b: &SymbolicVmInitialState,
+) -> String {
+    if a.vsp == b.vsp {
+        return reason;
+    }
+    let shown = |e: &Expr| format!("{e:?}").chars().take(160).collect::<String>();
+    match constant_vsp_delta(&a.vsp, &b.vsp) {
+        Some(delta) => format!("{reason} (constant vsp delta {delta:#x})"),
+        None => format!("{reason} (vsp {} vs {})", shown(&a.vsp), shown(&b.vsp)),
+    }
 }
 
 /// Decides how a block re-entered while already on the path proceeds.
@@ -2611,7 +2630,7 @@ impl Walker<'_, '_> {
                         hid_frame_pointer,
                     }
                 }
-                Err(_) => GeneralizeAcross::Stall,
+                Err(reason) => GeneralizeAcross::Stall(with_vsp_drift(reason, canonical, incoming)),
             };
         }
         let states = self.explored.get(&key).cloned().unwrap_or_default();
@@ -2627,7 +2646,12 @@ impl Walker<'_, '_> {
                     hid_frame_pointer,
                 }
             }
-            Err(_) => GeneralizeAcross::Stall,
+            Err(reason) => {
+                let drift = states.iter().find(|state| state.vsp != incoming.vsp);
+                GeneralizeAcross::Stall(drift.map_or(reason.clone(), |state| {
+                    with_vsp_drift(reason, state, incoming)
+                }))
+            }
         }
     }
 
@@ -2664,14 +2688,18 @@ impl Walker<'_, '_> {
             // even the generalization keeps broadening.
             if visited >= self.limits.max_visits_per_block.saturating_mul(2) {
                 self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
-                self.stall(key, key, "symbolic state keeps changing at this block");
+                self.stall(key, key, "symbolic state keeps changing at this block: ceiling");
                 return;
             }
             match self.generalize_across(key, &symbolic_in) {
                 GeneralizeAcross::Closed => return,
-                GeneralizeAcross::Stall => {
+                GeneralizeAcross::Stall(reason) => {
                     self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
-                    self.stall(key, key, "symbolic state keeps changing at this block");
+                    self.stall(
+                        key,
+                        key,
+                        format!("symbolic state keeps changing at this block: {reason}"),
+                    );
                     return;
                 }
                 GeneralizeAcross::Continue {
@@ -5216,7 +5244,13 @@ mod tests {
         // a block whose re-entries move it cannot be folded and fails closed.
         let states = [loop_state(0, w64(0))];
         let incoming = loop_state(8, w64(0));
-        assert!(fold_states(Va(0x1000), &states, &incoming).is_err());
+        let refusal = fold_states(Va(0x1000), &states, &incoming).expect_err("moves the VSP");
+        assert!(refusal.contains("stack pointer"), "{refusal}");
+        // The census needs the drift itself, not just the refusal: one VM stack
+        // cell of constant stride is a different lever from an unbounded VSP.
+        assert!(
+            with_vsp_drift(refusal, &states[0], &incoming).contains("constant vsp delta 0x8")
+        );
     }
 
     fn byte_cell_state(cell: Expr) -> SymbolicVmInitialState {

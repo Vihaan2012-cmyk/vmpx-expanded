@@ -630,6 +630,15 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
     let discovery = discover_vm_entries(&pe, VmDiscoveryLimits::default())?;
     let mut entries = discovery.entries.clone();
     let discovered = entries.len();
+    // Diagnostic: restrict the sweep to these entry RVAs (comma-separated hex), so
+    // one suspect entry re-runs in a minute instead of a whole sweep.
+    if let Ok(only) = std::env::var("VMPX_ONLY_ENTRIES") {
+        let keep: Vec<u32> = only
+            .split(',')
+            .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        entries.retain(|entry| keep.contains(&entry.rva.0));
+    }
     let sampled = opts.sample > 0 && entries.len() > opts.sample;
     if sampled {
         entries.truncate(opts.sample);
