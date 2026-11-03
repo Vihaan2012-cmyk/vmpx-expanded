@@ -1618,7 +1618,16 @@ struct Walker<'a, 'p> {
     config: crate::HandlerCodecRecoveryConfig,
     global_table: Option<crate::GlobalTableBase>,
     profile: crate::VmProfile,
+    /// Total nested entries followed. Load-bearing for soundness, NOT just the
+    /// cap: `discharge_vm_stack_assumption` only drops the external-store
+    /// assumption when this is 0, so it must keep counting every following.
     nested_followed: usize,
+    /// DISTINCT nested entry stubs followed. The cap bounds these rather than
+    /// the total, because sibling paths and loop unrolls re-enter the SAME stub
+    /// and were spending the budget on repeated work instead of on reaching new
+    /// nested entries. Bounded as before by the entry-global visit/instruction
+    /// caps and the hard per-entry memory cap, each of which fails closed.
+    nested_sites: BTreeSet<Rva>,
     current: Option<Rc<PathNode>>,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
@@ -3175,7 +3184,9 @@ impl Walker<'_, '_> {
             return;
         };
         let at = candidate.rva;
-        if self.nested_followed >= self.limits.max_nested_entries {
+        if !self.nested_sites.contains(&at)
+            && self.nested_sites.len() >= self.limits.max_nested_entries
+        {
             self.stall(
                 key,
                 vip,
@@ -3259,6 +3270,7 @@ impl Walker<'_, '_> {
             }
         };
         self.nested_followed += 1;
+        self.nested_sites.insert(at);
         self.add_edge(CfgEdge {
             from: key,
             to: setup.first_state.vip,
@@ -3659,6 +3671,7 @@ pub fn recover_vm_cfg_with_observed(
         global_table: bootstrap_global_table(&setup.bootstrap),
         profile: setup.profile,
         nested_followed: 0,
+        nested_sites: BTreeSet::new(),
         current: None,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
@@ -3897,6 +3910,7 @@ mod tests {
             global_table: None,
             profile: base,
             nested_followed: 0,
+            nested_sites: BTreeSet::new(),
             current: None,
             direction: base.bytecode_direction,
             section: Some(0),
