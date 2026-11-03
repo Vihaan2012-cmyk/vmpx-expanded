@@ -191,8 +191,11 @@ fn an_unliftable_semantic_stops_the_lift_at_its_index() {
     // same reason — it re-emits a real `rdtsc`, which was the largest single
     // blocker on devirtualized output for systems.xpl (146 of 462 CFG-complete
     // entries); see `a_timestamp_counter_lifts_as_a_passthrough` below.
+    // TableChecksum is no longer here either: the executor folds it concretely
+    // from the image, so it lowers as Computed. Without its recovered metadata
+    // it still fails, just as a symbolic-execution error rather than a lowering
+    // refusal — fail-closed either way.
     for semantic in [
-        VmHandlerSemantic::TableChecksum,
         VmHandlerSemantic::ConditionalBranch,
         VmHandlerSemantic::Xor,
     ] {

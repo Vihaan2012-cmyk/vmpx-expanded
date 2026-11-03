@@ -315,7 +315,21 @@ impl Walker<'_, '_> {
         for w in &report.external_writes {
             match vsp_offset(&w.address) {
                 Some(off) if off + i64::from(w.value.width.bytes()) <= entry_sp => {}
-                _ => return Err(format!("block {key} stores outside the VM's dead frame")),
+                other => {
+                    // Say WHICH it is: an offset that resolved but sits above the
+                    // frame is a correct refusal, while an address this matcher
+                    // simply cannot read is a gap in the matcher.
+                    let detail = match other {
+                        Some(off) => format!("offset {off} + {} > entry_sp {entry_sp}", w.value.width.bytes()),
+                        None => format!(
+                            "address not read as a vsp offset: {}",
+                            format!("{:?}", w.address.simplify()).chars().take(130).collect::<String>()
+                        ),
+                    };
+                    return Err(format!(
+                        "block {key} stores outside the VM's dead frame ({detail})"
+                    ));
+                }
             }
         }
         Ok((report, block.exit))

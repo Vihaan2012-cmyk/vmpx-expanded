@@ -227,6 +227,10 @@ pub(crate) fn lift_entry(
 
     let limits = VmCfgLimits {
         entry: entry_limits,
+        // Parity with `report`: without this the two tools build DIFFERENT
+        // graphs, and an entry `report --all` counts CFG-complete is refused
+        // here as "the CFG is incomplete". Measured: 131 of 462.
+        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
         ..VmCfgLimits::default()
     };
     let cfg = recover_vm_cfg_with_observed(pe, &candidate, limits, &observed)
@@ -345,6 +349,10 @@ pub(crate) fn with_entry_input<R>(
     .map_err(|error| format!("entry frame not recovered: {error}"))?;
     let limits = VmCfgLimits {
         entry: entry_limits,
+        // Parity with `report`: without this the two tools build DIFFERENT
+        // graphs, and an entry `report --all` counts CFG-complete is refused
+        // here as "the CFG is incomplete". Measured: 131 of 462.
+        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
         ..VmCfgLimits::default()
     };
     let observed = ObservedRun::default();
