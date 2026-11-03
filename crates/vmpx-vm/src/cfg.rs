@@ -50,8 +50,25 @@ use crate::{
 /// several concurrent entries stay well inside a 10 GB machine.
 const DEFAULT_MAX_MEMORY_BYTES: usize = 1536 * 1024 * 1024;
 
-/// Default per-entry wall-clock budget; bounds stragglers, never a finished entry.
-pub const DEFAULT_MAX_WALL_TIME: Duration = Duration::from_secs(60);
+/// Default per-entry wall-clock budget. This is a safety net for a pathological
+/// entry, not an exploration cap — but at 60s it was acting as one. Measured on
+/// systems.xpl (814 entries, `--all --serve-ro`, 24 threads), varying ONLY this:
+///
+/// | budget | N1 | WallClock stops | sweep |
+/// |--------|-----|-----|-------|
+/// | 60s    | 448 | 62  | 430s  |
+/// | 150s   | 452 | 22  | 661s  |
+/// | 400s   | 460 | 0   | 684s  |
+///
+/// So 60s was refusing 12 entries that do finish, and at 400s no entry is
+/// time-bound at all: the net has stopped deciding anything, which is where a
+/// timeout belongs. The sweep cost only 1.6x (not 6.7x) because the extra time
+/// is spent by a handful of entries. A lower budget only ever stops an entry
+/// sooner, recorded as `WallClock`, i.e. incomplete — so this is
+/// soundness-neutral in both directions. `VMPX_WALL_SECS` overrides it.
+/// N2 is unaffected: on the sound path every incomplete entry stops at a stall,
+/// none at the clock.
+pub const DEFAULT_MAX_WALL_TIME: Duration = Duration::from_secs(400);
 
 /// Over-estimate of the bytes one distinct hash-consed `Expr` node costs: the
 /// node, its `Arc` header, the interner's weak slot and bucket, and allocator
