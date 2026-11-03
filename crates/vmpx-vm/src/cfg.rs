@@ -1411,6 +1411,94 @@ fn widen_state(
     }))
 }
 
+/// `expr` rebuilt in a canonical affine form: its non-constant terms in a stable
+/// order, each with its coefficient, then one folded constant.
+///
+/// `VMProtect` writes the same stack address as `((base + a) - b) + c` in one
+/// block and `base + c'` in another. Those are semantically identical and
+/// structurally different, and `simplify` does not reassociate them —
+/// [`affine_vsp_parts`] exists precisely because it does not. Every state
+/// comparison in this module is structural (`Expr` is hash-consed, so `==` is a
+/// pointer test), so without this the same address in two forms reads as two
+/// different addresses and no fold, widen or back edge can see through it.
+///
+/// Semantics are preserved exactly: the result is the same wrapping sum of the
+/// same terms at the same width, just written one way. Anything that is not a
+/// pure Add/Sub/Neg/Const chain stays an opaque term with coefficient +-1, so a
+/// non-affine expression is returned unchanged rather than approximated. Any
+/// rebuild failure also returns the original.
+fn canonical_affine(expr: &Expr) -> Expr {
+    fn collect(expr: &Expr, positive: bool, terms: &mut Vec<(Expr, i64)>, constant: &mut u64) {
+        match &expr.kind {
+            ExprKind::Binary { op: BinaryOp::Add, left, right } => {
+                collect(left, positive, terms, constant);
+                collect(right, positive, terms, constant);
+            }
+            ExprKind::Binary { op: BinaryOp::Sub, left, right } => {
+                collect(left, positive, terms, constant);
+                collect(right, !positive, terms, constant);
+            }
+            ExprKind::Unary { op: UnaryOp::Neg, value } => collect(value, !positive, terms, constant),
+            ExprKind::Const { value } => {
+                *constant = if positive {
+                    constant.wrapping_add(*value)
+                } else {
+                    constant.wrapping_sub(*value)
+                };
+            }
+            _ => {
+                let step = if positive { 1 } else { -1 };
+                match terms.iter_mut().find(|(held, _)| held == expr) {
+                    Some((_, coefficient)) => *coefficient += step,
+                    None => terms.push((expr.clone(), step)),
+                }
+            }
+        }
+    }
+
+    let width = expr.width;
+    let mut terms: Vec<(Expr, i64)> = Vec::new();
+    let mut constant = 0_u64;
+    collect(&expr.simplify(), true, &mut terms, &mut constant);
+    terms.retain(|(_, coefficient)| *coefficient != 0);
+    // A stable order independent of how the expression was written. Debug text is
+    // what `affine_vsp_parts` already keys on, so the two agree on ordering.
+    terms.sort_by_cached_key(|(term, _)| format!("{term:?}"));
+
+    let mut accumulated: Option<Expr> = None;
+    for (term, coefficient) in terms {
+        let scaled = match coefficient {
+            1 => term,
+            -1 => Expr::unary(UnaryOp::Neg, term),
+            other => {
+                let Ok(scaled) = Expr::binary(
+                    BinaryOp::Mul,
+                    term,
+                    Expr::constant(width, other as u64),
+                ) else {
+                    return expr.clone();
+                };
+                scaled
+            }
+        };
+        accumulated = Some(match accumulated {
+            None => scaled,
+            Some(sum) => {
+                let Ok(sum) = Expr::binary(BinaryOp::Add, sum, scaled) else {
+                    return expr.clone();
+                };
+                sum
+            }
+        });
+    }
+    match (accumulated, constant) {
+        (None, constant) => Expr::constant(width, constant),
+        (Some(sum), 0) => sum,
+        (Some(sum), constant) => Expr::binary(BinaryOp::Add, sum, Expr::constant(width, constant))
+            .unwrap_or_else(|_| expr.clone()),
+    }
+}
+
 /// Flattens an affine VSP expression into its non-constant terms (keyed by
 /// stable debug text, carrying a signed coefficient) and the summed constant
 /// offset. Add/Sub/Neg are walked with sign so the `((base + a) - b) + c`
@@ -1654,38 +1742,54 @@ enum GeneralizeAcross {
 /// self-validating for the same reason: if the VSP is not rooted at
 /// `vsp_initial`, the substitution leaves it alone and the equality simply fails.
 fn closes_under_vm_stack_shift(
+    key: Va,
     ancestor: &SymbolicVmInitialState,
     reentry: &SymbolicVmInitialState,
 ) -> bool {
-    shift_ancestor_onto_reentry(ancestor, reentry)
-        .is_some_and(|shifted| simplified(&shifted) == simplified(reentry))
+    // Coverage, not equality, and by the SAME test the non-shifted case at the
+    // top of `loop_step` uses: `widen_state(..) == Ok(None)` is this module's own
+    // "the enclosing state already covers this re-entry". Equality was too
+    // strict — measured, the shifted ancestor's flags are often already a
+    // `loop_havoc_*` TOP from an earlier generalization while the re-entry
+    // carries a precise value, and TOP covers precise. Everything new here is
+    // the shift; the soundness notion is unchanged.
+    shift_ancestor_onto_reentry(ancestor, reentry).is_some_and(|shifted| {
+        matches!(
+            widen_state(key, &canonicalized(&shifted), &canonicalized(reentry)),
+            Ok(None)
+        )
+    })
 }
 
-/// Every expression in `state` put through `simplify`. Substituting the stack
-/// base for `base + delta` leaves nested sums like `((base + delta) + c)` that
-/// are semantically the re-entry's `base + c'` but not structurally equal to it,
-/// and structural equality is all `==` on a state can do. Interning makes the
-/// simplified forms share, so comparing them is still a pointer walk.
-fn simplified(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
+/// Every expression in `state` put through [`canonical_affine`]. Substituting the
+/// stack base for `base + delta` leaves nested sums like `((base + delta) + c)`
+/// that are semantically the re-entry's `base + c'` but not structurally equal to
+/// it, and structural equality is all `==` on a state can do. Memory cells are
+/// also sorted, because two states holding the same cells in a different order
+/// are the same state. Interning makes the canonical forms share, so comparing
+/// them is still a pointer test.
+fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
+    let mut memory_values: Vec<(Expr, Expr)> = state
+        .memory_values
+        .iter()
+        .map(|(address, value)| (canonical_affine(address), canonical_affine(value)))
+        .collect();
+    memory_values.sort_by_cached_key(|(address, _)| format!("{address:?}"));
     SymbolicVmInitialState {
-        vsp: state.vsp.simplify(),
-        flags: state.flags.simplify(),
+        vsp: canonical_affine(&state.vsp),
+        flags: canonical_affine(&state.flags),
         context_values: state
             .context_values
             .iter()
-            .map(|(slot, value)| (*slot, value.simplify()))
+            .map(|(slot, value)| (*slot, canonical_affine(value)))
             .collect(),
-        memory_values: state
-            .memory_values
-            .iter()
-            .map(|(address, value)| (address.simplify(), value.simplify()))
-            .collect(),
+        memory_values,
         fresh_allocations: state
             .fresh_allocations
             .iter()
             .map(|allocation| crate::semantic_exec::SymbolicFreshAllocation {
-                allocation: allocation.allocation.simplify(),
-                size: allocation.size.simplify(),
+                allocation: canonical_affine(&allocation.allocation),
+                size: canonical_affine(&allocation.size),
                 zero_initialized: allocation.zero_initialized,
             })
             .collect(),
@@ -1693,32 +1797,107 @@ fn simplified(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
     }
 }
 
-/// `ancestor` with its VM stack base advanced by the constant stride that
-/// separates it from `reentry`, or `None` when there is no single such base.
+/// Adds `delta` to every stack-relative expression in `expr`: any subexpression
+/// whose affine decomposition carries exactly `base_terms` as its non-constant
+/// part is `base + k`, so it becomes `base + k + delta`.
 ///
-/// The base is whichever register the VSP is built from — NOT necessarily
-/// `vsp_initial`. Measured: on all 90 refusals of the eight sampled entries the
-/// VSP is rooted elsewhere (a cross-profile transition re-homes it), so
-/// hardcoding `vsp_initial` made this test refuse everything. The VSP must
-/// depend on exactly ONE register for the shift to be well defined; a VSP built
-/// from two unknowns has no single base to advance and is refused.
+/// The shift CANNOT be done by substituting the base register. `VMProtect` builds
+/// the VM stack pointer out of obfuscated bitwise arithmetic — measured on these
+/// entries it is `Add(Not(Or(..)), k)` — so the base is one opaque term with the
+/// register buried inside it. Substituting the register rewrites the inside of
+/// that term and produces a term the re-entry never had; the whole opaque term
+/// has to move as a unit instead.
+///
+/// Top-down deliberately: a node that matches has its constant shifted and is
+/// NOT descended into, because its own base term must stay byte-identical.
+/// Descending as well would shift the base inside it and then shift the sum
+/// again, for 2*delta. Nodes that do not match are rebuilt from shifted
+/// children, so a stack address nested inside a load still moves.
+fn shift_stack_relative(expr: &Expr, base_terms: &BTreeMap<String, i64>, delta: u64) -> Expr {
+    let (terms, constant) = affine_vsp_parts(expr);
+    if !terms.is_empty() && terms == *base_terms {
+        let shifted = constant.wrapping_add(delta);
+        // Rebuild as (expr - constant) + shifted, which is the same sum with one
+        // different constant, without touching the opaque base term.
+        let base = Expr::binary(
+            BinaryOp::Sub,
+            expr.clone(),
+            Expr::constant(expr.width, constant),
+        );
+        if let Ok(base) = base
+            && let Ok(result) = Expr::binary(
+                BinaryOp::Add,
+                base,
+                Expr::constant(expr.width, shifted),
+            )
+        {
+            return result;
+        }
+        return expr.clone();
+    }
+    let rebuilt = match &expr.kind {
+        ExprKind::Binary { op, left, right } => Expr::binary(
+            *op,
+            shift_stack_relative(left, base_terms, delta),
+            shift_stack_relative(right, base_terms, delta),
+        )
+        .ok(),
+        ExprKind::Unary { op, value } => {
+            Some(Expr::unary(*op, shift_stack_relative(value, base_terms, delta)))
+        }
+        ExprKind::Load { address } => Some(Expr::load(
+            expr.width,
+            shift_stack_relative(address, base_terms, delta),
+        )),
+        ExprKind::Intrinsic { name, arguments } => Some(Expr::intrinsic(
+            expr.width,
+            name.clone(),
+            arguments
+                .iter()
+                .map(|argument| shift_stack_relative(argument, base_terms, delta))
+                .collect::<Vec<_>>(),
+        )),
+        _ => None,
+    };
+    rebuilt.unwrap_or_else(|| expr.clone())
+}
+
+/// `ancestor` with its whole VM stack advanced by the constant stride that
+/// separates it from `reentry`, or `None` when there is no such stride.
 fn shift_ancestor_onto_reentry(
     ancestor: &SymbolicVmInitialState,
     reentry: &SymbolicVmInitialState,
 ) -> Option<SymbolicVmInitialState> {
     let delta = constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0)?;
-    let bases = ancestor.vsp.dependencies();
-    let [base] = &bases.iter().collect::<Vec<_>>()[..] else {
+    let (base_terms, _) = affine_vsp_parts(&ancestor.vsp);
+    if base_terms.is_empty() {
         return None;
-    };
-    let shifted_base = Expr::binary(
-        BinaryOp::Add,
-        Expr::register(ancestor.vsp.width, (*base).clone()),
-        Expr::constant(ancestor.vsp.width, delta),
-    )
-    .ok()?;
-    let replacements = BTreeMap::from([((*base).clone(), shifted_base)]);
-    ancestor.substitute(&replacements).ok()
+    }
+    let shift = |expr: &Expr| shift_stack_relative(expr, &base_terms, delta);
+    Some(SymbolicVmInitialState {
+        vsp: shift(&ancestor.vsp),
+        flags: shift(&ancestor.flags),
+        context_values: ancestor
+            .context_values
+            .iter()
+            .map(|(slot, value)| (*slot, shift(value)))
+            .collect(),
+        memory_values: ancestor
+            .memory_values
+            .iter()
+            .map(|(address, value)| (shift(address), shift(value)))
+            .collect(),
+        fresh_allocations: ancestor
+            .fresh_allocations
+            .iter()
+            .map(|allocation| crate::semantic_exec::SymbolicFreshAllocation {
+                allocation: shift(&allocation.allocation),
+                size: shift(&allocation.size),
+                zero_initialized: allocation.zero_initialized,
+            })
+            .collect(),
+        ..ancestor.clone()
+    })
 }
 
 /// Diagnostic: the first field in which `ancestor` shifted by its constant VM
@@ -1732,19 +1911,32 @@ fn vm_stack_shift_mismatch(
     if constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0).is_none() {
         return "no constant stride".to_owned();
     }
-    let bases = ancestor.vsp.dependencies();
-    if bases.len() != 1 {
-        return format!("vsp has {} base registers", bases.len());
+    let (base_terms, _) = affine_vsp_parts(&ancestor.vsp);
+    if base_terms.is_empty() {
+        return "vsp has no non-constant base term".to_owned();
     }
-    let Some(a) = shift_ancestor_onto_reentry(ancestor, reentry).map(|s| simplified(&s)) else {
+    let Some(a) = shift_ancestor_onto_reentry(ancestor, reentry).map(|s| canonicalized(&s)) else {
         return "substitution failed".to_owned();
     };
-    let r = &simplified(reentry);
-    if a.vsp != r.vsp {
-        return "shifted vsp still differs".to_owned();
+    let r = &canonicalized(reentry);
+    // Report what the CLOSURE test decided, not a stricter one: an exact-equality
+    // walk below names a field that coverage may well tolerate.
+    match widen_state(Va(0), &a, r) {
+        Ok(None) => return "nothing (the shift covers it)".to_owned(),
+        Err(reason) => return format!("widen refuses: {reason}"),
+        Ok(Some(_)) => {}
     }
-    if a.flags != r.flags {
-        return "flags".to_owned();
+    if a.vsp != r.vsp {
+        let shown = |e: &Expr| format!("{e:?}").chars().take(150).collect::<String>();
+        return format!(
+            "shifted vsp still differs: shifted {} vs reentry {}",
+            shown(&a.vsp),
+            shown(&r.vsp)
+        );
+    }
+    if !covers(Some(&a.flags), Some(&r.flags)) {
+        let shown = |e: &Expr| format!("{e:?}").chars().take(100).collect::<String>();
+        return format!("flags: shifted {} vs reentry {}", shown(&a.flags), shown(&r.flags));
     }
     if a.memory_epoch != r.memory_epoch {
         return format!("memory_epoch {} vs {}", a.memory_epoch, r.memory_epoch);
@@ -1771,10 +1963,10 @@ fn vm_stack_shift_mismatch(
     if let Some(slot) = a
         .context_values
         .iter()
-        .find(|(slot, value)| r.context_values.get(slot) != Some(*value))
+        .find(|(slot, value)| !covers(Some(value), r.context_values.get(slot)))
         .map(|(slot, _)| *slot)
     {
-        return format!("context cell {slot:#x}");
+        return format!("context cell {slot:#x} not covered");
     }
     if a.memory_values.len() != r.memory_values.len() {
         return format!(
@@ -1783,13 +1975,13 @@ fn vm_stack_shift_mismatch(
             r.memory_values.len()
         );
     }
-    if a.memory_values != r.memory_values {
-        let same_set = a.memory_values.iter().all(|cell| r.memory_values.contains(cell));
-        return if same_set {
-            "memory cell ORDER only".to_owned()
-        } else {
-            "a memory cell".to_owned()
-        };
+    if let Some((address, _)) = a.memory_values.iter().find(|(address, value)| {
+        !r.memory_values
+            .iter()
+            .any(|(held, got)| held == address && covers(Some(value), Some(got)))
+    }) {
+        let shown = format!("{address:?}").chars().take(90).collect::<String>();
+        return format!("memory cell not covered at {shown}");
     }
     "nothing (would have closed)".to_owned()
 }
@@ -1856,7 +2048,7 @@ fn loop_step(
     match widen_to_fixpoint(key, enclosing, reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
-        Err(reason) => bounded_unroll_or_refuse(ancestors, reentry, observed_depth, reason),
+        Err(reason) => bounded_unroll_or_refuse(key, ancestors, reentry, observed_depth, reason),
     }
 }
 
@@ -1899,6 +2091,7 @@ fn vsp_stride_note(
 /// constant, it stays the existing fail-closed refusal — no depth is ever
 /// guessed, and the sound path (no observed depth) is never reached here.
 fn bounded_unroll_or_refuse(
+    key: Va,
     ancestors: &[&SymbolicVmInitialState],
     reentry: &SymbolicVmInitialState,
     observed_depth: Option<u64>,
@@ -1911,7 +2104,7 @@ fn bounded_unroll_or_refuse(
     let refuse = |reason: String| -> LoopStep {
         if ancestors
             .iter()
-            .any(|ancestor| closes_under_vm_stack_shift(ancestor, reentry))
+            .any(|ancestor| closes_under_vm_stack_shift(key, ancestor, reentry))
         {
             return LoopStep::CloseShifted;
         }
@@ -1954,6 +2147,11 @@ struct Walker<'a, 'p> {
     /// Total nested entries followed. Load-bearing for soundness, NOT just the
     /// cap: `discharge_vm_stack_assumption` only drops the external-store
     /// assumption when this is 0, so it must keep counting every following.
+    /// Why `follow_cross_profile_transition` last refused, for the
+    /// `MissingHandlerSpec` stall text. Each of its exits returns a bare
+    /// `false`, so without this the biggest sound-mode stall family names a
+    /// handler but never says which gate gave way.
+    transition_refusal: Option<String>,
     nested_followed: usize,
     /// DISTINCT nested entry stubs followed. The cap bounds these rather than
     /// the total, because sibling paths and loop unrolls re-enter the SAME stub
@@ -3100,7 +3298,7 @@ impl Walker<'_, '_> {
                     format!(
                         "undecodable opcode: handler {} has no recovered specification                          (status {:?}, semantic {:?}; \
                          transitions {}/{}, vip {:?}, key {:?}, hreg {:?}, dir {:?}, \
-                         trace_stop {:?}, fragments {:?}; {})",
+                         trace_stop {:?}, fragments {:?}; transition refused: {}; {})",
                         final_state.handler,
                         recovery.map(|r| r.status),
                         recovery
@@ -3114,6 +3312,7 @@ impl Walker<'_, '_> {
                         roles.bytecode_direction,
                         recovery.map(|r| r.trace_stop.clone()),
                         recovery.map(|r| r.trace_fragments),
+                        self.transition_refusal.as_deref().unwrap_or("not attempted"),
                         recovery.map_or(String::new(), |r| r
                             .diagnostics
                             .iter()
@@ -3858,21 +4057,30 @@ impl Walker<'_, '_> {
         if !self.transition_sites.contains(&key)
             && self.transition_sites.len() >= self.limits.max_profile_transitions
         {
-            return false;
+            {
+                self.transition_refusal = Some("transition budget spent".to_owned());
+                return false;
+            }
         }
         // A genuine transition handler ends a short handler-stream block; a very
         // long prefix is not a clean transition and symbolic-executing it would
         // allocate a large state for nothing. Fail closed past a modest cap.
         const MAX_TRANSITION_PREFIX: usize = 512;
         if instructions.len() > MAX_TRANSITION_PREFIX {
-            return false;
+            {
+                self.transition_refusal = Some("prefix too long for a clean transition".to_owned());
+                return false;
+            }
         }
         let profile = self.ctx_profile();
         let old_vsp = profile.effect_roles.vsp;
         let context_base = profile.effect_roles.context_base;
         let Some(entry_rva) = self.pe.optional.image_base.checked_rva_of(final_state.handler)
         else {
-            return false;
+            {
+                self.transition_refusal = Some("handler VA outside the image".to_owned());
+                return false;
+            }
         };
         // Prove the unresolved handler is a popped-target cross-profile transition.
         let Ok(transition) = analyze_vm_transition(
@@ -3882,10 +4090,16 @@ impl Walker<'_, '_> {
             context_base,
             self.limits.entry.trace,
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("transition analysis failed".to_owned());
+                return false;
+            }
         };
         let Some(recovered) = transition.recovered else {
-            return false;
+            {
+                self.transition_refusal = Some("no popped-target transition recovered".to_owned());
+                return false;
+            }
         };
         debug_assert!(recovered.report.state_effects_proven);
         // Symbolic state at the transition handler: the decoded prefix executed
@@ -3898,7 +4112,10 @@ impl Walker<'_, '_> {
             symbolic_in,
             Some(&observed_source(self)),
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("prefix symbolic execution failed".to_owned());
+                return false;
+            }
         };
         // Pop the concrete branch target off the VM stack.
         let Ok(pop) = execute_symbolic_linear_block_with_initial_state(
@@ -3908,14 +4125,29 @@ impl Walker<'_, '_> {
             &symbolic.continuation_state(),
             Some(&observed_source(self)),
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("pop of the branch target failed".to_owned());
+                return false;
+            }
         };
         let Some(Expr {
             kind: ExprKind::Const { value: target },
             ..
         }) = pop.branch_target
         else {
-            return false;
+            {
+                // The expression matters: if these are unresolved image reads
+                // then this stall family and the `memory_load_epoch` family are
+                // one cause, not two.
+                self.transition_refusal = Some(format!(
+                    "popped branch target is not a constant: {}",
+                    pop.branch_target.as_ref().map_or_else(
+                        || "none".to_owned(),
+                        |target| format!("{target:?}").chars().take(110).collect::<String>(),
+                    )
+                ));
+                return false;
+            }
         };
         // Decode the first dispatch at the target under the transition's proven
         // direction and handler anchor.
@@ -3928,7 +4160,10 @@ impl Walker<'_, '_> {
             },
             recovered.report.bytecode_direction,
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("first dispatch at the target did not decode".to_owned());
+                return false;
+            }
         };
         // Resolve the new register profile from the target's first handler.
         let Some(first_handler_rva) = self
@@ -3937,7 +4172,10 @@ impl Walker<'_, '_> {
             .image_base
             .checked_rva_of(first.state_after.handler)
         else {
-            return false;
+            {
+                self.transition_refusal = Some("target handler VA outside the image".to_owned());
+                return false;
+            }
         };
         let Ok(roles) = resolve_vm_profile_roles(
             self.pe,
@@ -3951,10 +4189,16 @@ impl Walker<'_, '_> {
                 proof_limits: self.limits.entry.dispatch_proof,
             },
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("role resolution at the target failed".to_owned());
+                return false;
+            }
         };
         let Some(resolved) = roles.recovered else {
-            return false;
+            {
+                self.transition_refusal = Some("no roles recovered at the target".to_owned());
+                return false;
+            }
         };
         // Proven switch: build the successor's per-block profile context. A new
         // profile recovers its own table anchors per handler, so none is threaded
@@ -4113,6 +4357,7 @@ pub fn recover_vm_cfg_with_observed(
         config: entry_stream_config(&setup.profile, limits.entry),
         global_table: bootstrap_global_table(&setup.bootstrap),
         profile: setup.profile,
+        transition_refusal: None,
         nested_followed: 0,
         nested_sites: BTreeSet::new(),
         current: None,
@@ -4355,6 +4600,7 @@ mod tests {
             config: entry_stream_config(&base, limits.entry),
             global_table: None,
             profile: base,
+            transition_refusal: None,
             nested_followed: 0,
             nested_sites: BTreeSet::new(),
             current: None,
@@ -5515,13 +5761,14 @@ mod tests {
         };
         let level1 = pushed((-8_i64) as u64, w64(7));
         let level2 = pushed((-16_i64) as u64, w64(7));
-        assert!(closes_under_vm_stack_shift(&level1, &level2));
+        assert!(closes_under_vm_stack_shift(Va(0x1000), &level1, &level2));
         assert!(!closes_under_vm_stack_shift(
+            Va(0x1000),
             &level1,
             &pushed((-16_i64) as u64, w64(9))
         ));
         // Equal VSPs are the ordinary case, handled by `widen_state`, not here.
-        assert!(!closes_under_vm_stack_shift(&level1, &level1));
+        assert!(!closes_under_vm_stack_shift(Va(0x1000), &level1, &level1));
 
         // Iterations that linger at one depth are not a stride violation: the
         // same chain with a repeat still proves −64.
