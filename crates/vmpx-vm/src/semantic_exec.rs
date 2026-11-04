@@ -78,6 +78,14 @@ pub struct SymbolicExecutionLimits {
     /// `AssumesExternalStoresDisjointFromVmStack` narrowing instead of the
     /// tainting havoc. Only while no frame pointer has escaped or been lost.
     pub assume_loaded_store_addresses_disjoint: bool,
+    /// Instant past which this block's execution gives up, so the per-entry
+    /// wall-clock budget bounds ONE block and not merely the gaps between
+    /// blocks. The CFG walk checked its deadline only between worklist items, so
+    /// a single block whose expressions blow up superlinearly ran unbounded --
+    /// which is why the per-block instruction limit could not be raised past 512
+    /// despite 102 entries being refused on it: doubling it hung the sweep
+    /// instead of failing closed. `None` leaves execution untimed.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for SymbolicExecutionLimits {
@@ -90,6 +98,7 @@ impl Default for SymbolicExecutionLimits {
             prove_read_only_when_suppressed: true,
             serve_observed_when_suppressed: false,
             assume_loaded_store_addresses_disjoint: false,
+            deadline: None,
         }
     }
 }
@@ -507,6 +516,20 @@ struct SymbolicMachine<'a> {
     resolved_image_addresses: BTreeSet<Va>,
     memory_source: Option<&'a dyn SymbolicMemorySource>,
     memory_epoch: u64,
+    /// Bumped by any store this machine cannot place at a concrete byte, so it
+    /// could reach anything. Names unresolved loads AT A CONCRETE ADDRESS,
+    /// together with that byte's own version below.
+    opaque_store_epoch: u64,
+    /// Per concrete byte address, how many times it has been stored.
+    ///
+    /// `memory_epoch` counts EVERY store, and naming unresolved loads from it
+    /// meant the same load of the same address read as a different value on
+    /// each pass: a VM handler's ordinary pushes and pops race it forward by
+    /// ~1000 per loop iteration, so two iterations never compared equal and no
+    /// loop carrying an unresolved load could converge. A store to one concrete
+    /// byte cannot change a different concrete byte, so it must not rename that
+    /// byte's loads.
+    byte_versions: BTreeMap<u64, u64>,
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
@@ -600,6 +623,8 @@ impl<'a> SymbolicMachine<'a> {
             resolved_image_addresses: BTreeSet::new(),
             memory_source,
             memory_epoch: initial.memory_epoch,
+            opaque_store_epoch: initial.memory_epoch,
+            byte_versions: BTreeMap::new(),
             memory_tainted: initial.memory_tainted,
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
@@ -762,7 +787,19 @@ impl<'a> SymbolicMachine<'a> {
                 all_unknown = false;
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value: at } = byte_address.kind {
+                // A concrete byte: only a store that could reach THIS byte may
+                // rename it. The `memory_load_epoch_` prefix is kept because
+                // consumers match on it.
+                let version = self.byte_versions.get(&at).copied().unwrap_or(0);
+                bytes.push(Expr::intrinsic(
+                    BitWidth::W8,
+                    format!("memory_load_epoch_{}_{version}", self.opaque_store_epoch),
+                    vec![byte_address],
+                ));
             } else {
+                // A symbolic address could be any byte, so every store still
+                // renames it: that is exactly what `memory_epoch` counts.
                 bytes.push(Expr::intrinsic(
                     BitWidth::W8,
                     format!("memory_load_epoch_{}", self.memory_epoch),
@@ -791,9 +828,19 @@ impl<'a> SymbolicMachine<'a> {
 
     fn write_memory_bytes(&mut self, address: &Expr, value: &Expr) -> Result<(), String> {
         for byte in 0..value.width.bytes() {
+            let byte_address = add_pointer_offset(address.clone(), i64::from(byte))
+                .map_err(|error| error.to_string())?;
+            // Version the byte so that if this cell is later discarded, loads of
+            // it cannot reuse a name minted before the store. A byte we cannot
+            // place could be any byte, so that invalidates every concrete name.
+            match byte_address.kind {
+                ExprKind::Const { value: at } => {
+                    *self.byte_versions.entry(at).or_default() += 1;
+                }
+                _ => self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1),
+            }
             self.memory.insert(
-                add_pointer_offset(address.clone(), i64::from(byte))
-                    .map_err(|error| error.to_string())?,
+                byte_address,
                 Expr::extract(BitWidth::W8, byte * 8, value.clone())
                     .map_err(|error| error.to_string())?,
             );
@@ -863,6 +910,9 @@ impl<'a> SymbolicMachine<'a> {
         width: BitWidth,
     ) -> Result<(), String> {
         self.advance_memory_epoch()?;
+        // The address could not be placed, so it could have reached any byte:
+        // concrete names minted before it are no longer valid either.
+        self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1);
         // Proof path: when the store address provably lies within a bounded byte
         // range over a single proven-region root (vsp_initial or a fresh
         // allocation), preserve exactly the tracked cells proven disjoint from
@@ -1078,6 +1128,7 @@ impl<'a> SymbolicMachine<'a> {
             NativeCallMemoryDecision::HavocTracked { reason } => {
                 self.protection_may_have_changed = true;
                 self.advance_memory_epoch()?;
+                self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1);
                 self.retain_memory(|_| false);
                 self.memory_tainted = false;
                 let touched_context = self.context.touched_cells.clone();
@@ -2453,6 +2504,18 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         }
     })?;
     for (instruction_index, instruction) in instructions.iter().enumerate() {
+        // Sampled, not per-instruction: a clock read costs more than many of the
+        // steps it guards, and a block is capped at a few thousand instructions.
+        if instruction_index % 32 == 0
+            && limits.deadline.is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            return Err(SymbolicExecutionError {
+                instruction_index,
+                vip: instruction.state_before.vip,
+                semantic: instruction.semantic,
+                message: "per-entry wall-clock budget exceeded".to_owned(),
+            });
+        }
         if instruction_index >= limits.max_instructions {
             return Err(SymbolicExecutionError {
                 instruction_index,
