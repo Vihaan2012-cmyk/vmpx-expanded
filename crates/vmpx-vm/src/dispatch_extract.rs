@@ -594,6 +594,50 @@ fn attempt_candidate(
     let has_prior_source = previous_source_index.is_some();
     let local_prefix_start = previous_source_index.map_or(0, |index| index + 1);
     let mut vip_rebased_before_source = false;
+    // A full-width write to the VIP whose value does not come FROM the VIP
+    // supersedes every earlier write to it: whatever clobbered the VIP before
+    // cannot reach the fetch. `mov vip, reg64` was already treated this way, but
+    // only when it was the first VIP write seen -- the scan refused on the first
+    // UNMODELLED write without looking ahead for a rebase that makes it
+    // irrelevant. A `pop vip` is such a rebase too; its value comes off the
+    // native stack.
+    //
+    // Measured on systems.xpl, that is VMProtect's cpuid handler: `cpuid`
+    // legitimately clobbers EBX, which is this profile's VIP, the handler pushes
+    // its four results to the VM stack, and then `pop rbx` restores the VIP
+    // before `sub rbx, 4` and the opcode fetch. Refusing on the cpuid wrote off
+    // the whole handler over a register the handler itself puts back.
+    let is_vip_rebase = |instruction: &Instruction| -> bool {
+        if instruction.op0_kind() != OpKind::Register
+            || instruction.op0_register() != canonical(roles.vip)
+            || instruction.op0_register().size() != 8
+        {
+            return false;
+        }
+        match instruction.mnemonic() {
+            Mnemonic::Mov => instruction.op1_kind() == OpKind::Register
+                && instruction.op1_register().size() == 8,
+            Mnemonic::Pop => true,
+            _ => false,
+        }
+    };
+    let last_vip_rebase: Option<usize> = if has_prior_source {
+        None
+    } else {
+        decoded
+            .iter()
+            .take(source_index)
+            .enumerate()
+            .filter(|(_, decoded)| {
+                let disposition = dispositions
+                    .get(&decoded.rva)
+                    .copied()
+                    .unwrap_or(NativeInstructionDisposition::Dead);
+                is_active(disposition) && is_vip_rebase(&decoded.instruction)
+            })
+            .map(|(index, _)| index)
+            .next_back()
+    };
     let mut pre_source_handler_writes = Vec::new();
     let mut pre_source_key_writes = Vec::new();
     for (index, decoded) in decoded.iter().take(source_index).enumerate() {
@@ -619,14 +663,12 @@ fn attempt_candidate(
             && writes_register(&mut factory, &decoded.instruction, canonical(roles.vip))
         {
             let instruction = &decoded.instruction;
-            let exact_full_width_rebase = !vip_rebased_before_source
-                && !has_prior_source
-                && instruction.mnemonic() == Mnemonic::Mov
-                && instruction.op0_kind() == OpKind::Register
-                && instruction.op1_kind() == OpKind::Register
-                && instruction.op0_register() == canonical(roles.vip)
-                && instruction.op1_register().size() == 8;
-            if exact_full_width_rebase {
+            // Superseded by a later rebase, so it cannot affect the fetch. Also
+            // keeps its delta out of `vip_delta`, which is what the rebase means.
+            if last_vip_rebase.is_some_and(|rebase| index < rebase) {
+                continue;
+            }
+            if last_vip_rebase == Some(index) {
                 vip_rebased_before_source = true;
                 continue;
             }
