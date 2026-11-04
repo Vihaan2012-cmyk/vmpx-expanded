@@ -353,9 +353,17 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         let mut full: Vec<Stmt> = prologue.clone();
         full.extend(body.clone());
         let mut n = 0;
+        // Unknowns the recovery left behind are inputs to the check too. Both
+        // sides are built from the same interned expressions, so each gets the
+        // same name and the same seeded value.
+        let mut unknowns = std::collections::BTreeSet::new();
+        intrinsic_inputs_of(&reference, &mut unknowns);
+        // And from the optimized side: narrowing can leave an unknown reachable
+        // there that the reference does not name identically.
+        intrinsic_inputs_of(&f, &mut unknowns);
         for k in 0..48 {
             let mut inputs = Env::new();
-            for v in &live_in {
+            for v in unknowns.iter().chain(live_in.iter()) {
                 let x = match k {
                     0 => 0,
                     1 => u64::MAX,
@@ -391,6 +399,40 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     })();
 
     Ok(Decompiled { text, structured, fallback_reason, check, text_check, loops, ifs, gotos })
+}
+
+/// Every intrinsic in `f`, named as a free input. These are seeded like the
+/// live-in registers but are NOT parameters: an unknown the recovery could not
+/// resolve is an input to the CHECK, not to the function's C signature.
+fn intrinsic_inputs_of(f: &Func, out: &mut std::collections::BTreeSet<String>) {
+    for block in f.blocks.values() {
+        for (_, e) in &block.assigns {
+            exec::intrinsic_inputs(e, out);
+        }
+        for store in &block.stores {
+            exec::intrinsic_inputs(&store.address, out);
+            exec::intrinsic_inputs(&store.value, out);
+        }
+        match &block.term {
+            Term::Goto(_) => {}
+            Term::Branch { cond, .. } => match cond {
+                ir::Cond::Cmp { a, b, .. } => {
+                    exec::intrinsic_inputs(a, out);
+                    exec::intrinsic_inputs(b, out);
+                }
+                ir::Cond::Opaque { args, .. } => {
+                    for a in args {
+                        exec::intrinsic_inputs(a, out);
+                    }
+                }
+            },
+            Term::Return(values) => {
+                for (_, e) in values {
+                    exec::intrinsic_inputs(e, out);
+                }
+            }
+        }
+    }
 }
 
 fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {

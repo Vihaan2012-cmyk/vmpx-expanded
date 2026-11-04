@@ -228,6 +228,25 @@ pub struct RegionExit {
 pub enum RecoveredExit {
     Callee(StubExit),
     Region(RegionExit),
+    /// The VM wrote a computed target into a return slot ABOVE the entry stack
+    /// pointer and transfers to it. Like [`RecoveredExit::Region`] this does not
+    /// return to the caller, but nothing is staged below the entry frame, so it
+    /// carries only the target. Kept separate from `Region` precisely because
+    /// `RegionExit::staged` drives how many bytes native reintegration retains,
+    /// and this case stages none.
+    Trampoline(TrampolineExit),
+}
+
+#[derive(Debug)]
+pub struct TrampolineExit {
+    pub registers: BTreeMap<X64NativeRegister, Expr>,
+    pub rflags: Expr,
+    /// The computed address control transfers to.
+    pub target: Expr,
+    /// Signed byte offset of the `ret` slot from the initial VM stack pointer,
+    /// or `None` when the final VSP is not rooted at the entry frame at all and
+    /// the slot therefore has no position in those coordinates.
+    pub slot_offset: Option<i64>,
 }
 
 fn add_offset(base: &Expr, offset: u32) -> Result<Expr, DecodedLiftError> {
@@ -250,6 +269,9 @@ pub fn recover_stub_exit(
         RecoveredExit::Callee(exit) => Ok(exit),
         RecoveredExit::Region(_) => Err(DecodedLiftError::NotCalleeReturn(
             "the return address was written by the VM, not read from caller stack".to_owned(),
+        )),
+        RecoveredExit::Trampoline(_) => Err(DecodedLiftError::NotCalleeReturn(
+            "the exit transfers to a computed continuation above the entry frame".to_owned(),
         )),
     }
 }
@@ -301,12 +323,9 @@ pub fn recover_exit(
     {
         return Err(fail("exit does not restore every register exactly once".to_owned()));
     }
-    let final_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial").ok_or_else(|| {
-        fail(format!(
-            "final VSP is not an affine offset of the entry frame (roots {:?})",
-            symbolic.final_vsp.dependencies()
-        ))
-    })?;
+    // Only the entry-frame CLASSIFICATION needs this; every slot below is read
+    // through `final_vsp` itself and so does not care what it is rooted at.
+    let placed_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial");
     let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
         symbolic
             .read_tracked_memory(add_offset(&symbolic.final_vsp, offset)?, BitWidth::W64)
@@ -321,6 +340,31 @@ pub fn recover_exit(
     let entry_sp = i64::try_from(frame_cells * 8)
         .unwrap_or(i64::MAX)
         .saturating_add(top_offset.cast_signed());
+    let Some(final_offset) = placed_offset else {
+        // The final VSP is rooted somewhere other than the entry frame —
+        // measured on systems.xpl it is `native_rbp_initial` every time, an exit
+        // that restores RSP from the caller's frame pointer. Nothing can be
+        // placed against the entry frame, so no callee return can be claimed.
+        // The transfer itself is still fully recovered though: the registers and
+        // the slot's value are read through `final_vsp` directly. Hand that back
+        // as a trampoline when the value is not the caller's own return address,
+        // and keep refusing when it is, because then it IS a return and the
+        // unwind amount is exactly what could not be computed.
+        return match read(return_offset) {
+            Ok(value) if !is_caller_return_address(&value) => {
+                Ok(RecoveredExit::Trampoline(TrampolineExit {
+                    registers,
+                    rflags,
+                    target: value,
+                    slot_offset: None,
+                }))
+            }
+            _ => Err(fail(format!(
+                "final VSP is not an affine offset of the entry frame (roots {:?})",
+                symbolic.final_vsp.dependencies()
+            ))),
+        };
+    };
     let return_slot = final_offset + i64::from(return_offset);
     match read(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
@@ -364,6 +408,18 @@ pub fn recover_exit(
         // stack. Popping it is byte-identical to popping the untouched caller
         // slot, so this is a clean callee return.
         Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
+        // Above the entry stack pointer with a VM-written value: the VM computed
+        // where to go and will transfer there. Fully recovered — the target, the
+        // registers and the flags are all in hand — so it is handed back rather
+        // than refused, and each consumer decides whether it can use it.
+        Ok(value) if return_slot > entry_sp && return_slot % 8 == 0 => {
+            return Ok(RecoveredExit::Trampoline(TrampolineExit {
+                registers,
+                rflags,
+                target: value,
+                slot_offset: Some(return_slot),
+            }));
+        }
         Ok(value) => {
             if std::env::var_os("VMPX_SEG_TRACE").is_some() {
                 eprintln!(
@@ -705,10 +761,14 @@ mod tests {
             recover_exit(&symbolic, &exit, 12, 0x28),
             Ok(RecoveredExit::Region(_))
         ));
-        // Ignoring top_offset put the entry stack pointer at 96 < 128 and refused.
-        assert!(matches!(
+        // What `top_offset` is load-bearing for is the REGION classification:
+        // ignoring it puts the entry stack pointer at 96, below the slot at 128,
+        // so the slot reads as sitting in the caller's frame and nothing can be
+        // staged. It used to refuse outright; now the same misplacement comes
+        // back as a trampoline, so assert on what the offset actually decides.
+        assert!(!matches!(
             recover_exit(&symbolic, &exit, 12, 0),
-            Err(DecodedLiftError::NotCalleeReturn(_))
+            Ok(RecoveredExit::Region(_))
         ));
     }
 

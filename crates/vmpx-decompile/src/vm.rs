@@ -73,7 +73,12 @@ fn hash_expr(e: &Expr, h: &mut impl Hasher) {
 
 fn is_live(n: &RNode) -> bool {
     match n {
-        RNode::Exit(x) => !x.region,
+        // A region exit transfers to a computed continuation instead of
+        // returning. That used to make it dead for printing purposes, which threw
+        // away a fully recovered function: the target, the registers and the
+        // flags are all in hand. It is live whenever recovery produced the
+        // target; only a region exit with no recovered target stays dead.
+        RNode::Exit(x) => !x.region || x.continuation.is_some(),
         RNode::Fork { arms, .. } => arms.iter().any(|(_, a)| is_live(a)),
         RNode::Loop { body, .. } => is_live(body),
         RNode::BackEdge { .. } => true,
@@ -112,6 +117,10 @@ fn signature(n: &RNode, rename: &BTreeMap<String, String>, h: &mut impl Hasher) 
         RNode::Exit(x) => {
             0_u8.hash(h);
             x.region.hash(h);
+            x.continuation.is_some().hash(h);
+            if let Some(target) = &x.continuation {
+                hash_expr(&sub(target), h);
+            }
             for (r, e) in &x.registers {
                 reg_name(*r).hash(h);
                 hash_expr(&sub(e), h);
@@ -452,20 +461,31 @@ fn eval_const(e: &Expr, env: &BTreeMap<String, Expr>) -> Option<u64> {
 /// by evaluating the selector with its flag words replaced by the project's own
 /// flag semantics for crafted operand pairs.
 fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond {
-    let opaque = |why: &str| Cond::Opaque {
-        desc: format!("branch_selector_is_{value:#x}[{why}]"),
-        args: vec![],
+    // `RNode::Fork`'s contract is `selector == value`, so that equality is
+    // always a sound condition and everything below is only an attempt to
+    // recover the ORIGINAL comparison hiding inside the VM's flag word, so the
+    // C reads `a < b` instead of an equality on a decrypted selector. The
+    // fallback used to be `Cond::Opaque`, which the evaluator cannot run (so
+    // the round-trip self-check could not clear the function) and which carried
+    // `args: vec![]`, making the branch look input-independent to `opt.rs`.
+    let direct = |why: &str, notes: &mut Vec<String>| -> Cond {
+        notes.push(format!("branch kept as `selector == {value:#x}` ({why})"));
+        Cond::Cmp {
+            op: Cmp::Eq,
+            a: selector.clone(),
+            b: Expr::constant(selector.width, selector.width.truncate(value)),
+        }
     };
     let nodes = flags_nodes(selector);
     if nodes.is_empty() {
-        return opaque("no flag inputs");
+        return direct("no flag inputs", notes);
     }
     // all flag words must be the same comparison of the same operands
     let first = &nodes[0];
-    let ExprKind::Intrinsic { name, arguments } = &first.kind else { return opaque("shape") };
+    let ExprKind::Intrinsic { name, arguments } = &first.kind else { return direct("shape", notes) };
     let (x, y) = match arguments.as_slice() {
         [x, y] => (x.clone(), y.clone()),
-        _ => return opaque("flag intrinsic arity"),
+        _ => return direct("flag intrinsic arity", notes),
     };
     let tied = nodes.iter().all(|n| {
         let ExprKind::Intrinsic { name: n2, arguments: a2 } = &n.kind else { return false };
@@ -475,7 +495,7 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
         a2[0].simplify() == x.simplify() && a2[1].simplify() == y.simplify()
     });
     if !tied {
-        return opaque("several different flag words");
+        return direct("several different flag words", notes);
     }
     let w = x.width;
     // The sampling below is generic over the flag intrinsic; only the shape of
@@ -488,7 +508,7 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     let is_nor = name.starts_with("vm_flags_nor_");
     let is_nand = name.starts_with("vm_flags_nand_");
     if !is_sub && !is_and && !is_nor && !is_nand {
-        return opaque(name);
+        return direct(name, notes);
     }
     // crafted operand pairs
     let mut rng = Rng(0x00C0_FFEE_1234_5678);
@@ -520,7 +540,7 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     };
     let mut samples: Vec<(u64, u64, bool)> = Vec::new();
     for (a, b) in pairs {
-        let Some(sv) = eval_sel(a, b) else { return opaque("flag word does not fold") };
+        let Some(sv) = eval_sel(a, b) else { return direct("flag word does not fold", notes) };
         samples.push((a, b, sv == value));
     }
     let ops = [
@@ -583,7 +603,7 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
             return Cond::Cmp { op, a, b };
         }
     }
-    opaque("no comparison matches the flag-word samples")
+    direct("no comparison matches the flag-word samples", notes)
 }
 
 // ------------------------------------------------------------------- lowering
@@ -627,6 +647,27 @@ impl Lower<'_> {
                 return Ok(id);
             }
             RNode::Exit(x) => {
+                // A region exit does not return a value, it transfers to a
+                // computed address. Emitted as a trampoline: the function yields
+                // the continuation target and the register state rides along as
+                // named components, which the printer reports as comments. The
+                // name says which it is, so a reader never mistakes a next-PC for
+                // a return value.
+                if let Some(target) = &x.continuation {
+                    let mut parts = vec![("continuation".to_owned(), fix(target))];
+                    for (r, e) in &x.registers {
+                        parts.push((reg_name(*r).to_owned(), fix(e)));
+                    }
+                    self.notes.push(
+                        "exit transfers to a computed continuation instead of returning; the value is the target address"
+                            .to_owned(),
+                    );
+                    self.blocks.insert(
+                        id,
+                        Block { id, assigns: vec![], stores: vec![], term: Term::Return(parts) },
+                    );
+                    return Ok(id);
+                }
                 let rax = x.registers.get(&X64NativeRegister::Rax).ok_or("exit has no rax")?;
                 for (r, e) in &x.registers {
                     if is_callee_saved(*r) {
@@ -651,14 +692,36 @@ impl Lower<'_> {
                 self.blocks.insert(id, Block { id, assigns, stores: vec![], term: Term::Goto(header) });
             }
             RNode::Fork { selector, arms, .. } => {
-                if arms.len() != 2 {
-                    return Err(format!("{}-way branch (switch) is not lowered", arms.len()));
+                // An N-way fork becomes a chain of equality tests. Only the
+                // two-arm case used to lower and anything wider refused the whole
+                // function, which was never a limit of the representation: the
+                // arms are keyed by distinct values of one selector and the
+                // recovered successor set is exhaustive, so the last arm is the
+                // final `else` and needs no test of its own — exactly the
+                // reasoning the two-arm case already used for `arms[1]`.
+                if arms.len() < 2 {
+                    return Err(format!("a fork needs two arms, got {}", arms.len()));
                 }
                 let sel = fix(selector);
-                let cond = decode_selector(&sel, arms[0].0, self.notes);
-                let then = self.lower(&arms[0].1, None)?;
-                let els = self.lower(&arms[1].1, None)?;
-                self.blocks.insert(id, Block { id, assigns: vec![], stores: vec![], term: Term::Branch { cond, then, els } });
+                let mut bodies = Vec::with_capacity(arms.len());
+                for (_, arm) in arms {
+                    bodies.push(self.lower(arm, None)?);
+                }
+                let mut tests = vec![id];
+                for _ in 2..arms.len() {
+                    tests.push(self.alloc());
+                }
+                if arms.len() > 2 {
+                    self.notes.push(format!("{}-way branch lowered as a chain of equality tests", arms.len()));
+                }
+                for (i, &test) in tests.iter().enumerate() {
+                    let cond = decode_selector(&sel, arms[i].0, self.notes);
+                    let els = tests.get(i + 1).copied().unwrap_or(bodies[arms.len() - 1]);
+                    self.blocks.insert(
+                        test,
+                        Block { id: test, assigns: vec![], stores: vec![], term: Term::Branch { cond, then: bodies[i], els } },
+                    );
+                }
             }
             RNode::Loop { phis, body, .. } => {
                 // merge byte lanes into wide phis
@@ -740,6 +803,7 @@ fn rewrite_tree(
         RNode::Exit(x) => RNode::Exit(RExit {
             registers: x.registers.iter().map(|(r, e)| (*r, f(e))).collect(),
             region: x.region,
+            continuation: x.continuation.as_ref().map(|t| f(t)),
         }),
         RNode::Stores { stores, next } => RNode::Stores {
             stores: stores
@@ -808,6 +872,7 @@ fn rewrite_exprs_only(n: &RNode, f: &dyn Fn(&Expr) -> Expr) -> RNode {
         RNode::Exit(x) => RNode::Exit(RExit {
             registers: x.registers.iter().map(|(r, e)| (*r, f(e))).collect(),
             region: x.region,
+            continuation: x.continuation.as_ref().map(|t| f(t)),
         }),
         RNode::Stores { stores, next } => RNode::Stores {
             stores: stores

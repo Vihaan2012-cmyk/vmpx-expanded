@@ -38,6 +38,11 @@ pub struct RExit {
     pub registers: BTreeMap<X64NativeRegister, Expr>,
     /// Returns through staged stack (a protector gate failure), not the caller.
     pub region: bool,
+    /// For a region exit, the computed address control transfers to —
+    /// `RegionExit::staged`'s word zero. Recovery produces it and the tree used
+    /// to drop it on the floor, which is why such an exit printed nothing at all
+    /// despite being fully recovered. `None` for an ordinary callee return.
+    pub continuation: Option<Expr>,
 }
 
 /// One observable store: memory the caller can still see after the VM returns.
@@ -344,7 +349,7 @@ impl Walker<'_, '_> {
             BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
             BlockExit::Stalled => return Err(format!("block {key} did not reach a boundary")),
         };
-        let report = execute_symbolic_linear_block_with_initial_state(
+        let mut report = execute_symbolic_linear_block_with_initial_state(
             &block.instructions,
             Some(boundary),
             SymbolicExecutionLimits::default(),
@@ -352,6 +357,41 @@ impl Walker<'_, '_> {
             self.input.memory,
         )
         .map_err(|e| format!("block {key} symbolic execution failed: {e}"))?;
+        // Parity with the CFG walk, which already retries a tainted block once
+        // with loaded-data store addresses treated as opaque pointers. Taint is
+        // the broad fallback for a store address that still mentions
+        // `vsp_initial` and so MIGHT alias the VM's own operand stack; the retry
+        // narrows it to the cells that could genuinely alias. Without this the
+        // rolled frontend refused 51 entries the CFG walk had already got past.
+        //
+        // Gated on the entry's CFG ALREADY carrying the assumption, which is what
+        // makes this parity rather than a second, quieter relaxation. The walk
+        // records `AssumesExternalStoresDisjointFromVmStack` whenever its own
+        // retry takes effect, and it is the recovery side that owns the label; a
+        // lift has no assumption set to add to. Were this ungated, an entry whose
+        // CFG never needed the relaxation — and which therefore still reads as
+        // PROVEN — could emit C that quietly rests on it.
+        let may_relax = self
+            .input
+            .cfg
+            .assumptions
+            .contains(&vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        if report.memory_tainted && may_relax {
+            let relaxed = SymbolicExecutionLimits {
+                assume_loaded_store_addresses_disjoint: true,
+                ..SymbolicExecutionLimits::default()
+            };
+            if let Ok(retry) = execute_symbolic_linear_block_with_initial_state(
+                &block.instructions,
+                Some(boundary),
+                relaxed,
+                state,
+                self.input.memory,
+            ) && !retry.memory_tainted
+            {
+                report = retry;
+            }
+        }
         // Four different causes wore one message, which hid which of them is
         // worth building for. Named separately so the census can rank them.
         // A memory havoc is a notification that address precision was lost, not
@@ -549,13 +589,20 @@ impl Walker<'_, '_> {
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
                     let recovered = recover_exit(&report, layout, self.input.frame.len(), self.input.top_offset)
                         .map_err(|e| e.to_string())?;
-                    let (registers, region) = match recovered {
-                        RecoveredExit::Callee(e) => (e.registers, false),
-                        RecoveredExit::Region(r) => (r.registers, true),
+                    let (registers, region, continuation) = match recovered {
+                        RecoveredExit::Callee(e) => (e.registers, false, None),
+                        // Fully recovered, just not a return: the decompiler
+                        // prints it as a trampoline to `target`.
+                        RecoveredExit::Trampoline(t) => (t.registers, true, Some(t.target)),
+                        // Word zero of the staged words IS the computed target.
+                        RecoveredExit::Region(r) => {
+                            let target = r.staged.first().cloned();
+                            (r.registers, true, target)
+                        }
                     };
                     return Ok(Self::with_stores(
                         pending_stores,
-                        RNode::Exit(RExit { registers, region }),
+                        RNode::Exit(RExit { registers, region, continuation }),
                     ));
                 }
                 BlockExit::Branch => {

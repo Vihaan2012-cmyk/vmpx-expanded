@@ -83,12 +83,111 @@ pub fn eval(e: &Expr, env: &Env) -> Result<u64, String> {
                 })
             }
             ExprKind::Load { address } => mem_read(go(address, env, memo)?, e.width),
-            ExprKind::Intrinsic { name, .. } => return Err(format!("intrinsic `{name}` not evaluable")),
+            // The project's own simplifier carries the VM's flag-word semantics
+            // (`vm_flags_sub_*`, `and`, `nor`, `nand`), which is how
+            // `vm::decode_selector` samples a flag word at all. So an intrinsic
+            // whose arguments evaluate can be FOLDED here instead of refused,
+            // and the self-check can then clear a function whose branch
+            // condition is a comparison on a flag word. Anything the simplifier
+            // has no semantics for -- a `memory_load_epoch_*`, say -- does not
+            // fold and is still refused, so this never invents a value.
+            ExprKind::Intrinsic { name, arguments } => {
+                // Fold first, where the simplifier has semantics for it. An
+                // argument that does not evaluate is not fatal: the whole
+                // intrinsic then falls back to being a free input below.
+                let mut folded = Vec::with_capacity(arguments.len());
+                let mut evaluable = true;
+                for argument in arguments {
+                    match go(argument, env, memo) {
+                        Ok(value) => folded.push(Expr::constant(argument.width, value)),
+                        Err(_) => {
+                            evaluable = false;
+                            break;
+                        }
+                    }
+                }
+                let constant = evaluable
+                    .then(|| Expr::intrinsic(e.width, name.clone(), folded).simplify())
+                    .and_then(|whole| match whole.kind {
+                        ExprKind::Const { value } => Some(value),
+                        _ => None,
+                    });
+                match constant {
+                    Some(value) => value,
+                    // Otherwise it is an UNKNOWN, exactly like an uninitialized
+                    // register, and gets a seeded input of its own rather than
+                    // failing the whole check. Refusing here is why a function
+                    // whose recovery widened a loop could not be verified at all:
+                    // a dropped VM-stack cell reads back as `memory_load_epoch_*`,
+                    // an intrinsic, where a generalized cell reads back as
+                    // `loop_havoc_*`, a register, which was already seeded.
+                    // Otherwise it is an UNKNOWN, like an uninitialized register.
+                    // Seeding it would let the check run -- and 346 of the 385
+                    // functions emitted on systems.xpl fail for exactly this
+                    // reason, with ZERO mismatches among those that do run, so
+                    // this is the single biggest verification lever there is.
+                    //
+                    // OFF by default because the first attempt is not trustworthy
+                    // yet: seeding turned "not evaluable" into MISMATCH rather
+                    // than into agreement. One unknown read at two widths across
+                    // `opt::narrow` has to denote one value, and until a concrete
+                    // case is traced it is not established that this keying does
+                    // that. Reporting ~300 fresh mismatches on a decompiler that
+                    // currently disagrees with its own IR nowhere would be worse
+                    // than reporting them unverified.
+                    None if seed_unknown_intrinsics() => e.width.truncate(
+                        *env.get(&intrinsic_key(e))
+                            .ok_or_else(|| format!("intrinsic `{name}` not evaluable"))?,
+                    ),
+                    None => return Err(format!("intrinsic `{name}` not evaluable")),
+                }
+            }
         };
         memo.insert(e.clone(), v);
         Ok(v)
     }
     go(e, env, &mut HashMap::new())
+}
+
+/// `VMPX_SEED_UNKNOWN_INTRINSICS=1`: see the note in [`eval`].
+fn seed_unknown_intrinsics() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_SEED_UNKNOWN_INTRINSICS").is_ok_and(|v| v == "1"))
+}
+
+/// A stable name for an intrinsic treated as a free input.
+///
+/// Both sides of a check see the SAME interned expression, so hashing it gives
+/// both the same name. A collision would only make two distinct unknowns share
+/// one value, which is equally true on both sides, so it can lose discriminating
+/// power but cannot turn agreement into disagreement. `#` cannot occur in a
+/// register name, so these can never shadow one.
+#[must_use]
+pub fn intrinsic_key(e: &Expr) -> String {
+    use std::hash::{Hash, Hasher};
+    let ExprKind::Intrinsic { name, arguments } = &e.kind else {
+        return String::new();
+    };
+    // Deliberately NOT the whole expression, and deliberately not its width.
+    // `opt::narrow` rewrites widths after the reference is cloned, so hashing
+    // the node would give the same logical unknown two different names on the
+    // two sides of the check and seed it twice with two different values -- a
+    // disagreement invented by the harness. The unknown is identified by what
+    // produced it; the width is applied where it is read.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    arguments.hash(&mut hasher);
+    format!("intrinsic#{name}#{:016x}", hasher.finish())
+}
+
+/// Names every intrinsic in `e` as a free input, nested ones included: an inner
+/// unknown may be what stops an outer intrinsic from folding.
+pub fn intrinsic_inputs(e: &Expr, out: &mut std::collections::BTreeSet<String>) {
+    crate::xu::rewrite(e, &mut |n| {
+        if matches!(n.kind, ExprKind::Intrinsic { .. }) {
+            out.insert(intrinsic_key(n));
+        }
+        None
+    });
 }
 
 pub fn eval_cond(c: &Cond, env: &Env) -> Result<bool, String> {

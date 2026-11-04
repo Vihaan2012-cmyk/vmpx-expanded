@@ -1207,6 +1207,16 @@ impl Builder<'_> {
                     })?;
                     let exit = match recovered {
                         RecoveredExit::Callee(exit) => exit,
+                        // Unchanged behaviour: this case used to be refused
+                        // inside `recover_exit` itself, and only the decompiler
+                        // can use it. Native reintegration cannot, because there
+                        // is no staged region for it to retain.
+                        RecoveredExit::Trampoline(_) => {
+                            return Err(DecodedLiftError::Cfg {
+                                block: key,
+                                reason: "the exit transfers to a computed continuation above the entry frame".to_owned(),
+                            });
+                        }
                         RecoveredExit::Region(exit) => {
                             let rflags = if is_native_rflags_initial(&exit.rflags) {
                                 None

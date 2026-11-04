@@ -599,6 +599,9 @@ impl Walker<'_, '_> {
                     let mut region_target = None;
                     let (exit, region_exit) = match recovered {
                         RecoveredExit::Callee(exit) => (exit, false),
+                        RecoveredExit::Trampoline(_) => {
+                            return Err("the exit transfers to a computed continuation above the entry frame".into());
+                        }
                         RecoveredExit::Region(region) => {
                             region_target = region.staged.first().map(|target| RegionTarget {
                                 target: target.simplify(),
