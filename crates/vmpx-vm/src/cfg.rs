@@ -1381,6 +1381,45 @@ fn widen_state(
     for (a_index, r_index, token) in memory_union(a, r).iter() {
         let a_entry = a_index.map(|index| &a.memory_values[index]);
         let r_entry = r_index.map(|index| &r.memory_values[index]);
+        // A cell the re-entry tracks and the enclosing state does not: DROPPING
+        // it is a widening, not a loss of soundness. An untracked, symbolically
+        // addressed byte reads back as a fresh `memory_load_epoch_*` unknown
+        // (`load_memory`'s symbolic miss path), and an unconstrained byte covers
+        // every concrete value the re-entry's cell could hold, so the enclosing
+        // state's denotation is the larger one — which is exactly what coverage
+        // asks.
+        //
+        // This is what lets such a loop reach a fixpoint at all. Measured on
+        // systems.xpl it is the largest single family of incomplete entries: a
+        // loop that pushes one 8-byte word per iteration and never pops it. The
+        // shift translates the whole tracked frame, but the frame's DEEP end is
+        // anchored at `vsp_initial` and does not move, so the re-entry always
+        // holds 8 byte-cells the shifted ancestor lacks ("memory cell count 352
+        // vs 360") and a per-cell model never converges. Summarizing just that
+        // anchored tail leaves a frame of FIXED size, and the loop closes in one
+        // step.
+        //
+        // NOT for a concrete address: there the miss path consults the static
+        // image BEFORE minting an unknown, so an untracked concrete byte is
+        // pinned to the image value rather than unconstrained. Dropping one
+        // would claim coverage of a cell we would then re-read as a stale
+        // constant. The reverse direction (tracked here, untracked in the
+        // re-entry) is never dropped either: there it is the RE-ENTRY whose
+        // denotation is larger, so coverage genuinely has to widen.
+        //
+        // NOT for a cell holding a FRAME-POINTER value. Dropping one hides it:
+        // the state no longer holds that pointer anywhere, an untracked load
+        // could later produce it, and frame privacy would have to be conceded --
+        // which is exactly what `fold_hid_frame_pointer` is for. A drop that
+        // leaves `changed` clear reports `Ok(None)`, "already covered", and that
+        // check never runs, so such a cell is widened the ordinary way instead.
+        if a_entry.is_none()
+            && let Some((address, value)) = r_entry
+            && !matches!(address.kind, ExprKind::Const { .. })
+            && !crate::semantic_exec::is_frame_pointer_value(value)
+        {
+            continue;
+        }
         let location = a_entry.or(r_entry).map(|entry| entry.0.clone());
         let cell = generalize(
             a_entry.map(|entry| &entry.1),
@@ -1613,6 +1652,15 @@ enum LoopStep {
     /// external-store assumption on such an entry is exactly the error this
     /// variant exists to prevent. See [`closes_under_vm_stack_shift`].
     CloseShifted,
+    /// The shifted enclosing state does NOT yet cover the re-entry, so continue
+    /// from this generalization of the two. [`LoopStep::CloseShifted`] is a
+    /// one-shot coverage test, which left a VSP-striding loop with no widening
+    /// iteration at all: whatever failed to be covered on the first try — in the
+    /// measured cases the flag word — refused the whole entry, even though the
+    /// very next round would have carried a TOP that covers it. This is to
+    /// `CloseShifted` what [`LoopStep::Widen`] is to [`LoopStep::Close`], and it
+    /// concedes frame privacy for exactly the same reason `CloseShifted` does.
+    WidenShifted(SymbolicVmInitialState),
     /// Still within the exact-unroll budget.
     Unroll,
     /// Continue from this generalization of every enclosing entry at once.
@@ -1938,9 +1986,9 @@ fn vm_stack_shift_mismatch(
         let shown = |e: &Expr| format!("{e:?}").chars().take(100).collect::<String>();
         return format!("flags: shifted {} vs reentry {}", shown(&a.flags), shown(&r.flags));
     }
-    if a.memory_epoch != r.memory_epoch {
-        return format!("memory_epoch {} vs {}", a.memory_epoch, r.memory_epoch);
-    }
+    // NOT compared: `widen_state` folds the epoch with `max` and never counts it
+    // as a change, so reporting it here only buried the field that actually
+    // blocks the fold. It cost two rounds of chasing the wrong thing.
     if a.next_native_call_epoch != r.next_native_call_epoch {
         return "native_call_epoch".to_owned();
     }
@@ -1968,13 +2016,11 @@ fn vm_stack_shift_mismatch(
     {
         return format!("context cell {slot:#x} not covered");
     }
-    if a.memory_values.len() != r.memory_values.len() {
-        return format!(
-            "memory cell count {} vs {}",
-            a.memory_values.len(),
-            r.memory_values.len()
-        );
-    }
+    // NOT a count comparison. `widen_state` drops a symbolically addressed cell
+    // the re-entry holds and this state does not -- that drop IS the widening --
+    // so a differing count is no longer what blocks the fold, and reporting it
+    // would bury the field that is, exactly as the epoch did before it. Only the
+    // cells this state actually holds have to be covered.
     if let Some((address, _)) = a.memory_values.iter().find(|(address, value)| {
         !r.memory_values
             .iter()
@@ -2107,6 +2153,22 @@ fn bounded_unroll_or_refuse(
             .any(|ancestor| closes_under_vm_stack_shift(key, ancestor, reentry))
         {
             return LoopStep::CloseShifted;
+        }
+        // The shift did not cover outright. Widen the shifted ancestor against
+        // the re-entry and continue from that, rather than refusing: it is the
+        // same generalization the non-striding path takes, and the shifted
+        // ancestor sits at the re-entry's own depth by construction, so the
+        // widened state does too. Converges because `generalize` goes to a
+        // site-keyed TOP rather than growing a bound per revisit, so the next
+        // round's coverage test sees TOP and closes; the visit, instruction and
+        // wall-clock caps remain the backstop.
+        for ancestor in ancestors {
+            if let Some(shifted) = shift_ancestor_onto_reentry(ancestor, reentry)
+                && let Ok(Some(widened)) =
+                    widen_state(key, &canonicalized(&shifted), &canonicalized(reentry))
+            {
+                return LoopStep::WidenShifted(widened);
+            }
         }
         LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason))
     };
@@ -3052,6 +3114,13 @@ impl Walker<'_, '_> {
                 self.frame_not_private = true;
                 self.record_loop_back(item, key);
                 None
+            }
+            // Same frame-privacy concession as `CloseShifted`, and the same
+            // continuation as `Widen`: the loop has not closed yet, it carries on
+            // from the generalization.
+            LoopStep::WidenShifted(widened) => {
+                self.frame_not_private = true;
+                Some(widened)
             }
             LoopStep::Refuse(reason) => {
                 self.stall(key, key, format!("loop cannot be closed: {reason}"));
@@ -4405,6 +4474,11 @@ pub fn recover_vm_cfg_with_observed(
         profile: None,
     }];
     let deadline = limits.max_wall_time.map(|budget| (Instant::now(), budget));
+    // Hand the same instant to the symbolic executor: the check below bounds the
+    // gaps between worklist items, not the work inside one.
+    if let Some((start, budget)) = deadline {
+        walker.limits.entry.symbolic.deadline = start.checked_add(budget);
+    }
     while let Some(item) = pending.pop() {
         if deadline.is_some_and(|(start, budget)| start.elapsed() >= budget) {
             walker.cfg.limit_hit.get_or_insert(CfgLimitHit::WallClock);
@@ -5512,7 +5586,7 @@ mod tests {
                     walk.observed_unrolls += 1;
                     ancestors.push(reentry);
                 }
-                LoopStep::Widen(state) => {
+                LoopStep::Widen(state) | LoopStep::WidenShifted(state) => {
                     walk.widened += 1;
                     ancestors.push(state);
                 }
@@ -5663,19 +5737,25 @@ mod tests {
     }
 
     #[test]
-    fn stack_shift_close_is_refused_once_any_other_cell_also_moves() {
-        // Same constant VSP stride, but a context cell changes too, so the
-        // re-entry is NOT the renaming of the enclosing state. Nothing may be
-        // concluded from the shift and the fail-closed refusal stands.
+    fn stack_shift_close_concludes_nothing_about_a_cell_that_also_moves() {
+        // Same constant VSP stride, but a context cell drifts too, so the
+        // re-entry is NOT the renaming of the enclosing state. What this guards
+        // is that NOTHING is concluded from the shift about the drifting cell.
+        // It used to be a flat refusal; the drift is now generalized instead,
+        // which concludes strictly less about the cell rather than more. The
+        // pairing with `loop_that_only_moves_the_stack_pointer_...` is the whole
+        // point: a pure shift closes with NO widening, a shift with a drift
+        // cannot close until the drift has been widened away.
         let step = |state: &SymbolicVmInitialState| {
             let mut next = state.clone();
             next.vsp = increment(&state.vsp);
             next.context_values.insert(0, increment(&state.context_values[&0]));
             next
         };
-        let reason = walk_loop_observed(loop_state(0, w64(0)), step, 2, None)
-            .expect_err("a drifting cell is not a pure stack shift");
-        assert!(reason.contains("stack pointer"), "{reason}");
+        let walk = walk_loop_observed(loop_state(0, w64(0)), step, 2, None)
+            .expect("the drift is widened away rather than refused");
+        assert!(walk.closed_shifted, "still closes through the stack-shift test");
+        assert!(walk.widened >= 1, "the drifting cell had to be generalized first");
     }
 
     /// A step that decrements VSP by a proven constant `delta` bytes each
