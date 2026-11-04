@@ -324,8 +324,12 @@ mod tests {
             not(bin(B::Or, not(p.clone()), k.clone())),
         );
         let f = crate::xu::mba_fold(&e);
-        let want = bin(B::Xor, p, k);
-        assert_eq!(f, want, "{f:?}");
+        // `p ^ k`, in either operand order: XOR is commutative and `mba_fold`
+        // promises no order, because it rebuilds from the cheapest circuit a
+        // table search found and that search has an atom order of its own.
+        let want = bin(B::Xor, p.clone(), k.clone());
+        let commuted = bin(B::Xor, k, p);
+        assert!(f == want || f == commuted, "{f:?}");
     }
 
     #[test]

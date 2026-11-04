@@ -265,6 +265,17 @@ fn b_ops(b: &B) -> usize {
 
 fn b_collect(e: &Expr, atoms: &mut Vec<Expr>, budget: &mut usize, depth: usize) -> B {
     if *budget == 0 || depth == 0 {
+        // A `Not` is never an atom. Negation is free in the boolean tree, and
+        // making `~x` an atom distinct from `x` presents the two as if they
+        // varied independently: the truth table is then computed over rows that
+        // cannot occur, and whatever identity the operands hide is invisible.
+        // `~(p | ~k) | ~(~p | k)` is exactly `p ^ k`, but with `~k` and `k` as
+        // separate atoms it reads as a four-atom table with no cheaper circuit,
+        // so nothing folded. Peeling costs no depth, which is the point: it is
+        // the operands that are worth spending the atom budget on.
+        if let ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, value } = &e.kind {
+            return B::Not(Box::new(b_collect(value, atoms, budget, 0)));
+        }
         return b_atom(e, atoms);
     }
     *budget -= 1;
