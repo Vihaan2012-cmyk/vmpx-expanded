@@ -104,7 +104,16 @@ pub enum InputDomainRefusal {
 
 fn unsupported(register: &str, reason: &str) -> InputDomainRefusal {
     let register = match register.split_once('@') {
-        Some((load, _)) => format!("{load} (untracked memory read)"),
+        // Keep the address. That suffix is the load's own argument expression
+        // (built as `{name}@{arguments:?}`), so it says WHERE the read comes
+        // from, and discarding it left the refusal naming an unknown without
+        // saying what it was a read OF -- the single fact that separates a
+        // jump-table index from an integrity check reading the image's own
+        // bytes. Bounded, since an address expression can be arbitrarily deep.
+        Some((load, address)) => {
+            let shown: String = address.chars().take(180).collect();
+            format!("{load} (untracked memory read at {shown})")
+        }
         None => register.to_owned(),
     };
     InputDomainRefusal::Unsupported {
