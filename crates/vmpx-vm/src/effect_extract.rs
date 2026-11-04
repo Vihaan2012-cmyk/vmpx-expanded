@@ -1963,6 +1963,20 @@ pub fn classify_handler_effects(
             "multiple semantic candidates match the normalized effects: {candidates:?}"
         ));
     }
+    if candidates.is_empty() {
+        // `Unknown` says only that nothing matched. Every gate above is a
+        // conjunction of a handful of shape predicates, so recording their values
+        // names the clause that refused instead of leaving the next reader to
+        // re-derive it from the handler body. Measured need: the systems.xpl
+        // handlers whose dispatch codecs now recover still stop at "semantic
+        // effects remain unknown", with nothing to say which clause failed.
+        evidence.push(format!(
+            "no semantic candidate matched: stack_effects={stack_effect_count}              context_effects={context_effect_count} bytecode_effects={bytecode_effect_count}              other_effects={other_effect_count} other_read={other_read}              other_write={other_write} ordinary_operandless={ordinary_operandless}              arithmetic_ops={} flags_to_vsp={} is_cpuid={is_cpuid}              is_cpuid_leaf_only={is_cpuid_leaf_only} vsp_delta={:?}              operand_width={operand_width:?}",
+            summary.arithmetic_operations.len(),
+            summary.captures_native_flags_to_vsp,
+            summary.vsp_delta,
+        ));
+    }
     evidence.extend(summary.diagnostics.iter().cloned());
     VmHandlerAnalysis {
         entry,

@@ -813,6 +813,23 @@ pub fn recover_handler_codecs(
         } else {
             diagnostics
                 .push("handler codecs recovered but semantic effects remain unknown".to_owned());
+            // Say WHY it is unknown. The analysis records which classification
+            // clause refused, but in its own `evidence`, which no caller of this
+            // reads -- so the one refusal a reader actually sees carried none of
+            // it. Says plainly when the analysis was never produced, too, since
+            // that is a different problem from a classification that ran and
+            // matched nothing.
+            match handler_analysis.as_ref() {
+                Some(analysis) => diagnostics.extend(
+                    analysis
+                        .evidence
+                        .iter()
+                        .filter(|line| line.starts_with("no semantic candidate matched"))
+                        .cloned(),
+                ),
+                None => diagnostics
+                    .push("no handler analysis was produced for this handler".to_owned()),
+            }
         }
         status = RecoveryStatus::PartiallyRecovered;
     }
