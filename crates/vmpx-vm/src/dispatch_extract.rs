@@ -940,10 +940,30 @@ fn attempt_table_indexed_candidate(
     terminal_evidence: &str,
 ) -> Result<DispatchExtractionCandidate, String> {
     let source = decoded[source_index];
-    // The opcode must be zero-extended so the index register holds exactly the
-    // unsigned table index.
-    if source.instruction.mnemonic() != Mnemonic::Movzx {
-        return Err("table-indexed opcode load is not zero-extended".to_owned());
+    // The index register must end up holding EXACTLY the unsigned value loaded.
+    // `movzx` is the obvious form, but a plain `mov` into a 32-bit register is
+    // just as exactly zero-extended -- an x86-64 write to a 32-bit register
+    // clears the upper half by definition -- and a 64-bit load needs no
+    // extension at all. A 16- or 8-bit `mov` is NOT acceptable, because it
+    // preserves the rest of the register, and `movsx` is sign-extended.
+    //
+    // Measured on systems.xpl: both dispatch sources this rejected decode to
+    // `mov r12d, [rbx]` (44 8B 23), a zero-extended 4-byte opcode fetch from the
+    // recovered VIP register. Nothing else here assumes a byte opcode -- the VIP
+    // delta is `opcode_width.bytes()` and the width is read from the memory
+    // operand -- so only this gate had to change.
+    let zero_extended = match source.instruction.mnemonic() {
+        Mnemonic::Movzx => true,
+        // `op0_register()` is `None` (size 0) when the destination is memory, so
+        // a store cannot slip through this.
+        Mnemonic::Mov => matches!(source.instruction.op0_register().size(), 4 | 8),
+        _ => false,
+    };
+    if !zero_extended {
+        return Err(format!(
+            "table-indexed opcode load is not zero-extended ({:?})",
+            source.instruction.mnemonic()
+        ));
     }
     let opcode_width = source_load_width(&source.instruction)
         .ok_or_else(|| "unsupported opcode width".to_owned())?;
