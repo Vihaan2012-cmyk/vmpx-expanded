@@ -606,6 +606,14 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     direct("no comparison matches the flag-word samples", notes)
 }
 
+/// `VMPX_LOWER_SPIN_ARMS=1`: lower an arm with no reachable function exit as a
+/// non-terminating loop instead of refusing the whole function. See the note at
+/// the `RNode::Dead` arm for why this is not yet a default.
+fn lower_spin_arms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_LOWER_SPIN_ARMS").is_ok_and(|v| v == "1"))
+}
+
 // ------------------------------------------------------------------- lowering
 
 struct Lower<'a> {
@@ -776,7 +784,38 @@ impl Lower<'_> {
                 self.loops.pop();
                 r?;
             }
-            RNode::Dead(why) => return Err(format!("a dead arm remained after gate collapse: {why}")),
+            RNode::Dead(why) => {
+                // An arm with no reachable function exit: control enters and
+                // never leaves. That IS a non-terminating loop, so emitting one
+                // is faithful rather than an assumption -- it is precisely what
+                // the recovered tree says about this path, and the arms that do
+                // return are unaffected.
+                //
+                // Refusing instead threw away the whole function over a path
+                // that cannot return. Measured on systems.xpl that was the
+                // largest bucket of CFG-complete entries emitting nothing at
+                // all: 126 of them, and it is where every entry opened by the
+                // VM-stack loop closure landed.
+                // OFF by default, behind `VMPX_LOWER_SPIN_ARMS=1`, and it stays
+                // off until the cost is known. An exit-less loop is a shape
+                // neither the structurer nor the renderer has ever been given,
+                // and a 45 GB runaway was observed on the first run that could
+                // have exercised it -- unattributed, the other candidate being a
+                // 4x instruction-limit budget pass running concurrently. A
+                // renderer that recurses on a loop with no exit would grow text
+                // without bound, which matches what was seen, so the default
+                // keeps the old refusal until that is ruled out on ONE entry
+                // under a memory cap.
+                if !lower_spin_arms() {
+                    return Err(format!("a dead arm remained after gate collapse: {why}"));
+                }
+                self.notes
+                    .push(format!("arm with no reachable exit lowered as a spin: {why}"));
+                self.blocks.insert(
+                    id,
+                    Block { id, assigns: vec![], stores: vec![], term: Term::Goto(id) },
+                );
+            }
         }
         Ok(id)
     }

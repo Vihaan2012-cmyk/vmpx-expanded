@@ -236,6 +236,16 @@ pub fn run_reference(f: &Func, inputs: &Env) -> Result<Outcome, String> {
         for (v, d) in &b.assigns {
             next.push((v.clone(), eval(d, &env)?));
         }
+        // A block that goes only to itself and does nothing is the lowering of an
+        // arm with no reachable exit. Recognize it in O(1) rather than spending
+        // the whole step budget discovering it, so one such path costs nothing.
+        if let Term::Goto(next) = &b.term
+            && *next == id
+            && b.assigns.is_empty()
+            && b.stores.is_empty()
+        {
+            return Err("this input reaches a path that never returns (spin)".to_owned());
+        }
         match &b.term {
             Term::Return(vals) => {
                 return Ok(Outcome { ret: eval(&vals[0].1, &env)?, stores });
