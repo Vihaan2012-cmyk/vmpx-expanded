@@ -946,6 +946,7 @@ fn main() {
                     | VmCfgAssumption::ObservedBranchTarget
                     | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => "OBSERVED",
                     VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
+                    | VmCfgAssumption::AssumesVmStackFramePrivate
                     | VmCfgAssumption::AssumesImageProtectionStable
                     | VmCfgAssumption::AssumesCrossVmSectionContinuation => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase

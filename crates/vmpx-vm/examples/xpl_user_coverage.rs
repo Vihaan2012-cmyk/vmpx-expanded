@@ -158,6 +158,7 @@ fn tier(a: &[VmCfgAssumption]) -> &'static str {
             | VmCfgAssumption::ObservedBranchTarget
             | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => 3,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
+            | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable
             | VmCfgAssumption::AssumesCrossVmSectionContinuation => 2,
             VmCfgAssumption::PreferredImageBase | VmCfgAssumption::OverApproximatedEnvironmentGate => 1,

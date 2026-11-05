@@ -87,6 +87,7 @@ pub fn tier_of<'a>(assumptions: impl IntoIterator<Item = &'a VmCfgAssumption>) -
             | VmCfgAssumption::ObservedBranchTarget
             | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => Tier::Observed,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
+            | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable
             | VmCfgAssumption::AssumesCrossVmSectionContinuation => Tier::UnprovenAssumption,
             VmCfgAssumption::PreferredImageBase

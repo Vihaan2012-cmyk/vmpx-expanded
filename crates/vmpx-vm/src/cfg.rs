@@ -317,6 +317,19 @@ pub enum VmCfgAssumption {
     /// it). Image-source reads remain withheld, so the narrowing only recovers
     /// the VM-stack-rooted VIP; it does not otherwise trust the store.
     AssumesExternalStoresDisjointFromVmStack,
+    /// Generalizing or closing a loop conceded that nothing outside the VM
+    /// aliases the VM stack frame. A widened state, or one re-expressed at a
+    /// moved stack base, describes the same concrete memory only under that
+    /// concession.
+    ///
+    /// Recorded SEPARATELY from `AssumesExternalStoresDisjointFromVmStack`,
+    /// which is inserted only when the symbolic executor actually narrowed an
+    /// external store. `frame_not_private` blocks discharging that one, so for a
+    /// long time the concession was recorded only on entries that happened to
+    /// have taken it — an entry that closed a strided loop without ever
+    /// narrowing a store carried no label at all and counted as PROVEN. The
+    /// concession is load-bearing either way, so it gets its own name.
+    AssumesVmStackFramePrivate,
     /// A constant read of a read-only, file-backed image page was served from
     /// the file after an external store suppressed image reads, assuming the
     /// page protection never changes at runtime (the binary imports
@@ -1751,6 +1764,7 @@ fn fold_hid_frame_pointer<'s>(
 }
 
 /// Outcome of generalizing a re-entry against a block's accumulated states.
+#[derive(Debug, Eq, PartialEq)]
 enum GeneralizeAcross {
     /// The running over-approximation already covers this re-entry: it closes.
     Closed,
@@ -3100,7 +3114,7 @@ impl Walker<'_, '_> {
             }
             LoopStep::Unroll => Some(item.symbolic.clone()),
             LoopStep::Widen(widened) => {
-                self.frame_not_private = true;
+                self.concede_frame_privacy();
                 Some(widened)
             }
             // The back edge closes, but the VM stack grows a constant amount per
@@ -3111,7 +3125,7 @@ impl Walker<'_, '_> {
             // N1 on the strength of a closed graph; it must not reach the proven
             // tier on the strength of a frame bound that does not hold.
             LoopStep::CloseShifted => {
-                self.frame_not_private = true;
+                self.concede_frame_privacy();
                 self.record_loop_back(item, key);
                 None
             }
@@ -3119,7 +3133,7 @@ impl Walker<'_, '_> {
             // continuation as `Widen`: the loop has not closed yet, it carries on
             // from the generalization.
             LoopStep::WidenShifted(widened) => {
-                self.frame_not_private = true;
+                self.concede_frame_privacy();
                 Some(widened)
             }
             LoopStep::Refuse(reason) => {
@@ -3198,6 +3212,24 @@ impl Walker<'_, '_> {
             };
             return self.continue_from(key, folded);
         }
+        // Counted under its own borrow so the shift below can take `&mut self`.
+        let at_this_depth = self
+            .explored
+            .get(&key)
+            .map_or(0, |states| states.iter().filter(|s| s.vsp == incoming.vsp).count());
+        if at_this_depth == 0 {
+            // Phase-local folding has nothing to fold against: every state
+            // recorded here sits at a different VM stack depth. That is exactly
+            // what a strided loop BODY looks like, and `visited` counts states
+            // across all depths, so such a block piles up one state per phase and
+            // dies at the ceiling without the fold ever engaging. Shift the
+            // recorded phases onto this re-entry's depth — the same substitution
+            // the loop HEAD already uses to close a strided back edge — and fold
+            // against those instead.
+            if let Some(folded) = self.fold_shifted_phases(key, incoming) {
+                return folded;
+            }
+        }
         let states: Vec<&SymbolicVmInitialState> = self
             .explored
             .get(&key)
@@ -3217,6 +3249,73 @@ impl Walker<'_, '_> {
             Err(reason) => Err(reason),
         };
         self.continue_from(key, folded)
+    }
+
+    /// Folds this re-entry against the block's other phases, each re-expressed at
+    /// the re-entry's VM stack depth. `None` when nothing here shifts, leaving the
+    /// ordinary (empty) fold to decide.
+    ///
+    /// The shift re-expresses an ancestor's cells relative to a moved stack base,
+    /// so it describes the same concrete memory only if nothing outside the VM
+    /// aliases the frame. That is a concession, not a proof, so every result here
+    /// sets `frame_not_private`: it can reach N1 and never N2.
+    fn fold_shifted_phases(
+        &mut self,
+        key: Va,
+        incoming: &SymbolicVmInitialState,
+    ) -> Option<GeneralizeAcross> {
+        // A recorded canonical is already a fold of many states, so it is both
+        // tighter and cheaper to shift than the raw history; fall back to the
+        // history only when no phase has converged yet.
+        let shifted: Vec<SymbolicVmInitialState> = self
+            .widened
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|phase| shift_ancestor_onto_reentry(phase, incoming))
+            .collect();
+        let shifted = if shifted.is_empty() {
+            self.explored
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter_map(|state| shift_ancestor_onto_reentry(state, incoming))
+                .collect()
+        } else {
+            shifted
+        };
+        if shifted.is_empty() {
+            return None;
+        }
+        let reentry = canonicalized(incoming);
+        // Closing is the whole point. Folding alone does not converge a strided
+        // block: the fold's result is recorded at THIS depth, the next re-entry
+        // arrives one stride deeper, finds no canonical of its own again, and the
+        // block still spends one state per phase until the ceiling. Only a shifted
+        // phase that already COVERS the re-entry subsumes the back edge.
+        if shifted
+            .iter()
+            .any(|phase| matches!(widen_state(key, &canonicalized(phase), &reentry), Ok(None)))
+        {
+            self.concede_frame_privacy();
+            return Some(GeneralizeAcross::Closed);
+        }
+        // Not covered yet: broaden across the shifted phases so a later one is.
+        let folded = fold_states(key, shifted.iter(), incoming).ok()?;
+        let hid = fold_hid_frame_pointer(shifted.iter().chain([incoming]), &folded);
+        self.concede_frame_privacy();
+        Some(self.continue_from(key, Ok((folded, hid))))
+    }
+
+    /// Records the frame-privacy concession a generalization rests on: both the
+    /// flag that bars the discharge and the label that names it on the result.
+    /// See [`VmCfgAssumption::AssumesVmStackFramePrivate`] for why the flag alone
+    /// was not enough.
+    fn concede_frame_privacy(&mut self) {
+        self.frame_not_private = true;
+        self.cfg
+            .assumptions
+            .insert(VmCfgAssumption::AssumesVmStackFramePrivate);
     }
 
     /// Charges a generalization and records it as its phase's canonical. Split
@@ -5943,6 +6042,64 @@ mod tests {
             widen_state(Va(0x1000), &canonical, &loop_state(0, w64(99))),
             Ok(None)
         ));
+    }
+
+    /// The ceiling family: a block whose every recorded state sits at a
+    /// different VM stack depth. Phase-local folding has no sibling to fold
+    /// against, so before the shift such a block spent one state per phase and
+    /// died at `max_visits_per_block * 2` with "symbolic state keeps changing".
+    /// Shifting a recorded phase onto the re-entry's depth closes it instead —
+    /// and concedes frame privacy, so it can reach N1 and never N2.
+    #[test]
+    fn a_block_re_reached_only_at_new_stack_depths_closes_by_shifting_a_phase() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        let key = Va(RDATA_VA);
+        // Four phases, 8 bytes apart, identical but for the stack base.
+        for offset in [0, 8, 16, 24] {
+            walker.explored.entry(key).or_default().push(loop_state(offset, w64(7)));
+        }
+        let incoming = loop_state(32, w64(7));
+        assert!(
+            walker.explored[&key].iter().all(|s| s.vsp != incoming.vsp),
+            "the point of the fixture is that no recorded state shares the re-entry's depth"
+        );
+        assert_eq!(walker.generalize_across(key, &incoming), GeneralizeAcross::Closed);
+        assert!(
+            walker.frame_not_private,
+            "closing by shifting the stack base concedes frame privacy"
+        );
+    }
+
+    /// The shift must not rescue a block whose drift is not a pure stack stride:
+    /// a re-entry that also changes a tracked cell still fails closed, because
+    /// re-expressing the ancestor at the new depth does not cover it.
+    #[test]
+    fn shifting_a_phase_does_not_close_a_block_whose_cells_also_move() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        let key = Va(RDATA_VA);
+        walker.explored.entry(key).or_default().push(loop_state(0, w64(7)));
+        let outcome = walker.generalize_across(key, &loop_state(8, w64(9)));
+        assert_ne!(outcome, GeneralizeAcross::Closed, "{outcome:?}");
     }
 
     #[test]
