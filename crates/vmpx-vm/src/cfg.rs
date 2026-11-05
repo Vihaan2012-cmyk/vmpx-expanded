@@ -7,7 +7,7 @@
 //! Anything unresolved stops that path and is reported; no edge is invented.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -1513,8 +1513,10 @@ fn canonical_affine(expr: &Expr) -> Expr {
     let mut constant = 0_u64;
     collect(&expr.simplify(), true, &mut terms, &mut constant);
     terms.retain(|(_, coefficient)| *coefficient != 0);
-    // A stable order independent of how the expression was written. Debug text is
-    // what `affine_vsp_parts` already keys on, so the two agree on ordering.
+    // A stable order independent of how the expression was written. Ordering on
+    // the interned hash instead measured +0 on the entry it was meant to help,
+    // and it changes the canonical form, so the Debug text stays: a behavioural
+    // change with no measured benefit is not worth the risk to N1.
     terms.sort_by_cached_key(|(term, _)| format!("{term:?}"));
 
     let mut accumulated: Option<Expr> = None;
@@ -1558,8 +1560,18 @@ fn canonical_affine(expr: &Expr) -> Expr {
 /// single constant — the reduction `simplify` alone does not perform on `Sub`.
 /// Any other node (a multiply, a load, a flag intrinsic) stays an opaque term,
 /// so a non-affine VSP step cannot be mistaken for a constant adjustment.
-fn affine_vsp_parts(expr: &Expr) -> (BTreeMap<String, i64>, u64) {
-    fn collect(expr: &Expr, positive: bool, terms: &mut BTreeMap<String, i64>, constant: &mut u64) {
+/// Decomposes a VSP expression into non-constant terms and a constant offset.
+///
+/// Terms are keyed by the EXPRESSION, not by its rendered Debug text. `Expr`
+/// hashes and compares through interned `ExprRef`s, both O(1), so this keys on
+/// node identity instead of building a String per term — and `VMProtect` builds
+/// the VSP out of an opaque `Add(Not(Or(..)), k)`, so those Strings were large.
+/// The relation is the same either way (Debug rendering is faithful), so this is
+/// semantics-preserving. It did NOT turn out to be the cost on the entry that
+/// motivated it — 50 s per `generalize_across` call and 13 GB of transient heap
+/// survive it, and that cost is still unlocated.
+fn affine_vsp_parts(expr: &Expr) -> (HashMap<Expr, i64>, u64) {
+    fn collect(expr: &Expr, positive: bool, terms: &mut HashMap<Expr, i64>, constant: &mut u64) {
         match &expr.kind {
             ExprKind::Binary {
                 op: BinaryOp::Add,
@@ -1591,12 +1603,12 @@ fn affine_vsp_parts(expr: &Expr) -> (BTreeMap<String, i64>, u64) {
                 };
             }
             _ => {
-                let coefficient = terms.entry(format!("{expr:?}")).or_insert(0);
+                let coefficient = terms.entry(expr.clone()).or_insert(0);
                 *coefficient += if positive { 1 } else { -1 };
             }
         }
     }
-    let mut terms = BTreeMap::new();
+    let mut terms = HashMap::new();
     let mut constant = 0_u64;
     collect(&expr.simplify(), true, &mut terms, &mut constant);
     terms.retain(|_, coefficient| *coefficient != 0);
@@ -1891,7 +1903,7 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
 /// identity.
 type ShiftMemo = std::collections::HashMap<Expr, Expr>;
 
-fn shift_stack_relative(expr: &Expr, base_terms: &BTreeMap<String, i64>, delta: u64) -> Expr {
+fn shift_stack_relative(expr: &Expr, base_terms: &HashMap<Expr, i64>, delta: u64) -> Expr {
     shift_stack_relative_memo(expr, base_terms, delta, &mut ShiftMemo::new())
 }
 
@@ -1903,7 +1915,7 @@ fn shift_stack_relative(expr: &Expr, base_terms: &BTreeMap<String, i64>, delta: 
 /// retained. The memo makes it linear in distinct nodes.
 fn shift_stack_relative_memo(
     expr: &Expr,
-    base_terms: &BTreeMap<String, i64>,
+    base_terms: &HashMap<Expr, i64>,
     delta: u64,
     memo: &mut ShiftMemo,
 ) -> Expr {
@@ -1917,7 +1929,7 @@ fn shift_stack_relative_memo(
 
 fn shift_stack_relative_uncached(
     expr: &Expr,
-    base_terms: &BTreeMap<String, i64>,
+    base_terms: &HashMap<Expr, i64>,
     delta: u64,
     memo: &mut ShiftMemo,
 ) -> Expr {
