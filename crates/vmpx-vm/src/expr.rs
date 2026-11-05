@@ -751,6 +751,29 @@ thread_local! {
     static COUNT_HINT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+/// Diagnostic: interned nodes still held somewhere (`live`) and dead weak slots
+/// awaiting a sweep (`dead`). Every live node is at least one `Node` plus its
+/// bucket entry, so this is the only part of the heap no per-entry accounting
+/// sees — the walker charges for the state it holds, not for the interner.
+#[must_use]
+pub fn interner_census() -> (usize, usize) {
+    let mut live = 0;
+    let mut dead = 0;
+    for shard in INTERNER.iter() {
+        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        for bucket in guard.buckets.values() {
+            for weak in bucket {
+                if weak.strong_count() > 0 {
+                    live += 1;
+                } else {
+                    dead += 1;
+                }
+            }
+        }
+    }
+    (live, dead)
+}
+
 /// Counts distinct nodes reachable from all `roots` together, so a subtree shared
 /// between expressions is counted once. Saturates at `limit + 1`.
 pub fn distinct_node_count_bounded<'a>(

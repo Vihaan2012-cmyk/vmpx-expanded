@@ -1763,6 +1763,17 @@ fn fold_hid_frame_pointer<'s>(
     })
 }
 
+/// Outcome of scanning a block's phases shifted onto one re-entry's depth.
+enum ShiftedPhases {
+    /// Nothing here shifts, or the fold refused: the ordinary same-depth fold
+    /// still gets to decide.
+    None,
+    /// A shifted phase already covers the re-entry, so the back edge closes.
+    Covered,
+    /// Not covered yet; carry on from this broadened state.
+    Folded(SymbolicVmInitialState),
+}
+
 /// Outcome of generalizing a re-entry against a block's accumulated states.
 #[derive(Debug, Eq, PartialEq)]
 enum GeneralizeAcross {
@@ -1875,7 +1886,41 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
 /// Descending as well would shift the base inside it and then shift the sum
 /// again, for 2*delta. Nodes that do not match are rebuilt from shifted
 /// children, so a stack address nested inside a load still moves.
+/// Shared across every cell of one state: `Expr` hashes and compares through
+/// interned `ExprRef`s, both O(1), so keying on the expression is keying on node
+/// identity.
+type ShiftMemo = std::collections::HashMap<Expr, Expr>;
+
 fn shift_stack_relative(expr: &Expr, base_terms: &BTreeMap<String, i64>, delta: u64) -> Expr {
+    shift_stack_relative_memo(expr, base_terms, delta, &mut ShiftMemo::new())
+}
+
+/// Memoized on node identity. Expressions here are a hash-consed DAG, and the
+/// unmemoized walk descended into every *edge*, so a subterm shared k ways was
+/// rebuilt k times — the DAG expanded into its tree. Measured on one entry's
+/// `generalize_across`: eight calls of 60-80 s each holding 11 GB of transient
+/// nodes, against a per-entry cap that never fired because none of it is
+/// retained. The memo makes it linear in distinct nodes.
+fn shift_stack_relative_memo(
+    expr: &Expr,
+    base_terms: &BTreeMap<String, i64>,
+    delta: u64,
+    memo: &mut ShiftMemo,
+) -> Expr {
+    if let Some(done) = memo.get(expr) {
+        return done.clone();
+    }
+    let result = shift_stack_relative_uncached(expr, base_terms, delta, memo);
+    memo.insert(expr.clone(), result.clone());
+    result
+}
+
+fn shift_stack_relative_uncached(
+    expr: &Expr,
+    base_terms: &BTreeMap<String, i64>,
+    delta: u64,
+    memo: &mut ShiftMemo,
+) -> Expr {
     let (terms, constant) = affine_vsp_parts(expr);
     if !terms.is_empty() && terms == *base_terms {
         let shifted = constant.wrapping_add(delta);
@@ -1900,23 +1945,23 @@ fn shift_stack_relative(expr: &Expr, base_terms: &BTreeMap<String, i64>, delta: 
     let rebuilt = match &expr.kind {
         ExprKind::Binary { op, left, right } => Expr::binary(
             *op,
-            shift_stack_relative(left, base_terms, delta),
-            shift_stack_relative(right, base_terms, delta),
+            shift_stack_relative_memo(left, base_terms, delta, memo),
+            shift_stack_relative_memo(right, base_terms, delta, memo),
         )
         .ok(),
         ExprKind::Unary { op, value } => {
-            Some(Expr::unary(*op, shift_stack_relative(value, base_terms, delta)))
+            Some(Expr::unary(*op, shift_stack_relative_memo(value, base_terms, delta, memo)))
         }
         ExprKind::Load { address } => Some(Expr::load(
             expr.width,
-            shift_stack_relative(address, base_terms, delta),
+            shift_stack_relative_memo(address, base_terms, delta, memo),
         )),
         ExprKind::Intrinsic { name, arguments } => Some(Expr::intrinsic(
             expr.width,
             name.clone(),
             arguments
                 .iter()
-                .map(|argument| shift_stack_relative(argument, base_terms, delta))
+                .map(|argument| shift_stack_relative_memo(argument, base_terms, delta, memo))
                 .collect::<Vec<_>>(),
         )),
         _ => None,
@@ -1935,7 +1980,12 @@ fn shift_ancestor_onto_reentry(
     if base_terms.is_empty() {
         return None;
     }
-    let shift = |expr: &Expr| shift_stack_relative(expr, &base_terms, delta);
+    // One memo for the whole state: its cells share subterms heavily, so a
+    // per-expression memo would rebuild the same DAG once per cell.
+    let memo = std::cell::RefCell::new(ShiftMemo::new());
+    let shift = |expr: &Expr| {
+        shift_stack_relative_memo(expr, &base_terms, delta, &mut memo.borrow_mut())
+    };
     Some(SymbolicVmInitialState {
         vsp: shift(&ancestor.vsp),
         flags: shift(&ancestor.flags),
@@ -2291,7 +2341,14 @@ struct Walker<'a, 'p> {
     private_frame_hi: Option<i64>,
     /// Set once a report may leak the frame address or write outside the frame,
     /// or a loop widening may have hidden such a pointer.
+    /// OBSERVED: the VM stack frame really did escape — an address of it was
+    /// exposed, or a store landed past its proven extent. A fact.
     frame_not_private: bool,
+    /// CONCEDED: privacy was ASSUMED, to generalize or close a loop. Not the
+    /// same claim as the field above, and keeping both in one flag denied the
+    /// taint retry to every entry that closed a strided loop — the retry wants
+    /// privacy to HOLD, and a concession is "not proven", not "false".
+    frame_privacy_conceded: bool,
     /// Some report let a value derived from the frame (possibly mere data) leave it.
     frame_derived_escape: bool,
     /// Diagnostic: a report reported the frame ADDRESS escaping.
@@ -2412,7 +2469,30 @@ const DEFAULT_MAX_FLAGS: usize = 2;
 
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
+/// Diagnostic: with `VMPX_MEM_TRACE=1`, names any single call that ran longer
+/// than five seconds. The walker-level trace samples between worklist items, so
+/// it cannot fire while the walk is inside one call -- which is where the 11.7 GB
+/// transient on entry 0xdb9023d lives.
+fn note_slow(label: &str, start: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VMPX_MEM_TRACE").is_some()) {
+        return;
+    }
+    let ms = start.elapsed().as_millis();
+    if ms >= 5_000 {
+        let (live, dead) = crate::expr::interner_census();
+        println!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
+    }
+}
+
 fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    let at = std::time::Instant::now();
+    let out = resolve_targets_inner(target, limits);
+    note_slow("resolve_targets", at);
+    out
+}
+
+fn resolve_targets_inner(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
     let simplified = target.simplify();
     if let ExprKind::Const { value } = simplified.kind {
         return Ok((vec![value], false));
@@ -2963,6 +3043,47 @@ impl Walker<'_, '_> {
             .saturating_add(root_count.saturating_mul(STATE_ROOT_BYTES))
     }
 
+    /// Diagnostic: with `VMPX_MEM_TRACE=1`, prints the walker's own containers
+    /// every two seconds. The per-entry cap counts the symbolic state the walker
+    /// holds; an entry reached 12 GB resident against a 1.5 GB cap that never
+    /// fired, so something it does not count holds the rest. Correlate these
+    /// against an external RSS sample: whichever column tracks RSS is the site.
+    fn mem_trace(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VMPX_MEM_TRACE").is_some()) {
+            return;
+        }
+        let start = START.get_or_init(std::time::Instant::now);
+        let secs = start.elapsed().as_secs();
+        if secs < LAST.load(Ordering::Relaxed) + 2 {
+            return;
+        }
+        LAST.store(secs, Ordering::Relaxed);
+        let states: usize = self.explored.values().map(Vec::len).sum();
+        let canon: usize = self.widened.values().map(Vec::len).sum();
+        let instrs: usize = self.decoded.values().map(|b| b.instructions.len()).sum();
+        let (live, dead) = crate::expr::interner_census();
+        println!(
+            "[mem {secs:>4}s] charged={:>6}MB blocks={:<5} states={:<6} canon={:<5} decoded={:<5} \
+             decoded_instrs={:<8} cfg_blocks={:<5} visits={:<6} interner_live={:<9} \
+             interner_dead={:<8} interner_live_MB={:>6}",
+            self.live_bytes / (1024 * 1024),
+            self.explored.len(),
+            states,
+            canon,
+            self.decoded.len(),
+            instrs,
+            self.cfg.blocks.len(),
+            self.cfg.visits,
+            live,
+            dead,
+            live.saturating_mul(EXPR_NODE_BYTES) / (1024 * 1024),
+        );
+    }
+
     /// Adds `bytes` to the live estimate; on exceeding the cap records
     /// `CfgLimitHit::Memory` and a stall, and returns false (fail closed).
     fn charge(&mut self, bytes: usize, key: Va, vip: Va) -> bool {
@@ -3264,47 +3385,74 @@ impl Walker<'_, '_> {
         key: Va,
         incoming: &SymbolicVmInitialState,
     ) -> Option<GeneralizeAcross> {
+        match self.scan_shifted_phases(key, incoming) {
+            ShiftedPhases::None => None,
+            ShiftedPhases::Covered => {
+                self.concede_frame_privacy();
+                Some(GeneralizeAcross::Closed)
+            }
+            ShiftedPhases::Folded(folded) => {
+                self.concede_frame_privacy();
+                // `false`, not a computed fold-hid test: this path concedes frame
+                // privacy outright above, so the flag the caller ORs in is already
+                // set and a test of what the fold dropped would decide nothing.
+                Some(self.continue_from(key, Ok((folded, false))))
+            }
+        }
+    }
+
+    /// Walks the block's other phases, each re-expressed at the re-entry's VM
+    /// stack depth, holding ONE shifted copy at a time.
+    ///
+    /// Materializing them all was measured at 171 s and 11.7 GB transient in a
+    /// single call: `shift_ancestor_onto_reentry` substitutes over every cell of
+    /// a state, so a vector of N shifted phases is N full copies of the state's
+    /// expressions alive at once. Nothing the walker retains grows during that
+    /// spike, which is why the per-entry cap never saw it -- the peak is this
+    /// scan's own working set, and bounding it is the whole fix.
+    fn scan_shifted_phases(&self, key: Va, incoming: &SymbolicVmInitialState) -> ShiftedPhases {
+        let reentry = canonicalized(incoming);
+        let empty: &[SymbolicVmInitialState] = &[];
+        let canonicals = self.widened.get(&key).map_or(empty, Vec::as_slice);
         // A recorded canonical is already a fold of many states, so it is both
         // tighter and cheaper to shift than the raw history; fall back to the
         // history only when no phase has converged yet.
-        let shifted: Vec<SymbolicVmInitialState> = self
-            .widened
-            .get(&key)
-            .into_iter()
-            .flatten()
-            .filter_map(|phase| shift_ancestor_onto_reentry(phase, incoming))
-            .collect();
-        let shifted = if shifted.is_empty() {
-            self.explored
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .filter_map(|state| shift_ancestor_onto_reentry(state, incoming))
-                .collect()
+        let sources = if canonicals.is_empty() {
+            self.explored.get(&key).map_or(empty, Vec::as_slice)
         } else {
-            shifted
+            canonicals
         };
-        if shifted.is_empty() {
-            return None;
+        // OLDEST first, and at most `max_visits_per_block` of them. Order is not
+        // a detail here: folding oldest-first reaches a stable over-approximation
+        // in a few steps, while newest-first re-widens against ever more
+        // different states and the accumulator grows. Measured on one entry,
+        // same budget, only the order reversed: 0.55 GB flat against 13.4 GB.
+        // The bound then caps the per-call cost, since shifting one phase
+        // substitutes over every cell of a state.
+        let budget = self.limits.max_visits_per_block;
+        let mut acc: Option<SymbolicVmInitialState> = None;
+        for phase in sources.iter().take(budget) {
+            let Some(shifted) = shift_ancestor_onto_reentry(phase, incoming) else {
+                continue;
+            };
+            // Closing is the whole point. Folding alone does not converge a
+            // strided block: the fold's result is recorded at THIS depth, the
+            // next re-entry arrives one stride deeper, finds no canonical of its
+            // own again, and the block still spends one state per phase until the
+            // ceiling. Only a shifted phase that already COVERS the re-entry
+            // subsumes the back edge.
+            if matches!(widen_state(key, &canonicalized(&shifted), &reentry), Ok(None)) {
+                return ShiftedPhases::Covered;
+            }
+            // Not covered yet: broaden so a later re-entry is.
+            let base = acc.unwrap_or_else(|| incoming.clone());
+            acc = Some(match widen_state(key, &base, &shifted) {
+                Ok(Some(widened)) => widened,
+                Ok(None) => base,
+                Err(_) => return ShiftedPhases::None,
+            });
         }
-        let reentry = canonicalized(incoming);
-        // Closing is the whole point. Folding alone does not converge a strided
-        // block: the fold's result is recorded at THIS depth, the next re-entry
-        // arrives one stride deeper, finds no canonical of its own again, and the
-        // block still spends one state per phase until the ceiling. Only a shifted
-        // phase that already COVERS the re-entry subsumes the back edge.
-        if shifted
-            .iter()
-            .any(|phase| matches!(widen_state(key, &canonicalized(phase), &reentry), Ok(None)))
-        {
-            self.concede_frame_privacy();
-            return Some(GeneralizeAcross::Closed);
-        }
-        // Not covered yet: broaden across the shifted phases so a later one is.
-        let folded = fold_states(key, shifted.iter(), incoming).ok()?;
-        let hid = fold_hid_frame_pointer(shifted.iter().chain([incoming]), &folded);
-        self.concede_frame_privacy();
-        Some(self.continue_from(key, Ok((folded, hid))))
+        acc.map_or(ShiftedPhases::None, ShiftedPhases::Folded)
     }
 
     /// Records the frame-privacy concession a generalization rests on: both the
@@ -3312,7 +3460,7 @@ impl Walker<'_, '_> {
     /// See [`VmCfgAssumption::AssumesVmStackFramePrivate`] for why the flag alone
     /// was not enough.
     fn concede_frame_privacy(&mut self) {
-        self.frame_not_private = true;
+        self.frame_privacy_conceded = true;
         self.cfg
             .assumptions
             .insert(VmCfgAssumption::AssumesVmStackFramePrivate);
@@ -3345,6 +3493,7 @@ impl Walker<'_, '_> {
     }
 
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
+        self.mem_trace();
         // Walk this block (and the successors it queues) under its profile.
         // `None` is the base profile, so the sound path is unchanged.
         self.active.clone_from(&item.profile);
@@ -3361,7 +3510,10 @@ impl Walker<'_, '_> {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
         }
-        let Some(mut symbolic_in) = self.enter_loop(item) else {
+        let at = std::time::Instant::now();
+        let entered = self.enter_loop(item);
+        note_slow("enter_loop", at);
+        let Some(mut symbolic_in) = entered else {
             return;
         };
         if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
@@ -3380,7 +3532,10 @@ impl Walker<'_, '_> {
                 self.stall(key, key, "symbolic state keeps changing at this block: ceiling");
                 return;
             }
-            match self.generalize_across(key, &symbolic_in) {
+            let at = std::time::Instant::now();
+            let across = self.generalize_across(key, &symbolic_in);
+            note_slow("generalize_across", at);
+            match across {
                 GeneralizeAcross::Closed => return,
                 GeneralizeAcross::Stall(reason) => {
                     self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
@@ -3399,7 +3554,7 @@ impl Walker<'_, '_> {
                     // frame-pointer-bearing cell. Conceding on every fold cost
                     // 115 CFG-complete entries the proven tier even though no
                     // frame pointer had been lost (ptr_lost=false in all of them).
-                    self.frame_not_private |= hid_frame_pointer;
+                    self.frame_privacy_conceded |= hid_frame_pointer;
                     symbolic_in = widened;
                 }
             }
@@ -3419,7 +3574,10 @@ impl Walker<'_, '_> {
             state: symbolic_in.clone(),
             parent: item.path.clone(),
         }));
-        if !self.decode_block(item) {
+        let at = std::time::Instant::now();
+        let decoded_ok = self.decode_block(item);
+        note_slow("decode_block", at);
+        if !decoded_ok {
             return;
         }
         let (final_state, stop, boundary, error, instructions) = {
@@ -3508,6 +3666,11 @@ impl Walker<'_, '_> {
             Ok(report)
                 if report.memory_tainted
                     && boundary == Some(VmHandlerSemantic::UnconditionalBranch)
+                    // Only the OBSERVED escape bars this retry. A loop
+                    // generalization that conceded privacy has not shown the
+                    // frame is aliased, and the retry's own result is labeled
+                    // the same unproven tier, so denying it bought nothing and
+                    // cost every entry that closed a strided loop.
                     && !self.frame_not_private
                     && !self.frame_pointer_lost =>
             {
@@ -4081,6 +4244,7 @@ impl Walker<'_, '_> {
         let derived_leak = self.frame_pointer_lost && self.frame_derived_escape;
         if self.private_frame_hi.is_some()
             && !self.frame_not_private
+            && !self.frame_privacy_conceded
             && !derived_leak
             && self.nested_followed == 0
         {
@@ -4094,9 +4258,10 @@ impl Walker<'_, '_> {
         // blocking condition is the lever: raising N2 means discharging here, not
         // completing more CFGs.
         self.cfg.discharge_refusal = Some(format!(
-            "no_private_frame={} frame_not_private={} [addr_escape={} store_past={}] derived_leak={} (ptr_lost={} ptr_escape={}) nested={}",
+            "no_private_frame={} frame_not_private={} conceded={} [addr_escape={} store_past={}] derived_leak={} (ptr_lost={} ptr_escape={}) nested={}",
             self.private_frame_hi.is_none(),
             self.frame_not_private,
+            self.frame_privacy_conceded,
             self.frame_escape_seen,
             self.frame_store_past
                 .map_or_else(|| "no".to_owned(), |(hi, w)| format!("hi={hi:#x}<written={w:#x}")),
@@ -4559,6 +4724,7 @@ pub fn recover_vm_cfg_with_observed(
         observed_branch_targets: &observed.branch_targets,
         private_frame_hi,
         frame_not_private: false,
+        frame_privacy_conceded: false,
         frame_derived_escape: false,
         frame_pointer_lost: false,
         frame_escape_seen: false,
@@ -4807,6 +4973,7 @@ mod tests {
             observed_branch_targets: &observed.branch_targets,
             private_frame_hi: None,
             frame_not_private: false,
+            frame_privacy_conceded: false,
             frame_derived_escape: false,
             frame_pointer_lost: false,
             frame_escape_seen: false,
@@ -6075,8 +6242,13 @@ mod tests {
         );
         assert_eq!(walker.generalize_across(key, &incoming), GeneralizeAcross::Closed);
         assert!(
-            walker.frame_not_private,
+            walker.frame_privacy_conceded,
             "closing by shifting the stack base concedes frame privacy"
+        );
+        assert!(
+            !walker.frame_not_private,
+            "a concession is not an observed escape: conflating them denied the \
+             taint retry to every entry that closed a strided loop"
         );
     }
 

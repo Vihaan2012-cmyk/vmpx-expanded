@@ -119,6 +119,7 @@ pub use exception_flow::{
 };
 pub use expr::{
     BinaryOp, Expr, ExprError, ExprKind, ExprRef, ResizeOp, UnaryOp, distinct_node_count_bounded,
+    interner_census,
 };
 pub use handler_slice::{
     HandlerSliceConfig, NativeBackwardSlice, NativeInstructionDisposition, NativeSliceInstruction,
