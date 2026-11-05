@@ -622,12 +622,13 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     direct("no comparison matches the flag-word samples", notes)
 }
 
-/// `VMPX_LOWER_SPIN_ARMS=1`: lower an arm with no reachable function exit as a
-/// non-terminating loop instead of refusing the whole function. See the note at
-/// the `RNode::Dead` arm for why this is not yet a default.
+/// Lower an arm with no reachable function exit as a non-terminating loop
+/// instead of refusing the whole function. ON by default; `VMPX_NO_SPIN_ARMS=1`
+/// restores the old refusal for comparison. See the note at the `RNode::Dead`
+/// arm for the measurement that earned the default.
 fn lower_spin_arms() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VMPX_LOWER_SPIN_ARMS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("VMPX_NO_SPIN_ARMS").is_ok_and(|v| v == "1"))
 }
 
 // ------------------------------------------------------------------- lowering
@@ -808,20 +809,23 @@ impl Lower<'_> {
                 // return are unaffected.
                 //
                 // Refusing instead threw away the whole function over a path
-                // that cannot return. Measured on systems.xpl that was the
-                // largest bucket of CFG-complete entries emitting nothing at
-                // all: 126 of them, and it is where every entry opened by the
-                // VM-stack loop closure landed.
-                // OFF by default, behind `VMPX_LOWER_SPIN_ARMS=1`, and it stays
-                // off until the cost is known. An exit-less loop is a shape
-                // neither the structurer nor the renderer has ever been given,
-                // and a 45 GB runaway was observed on the first run that could
-                // have exercised it -- unattributed, the other candidate being a
-                // 4x instruction-limit budget pass running concurrently. A
-                // renderer that recurses on a loop with no exit would grow text
-                // without bound, which matches what was seen, so the default
-                // keeps the old refusal until that is ruled out on ONE entry
-                // under a memory cap.
+                // that cannot return, and that was the largest bucket of
+                // CFG-complete entries emitting nothing at all -- 204 of them on
+                // systems.xpl once the VM-stack loop closures landed, since that
+                // is where every entry they opened arrives.
+                //
+                // This was gated off while a 45 GB runaway stood unattributed
+                // between it and a concurrent 4x instruction-limit budget pass:
+                // a renderer that recursed on an exit-less loop would grow text
+                // without bound, which matched what was seen. The runaway was
+                // then traced to the budget pass, and the whole 814-entry sweep
+                // under a per-process memory cap settles the rest: 8 processes,
+                // 1.0 GB peak each, nothing killed, 869 arms lowered.
+                //
+                // Emitting 390 -> 594, and the IR round-trip self-check 38 ->
+                // 192 -- the newly emitted functions verify at a far higher rate
+                // than the old population, which is what an anti-analysis trap
+                // being removed from otherwise clean code looks like.
                 if !lower_spin_arms() {
                     return Err(format!("a dead arm remained after gate collapse: {why}"));
                 }
