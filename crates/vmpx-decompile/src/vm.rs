@@ -175,31 +175,47 @@ fn sig(n: &RNode) -> u64 {
 fn collapse(n: &RNode, notes: &mut Vec<String>) -> Result<RNode, String> {
     match n {
         RNode::Fork { selector, env: true, block, arms } => {
-            let _ = selector;
-            let mut live: Vec<RNode> = Vec::new();
-            for (_, a) in arms {
+            // Keyed by arm value: the differing-arms fallback below rebuilds a
+            // fork, and a fork without its selector values is not lowerable.
+            let mut live: Vec<(u64, RNode)> = Vec::new();
+            for (v, a) in arms {
                 if !is_live(a) {
                     continue;
                 }
                 let c = collapse(a, notes)?;
                 if is_live(&c) {
-                    live.push(c);
+                    live.push((*v, c));
                 }
             }
             match live.len() {
                 0 => Ok(RNode::Dead(format!("every arm of the gate at {block} fails"))),
                 1 => {
                     notes.push(format!("environment gate at {block}: {} failing arm(s) dropped", arms.len() - 1));
-                    Ok(live.remove(0))
+                    Ok(live.remove(0).1)
                 }
                 n => {
-                    let first = sig(&live[0]);
-                    if live.iter().all(|a| sig(a) == first) {
+                    let first = sig(&live[0].1);
+                    if live.iter().all(|(_, a)| sig(a) == first) {
                         notes.push(format!("environment gate at {block}: {n} identical live arms collapsed"));
-                        Ok(live.remove(0))
-                    } else {
-                        Err(format!("environment gate at {block} has {n} live arms that differ after collapse"))
+                        return Ok(live.remove(0).1);
                     }
+                    // Collapsing is a SIMPLIFICATION — it removes anti-analysis
+                    // noise when every surviving arm does the same thing. When
+                    // they differ there is nothing to simplify, and refusing the
+                    // whole function was never the honest fallback: the CFG
+                    // already over-approximated this gate by following every
+                    // target, so keeping the fork on its real selector drops no
+                    // behavior and claims nothing extra. It is strictly more
+                    // faithful than picking one arm.
+                    notes.push(format!(
+                        "environment gate at {block}: {n} live arms differ, kept as a fork on the environment value"
+                    ));
+                    Ok(RNode::Fork {
+                        selector: selector.clone(),
+                        env: true,
+                        block: *block,
+                        arms: live,
+                    })
                 }
             }
         }
