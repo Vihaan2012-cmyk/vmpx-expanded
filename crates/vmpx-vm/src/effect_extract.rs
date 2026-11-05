@@ -1972,7 +1972,11 @@ pub fn classify_handler_effects(
         // effects remain unknown", with nothing to say which clause failed.
         evidence.push(format!(
             "no semantic candidate matched: stack_effects={stack_effect_count}              context_effects={context_effect_count} bytecode_effects={bytecode_effect_count}              other_effects={other_effect_count} other_read={other_read}              other_write={other_write} ordinary_operandless={ordinary_operandless}              arithmetic_ops={} flags_to_vsp={} is_cpuid={is_cpuid}              is_cpuid_leaf_only={is_cpuid_leaf_only} vsp_delta={:?}              operand_width={operand_width:?}",
-            summary.arithmetic_operations.len(),
+            // The NAMES, not just the count. Every one of these handlers matches
+            // the cpuid-leaf-only shape except for `arithmetic_operations`, and
+            // deciding whether that op is load-bearing or obfuscation needs to
+            // know which op it is.
+            format_args!("{}{:?}", summary.arithmetic_operations.len(), summary.arithmetic_operations),
             summary.captures_native_flags_to_vsp,
             summary.vsp_delta,
         ));
