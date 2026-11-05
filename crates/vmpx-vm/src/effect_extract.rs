@@ -79,6 +79,13 @@ pub struct HandlerEffectSummary {
     pub resets_key_from_vip: bool,
     pub reinitializes_handler_base: bool,
     pub arithmetic_operations: Vec<String>,
+    /// Diagnostic companion to `arithmetic_operations`: each op's slice
+    /// disposition. `LiveDependency` means its result is PROVEN to reach a
+    /// live-out register; `ConservativeMemory`/`ConservativeBarrier` mean only
+    /// that it could not be proven dead. The semantic gates require this list to
+    /// be empty, so which of those two it is decides whether the gate is tight
+    /// or merely imprecise.
+    pub arithmetic_dispositions: Vec<String>,
     pub resize_operations: Vec<HandlerResizeEffect>,
     pub timestamp_counter_reads: Vec<Rva>,
     /// Stores of the low bytes of the pre-adjustment VSP to the VM stack top.
@@ -434,6 +441,7 @@ pub fn extract_handler_effects_keyed(
     let mut zero_registers = BTreeSet::new();
     let mut final_handler_base_is_static = false;
     let mut arithmetic_operations = Vec::new();
+    let mut arithmetic_dispositions = Vec::new();
     let mut resize_operations = Vec::new();
     let mut timestamp_counter_reads = Vec::new();
     let mut narrow_vsp_pushes = Vec::new();
@@ -614,6 +622,7 @@ pub fn extract_handler_effects_keyed(
                 .any(|role| role == canonical(instruction.op0_register())))
         {
             arithmetic_operations.push(format!("{:?}", instruction.mnemonic()));
+            arithmetic_dispositions.push(format!("{disposition:?}"));
         }
         let resize_operation = match instruction.mnemonic() {
             Mnemonic::Movzx => Some(ResizeOp::ZeroExtend),
@@ -723,6 +732,7 @@ pub fn extract_handler_effects_keyed(
         resets_key_from_vip,
         reinitializes_handler_base: final_handler_base_is_static,
         arithmetic_operations,
+        arithmetic_dispositions,
         resize_operations,
         timestamp_counter_reads,
         narrow_vsp_pushes,
@@ -1976,7 +1986,12 @@ pub fn classify_handler_effects(
             // the cpuid-leaf-only shape except for `arithmetic_operations`, and
             // deciding whether that op is load-bearing or obfuscation needs to
             // know which op it is.
-            format_args!("{}{:?}", summary.arithmetic_operations.len(), summary.arithmetic_operations),
+            format_args!(
+                "{}{:?}{:?}",
+                summary.arithmetic_operations.len(),
+                summary.arithmetic_operations,
+                summary.arithmetic_dispositions
+            ),
             summary.captures_native_flags_to_vsp,
             summary.vsp_delta,
         ));
