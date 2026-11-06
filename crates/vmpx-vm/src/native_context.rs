@@ -473,7 +473,24 @@ fn failed_frame(entry_stub: Rva, diagnostics: Vec<String>) -> X64NativeFrameRepo
 
 /// Recovers an x64 VM entry's saved-native frame from instruction provenance.
 /// The entry must transfer through a direct call; its target may use arbitrarily
-/// many direct-jump fragments. A frame is accepted only when all fifteen
+/// many direct-jump fragments.
+///
+/// NOTE, measured 2026-11-07: this starts AT the entry stub, so native code
+/// BEFORE it is never decoded -- and the analysis is call-based, while the real
+/// virtualized functions on systems.xpl are reached by `jmp`. All 12 of them sit
+/// behind a 4-12 instruction prologue in their own `.pdata` function that sets a
+/// register with `lea r64,[rip+disp]` (5 also load from a constant address), so
+/// the VM entry inherits values that ARE statically known.
+///
+/// Teaching `update_provenance` to recognise that `lea`, and `observe_target_push`
+/// to carry `Provenance::RelocatedConstant` through instead of dropping it into
+/// `Unknown`, was built and measured: +0 on BOTH instruments, every stall cause
+/// and every input-closed cause byte-identical. The reason is this window --
+/// the instruction is never seen, so the new case never fires. Reverted.
+///
+/// Using that prologue state requires widening the window backwards to the
+/// enclosing `.pdata` function start and admitting a `jmp`-reached entry, which
+/// is a change to what this function analyses, not an extra provenance case. A frame is accepted only when all fifteen
 /// non-RSP GPR values and unmodified RFLAGS are saved before a full-width
 /// `MOV cursor,RSP` capture.
 ///

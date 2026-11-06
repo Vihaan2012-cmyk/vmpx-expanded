@@ -403,7 +403,9 @@ fn recover_all(
                                 audit_complete(entry, cfg);
                             }
                         }
-                        mine.push((index, classify(result)));
+                        let outcome = classify(result);
+                        note_progress(&outcome);
+                        mine.push((index, outcome));
                     }
                     mine
                 })
@@ -423,7 +425,62 @@ fn recover_all(
             .collect::<Vec<_>>()
     });
     panic::set_hook(prev_hook);
+    flush_progress();
     out
+}
+
+/// Running tallies, flushed as entries finish so a sweep that is killed or times
+/// out still reports what it had.
+///
+/// `report` otherwise prints its headline only at the very end, so a run cut
+/// short yields NOTHING -- no N1, no N2, not even a count of how far it got. On
+/// a 253 MB sample a sweep is 15-20 minutes and a budget pass can exceed any
+/// timeout, and losing the whole measurement to the last entry has cost several
+/// runs. The stall dump was already incremental; the counts were not.
+///
+/// `VMPX_PROGRESS=<file>` writes `done/n1/n2/incomplete/errors`, rewritten in
+/// place every `PROGRESS_EVERY` entries and once more when the sweep ends. A
+/// write failure is ignored: progress reporting must never fail a measurement.
+static PROGRESS: std::sync::Mutex<(usize, usize, usize, usize, usize)> =
+    std::sync::Mutex::new((0, 0, 0, 0, 0));
+
+const PROGRESS_EVERY: usize = 16;
+
+fn note_progress(outcome: &Outcome) {
+    let Some(path) = std::env::var_os("VMPX_PROGRESS") else {
+        return;
+    };
+    let mut counts = PROGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    counts.0 += 1;
+    match outcome {
+        Outcome::Complete(assumptions) => {
+            counts.1 += 1;
+            if assumptions.is_empty() {
+                counts.2 += 1;
+            }
+        }
+        Outcome::Incomplete => counts.3 += 1,
+        Outcome::Error | Outcome::Panic => counts.4 += 1,
+    }
+    if counts.0 % PROGRESS_EVERY == 0 {
+        write_progress(&path, *counts);
+    }
+}
+
+fn write_progress(path: &std::ffi::OsStr, counts: (usize, usize, usize, usize, usize)) {
+    let (done, n1, n2, incomplete, errors) = counts;
+    let _ = std::fs::write(
+        path,
+        format!("done={done} n1={n1} n2={n2} incomplete={incomplete} errors={errors}\n"),
+    );
+}
+
+/// Final flush, so the last partial batch is not lost.
+pub(crate) fn flush_progress() {
+    if let Some(path) = std::env::var_os("VMPX_PROGRESS") {
+        let counts = *PROGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_progress(&path, counts);
+    }
 }
 
 fn tally(outcomes: &[Outcome], discovered: usize, sampled: bool) -> StaticSweep {
