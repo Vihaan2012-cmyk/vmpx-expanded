@@ -345,6 +345,43 @@ pub(crate) fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportRepor
     results
 }
 
+/// Global slots the detonation should capture, from `VMPX_DYNAMIC_CAPTURE` as
+/// `addr:len` pairs (`0x1a2b3c:8,0x1a2b44:4`), length in bytes.
+///
+/// These are the constant-addressed untracked reads a prior static pass could
+/// not resolve; feeding them back is what turns `observed globals=0` into a
+/// seed. A malformed pair is reported and skipped rather than failing the run,
+/// because this only ever feeds the experimental tier.
+fn dynamic_capture_requests(warnings: &mut Vec<String>) -> Vec<(u64, usize)> {
+    let Ok(spec) = std::env::var("VMPX_DYNAMIC_CAPTURE") else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+    for item in spec.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let (address, length) = match item.split_once(':') {
+            Some((address, length)) => (address, length),
+            None => (item, "8"),
+        };
+        let address = address.trim().trim_start_matches("0x");
+        match (u64::from_str_radix(address, 16), length.trim().parse::<usize>()) {
+            (Ok(address), Ok(length)) if length > 0 && length <= 4096 => {
+                requests.push((address, length));
+            }
+            _ => warnings.push(format!(
+                "[dynamic][experimental] ignoring malformed VMPX_DYNAMIC_CAPTURE entry {item:?}; \
+                 expected <hex-address>[:<length-bytes>]"
+            )),
+        }
+    }
+    if !requests.is_empty() {
+        warnings.push(format!(
+            "[dynamic][experimental] capturing {} requested global slot(s)",
+            requests.len()
+        ));
+    }
+    requests
+}
+
 /// Unifies executable-stub discovery with the VM entries reachable from exports
 /// into one deduplicated list. Inventory only: nothing here is recovered.
 pub(crate) fn build_vm_inventory(
@@ -942,7 +979,29 @@ pub fn analyze_clean_with_image(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(base.max_steps);
-        let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, ..base };
+        // `capture_globals` is CALLER-DRIVEN: the emulator captures only the
+        // (address, length) pairs it is asked for. Passing the default empty list
+        // meant `observed globals=0` at every step budget, so the globals bridge
+        // looked ineffective when it had simply never been told what to watch.
+        //
+        // Only a read at a CONSTANT address is a global a later run can supply.
+        // Measured on systems.xpl, of 270 untracked reads that block replacement
+        // just 22 are constant-addressed; the other ~138 are rooted in a caller
+        // register (`native_rsi_initial` and friends), so they are caller data
+        // with a different address per call site and no observation can bind
+        // them. Sizing that first is why this is worth ~22 entries, not 143.
+        //
+        // Addresses come from a prior static pass, which is the honest order for
+        // an observed-tier assist: let static recovery say what it could not
+        // resolve, then watch exactly those slots. Within one invocation the
+        // detonation runs before any static recovery, so they arrive by knob.
+        let capture_globals = dynamic_capture_requests(&mut warnings);
+        let opts = vmpx_emulate::DetonateOptions {
+            export_reference,
+            max_steps,
+            capture_globals,
+            ..base
+        };
         match vmpx_emulate::detonate(&input_pe, &opts) {
             Ok(result) => {
                 warnings.push(format!(
@@ -2338,7 +2397,10 @@ pub(crate) fn replacement_config(
     .ok()
     .filter(|report| report.complete && report.targets.len() == 1)
     .map(|report| report.targets[0].va)
-    .map(|va| va.0);
+    // Resolved to a single proven target, so this is the constant form. A
+    // continuation that could NOT be resolved is the computed form, which does
+    // not need resolving at all -- see `ReplacementContinuation::Computed`.
+    .map(|va| vmpx_vmlift::ReplacementContinuation::Address(va.0));
     vmpx_vmlift::ReplacementConfig {
         inputs: inputs.to_vec(),
         max_expression_nodes: 200_000,

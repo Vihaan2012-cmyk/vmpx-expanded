@@ -48,10 +48,10 @@ pub struct ReplacementConfig {
     /// Intrinsics that may be lowered to a real imported call.
     pub import_calls: BTreeMap<String, crate::ImportCall>,
     /// Where the recovered VM exit transfers control instead of returning to the
-    /// original caller. The emitted function ends with a tail jump to this
-    /// address after restoring the exit register state, so the protector's own
-    /// native continuation runs and performs the real return.
-    pub continuation: Option<u64>,
+    /// original caller, so the protector's own native continuation runs and
+    /// performs the real return. Emitted after the exit register state is
+    /// restored.
+    pub continuation: Option<ReplacementContinuation>,
     /// Observable effects the virtualized routine performs, in execution order.
     /// A replacement that omitted them would compute the right registers and
     /// still be wrong, so they are emitted before the epilogue restores state.
@@ -176,6 +176,23 @@ pub(crate) const ENTRY_STACK_POINTER: &str = "__entry_rsp";
 /// materialises the real value (here `Operation::ReadFlags`). Callers that bind
 /// it must also map `native_rflags_initial` onto this name.
 pub const ENTRY_FLAGS: &str = "__entry_rflags";
+
+/// Where a recovered VM exit transfers control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplacementContinuation {
+    /// A resolved address: a real `jmp` to a constant.
+    Address(u64),
+    /// A target the routine COMPUTES -- typically read from caller data, so no
+    /// per-function analysis can resolve it. The replacement does not need to:
+    /// it stages the value and transfers through it, which preserves behaviour
+    /// without knowing the destination.
+    ///
+    /// Staged in MEMORY, at `[entry_rsp - 8]`, deliberately. `ReturnRetaining`
+    /// releases the frame with a `lea` rather than pops, so a staged qword
+    /// survives teardown while a target left in a register would be clobbered
+    /// when that register is one of the preserved ones.
+    Computed(Expr),
+}
 
 /// The symbol the VM model uses for the condition state on entry.
 pub const NATIVE_RFLAGS_INITIAL: &str = "native_rflags_initial";
@@ -353,9 +370,23 @@ pub fn build_replacement_popping(
         .and_then(|base| base.checked_add(effect_slot_count))
         .map(SpillSlot)
         .ok_or(ReplacementError::TooManyInputs)?;
-    let mut window_base = flag_slot
+    let flags_slots = u16::from(config.rflags.is_some());
+    // A computed continuation target gets its own shared slot too, for the same
+    // reason the flag word does: it is materialised before the epilogue puts
+    // exit values in registers, so it cannot be computed afterwards in scratch
+    // registers that are already holding them.
+    let computed_continuation = match &config.continuation {
+        Some(ReplacementContinuation::Computed(target)) => Some(target.clone()),
+        _ => None,
+    };
+    let continuation_slot = flag_slot
         .0
-        .checked_add(u16::from(config.rflags.is_some()))
+        .checked_add(flags_slots)
+        .map(SpillSlot)
+        .ok_or(ReplacementError::TooManyInputs)?;
+    let mut window_base = continuation_slot
+        .0
+        .checked_add(u16::from(computed_continuation.is_some()))
         .ok_or(ReplacementError::TooManyInputs)?;
     // The shared region ends where the first fragment window begins.
     let shared_end = window_base;
@@ -592,6 +623,33 @@ pub fn build_replacement_popping(
         });
     }
 
+    // 1d. Materialise a computed continuation target into its slot, for the same
+    // reason and at the same point as the flag word. The transfer below pops this
+    // slot, so the target never has to be live in a register at teardown.
+    if let Some(target) = &computed_continuation {
+        let bound = substitute_effect_bindings(
+            &rewrite_symbols(target, &config.symbol_rewrites)?,
+            &effect_bindings,
+        )?;
+        let (target_operations, target_value) = lower_fragment(
+            &bound,
+            &inputs,
+            &extra_inputs,
+            config,
+            &mut canonical,
+            &mut assignments,
+            &mut next_register,
+            &mut window_base,
+            &shared_end,
+            &mut trust,
+        )?;
+        operations.extend(target_operations);
+        operations.push(Operation::SpillStore {
+            slot: continuation_slot,
+            source: target_value,
+        });
+    }
+
     // 2. One body per exit register. Each body reads its inputs from the shared
     // frame and stores its result into its own slot.
     for (index, (register, expression)) in ordered.iter().enumerate() {
@@ -795,10 +853,20 @@ pub fn build_replacement_popping(
 
     // A tail jump tears the frame down itself, so it replaces the return rather
     // than following it; emitting both would leave an unreachable `ret`.
-    match config.continuation {
-        Some(target) => operations.push(Operation::JumpToAddress(vmpx_recompile::NativeAddress(
-            target,
-        ))),
+    // Index of the transfer that still needs its retained byte count, which is
+    // only computable once `preserve` and `stack_allocation` are final below.
+    let mut retain_through_slot: Option<usize> = None;
+    match &config.continuation {
+        Some(ReplacementContinuation::Address(target)) => operations.push(
+            Operation::JumpToAddress(vmpx_recompile::NativeAddress(*target)),
+        ),
+        Some(ReplacementContinuation::Computed(_)) => {
+            retain_through_slot = Some(operations.len());
+            // Patched below. `ReturnRetaining` releases the frame with a `lea`,
+            // so the staged qword survives the teardown that would clobber a
+            // register.
+            operations.push(Operation::ReturnRetaining { bytes: 0 });
+        }
         None if return_pop.is_some() => {
             operations.push(Operation::ReturnPopping {
                 bytes: return_pop.unwrap_or(0),
@@ -868,6 +936,23 @@ pub fn build_replacement_popping(
         if residual != 0 {
             stack_allocation = stack_allocation.saturating_add(residual);
         }
+    }
+    // The transfer returns through the continuation slot. `ReturnRetaining`
+    // releases `pushed + stack_allocation - bytes`, leaving RSP `bytes` below the
+    // entry stack pointer, so popping slot k -- which sits `k * 8` above the body
+    // RSP -- needs exactly `pushed + stack_allocation - k * 8`. Computed here
+    // because neither term is final until now.
+    if let Some(index) = retain_through_slot {
+        let pushed = u32::try_from(preserve.len())
+            .map_err(|_| ReplacementError::TooManyInputs)?
+            .saturating_mul(8);
+        let offset = u32::from(continuation_slot.0).saturating_mul(8);
+        let bytes = pushed
+            .saturating_add(stack_allocation)
+            .checked_sub(offset)
+            .filter(|bytes| *bytes >= 8)
+            .ok_or(ReplacementError::TooManyInputs)?;
+        operations[index] = Operation::ReturnRetaining { bytes };
     }
     let function = Function {
         operations,
@@ -1674,6 +1759,83 @@ mod tests {
     /// has to notice and capture it itself, because `replacement_inputs` sorts
     /// its list and a `__entry_*` name would sort AHEAD of every `native_*` one,
     /// putting the capture before the architectural registers it may clobber.
+    /// A virtualized routine whose continuation target is COMPUTED -- read from
+    /// caller data, not a constant -- can be replaced without resolving where it
+    /// goes. The replacement stages the target and transfers through it, which is
+    /// behaviour-preserving and needs no interprocedural analysis.
+    ///
+    /// `ReturnRetaining` tears the frame down with a `lea`, not pops, so a target
+    /// staged in MEMORY survives teardown by construction. That is the whole
+    /// reason to stage it rather than hold it in a register: a register holding
+    /// the target would be clobbered if it were one of the preserved ones.
+    #[test]
+    fn a_computed_continuation_transfers_through_a_staged_target() {
+        let inputs = vec![("native_rcx_initial".to_owned(), PhysicalRegister::Rcx)];
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 1))]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            // The target is a function of an input, not an address we know.
+            continuation: Some(ReplacementContinuation::Computed(
+                Expr::binary(
+                    vmpx_vm::BinaryOp::Add,
+                    Expr::register(BitWidth::W64, "native_rcx_initial"),
+                    Expr::constant(BitWidth::W64, 0x20),
+                )
+                .expect("sum"),
+            )),
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("a computed continuation must build");
+        let operations = &replacement.function.operations;
+        assert!(
+            operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::ReturnRetaining { .. })),
+            "the transfer must go through the staged qword; ops: {operations:?}"
+        );
+        assert!(
+            !operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::JumpToAddress(_))),
+            "a computed target must not be emitted as an absolute jump"
+        );
+        // The safety property: the qword the `ret` pops must be exactly a slot
+        // the body stored into. `ReturnRetaining` leaves RSP `bytes` below the
+        // entry stack pointer, and slot k sits `k * 8` above the body RSP, so the
+        // popped slot is `(pushed + stack_allocation - bytes) / 8`. If that does
+        // not correspond to a real store, the transfer jumps through whatever
+        // happened to be on the stack.
+        let frame = &replacement.function.frame;
+        let Some(Operation::ReturnRetaining { bytes }) = operations
+            .iter()
+            .find(|operation| matches!(operation, Operation::ReturnRetaining { .. }))
+        else {
+            panic!("no retaining transfer: {operations:?}");
+        };
+        let pushed = u32::try_from(frame.preserve.len()).expect("small") * 8;
+        let popped = pushed
+            .saturating_add(frame.stack_allocation)
+            .checked_sub(*bytes)
+            .expect("the retained region lies inside the frame");
+        assert_eq!(popped % 8, 0, "the popped address must be slot-aligned");
+        let slot = u16::try_from(popped / 8).expect("slot index");
+        assert!(
+            operations.iter().any(|operation| matches!(
+                operation,
+                Operation::SpillStore { slot: stored, .. } if stored.0 == slot
+            )),
+            "the transfer pops slot {slot}, which nothing stored; ops: {operations:?}"
+        );
+    }
+
     #[test]
     fn a_preserved_flag_word_captures_itself_without_being_declared() {
         let inputs = vec![("native_rax_initial".to_owned(), PhysicalRegister::Rax)];

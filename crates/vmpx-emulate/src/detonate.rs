@@ -33,7 +33,22 @@ use crate::winapi::WinApiHook;
 use crate::xplm::{CallbackKind, GuestCall, RecordedCallback, RetKind, Xplm};
 use std::cell::RefCell;
 
-const DEFAULT_MAX_STEPS: u64 = 2_000_000;
+/// A step CEILING, not a target: a sample that halts naturally is unaffected, so
+/// this only has to be high enough that a real one is not cut off before it
+/// observes anything.
+///
+/// 2_000_000 was not. systems.xpl (a 253 MB plugin whose LZMA depack alone
+/// dominates that) ended `stop=StepLimit` with `imports captured=0,
+/// observed globals=0, observed loop depths=0` -- the detonation contributed
+/// NOTHING and read as "the bridge does not help" rather than "the budget ran
+/// out". Raised to 1.2e9, measured at ~7M steps/s, so ~170 s worst case on an
+/// opt-in `--dynamic` path; at that budget the same sample captured 6 imports.
+/// `VMPX_DYNAMIC_MAXSTEPS` still overrides it.
+///
+/// Known not to be enough for everything: this sample needs ~27e9 steps to
+/// reach its OEP, so OEP-gated facts stay out of reach here -- and a fully
+/// virtualized DllMain has no write-then-execute OEP to detect at any budget.
+const DEFAULT_MAX_STEPS: u64 = 1_200_000_000;
 
 // COFF characteristic: the image is a DLL.
 const IMAGE_FILE_DLL: u16 = 0x2000;
