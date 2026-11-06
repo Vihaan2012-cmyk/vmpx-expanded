@@ -256,7 +256,12 @@ pub(crate) fn map_exit(
         .stores
         .iter()
         .map(|st| {
-            Ok(CollectedStore { address: f(&st.address)?, value: f(&st.value)?, width: st.width })
+            Ok(CollectedStore {
+                address: f(&st.address)?,
+                value: f(&st.value)?,
+                width: st.width,
+                epoch: st.epoch,
+            })
         })
         .collect::<Result<_, String>>()?;
     out.effects.calls = s

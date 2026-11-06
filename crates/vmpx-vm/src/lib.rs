@@ -133,12 +133,15 @@ pub use image_concretize::{
 };
 pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage, set_volatile_image_pages, set_volatile_image_ranges};
 pub use input_closed::{
-    exit_closure_violation, input_closure_violation, is_expr_input_closed, is_input_closed,
+    exit_closure_violation, input_closure_violation, input_closure_violation_allowing_loads,
+    is_expr_input_closed, is_input_closed, is_pure_intrinsic,
 };
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
     InputDomainRefusal, RefusalCause, abstract_epoch_loads, add_flags_cover,
-    diagnose_branch_refusals, infer_branch_input_domains,
+    OPAQUE_STATE_PREFIX, abstract_opaque_intrinsics, diagnose_branch_refusals,
+    infer_branch_input_domains, materialize_epoch_loads_from, mentions_opaque_state,
+    substitute_opaque_intrinsics,
 };
 pub use model::{
     BytecodeDirection, EffectKnowledge, RecoveryStatus, StateValue, VmContextLayout, VmDecodeState,

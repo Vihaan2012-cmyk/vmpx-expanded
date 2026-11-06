@@ -192,15 +192,61 @@ fn concretize(pe: &PeImage<'_>, expression: &vmpx_vm::Expr) -> (vmpx_vm::Expr, b
     }
 }
 
+/// Seeds the opaque-state probe substitutes, for the diagnostic alone.
+///
+/// MEASURED on systems.xpl (2026-11-07): of 241 exits refused for opaque state,
+/// all 241 come back VARIES, so this route recovers nothing. An earlier probe
+/// that gave every opaque term ONE shared constant reported 146 as independent
+/// and drove `recovered` 20 -> 158; that was an artefact -- a shared constant
+/// makes `checksum_a ^ checksum_b` fold to zero under every seed. The fills are
+/// per-term (see `substitute_opaque_intrinsics`) and the number collapses back
+/// to 0. The dependence on distinct integrity terms is real, so these functions
+/// are not pure functions of their inputs under any purely static reading.
+/// A wide spread matters: on systems.xpl, going from 4 fills to 7 removed 8 of
+/// 146 acceptances, so a narrow probe does produce false positives.
+const OPAQUE_STATE_FILLS: [u64; 23] = [
+    1,
+    2,
+    3,
+    u64::MAX,
+    u64::MAX - 1,
+    0x5555_5555_5555_5555,
+    0xAAAA_AAAA_AAAA_AAAA,
+    0x8000_0000_0000_0000,
+    0x0000_0000_8000_0000,
+    0x0000_0000_0000_0080,
+    0x0123_4567_89AB_CDEF,
+    0xDEAD_BEEF_CAFE_F00D,
+    0xFFFF_FFFF_0000_0000,
+    0x0000_0000_FFFF_FFFF,
+    0xFF00_FF00_FF00_FF00,
+    0x00FF_00FF_00FF_00FF,
+    0x7FFF_FFFF_FFFF_FFFF,
+    0x0F0F_0F0F_0F0F_0F0F,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0x1234_5678_9ABC_DEF0,
+    0xA5A5_A5A5_A5A5_A5A5,
+    0x3141_5926_5358_9793,
+    0x2718_2818_2845_9045,
+];
+
+/// What closing a function rested on. Each flag marks a recovery that is never
+/// PROVEN, so the tier it feeds must stay below N2.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ClosedAssumptions {
+    /// Closing required folding an image-backed read: holds only while the
+    /// image's protection does (`AssumesImageProtectionStable`).
+    pub image_protection: bool,
+}
+
 /// The native exit of `path` if it, its stores and its memory are all closed
-/// over `allowed`. `assumes_image_protection` reports whether closing it
-/// required folding an image-backed read.
+/// over `allowed`. `assumptions` records what closing it rested on.
 fn closed_exit(
     pe: &PeImage<'_>,
     family: &RecoveredEntryPathFamily,
     path: &RecoveredEntryPath,
     allowed: &BTreeSet<String>,
-    assumes_image_protection: &mut bool,
+    assumptions: &mut ClosedAssumptions,
 ) -> Result<(NativeExitState, CollectedEffects), String> {
     let mut exit = path
         .native_exit
@@ -213,15 +259,86 @@ fn closed_exit(
     {
         let (folded, resolved) = concretize(pe, value);
         *value = folded;
-        *assumes_image_protection |= resolved;
+        assumptions.image_protection |= resolved;
     }
     // Name the TERM, not just the fact. The three causes need different work: an
     // unbound register can be admitted by widening the replacement's input set,
     // while a load or an opaque intrinsic cannot.
     if let Some(why) = exit_closure_violation(&exit, allowed) {
-        return Err(format!(
-            "exit depends on a symbol outside the replacement inputs: {why}"
-        ));
+        // An unresolved read is an opaque `memory_load_epoch_N` intrinsic, and a
+        // replacement needs only to perform the same read, which `expr_codegen`
+        // already lowers. The epoch makes it sound: a replacement emits every
+        // store before computing any value, so a materialised read observes all
+        // of them -- which is what the VM saw exactly when the read's epoch was
+        // already at or above every store's. Reads below that keep refusing.
+        let after_every_store = vmpx_vmlift::last_write_epoch(family, path);
+        let retried = {
+            let mut candidate = exit.clone();
+            for value in candidate
+                .registers
+                .values_mut()
+                .chain([&mut candidate.rflags, &mut candidate.return_address])
+            {
+                if let Ok(materialised) =
+                    vmpx_vm::materialize_epoch_loads_from(value, after_every_store)
+                {
+                    *value = materialised;
+                }
+            }
+            candidate
+        };
+        let still_open = retried
+            .registers
+            .values()
+            .chain([&retried.rflags, &retried.return_address])
+            .find_map(|value| vmpx_vm::input_closure_violation_allowing_loads(value, allowed));
+        match still_open {
+            None => exit = retried,
+            Some(remaining) => {
+                // DIAGNOSTIC: is the dependence on opaque state SEMANTIC or only
+                // syntactic? VMProtect mixes integrity checksums and `rdtsc`
+                // into register values and cancels them out again. Substituting
+                // several fills and comparing says whether the exit actually
+                // varies. Evidence for a ceiling, never a basis for accepting.
+                let probe = |fill: u64| {
+                    let mut candidate = exit.clone();
+                    for value in candidate
+                        .registers
+                        .values_mut()
+                        .chain([&mut candidate.rflags, &mut candidate.return_address])
+                    {
+                        if let Ok(substituted) =
+                            vmpx_vm::substitute_opaque_intrinsics(value, fill)
+                        {
+                            *value = substituted;
+                        }
+                    }
+                    candidate
+                };
+                let reference = probe(0);
+                let independent = OPAQUE_STATE_FILLS
+                    .iter()
+                    .all(|fill| probe(*fill) == reference);
+                let closed_after = independent
+                    && reference
+                        .registers
+                        .values()
+                        .chain([&reference.rflags, &reference.return_address])
+                        .all(|value| input_closure_violation(value, allowed).is_none());
+                let probe_verdict = if !independent {
+                    "VARIES"
+                } else if closed_after {
+                    "INDEPENDENT-AND-CLOSED"
+                } else {
+                    "INDEPENDENT-BUT-OPEN"
+                };
+                return Err(format!(
+                    "exit depends on a symbol outside the replacement inputs: {why} \
+                     (after materialising reads at or above store epoch \
+                     {after_every_store}: {remaining}; opaque-state probe: {probe_verdict})"
+                ));
+            }
+        }
     }
     // Side effects must be closed too, and nothing may be hidden in memory the
     // exit expressions do not mention.
@@ -234,7 +351,7 @@ fn closed_exit(
         let (value, value_resolved) = concretize(pe, &store.value);
         store.address = address;
         store.value = value;
-        *assumes_image_protection |= address_resolved || value_resolved;
+        assumptions.image_protection |= address_resolved || value_resolved;
     }
     if let Some(why) = effects.stores.iter().find_map(|store| {
         input_closure_violation(&store.address, allowed)
@@ -282,9 +399,8 @@ pub(crate) fn recover_input_closed(
             "path depends on an enumerated input".to_owned(),
         ));
     }
-    let mut assumes_image_protection = false;
-    let (exit, effects) =
-        closed_exit(pe, &family, path, &allowed, &mut assumes_image_protection)?;
+    let mut assumptions = ClosedAssumptions::default();
+    let (exit, effects) = closed_exit(pe, &family, path, &allowed, &mut assumptions)?;
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
     Ok(InputClosedFunction {
@@ -293,7 +409,7 @@ pub(crate) fn recover_input_closed(
         effects,
         inputs: allowed,
         live_in: calling_convention(&family, &frame).live_in,
-        assumes_image_protection,
+        assumes_image_protection: assumptions.image_protection,
     })
 }
 
@@ -314,11 +430,11 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
     if !family.domain_complete || !family.all_paths_reach_vm_exit {
         return Err("branch paths are not complete".to_owned());
     }
-    let mut assumes_image_protection = false;
+    let mut assumptions = ClosedAssumptions::default();
     // The replacement evaluates the branch target to pick a path, so the guard
     // itself must be closed over the replacement's inputs.
     let (branch_target, branch_resolved) = concretize(pe, &guarded.branch_target);
-    assumes_image_protection |= branch_resolved;
+    assumptions.image_protection |= branch_resolved;
     if let Some(why) = input_closure_violation(&branch_target, &allowed) {
         return Err(format!(
             "branch target depends on a symbol outside the replacement inputs: {why}"
@@ -329,8 +445,7 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         if !path.assignments.is_empty() {
             return Err("branching path was specialized by an input".to_owned());
         }
-        let (exit, effects) =
-            closed_exit(pe, family, path, &allowed, &mut assumes_image_protection)?;
+        let (exit, effects) = closed_exit(pe, family, path, &allowed, &mut assumptions)?;
         paths.push(BranchPath {
             target: *target,
             exit,

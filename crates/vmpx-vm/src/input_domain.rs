@@ -371,6 +371,135 @@ pub fn abstract_epoch_loads(expr: &Expr) -> Result<Expr, crate::ExprError> {
     })
 }
 
+/// The inverse of [`abstract_epoch_loads`], for reads that already observe every
+/// store: turns `memory_load_epoch_N(address)` into a real `Load` when
+/// `N >= min_epoch`, leaving earlier reads untouched.
+///
+/// An unresolved read becomes an opaque intrinsic, which is why a replacement
+/// refuses it -- yet a replacement needs only to perform the same read, and
+/// `expr_codegen` already lowers `ExprKind::Load`. The intrinsic form is what
+/// hides that.
+///
+/// The epoch is what makes it sound. A replacement emits every store before it
+/// computes any value, so a materialised read observes ALL of them -- which is
+/// what the VM saw exactly when the read's epoch was already at or above every
+/// store's. Pass `min_epoch` as the maximum store epoch on the path; reads below
+/// it must keep refusing, because they ran before a write they would now see.
+///
+/// # Errors
+///
+/// Propagates expression reconstruction failures.
+/// The prefix every abstracted opaque-state variable carries, so a caller can
+/// tell whether the simplifier cancelled it out.
+pub const OPAQUE_STATE_PREFIX: &str = "__opaque_state@";
+
+/// Replaces every OPAQUE intrinsic with one free variable per distinct
+/// `(name, arguments)`, so repeated occurrences of the same checksum or `rdtsc`
+/// read share a variable while unrelated ones stay independent.
+///
+/// If the variable does not survive simplification, the expression provably does
+/// not depend on that opaque state -- the cancellation is syntactic and needs no
+/// solver. If it does survive, independence is still possible but only a
+/// decision procedure can establish it.
+///
+/// # Errors
+///
+/// Propagates expression rebuild failures.
+pub fn abstract_opaque_intrinsics(expression: &Expr) -> Result<Expr, crate::ExprError> {
+    expression.rewrite_intrinsics(&mut |width, name, arguments| {
+        (!crate::is_pure_intrinsic(name)).then(|| {
+            Expr::register(width, format!("{OPAQUE_STATE_PREFIX}{name}@{arguments:?}"))
+        })
+    })
+}
+
+/// True iff any abstracted opaque-state variable survives in `expression`.
+#[must_use]
+pub fn mentions_opaque_state(expression: &Expr) -> bool {
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => {}
+            ExprKind::Register { name } => {
+                if name.starts_with(OPAQUE_STATE_PREFIX) {
+                    return true;
+                }
+            }
+            ExprKind::Load { address: value }
+            | ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    false
+}
+
+/// Replaces every OPAQUE intrinsic with a constant derived from `seed` AND the
+/// intrinsic's own identity, leaving pure intrinsics alone.
+///
+/// Substituting several seeds and comparing the results tests whether an
+/// expression depends on opaque machine state at all. VMProtect mixes integrity
+/// checksums and `rdtsc` into register values that cancel out again, so a
+/// syntactic dependence is often not a semantic one.
+///
+/// The value MUST depend on the intrinsic's identity, not on the seed alone:
+/// giving every opaque term one shared constant makes `checksum_a ^ checksum_b`
+/// fold to zero under every seed, which would accept an exit that in fact
+/// differs on every run. Equal terms still share a value, so genuine
+/// cancellation is preserved.
+///
+/// Agreement across seeds is evidence, not proof -- only a decision procedure
+/// over a free variable (see [`abstract_opaque_intrinsics`]) settles it.
+///
+/// # Errors
+///
+/// Propagates width errors from rebuilding the expression.
+pub fn substitute_opaque_intrinsics(expression: &Expr, seed: u64) -> Result<Expr, crate::ExprError> {
+    expression.rewrite_intrinsics(&mut |width, name, arguments| {
+        (!crate::is_pure_intrinsic(name))
+            .then(|| Expr::constant(width, opaque_fill(seed, name, arguments)))
+    })
+}
+
+/// A per-term value: FxHash-style mixing of the seed with the term's identity.
+fn opaque_fill(seed: u64, name: &str, arguments: &[Expr]) -> u64 {
+    const K: u64 = 0x517C_C1B7_2722_0A95;
+    let mut hash = seed ^ K;
+    let mut absorb = |byte: u8| {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(K);
+        hash ^= hash >> 29;
+    };
+    for byte in name.as_bytes() {
+        absorb(*byte);
+    }
+    for byte in format!("{arguments:?}").as_bytes() {
+        absorb(*byte);
+    }
+    hash
+}
+
+pub fn materialize_epoch_loads_from(
+    expr: &Expr,
+    min_epoch: u64,
+) -> Result<Expr, crate::ExprError> {
+    expr.rewrite_intrinsics(&mut |width, name, arguments| {
+        let epoch = name
+            .strip_prefix("memory_load_epoch_")
+            .and_then(|suffix| suffix.parse::<u64>().ok())?;
+        (epoch >= min_epoch && arguments.len() == 1)
+            .then(|| Expr::load(width, arguments[0].clone()))
+    })
+}
+
 /// `expr == (±x + offset) mod 2^bits` for `x = register >> shift`, which ranges
 /// over `[0, 2^span)`.
 struct Affine {
@@ -3372,5 +3501,94 @@ mod tests {
             ),
             Err(crate::SymbolicDomainError::NonConcreteResult)
         ));
+    }
+
+    #[test]
+    fn opaque_substitution_spares_pure_intrinsics() {
+        let opaque = Expr::intrinsic(BitWidth::W32, "read_timestamp_counter_7", vec![]);
+        let pure = Expr::intrinsic(
+            BitWidth::W32,
+            "vm_flags_add_w32",
+            vec![Expr::constant(BitWidth::W32, 3)],
+        );
+        let filled = substitute_opaque_intrinsics(&opaque, 0x99).expect("substitute");
+        assert!(matches!(filled.kind, crate::ExprKind::Const { .. }));
+        let kept = substitute_opaque_intrinsics(&pure, 0x99).expect("substitute");
+        assert_eq!(kept, pure);
+    }
+
+    #[test]
+    fn distinct_opaque_terms_must_not_share_a_probe_value() {
+        // The trap: one shared constant makes `a ^ b` fold to zero under every
+        // seed, so an exit that differs on every run looks input-closed. Equal
+        // terms still have to cancel.
+        let term = |name: &str| Expr::intrinsic(BitWidth::W32, name, vec![]);
+        let differing = Expr::binary(
+            BinaryOp::Xor,
+            term("table_checksum_low_byte_xor_w32"),
+            term("read_timestamp_counter_3"),
+        )
+        .expect("xor");
+        let same = Expr::binary(
+            BinaryOp::Xor,
+            term("read_timestamp_counter_3"),
+            term("read_timestamp_counter_3"),
+        )
+        .expect("xor");
+        for seed in [0_u64, 1, 0xDEAD_BEEF, u64::MAX] {
+            assert_ne!(
+                substitute_opaque_intrinsics(&differing, seed).expect("substitute"),
+                Expr::constant(BitWidth::W32, 0),
+                "two different opaque terms must not cancel at seed {seed:#x}"
+            );
+            assert_eq!(
+                substitute_opaque_intrinsics(&same, seed).expect("substitute"),
+                Expr::constant(BitWidth::W32, 0),
+                "one term xored with itself must cancel at seed {seed:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_probe_sees_a_cancellation_the_free_variable_abstraction_does_not() {
+        // `x ^ c ^ c` is x whatever c is, but recognising that needs XOR
+        // reassociation across a non-constant operand, which neither the folder
+        // nor the abstraction performs. This is the gap a decision procedure has
+        // to close, and why the acceptance below it stays an assumption.
+        let checksum = Expr::intrinsic(BitWidth::W32, "table_checksum_low_byte_xor_w32", vec![]);
+        let x = Expr::register(BitWidth::W32, "native_rax_initial");
+        let mixed = Expr::binary(
+            BinaryOp::Xor,
+            Expr::binary(BinaryOp::Xor, x.clone(), checksum.clone()).expect("xor"),
+            checksum,
+        )
+        .expect("xor");
+        assert_ne!(
+            substitute_opaque_intrinsics(&mixed, 0).expect("substitute"),
+            x,
+            "folding alone does not reassociate across a register"
+        );
+        let abstracted = abstract_opaque_intrinsics(&mixed).expect("abstract");
+        assert!(mentions_opaque_state(&abstracted));
+    }
+
+    #[test]
+    fn repeated_opaque_reads_share_one_abstraction_variable() {
+        let read = |epoch: u32| {
+            Expr::intrinsic(
+                BitWidth::W64,
+                format!("memory_load_epoch_{epoch}"),
+                vec![Expr::constant(BitWidth::W64, 0x1000)],
+            )
+        };
+        let same = Expr::binary(BinaryOp::Sub, read(4), read(4)).expect("sub");
+        let differing = Expr::binary(BinaryOp::Sub, read(4), read(5)).expect("sub");
+        // One variable for equal reads, so a difference of equal reads folds.
+        let same = abstract_opaque_intrinsics(&same).expect("abstract");
+        assert_eq!(same, Expr::constant(BitWidth::W64, 0));
+        assert!(!mentions_opaque_state(&same));
+        // Different reads stay independent and cannot fold.
+        let differing = abstract_opaque_intrinsics(&differing).expect("abstract");
+        assert!(mentions_opaque_state(&differing));
     }
 }

@@ -164,6 +164,7 @@ fn an_unmodeled_recovered_store_is_never_proven() {
         address: reg(R::Rdx),
         value: k(1),
         width: W,
+        epoch: 1,
     });
     rec.paths[0].store_epochs.push(1);
     let out = diff(&rec);

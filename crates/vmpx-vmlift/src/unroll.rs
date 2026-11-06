@@ -249,6 +249,7 @@ impl Walker<'_, '_> {
                         address: write.address.clone(),
                         value: write.value.clone(),
                         width: write.value.width,
+                        epoch: write.epoch,
                     },
                     write.epoch,
                 ));

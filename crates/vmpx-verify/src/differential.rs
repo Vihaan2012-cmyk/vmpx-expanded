@@ -997,7 +997,9 @@ fn finish(
         if base == rsp && offset < 0 {
             dropped += 1;
         } else {
-            kept.push(CollectedStore { address, value, width });
+            // Reconstructed from a store triple with no epoch; u64::MAX is
+            // the conservative value.
+            kept.push(CollectedStore { address, value, width, epoch: u64::MAX });
         }
     }
     NativeFunction {

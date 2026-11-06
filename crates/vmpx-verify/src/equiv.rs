@@ -725,6 +725,7 @@ mod tests {
                     address: k(0x10),
                     value: store_value,
                     width: W,
+                    epoch: 1,
                 }],
                 calls: Vec::new(),
                 unsupported: Vec::new(),

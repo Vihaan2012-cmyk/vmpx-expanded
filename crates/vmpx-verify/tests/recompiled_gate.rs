@@ -77,6 +77,7 @@ fn with_store(mut vm: ExitSemantics) -> ExitSemantics {
         address: bin(BinaryOp::Add, reg(R::Rbx), k(8)),
         value: reg(R::Rsi),
         width: W,
+        epoch: 1,
     });
     vm
 }

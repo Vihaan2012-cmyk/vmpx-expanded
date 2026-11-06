@@ -197,6 +197,57 @@ fn checked_pointer_add(address: u64, stride: i8, index: usize) -> Option<u64> {
     }
 }
 
+/// A compact shape of an expression: the leaves it actually depends on. The
+/// `Debug` tree is far too deep to read in a log line.
+fn summarize(expression: &Expr) -> String {
+    let mut registers = std::collections::BTreeSet::new();
+    let mut constants = 0usize;
+    let mut loads = 0usize;
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => constants += 1,
+            ExprKind::Register { name } => {
+                registers.insert(name.clone());
+            }
+            ExprKind::Load { address } => {
+                loads += 1;
+                pending.push(address);
+            }
+            ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+            ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    let intrinsics = expression.intrinsic_dependencies();
+    format!(
+        "regs{registers:?} intrinsics{:?} consts={constants} loads={loads}",
+        intrinsics.iter().collect::<Vec<_>>()
+    )
+}
+
+/// Why a checksum declined, printed under `VMPX_CHECKSUM_WHY=1`. Bounded, so a
+/// whole-image run cannot flood the log.
+fn checksum_decline(reason: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    if !std::env::var("VMPX_CHECKSUM_WHY").is_ok_and(|v| v == "1") {
+        return;
+    }
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 60 {
+        eprintln!("[checksum-decline] {reason}");
+    }
+}
+
 fn resolve_checksum(pe: &PeImage<'_>, arguments: &[Expr], byte_limit: usize) -> Option<u64> {
     let [
         accumulator,
@@ -210,27 +261,77 @@ fn resolve_checksum(pe: &PeImage<'_>, arguments: &[Expr], byte_limit: usize) -> 
         _snapshot,
     ] = arguments
     else {
+        checksum_decline(&format!("arity {}", arguments.len()));
         return None;
     };
-    let mut accumulator = u32::try_from(constant(accumulator)?).ok()?;
-    let pointer = constant(pointer)?;
-    let length = usize::try_from(constant(length)?).ok()?;
-    let table = constant(table)?;
-    let shift_bits = u32::try_from(constant(shift_bits)?).ok()?;
-    let shift_right = constant(shift_right)? != 0;
-    let pointer_stride = u8::try_from(constant(pointer_stride)?).ok()?.cast_signed();
-    let iteration_xor = u32::try_from(constant(iteration_xor)?).ok()?;
+    let mut accumulator = u32::try_from(constant(accumulator).or_else(|| {
+        checksum_decline("accumulator not constant");
+        None
+    })?)
+    .ok()?;
+    let pointer = constant(pointer).or_else(|| {
+        checksum_decline(&format!("pointer not constant: {}", summarize(pointer)));
+        None
+    })?;
+    let length = usize::try_from(constant(length).or_else(|| {
+        checksum_decline("length not constant");
+        None
+    })?)
+    .ok()?;
+    let table = constant(table).or_else(|| {
+        checksum_decline("table not constant");
+        None
+    })?;
+    let shift_bits = u32::try_from(constant(shift_bits).or_else(|| {
+        checksum_decline("shift_bits not constant");
+        None
+    })?)
+    .ok()?;
+    let shift_right = constant(shift_right).or_else(|| {
+        checksum_decline("shift_right not constant");
+        None
+    })? != 0;
+    let pointer_stride = u8::try_from(constant(pointer_stride).or_else(|| {
+        checksum_decline("pointer_stride not constant");
+        None
+    })?)
+    .ok()?
+    .cast_signed();
+    let iteration_xor = u32::try_from(constant(iteration_xor).or_else(|| {
+        checksum_decline("iteration_xor not constant");
+        None
+    })?)
+    .ok()?;
     if length > byte_limit || shift_bits >= 32 {
+        checksum_decline(&format!(
+            "length {length} vs limit {byte_limit}, shift_bits {shift_bits}"
+        ));
         return None;
     }
     let mut reader = ImageReader::new(pe);
     for index in 0..length {
         let input_address = checked_pointer_add(pointer, pointer_stride, index)?;
-        let input = u8::try_from(reader.read(input_address, BitWidth::W8)?).ok()?;
+        let input = u8::try_from(
+            reader
+                .read(input_address, BitWidth::W8)
+                .or_else(|| {
+                    checksum_decline(&format!("input byte unreadable at {input_address:#x}"));
+                    None
+                })?,
+        )
+        .ok()?;
         let table_index = usize::from(accumulator.to_le_bytes()[0] ^ input);
         let table_offset = u64::try_from(table_index.checked_mul(4)?).ok()?;
         let entry_address = table.checked_add(table_offset)?;
-        let entry = u32::try_from(reader.read(entry_address, BitWidth::W32)?).ok()?;
+        let entry = u32::try_from(
+            reader
+                .read(entry_address, BitWidth::W32)
+                .or_else(|| {
+                    checksum_decline(&format!("table entry unreadable at {entry_address:#x}"));
+                    None
+                })?,
+        )
+        .ok()?;
         let shifted = if shift_right {
             accumulator.wrapping_shr(shift_bits)
         } else {

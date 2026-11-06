@@ -41,7 +41,7 @@ pub use decoded_lift::{
 pub use entry_frame::{frame_initial_state, recover_entry_frame};
 pub use effect_liveness::{
     CollectedCall, CollectedEffects, CollectedStore, EntryEffectLivenessReport,
-    PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects,
+    PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects, last_write_epoch,
 };
 pub use equivalence::{
     Assignment, AssignmentDivergence, Divergence, ExitSemantics, Side, Verdict, VerificationReport,

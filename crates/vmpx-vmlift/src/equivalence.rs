@@ -285,11 +285,13 @@ mod tests {
                         address: c(0x10),
                         value: c(1),
                         width: BitWidth::W64,
+                        epoch: 1,
                     },
                     CollectedStore {
                         address: c(0x18),
                         value: c(2),
                         width: BitWidth::W64,
+                        epoch: 2,
                     },
                 ],
                 calls: vec![CollectedCall {

@@ -366,6 +366,8 @@ impl Machine<'_> {
                     address: a,
                     value,
                     width,
+                    // No epoch at the IR layer; see `CollectedStore::epoch`.
+                    epoch: u64::MAX,
                 });
             }
             Operation::SpillLoad { destination, slot } => {
@@ -1125,6 +1127,7 @@ fn rewrite_exit(
                         address: r(&s.address)?,
                         value: r(&s.value)?,
                         width: s.width,
+                        epoch: s.epoch,
                     })
                 })
                 .collect::<Result<_, String>>()?,

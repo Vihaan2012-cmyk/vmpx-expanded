@@ -8,7 +8,8 @@ use crate::{Expr, NativeExitState};
 /// Intrinsic families that are pure functions of their arguments. Everything
 /// else (memory epochs/snapshots, native-call results, fresh allocations,
 /// timestamp counter, unknown names) is opaque machine state and never closed.
-fn is_pure_intrinsic(name: &str) -> bool {
+#[must_use]
+pub fn is_pure_intrinsic(name: &str) -> bool {
     name.starts_with("vm_flags_") || name.starts_with("x86_unsigned_")
 }
 
@@ -78,6 +79,51 @@ fn short(expr: &Expr) -> String {
         return text;
     }
     text.chars().take(120).collect::<String>() + "..."
+}
+
+/// As [`input_closure_violation`], but a `Load` is permitted when its ADDRESS is
+/// closed: the replacement computes the address and performs the read itself.
+///
+/// Sound only once the caller has established that the read may happen where the
+/// replacement puts it -- see [`crate::materialize_epoch_loads_from`]. The
+/// ordinary predicate refuses every load because that does not hold in general.
+#[must_use]
+pub fn input_closure_violation_allowing_loads(
+    expr: &Expr,
+    allowed: &BTreeSet<String>,
+) -> Option<String> {
+    use crate::ExprKind;
+    let mut pending = vec![expr];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => {}
+            ExprKind::Register { name } => {
+                if !allowed.contains(name) {
+                    return Some(format!("unbound register {name}"));
+                }
+            }
+            // The read is allowed; its ADDRESS still has to be computable.
+            ExprKind::Load { address } => pending.push(address),
+            ExprKind::Intrinsic { name, arguments } => {
+                if !is_pure_intrinsic(name) {
+                    return Some(format!("opaque intrinsic {name}"));
+                }
+                pending.extend(arguments);
+            }
+            ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    None
 }
 
 /// WHY the exit is not closed, naming the slot as well as the term.

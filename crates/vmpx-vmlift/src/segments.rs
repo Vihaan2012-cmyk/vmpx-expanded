@@ -563,7 +563,7 @@ impl Walker<'_, '_> {
                     return Err(format!("block {key} stores outside the VM's dead frame").into());
                 }
                 walk.stores.push((
-                    CollectedStore { address: write.address.clone(), value: write.value.clone(), width: write.value.width },
+                    CollectedStore { address: write.address.clone(), value: write.value.clone(), width: write.value.width, epoch: write.epoch },
                     write.epoch,
                 ));
             }

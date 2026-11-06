@@ -2572,6 +2572,9 @@ impl Collector<'_> {
                         address,
                         value,
                         width: store.width,
+                        // Lowered from a replacement config, which carries no
+                        // epoch; u64::MAX is the conservative value.
+                        epoch: u64::MAX,
                     });
                 }
                 StepKind::Load(read) => {
@@ -2668,6 +2671,10 @@ impl Collector<'_> {
                         address,
                         value: bind_reads(word, &acc.bindings)?,
                         width: BitWidth::W64,
+                        // No epoch at this layer: u64::MAX is the conservative
+                        // value, since a read must be at or above every store's
+                        // epoch to be materialised and nothing reaches MAX.
+                        epoch: u64::MAX,
                     });
                 }
                 let retained = u32::try_from(leaf.staged.len() * 8).unwrap_or(u32::MAX);
