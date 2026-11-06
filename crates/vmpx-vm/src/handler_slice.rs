@@ -397,6 +397,44 @@ mod tests {
         assert!(slice.live_in_registers.contains(&"RDX".to_owned()));
     }
 
+    /// A write to RCX before a `cpuid` is LIVE, not dead: `cpuid` reads ECX as
+    /// its subleaf. Worth pinning, because it looks dead -- `cpuid` also DEFINES
+    /// ECX, so the obvious reading is that the earlier write is killed. It is
+    /// not, and the slice is right to keep it.
+    ///
+    /// This is why VMProtect's CPUID handlers carry a non-empty
+    /// `arithmetic_operations`: the three blocking real virtualized functions on
+    /// systems.xpl each place one MBA write to RCX immediately before the
+    /// `cpuid` (`ror cl,cl`, `and rcx,rbp`, `neg ch`), and each is a genuine
+    /// dataflow edge into the subleaf. The semantic gate must therefore reason
+    /// about WHERE the value goes, not whether it is live -- see
+    /// `effect_extract`'s cpuid-leaf-only candidate.
+    #[test]
+    fn a_write_before_cpuid_stays_live_because_cpuid_reads_ecx() {
+        let trace = trace_from_bytes(&[
+            0xD2, 0xC9, // ror cl, cl   -> feeds cpuid's ECX subleaf
+            0x0F, 0xA2, // cpuid
+            0xFF, 0xE2, // jmp rdx
+        ]);
+        let slice = backward_slice_handler_trace(
+            &trace,
+            &HandlerSliceConfig {
+                live_out_registers: vec![Register::RCX],
+                live_out_rflags: 0,
+            },
+        );
+        assert_eq!(
+            slice.instructions[0].disposition,
+            NativeInstructionDisposition::LiveDependency,
+            "got {:?}",
+            slice
+                .instructions
+                .iter()
+                .map(|i| (i.text.clone(), i.disposition))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn partial_register_write_kills_the_same_live_bit_range() {
         let trace = trace_from_bytes(&[

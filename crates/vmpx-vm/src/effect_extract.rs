@@ -86,6 +86,11 @@ pub struct HandlerEffectSummary {
     /// be empty, so which of those two it is decides whether the gate is tight
     /// or merely imprecise.
     pub arithmetic_dispositions: Vec<String>,
+    /// Canonical destination register of each `arithmetic_operations` entry, so
+    /// a semantic gate can reason about WHERE the value goes instead of only
+    /// whether the op exists. The ops are all live (see
+    /// `arithmetic_dispositions`), so liveness alone decides nothing.
+    pub arithmetic_destinations: Vec<String>,
     pub resize_operations: Vec<HandlerResizeEffect>,
     pub timestamp_counter_reads: Vec<Rva>,
     /// Stores of the low bytes of the pre-adjustment VSP to the VM stack top.
@@ -442,6 +447,7 @@ pub fn extract_handler_effects_keyed(
     let mut final_handler_base_is_static = false;
     let mut arithmetic_operations = Vec::new();
     let mut arithmetic_dispositions = Vec::new();
+    let mut arithmetic_destinations = Vec::new();
     let mut resize_operations = Vec::new();
     let mut timestamp_counter_reads = Vec::new();
     let mut narrow_vsp_pushes = Vec::new();
@@ -623,6 +629,11 @@ pub fn extract_handler_effects_keyed(
         {
             arithmetic_operations.push(format!("{:?}", instruction.mnemonic()));
             arithmetic_dispositions.push(format!("{disposition:?}"));
+            arithmetic_destinations.push(if instruction.op0_kind() == OpKind::Register {
+                format!("{:?}", canonical(instruction.op0_register()))
+            } else {
+                "memory-or-implicit".to_owned()
+            });
         }
         let resize_operation = match instruction.mnemonic() {
             Mnemonic::Movzx => Some(ResizeOp::ZeroExtend),
@@ -733,6 +744,7 @@ pub fn extract_handler_effects_keyed(
         reinitializes_handler_base: final_handler_base_is_static,
         arithmetic_operations,
         arithmetic_dispositions,
+        arithmetic_destinations,
         resize_operations,
         timestamp_counter_reads,
         narrow_vsp_pushes,
@@ -1706,11 +1718,32 @@ pub fn classify_handler_effects(
     {
         add_candidate(VmHandlerSemantic::Cpuid, Some(BitWidth::W32));
     }
+    // Arithmetic whose every destination is RCX cannot change what the leaf-only
+    // CPUID semantic models. `cpuid` reads ECX as its subleaf, so such an op IS
+    // live (see `handler_slice`'s
+    // `a_write_before_cpuid_stays_live_because_cpuid_reads_ecx`) -- but the
+    // semantic already treats that subleaf as a FRESH OPAQUE input and the four
+    // result dwords as opaque CPU-dependent intrinsics parameterized on it. A
+    // different subleaf therefore yields a different unknown, not a known value,
+    // so the recovered semantic is identical either way. RCX is not in
+    // `live_out_registers` for handler recovery ([vsp, handler, vip,
+    // rolling_key]), and `cpuid` redefines it, so the subleaf is its only live
+    // use inside the handler.
+    //
+    // Measured on systems.xpl: this is the whole reason three PROVEN virtualized
+    // functions stall. Each handler is the exact leaf-only shape -- leaf read at
+    // VmStack+0, vsp_delta -12, four dword results -- carrying one MBA write to
+    // RCX right before the `cpuid` (`ror cl,cl`, `and rcx,rbp`, `neg ch`).
+    let arithmetic_only_feeds_cpuid_subleaf = !summary.arithmetic_destinations.is_empty()
+        && summary
+            .arithmetic_destinations
+            .iter()
+            .all(|destination| destination == "RCX");
     if ordinary_operandless
         && !other_read
         && !other_write
         && !summary.captures_native_flags_to_vsp
-        && summary.arithmetic_operations.is_empty()
+        && (summary.arithmetic_operations.is_empty() || arithmetic_only_feeds_cpuid_subleaf)
         && is_cpuid_leaf_only
         && stack_effect_count == 5
         && other_effect_count == 0
