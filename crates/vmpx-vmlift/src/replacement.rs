@@ -165,6 +165,45 @@ pub fn build_replacement(
 
 pub(crate) const ENTRY_STACK_POINTER: &str = "__entry_rsp";
 
+/// The condition state the routine was ENTERED with. A routine that leaves its
+/// caller's flags untouched has an exit flag word of exactly this, so a
+/// replacement must be able to read it -- but rflags is not an architectural GP
+/// register, so it is not among the bound inputs and such a routine was refused
+/// for depending on a symbol outside them.
+///
+/// Captured the same way [`ENTRY_STACK_POINTER`] is: declared as an input
+/// against a physical register, whose capture is replaced by the operation that
+/// materialises the real value (here `Operation::ReadFlags`). Callers that bind
+/// it must also map `native_rflags_initial` onto this name.
+pub const ENTRY_FLAGS: &str = "__entry_rflags";
+
+/// The symbol the VM model uses for the condition state on entry.
+pub const NATIVE_RFLAGS_INITIAL: &str = "native_rflags_initial";
+
+/// True when any expression the routine will lower reads the entry flag word, so
+/// the builder knows to capture it. Checked over every lowered expression, not
+/// just the exit flags: a register value or a store can read it too.
+fn references_native_rflags(
+    registers: &BTreeMap<X64NativeRegister, Expr>,
+    config: &ReplacementConfig,
+) -> bool {
+    let reads = |expr: &Expr| {
+        expr.dependencies()
+            .iter()
+            .any(|name| name == NATIVE_RFLAGS_INITIAL)
+    };
+    registers.values().any(reads)
+        || config.rflags.as_ref().is_some_and(reads)
+        || config
+            .effects
+            .iter()
+            .any(|effect| reads(&effect.address) || reads(&effect.value))
+        || config
+            .effect_calls
+            .iter()
+            .any(|call| call.arguments.iter().any(reads))
+}
+
 /// As [`build_replacement`], but the routine returns through the qword
 /// `return_pop` bytes above the stack pointer it was entered with, discarding the
 /// bytes in between. This is how a virtualized epilogue that unwinds caller stack
@@ -184,19 +223,34 @@ pub fn build_replacement_popping(
     // below the one the routine is entered with. Reading it needs the entry
     // stack pointer, which is captured with the other inputs.
     let extended;
-    let config = if let Some(bytes) = stack_root_bytes {
-        let entry = Expr::register(vmpx_vm::BitWidth::W64, ENTRY_STACK_POINTER);
-        let root = Expr::binary(
-            vmpx_vm::BinaryOp::Sub,
-            entry,
-            Expr::constant(vmpx_vm::BitWidth::W64, u64::from(bytes)),
-        )
-        .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+    let needs_entry_flags = references_native_rflags(registers, config);
+    let config = if stack_root_bytes.is_some() || needs_entry_flags {
         let mut owned = config.clone();
-        owned
-            .inputs
-            .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
-        owned.symbol_rewrites.insert("vsp_initial".to_owned(), root);
+        if let Some(bytes) = stack_root_bytes {
+            let entry = Expr::register(vmpx_vm::BitWidth::W64, ENTRY_STACK_POINTER);
+            let root = Expr::binary(
+                vmpx_vm::BinaryOp::Sub,
+                entry,
+                Expr::constant(vmpx_vm::BitWidth::W64, u64::from(bytes)),
+            )
+            .map_err(|error| ReplacementError::EffectBindings(error.to_string()))?;
+            owned
+                .inputs
+                .push((ENTRY_STACK_POINTER.to_owned(), PhysicalRegister::Rax));
+            owned.symbol_rewrites.insert("vsp_initial".to_owned(), root);
+        }
+        if needs_entry_flags {
+            // Appended, never sorted into place: the capture that reads the
+            // flags overwrites its carrier register, so it is only safe once
+            // every architectural input has already been captured and spilled.
+            owned
+                .inputs
+                .push((ENTRY_FLAGS.to_owned(), PhysicalRegister::Rax));
+            owned.symbol_rewrites.insert(
+                NATIVE_RFLAGS_INITIAL.to_owned(),
+                Expr::register(vmpx_vm::BitWidth::W64, ENTRY_FLAGS),
+            );
+        }
         extended = owned;
         &extended
     } else {
@@ -267,6 +321,14 @@ pub fn build_replacement_popping(
             // Registered last, so every entry register is already captured and
             // this register may be overwritten.
             capture_ops.push(Operation::EntryStackPointer {
+                destination: source,
+            });
+        }
+        if name == ENTRY_FLAGS {
+            // Same contract as the entry stack pointer: the physical register it
+            // was declared against is only a carrier, so reading the flags over
+            // it is safe once every entry register has been captured.
+            capture_ops.push(Operation::ReadFlags {
                 destination: source,
             });
         }
@@ -1562,6 +1624,90 @@ mod tests {
         assert!(
             matches!(error, ReplacementError::FlagsAreNotAConditionState),
             "the refusal must name the reason: {error}"
+        );
+    }
+
+    /// A routine that leaves its caller's condition state untouched has an exit
+    /// flag word of exactly `native_rflags_initial`, so the replacement has to be
+    /// able to READ the incoming flags. rflags is not an architectural GP
+    /// register, so it was never among the bound inputs, and such a routine was
+    /// refused for depending on a symbol outside them -- 135 of 264 closedness
+    /// refusals on systems.xpl, 125 of those on the rflags slot itself.
+    ///
+    /// `Operation::ReadFlags` already exists in the recompiler, so the capture is
+    /// the same shape `ENTRY_STACK_POINTER` already uses: a synthetic input bound
+    /// to a physical register whose capture is special-cased.
+    #[test]
+    fn the_incoming_flag_word_is_a_capturable_input() {
+        let inputs = vec![
+            ("native_rax_initial".to_owned(), PhysicalRegister::Rax),
+            (ENTRY_FLAGS.to_owned(), PhysicalRegister::Rcx),
+        ];
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 7))]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            // The routine preserves the caller's flags verbatim.
+            rflags: Some(Expr::register(BitWidth::W64, ENTRY_FLAGS)),
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("a preserved flag word must be buildable");
+        assert!(
+            replacement
+                .function
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::ReadFlags { .. })),
+            "the capture block must read the incoming flags"
+        );
+    }
+
+    /// The real shape: the recovered exit says `native_rflags_initial`, the VM
+    /// model's name, and the caller declares no flag input at all. The builder
+    /// has to notice and capture it itself, because `replacement_inputs` sorts
+    /// its list and a `__entry_*` name would sort AHEAD of every `native_*` one,
+    /// putting the capture before the architectural registers it may clobber.
+    #[test]
+    fn a_preserved_flag_word_captures_itself_without_being_declared() {
+        let inputs = vec![("native_rax_initial".to_owned(), PhysicalRegister::Rax)];
+        let registers =
+            BTreeMap::from([(X64NativeRegister::Rax, Expr::constant(BitWidth::W64, 7))]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: Some(Expr::register(BitWidth::W64, "native_rflags_initial")),
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("a preserved flag word must build without being declared");
+        let operations = &replacement.function.operations;
+        let read_at = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::ReadFlags { .. }))
+            .expect("the builder must capture the entry flags");
+        let last_architectural_spill = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| matches!(operation, Operation::SpillStore { .. }))
+            .map(|(index, _)| index)
+            .next()
+            .expect("the architectural inputs are captured first");
+        assert!(
+            read_at > last_architectural_spill,
+            "the flag read clobbers its carrier, so it must come after the \
+             architectural captures; ops: {operations:?}"
         );
     }
 

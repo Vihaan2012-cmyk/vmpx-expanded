@@ -129,6 +129,16 @@ fn entry_inputs(
     let allowed = inputs
         .into_iter()
         .map(|(name, _)| name)
+        // The entry condition state. Not an architectural GP register, so
+        // `replacement_inputs` never listed it, and a routine that preserves its
+        // caller's flags -- exit rflags == this symbol -- was refused for
+        // depending on something outside the inputs. 135 of 264 closedness
+        // refusals on systems.xpl, 125 on the rflags slot itself.
+        //
+        // The replacement DOES provide it: `build_replacement` captures it with
+        // `Operation::ReadFlags` whenever a lowered expression reads it, so
+        // admitting it here is backed by a real binding, not an assumption.
+        .chain([vmpx_vmlift::ENTRY_FLAGS_SYMBOL.to_owned()])
         .chain(rewrites.into_keys())
         .collect();
     Ok((candidate, allowed))
