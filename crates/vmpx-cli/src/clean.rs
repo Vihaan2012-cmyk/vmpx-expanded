@@ -883,6 +883,22 @@ pub fn analyze_clean_with_image(
         .iter()
         .map(|module| module.entries.len())
         .sum::<usize>();
+    // The executable stub scan is OFF here, and that is why `clean` sees 2 VM
+    // entries where `report --all` sees 814: every one of those comes from this
+    // scan, as `VmEntrySource::ExecutableScan` with
+    // `reachability=UnprovenExecutableCandidate`. They are byte-pattern
+    // CANDIDATES, so splicing native code over one is unsound in exactly the way
+    // the "entry path family is not proven safe for native replacement" blocker
+    // describes.
+    //
+    // Turning the scan ON was measured and changes NOTHING: `vm_entries` goes
+    // 2 -> 814 and `routines` stays 4. Replacement here is driven from the
+    // module entry point -- the DllMain reason family (`native_rdx_initial`
+    // 0..3) plus the nested entries its continuations reach -- not from a
+    // function inventory. So feeding arbitrary discovered entries in has nowhere
+    // to go, and raising N1 cannot produce more devirtualized output by itself.
+    // What that needs is a PROVEN function inventory (real call site, proven
+    // entry address, recovered calling convention) wired into `reintegrate`.
     let discovery = discover_vm_entries(
         &pe,
         VmDiscoveryLimits {
