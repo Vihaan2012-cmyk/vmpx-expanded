@@ -15,7 +15,8 @@ use vmpx_vm::{
     BranchingRecoveryLimits, DomainCertificate, EntryPathRecoveryLimits, Expr, NativeExitState,
     RecoveredEntryPath, RecoveredEntryPathFamily, VmDiscoveryLimits, VmEntryCandidate,
     VmProfileExplorerLimits, X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
-    is_expr_input_closed, is_input_closed, recover_branching_entry_paths, recover_entry_paths,
+    exit_closure_violation, input_closure_violation, recover_branching_entry_paths,
+    recover_entry_paths,
 };
 use vmpx_vmlift::{CollectedEffects, calling_convention, collect_path_effects};
 
@@ -144,8 +145,13 @@ fn closed_exit(
         .native_exit
         .clone()
         .ok_or_else(|| "no native exit state".to_owned())?;
-    if !is_input_closed(&exit, allowed) {
-        return Err("exit depends on a symbol outside the replacement inputs".to_owned());
+    // Name the TERM, not just the fact. The three causes need different work: an
+    // unbound register can be admitted by widening the replacement's input set,
+    // while a load or an opaque intrinsic cannot.
+    if let Some(why) = exit_closure_violation(&exit, allowed) {
+        return Err(format!(
+            "exit depends on a symbol outside the replacement inputs: {why}"
+        ));
     }
     // Side effects must be closed too, and nothing may be hidden in memory the
     // exit expressions do not mention.
@@ -153,10 +159,16 @@ fn closed_exit(
     if !effects.unsupported.is_empty() || !effects.calls.is_empty() {
         return Err("path has unsupported effects or native calls".to_owned());
     }
-    if !effects.stores.iter().all(|store| {
-        is_expr_input_closed(&store.address, allowed) && is_expr_input_closed(&store.value, allowed)
+    if let Some(why) = effects.stores.iter().find_map(|store| {
+        input_closure_violation(&store.address, allowed)
+            .map(|w| format!("address: {w}"))
+            .or_else(|| {
+                input_closure_violation(&store.value, allowed).map(|w| format!("value: {w}"))
+            })
     }) {
-        return Err("a store depends on a symbol outside the replacement inputs".to_owned());
+        return Err(format!(
+            "a store depends on a symbol outside the replacement inputs: {why}"
+        ));
     }
     if !memory_is_exact(family, path) {
         return Err("path has memory havocs or tainted memory".to_owned());
@@ -224,8 +236,10 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
     }
     // The replacement evaluates the branch target to pick a path, so the guard
     // itself must be closed over the replacement's inputs.
-    if !is_expr_input_closed(&guarded.branch_target, &allowed) {
-        return Err("branch target depends on a symbol outside the replacement inputs".to_owned());
+    if let Some(why) = input_closure_violation(&guarded.branch_target, &allowed) {
+        return Err(format!(
+            "branch target depends on a symbol outside the replacement inputs: {why}"
+        ));
     }
     let mut paths = Vec::with_capacity(family.paths.len());
     for (path, target) in family.paths.iter().zip(&guarded.targets) {

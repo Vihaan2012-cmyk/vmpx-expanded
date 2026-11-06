@@ -132,7 +132,9 @@ pub use image_concretize::{
     concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
 };
 pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage, set_volatile_image_pages, set_volatile_image_ranges};
-pub use input_closed::{is_expr_input_closed, is_input_closed};
+pub use input_closed::{
+    exit_closure_violation, input_closure_violation, is_expr_input_closed, is_input_closed,
+};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
     InputDomainRefusal, RefusalCause, abstract_epoch_loads, add_flags_cover,
