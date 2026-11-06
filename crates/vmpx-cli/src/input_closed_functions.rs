@@ -39,6 +39,10 @@ pub(crate) struct InputClosedFunction {
     /// Task 3's inferred live-in registers. Informational only: it
     /// under-reports, so it never narrows `inputs`.
     pub live_in: BTreeSet<X64NativeRegister>,
+    /// True when closing this function required folding an image-backed read to
+    /// a constant, which holds only while the image's protection does. Such a
+    /// recovery rests on `AssumesImageProtectionStable` and is never PROVEN.
+    pub assumes_image_protection: bool,
 }
 
 /// A virtualized function whose first virtual branch depends on its inputs and
@@ -148,17 +152,69 @@ fn entry_inputs(
     Ok((candidate, allowed))
 }
 
+/// `VMPX_CONCRETIZE_IMAGE=1`: fold image-backed opaque intrinsics to constants
+/// before the closedness check.
+///
+/// Opt-in for the same reason `--serve-ro` is. `concretize_with_immutable_image`
+/// states that it "deliberately does not infer memory immutability" and that a
+/// caller may treat its result as a proof "only after separately establishing
+/// that all represented memory epochs preserve the referenced image bytes".
+/// This binary imports `VirtualProtect`, so that cannot be established -- a
+/// recovery that depends on this rests on `AssumesImageProtectionStable` and can
+/// never be PROVEN.
+fn concretize_image_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_CONCRETIZE_IMAGE").is_ok_and(|value| value == "1"))
+}
+
+/// Folds image-backed opaque intrinsics in `expression` to constants, returning
+/// the rewritten expression and whether anything was resolved.
+///
+/// Resolves exactly the two shapes that dominate the closedness refusals:
+/// `memory_load_epoch_N` at a constant address, and the table-checksum
+/// recurrence. Both read bytes the file already contains, so the value is
+/// computable -- but only under image immutability, which is why the caller
+/// records the assumption.
+fn concretize(pe: &PeImage<'_>, expression: &vmpx_vm::Expr) -> (vmpx_vm::Expr, bool) {
+    if !concretize_image_reads() {
+        return (expression.clone(), false);
+    }
+    match vmpx_vm::concretize_with_immutable_image(
+        pe,
+        expression,
+        &BTreeMap::new(),
+        vmpx_vm::ImageConcretizationLimits::default(),
+    ) {
+        Ok(report) if report.resolved_intrinsics > 0 => (report.expression, true),
+        // Unresolved or over budget: keep the original and let the closedness
+        // check refuse it exactly as before.
+        _ => (expression.clone(), false),
+    }
+}
+
 /// The native exit of `path` if it, its stores and its memory are all closed
-/// over `allowed`.
+/// over `allowed`. `assumes_image_protection` reports whether closing it
+/// required folding an image-backed read.
 fn closed_exit(
+    pe: &PeImage<'_>,
     family: &RecoveredEntryPathFamily,
     path: &RecoveredEntryPath,
     allowed: &BTreeSet<String>,
+    assumes_image_protection: &mut bool,
 ) -> Result<(NativeExitState, CollectedEffects), String> {
-    let exit = path
+    let mut exit = path
         .native_exit
         .clone()
         .ok_or_else(|| "no native exit state".to_owned())?;
+    for value in exit
+        .registers
+        .values_mut()
+        .chain([&mut exit.rflags, &mut exit.return_address])
+    {
+        let (folded, resolved) = concretize(pe, value);
+        *value = folded;
+        *assumes_image_protection |= resolved;
+    }
     // Name the TERM, not just the fact. The three causes need different work: an
     // unbound register can be admitted by widening the replacement's input set,
     // while a load or an opaque intrinsic cannot.
@@ -169,9 +225,16 @@ fn closed_exit(
     }
     // Side effects must be closed too, and nothing may be hidden in memory the
     // exit expressions do not mention.
-    let effects = collect_path_effects(family, path);
+    let mut effects = collect_path_effects(family, path);
     if !effects.unsupported.is_empty() || !effects.calls.is_empty() {
         return Err("path has unsupported effects or native calls".to_owned());
+    }
+    for store in &mut effects.stores {
+        let (address, address_resolved) = concretize(pe, &store.address);
+        let (value, value_resolved) = concretize(pe, &store.value);
+        store.address = address;
+        store.value = value;
+        *assumes_image_protection |= address_resolved || value_resolved;
     }
     if let Some(why) = effects.stores.iter().find_map(|store| {
         input_closure_violation(&store.address, allowed)
@@ -219,7 +282,9 @@ pub(crate) fn recover_input_closed(
             "path depends on an enumerated input".to_owned(),
         ));
     }
-    let (exit, effects) = closed_exit(&family, path, &allowed)?;
+    let mut assumes_image_protection = false;
+    let (exit, effects) =
+        closed_exit(pe, &family, path, &allowed, &mut assumes_image_protection)?;
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
     Ok(InputClosedFunction {
@@ -228,6 +293,7 @@ pub(crate) fn recover_input_closed(
         effects,
         inputs: allowed,
         live_in: calling_convention(&family, &frame).live_in,
+        assumes_image_protection,
     })
 }
 
@@ -248,9 +314,12 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
     if !family.domain_complete || !family.all_paths_reach_vm_exit {
         return Err("branch paths are not complete".to_owned());
     }
+    let mut assumes_image_protection = false;
     // The replacement evaluates the branch target to pick a path, so the guard
     // itself must be closed over the replacement's inputs.
-    if let Some(why) = input_closure_violation(&guarded.branch_target, &allowed) {
+    let (branch_target, branch_resolved) = concretize(pe, &guarded.branch_target);
+    assumes_image_protection |= branch_resolved;
+    if let Some(why) = input_closure_violation(&branch_target, &allowed) {
         return Err(format!(
             "branch target depends on a symbol outside the replacement inputs: {why}"
         ));
@@ -260,7 +329,8 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         if !path.assignments.is_empty() {
             return Err("branching path was specialized by an input".to_owned());
         }
-        let (exit, effects) = closed_exit(family, path, &allowed)?;
+        let (exit, effects) =
+            closed_exit(pe, family, path, &allowed, &mut assumes_image_protection)?;
         paths.push(BranchPath {
             target: *target,
             exit,
@@ -271,7 +341,7 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         .map_err(|error| error.to_string())?;
     Ok(BranchingFunction {
         rva,
-        branch_target: guarded.branch_target.clone(),
+        branch_target,
         paths,
         domain_complete: family.domain_complete,
         inputs: allowed,
@@ -384,6 +454,7 @@ mod tests {
             },
             inputs: BTreeSet::new(),
             live_in: BTreeSet::new(),
+            assumes_image_protection: false,
         }
     }
 
