@@ -197,18 +197,24 @@ pub enum ReplacementContinuation {
 /// The symbol the VM model uses for the condition state on entry.
 pub const NATIVE_RFLAGS_INITIAL: &str = "native_rflags_initial";
 
-/// True when any expression the routine will lower reads the entry flag word, so
-/// the builder knows to capture it. Checked over every lowered expression, not
-/// just the exit flags: a register value or a store can read it too.
-fn references_native_rflags(
+/// The caller's return address, the qword at the entry stack pointer. Like the
+/// flag word it is not an architectural GP register, so it is not a bound input
+/// -- but a replacement can read it, so an exit that uses it is replaceable.
+pub const NATIVE_RETURN_ADDRESS_INITIAL: &str = "native_return_address_initial";
+
+/// The synthetic input carrying [`NATIVE_RETURN_ADDRESS_INITIAL`], captured as
+/// an entry-stack-pointer read followed by a load through it.
+pub const ENTRY_RETURN_ADDRESS: &str = "__entry_return_address";
+
+/// True when any expression the routine will lower reads `symbol`, so the
+/// builder knows to capture it. Checked over every lowered expression, not just
+/// the exit registers: the flag word, a store, or a call argument can read it.
+fn references_symbol(
     registers: &BTreeMap<X64NativeRegister, Expr>,
     config: &ReplacementConfig,
+    symbol: &str,
 ) -> bool {
-    let reads = |expr: &Expr| {
-        expr.dependencies()
-            .iter()
-            .any(|name| name == NATIVE_RFLAGS_INITIAL)
-    };
+    let reads = |expr: &Expr| expr.dependencies().iter().any(|name| name == symbol);
     registers.values().any(reads)
         || config.rflags.as_ref().is_some_and(reads)
         || config
@@ -219,6 +225,10 @@ fn references_native_rflags(
             .effect_calls
             .iter()
             .any(|call| call.arguments.iter().any(reads))
+        || matches!(
+            &config.continuation,
+            Some(ReplacementContinuation::Computed(target)) if reads(target)
+        )
 }
 
 /// As [`build_replacement`], but the routine returns through the qword
@@ -240,8 +250,10 @@ pub fn build_replacement_popping(
     // below the one the routine is entered with. Reading it needs the entry
     // stack pointer, which is captured with the other inputs.
     let extended;
-    let needs_entry_flags = references_native_rflags(registers, config);
-    let config = if stack_root_bytes.is_some() || needs_entry_flags {
+    let needs_entry_flags = references_symbol(registers, config, NATIVE_RFLAGS_INITIAL);
+    let needs_return_address =
+        references_symbol(registers, config, NATIVE_RETURN_ADDRESS_INITIAL);
+    let config = if stack_root_bytes.is_some() || needs_entry_flags || needs_return_address {
         let mut owned = config.clone();
         if let Some(bytes) = stack_root_bytes {
             let entry = Expr::register(vmpx_vm::BitWidth::W64, ENTRY_STACK_POINTER);
@@ -266,6 +278,16 @@ pub fn build_replacement_popping(
             owned.symbol_rewrites.insert(
                 NATIVE_RFLAGS_INITIAL.to_owned(),
                 Expr::register(vmpx_vm::BitWidth::W64, ENTRY_FLAGS),
+            );
+        }
+        if needs_return_address {
+            // Same contract as the flag word, and appended for the same reason.
+            owned
+                .inputs
+                .push((ENTRY_RETURN_ADDRESS.to_owned(), PhysicalRegister::Rax));
+            owned.symbol_rewrites.insert(
+                NATIVE_RETURN_ADDRESS_INITIAL.to_owned(),
+                Expr::register(vmpx_vm::BitWidth::W64, ENTRY_RETURN_ADDRESS),
             );
         }
         extended = owned;
@@ -347,6 +369,19 @@ pub fn build_replacement_popping(
             // it is safe once every entry register has been captured.
             capture_ops.push(Operation::ReadFlags {
                 destination: source,
+            });
+        }
+        if name == ENTRY_RETURN_ADDRESS {
+            // The caller's return address is the qword AT the entry stack
+            // pointer, so the carrier first takes that pointer and is then
+            // loaded through. Both writes target the same carrier, which is
+            // spilled immediately below.
+            capture_ops.push(Operation::EntryStackPointer {
+                destination: source,
+            });
+            capture_ops.push(Operation::Load {
+                destination: source,
+                address: vmpx_recompile::Address::new(source, 0),
             });
         }
         capture_ops.push(Operation::SpillStore { slot, source });
@@ -1768,6 +1803,60 @@ mod tests {
     /// staged in MEMORY survives teardown by construction. That is the whole
     /// reason to stage it rather than hold it in a register: a register holding
     /// the target would be clobbered if it were one of the preserved ones.
+    /// The caller's return address is available to a replacement -- it is the
+    /// qword at the entry stack pointer -- but like the flag word it is not an
+    /// architectural GP register, so it was never a bound input and any exit
+    /// reading it was refused. 4 such refusals on systems.xpl.
+    ///
+    /// Captured as `EntryStackPointer` followed by a load through it, appended
+    /// last for the same reason the flag capture is: it clobbers its carrier.
+    #[test]
+    fn the_caller_return_address_captures_itself_from_the_entry_stack() {
+        let inputs = vec![("native_rax_initial".to_owned(), PhysicalRegister::Rax)];
+        let registers = BTreeMap::from([(
+            X64NativeRegister::Rax,
+            Expr::register(BitWidth::W64, "native_return_address_initial"),
+        )]);
+        let config = ReplacementConfig {
+            inputs,
+            max_expression_nodes: 10_000,
+            max_spill_slots: 32,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        let replacement = build_replacement(&registers, &config, CodeAddress(0x1_4000_1000))
+            .expect("an exit that returns the caller's return address must build");
+        let operations = &replacement.function.operations;
+        let entry_at = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::EntryStackPointer { .. }))
+            .expect("the capture must read the entry stack pointer");
+        let load_at = operations
+            .iter()
+            .position(|operation| matches!(
+                operation,
+                Operation::Load { address, .. } if address.displacement == 0
+            ))
+            .expect("the capture must load through it");
+        assert!(
+            load_at > entry_at,
+            "the load must follow the entry-stack-pointer read; ops: {operations:?}"
+        );
+        let first_spill = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::SpillStore { .. }))
+            .expect("architectural inputs are captured first");
+        assert!(
+            entry_at > first_spill,
+            "the capture clobbers its carrier, so it must follow the architectural \
+             captures; ops: {operations:?}"
+        );
+    }
+
     #[test]
     fn a_computed_continuation_transfers_through_a_staged_target() {
         let inputs = vec![("native_rcx_initial".to_owned(), PhysicalRegister::Rcx)];

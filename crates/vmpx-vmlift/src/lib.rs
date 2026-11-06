@@ -61,7 +61,8 @@ pub use live_in::{
 };
 pub use replacement::{
     EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementContinuation,
-    ReplacementError, build_replacement, build_replacement_popping,
+    NATIVE_RETURN_ADDRESS_INITIAL, ReplacementError, build_replacement,
+    build_replacement_popping,
 };
 /// The VM-model symbol for the entry condition state, which a replacement
 /// captures for itself. Exported so the closedness check can admit it.

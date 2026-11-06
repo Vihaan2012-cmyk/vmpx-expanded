@@ -139,6 +139,10 @@ fn entry_inputs(
         // `Operation::ReadFlags` whenever a lowered expression reads it, so
         // admitting it here is backed by a real binding, not an assumption.
         .chain([vmpx_vmlift::ENTRY_FLAGS_SYMBOL.to_owned()])
+        // The caller's return address, likewise provided rather than assumed:
+        // `build_replacement` captures it as an entry-stack-pointer read plus a
+        // load through it. 4 refusals on systems.xpl.
+        .chain([vmpx_vmlift::NATIVE_RETURN_ADDRESS_INITIAL.to_owned()])
         .chain(rewrites.into_keys())
         .collect();
     Ok((candidate, allowed))
