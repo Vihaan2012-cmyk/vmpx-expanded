@@ -2389,6 +2389,14 @@ pub(crate) fn replacement_config(
     // to the caller. Resolve that continuation so the replacement can
     // tail-jump into it after restoring the exit state, which is what makes
     // it a drop-in for the VM entry.
+    // Only the single-proven-target form is wired. Routing the proven-but-
+    // multi-target case through `ReplacementContinuation::Computed` was built and
+    // MEASURED on systems.xpl: +0, census byte-identical, `recovered` still 20,
+    // `.vmpx0` unchanged. The reason is structural rather than incidental --
+    // `replacement_config` is only reached by exits that already survived
+    // recovery, and those all resolve to one target; the refusals that would
+    // benefit never get this far. Reverted rather than left as dead code whose
+    // only live risk is emitting a transfer where an ordinary return belongs.
     let continuation = vmpx_vm::recover_modulo_image_targets(
         pe,
         &exit.return_address,
@@ -2397,9 +2405,6 @@ pub(crate) fn replacement_config(
     .ok()
     .filter(|report| report.complete && report.targets.len() == 1)
     .map(|report| report.targets[0].va)
-    // Resolved to a single proven target, so this is the constant form. A
-    // continuation that could NOT be resolved is the computed form, which does
-    // not need resolving at all -- see `ReplacementContinuation::Computed`.
     .map(|va| vmpx_vmlift::ReplacementContinuation::Address(va.0));
     vmpx_vmlift::ReplacementConfig {
         inputs: inputs.to_vec(),
