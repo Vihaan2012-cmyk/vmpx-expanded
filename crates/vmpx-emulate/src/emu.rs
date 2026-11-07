@@ -408,6 +408,55 @@ pub struct Emulator {
     bcache: Vec<Option<Box<Block>>>,
     /// Which hook events `run`/`run_until` still need to deliver (see [`Interest`]).
     gate: Gate,
+    /// Dispatch counters, for finding where a long run spends its steps.
+    pub prof: Prof,
+}
+
+/// Where a run's steps went. Plain counters: the interpreter is single-threaded
+/// and an increment is far cheaper than the step it measures.
+#[derive(Clone)]
+pub struct Prof {
+    /// Steps dispatched through the pre-resolved fast path.
+    pub fast: u64,
+    /// Steps that fell back to the generic `exec` (full iced `Instruction`).
+    pub slow: u64,
+    /// Blocks executed whole, and the ops they retired.
+    pub blocks: u64,
+    pub block_ops: u64,
+    /// Steps taken one at a time because no block was available.
+    pub single: u64,
+    /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
+    pub slow_mn: Box<[u64]>,
+}
+
+impl Default for Prof {
+    fn default() -> Self {
+        Self {
+            fast: 0,
+            slow: 0,
+            blocks: 0,
+            block_ops: 0,
+            single: 0,
+            slow_mn: vec![0; 2048].into_boxed_slice(),
+        }
+    }
+}
+
+impl Prof {
+    /// The mnemonics that most often took the slow path, most frequent first.
+    #[must_use]
+    pub fn top_slow(&self, count: usize) -> Vec<(usize, u64)> {
+        let mut rows: Vec<(usize, u64)> = self
+            .slow_mn
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| (i, *n))
+            .collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        rows.truncate(count);
+        rows
+    }
 }
 
 /// A straight-line run of pre-resolved instructions starting at `start`,
@@ -566,6 +615,7 @@ impl Emulator {
             .into_boxed_slice(),
             bcache: (0..BCACHE_SIZE).map(|_| None).collect(),
             gate: Gate::ALL,
+            prof: Prof::default(),
         }
     }
 
@@ -600,9 +650,12 @@ impl Emulator {
         self.cur.1 = p.mn;
         let next = rip.wrapping_add(u64::from(p.len));
         let new_rip = if p.kind == K::Slow {
+            self.prof.slow += 1;
+            self.prof.slow_mn[p.mn as usize & 2047] += 1;
             let ins = self.dcache[slot].ins;
             self.exec(&ins, next)?
         } else {
+            self.prof.fast += 1;
             self.exec_fast(&p, next)?
         };
         self.cpu.rip = new_rip;
@@ -684,7 +737,9 @@ impl Emulator {
                     // early at a taken branch, a redirect, the target or a
                     // code write).
                     if b.ops.len() as u64 <= left && !b.has(target) {
+                        self.prof.blocks += 1;
                         let (done, stop) = self.exec_block(&b);
+                        self.prof.block_ops += done;
                         self.bcache[slot] = Some(b);
                         left -= done;
                         if let Some(s) = stop {
@@ -695,6 +750,7 @@ impl Emulator {
                     self.bcache[slot] = Some(b);
                 }
             }
+            self.prof.single += 1;
             if let Err(s) = self.step() {
                 return s;
             }
@@ -821,12 +877,15 @@ impl Emulator {
             self.cur.0 = rip;
             let next = rip.wrapping_add(u64::from(p.len));
             let r = if p.kind == K::Slow {
+                self.prof.slow += 1;
+                self.prof.slow_mn[p.mn as usize & 2047] += 1;
                 self.cpu.rip = rip;
                 self.cur.1 = p.mn;
                 self.steps = base + i as u64;
                 let ins = b.slow[p.t as usize];
                 self.exec(&ins, next).map_err(Box::new)
             } else {
+                self.prof.fast += 1;
                 self.exec_fast(p, next)
             };
             let nr = match r {

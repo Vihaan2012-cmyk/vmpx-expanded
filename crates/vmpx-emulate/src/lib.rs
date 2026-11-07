@@ -87,6 +87,7 @@ pub use differential::{
 };
 pub use emu::{
     Emulator, FlowEvent, FlowKind, Hook, HookAction, InsnAudit, Interest, MemEvent, ObserveConfig,
+    Prof,
     Span, Stop, TraceEntry,
 };
 pub use iat_fill::{
