@@ -46,6 +46,18 @@ use crate::{
     recover_modulo_image_targets, recover_native_exit_state, value_range, ImageTableBranchLimits,
 };
 
+/// Distinct nodes one `shift_ancestor_onto_reentry` may decompose before it
+/// gives up. Each node costs an `affine_vsp_parts` decomposition of its whole
+/// subtree, which allocates a map of its terms, so the work is quadratic in the
+/// expression while the node COUNT -- the only thing the walker charges --
+/// stays flat. That is why a state that passes every size check can still take
+/// resident memory past 13 GB.
+///
+/// Exhausting the budget abandons the shift, so the fold simply does not
+/// happen: the entry falls back to the ordinary path and, failing that, stalls.
+/// Incomplete, never unsound.
+const SHIFT_NODE_BUDGET: usize = 200_000;
+
 /// 1.5 GiB per entry: far above any entry that completes, yet small enough that
 /// several concurrent entries stay well inside a 10 GB machine.
 const DEFAULT_MAX_MEMORY_BYTES: usize = 1536 * 1024 * 1024;
@@ -1305,6 +1317,7 @@ type MemorySite = (Option<usize>, Option<usize>, String);
 /// hundreds of KB, so the union is memoized on the two address sequences (the
 /// loop fixpoints re-widen the same sites over and over).
 fn memory_union(a: &SymbolicVmInitialState, r: &SymbolicVmInitialState) -> Rc<Vec<MemorySite>> {
+
     type Entry = (Vec<Expr>, Vec<Expr>, Rc<Vec<MemorySite>>);
     thread_local! {
         static UNIONS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1876,7 +1889,18 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
         .iter()
         .map(|(address, value)| (canonical_affine(address), canonical_affine(value)))
         .collect();
-    memory_values.sort_by_cached_key(|(address, _)| format!("{address:?}"));
+    // `site_key`, not `format!("{address:?}")`: Debug prints a shared DAG as a
+    // TREE, so one heavily shared address renders to gigabytes and this sort key
+    // was unbounded. Measured on entry 0xc43d80e at an 8192 instruction limit,
+    // this single line was 40.8s of a 40.9s `generalize_across` and took
+    // resident memory past 13GB, while every counter the walker charges stayed
+    // flat -- which is why the per-entry memory cap never fired.
+    //
+    // `site_key` is the same bounded rendering the memory-union keys already
+    // use: a bounded prefix, falling back to a structural hash when the address
+    // outgrows it. The order stays deterministic, which is all a canonical form
+    // needs.
+    memory_values.sort_by_cached_key(|(address, _)| site_key(address));
     SymbolicVmInitialState {
         vsp: canonical_affine(&state.vsp),
         flags: canonical_affine(&state.flags),
@@ -1921,7 +1945,7 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
 type ShiftMemo = std::collections::HashMap<Expr, Expr>;
 
 fn shift_stack_relative(expr: &Expr, base_terms: &HashMap<Expr, i64>, delta: u64) -> Expr {
-    shift_stack_relative_memo(expr, base_terms, delta, &mut ShiftMemo::new())
+    shift_stack_relative_memo(expr, base_terms, delta, &mut ShiftMemo::new(), &std::cell::Cell::new(SHIFT_NODE_BUDGET))
 }
 
 /// Memoized on node identity. Expressions here are a hash-consed DAG, and the
@@ -1935,11 +1959,19 @@ fn shift_stack_relative_memo(
     base_terms: &HashMap<Expr, i64>,
     delta: u64,
     memo: &mut ShiftMemo,
+    budget: &std::cell::Cell<usize>,
 ) -> Expr {
     if let Some(done) = memo.get(expr) {
         return done.clone();
     }
-    let result = shift_stack_relative_uncached(expr, base_terms, delta, memo);
+    // Out of budget: hand back the node untouched and let the caller abandon
+    // the whole shift. Returning a partially shifted state would be wrong, so
+    // the exhausted flag (budget stuck at zero) is what the caller checks.
+    if budget.get() == 0 {
+        return expr.clone();
+    }
+    budget.set(budget.get() - 1);
+    let result = shift_stack_relative_uncached(expr, base_terms, delta, memo, budget);
     memo.insert(expr.clone(), result.clone());
     result
 }
@@ -1949,6 +1981,7 @@ fn shift_stack_relative_uncached(
     base_terms: &HashMap<Expr, i64>,
     delta: u64,
     memo: &mut ShiftMemo,
+    budget: &std::cell::Cell<usize>,
 ) -> Expr {
     let (terms, constant) = affine_vsp_parts(expr);
     if !terms.is_empty() && terms == *base_terms {
@@ -1974,23 +2007,23 @@ fn shift_stack_relative_uncached(
     let rebuilt = match &expr.kind {
         ExprKind::Binary { op, left, right } => Expr::binary(
             *op,
-            shift_stack_relative_memo(left, base_terms, delta, memo),
-            shift_stack_relative_memo(right, base_terms, delta, memo),
+            shift_stack_relative_memo(left, base_terms, delta, memo, budget),
+            shift_stack_relative_memo(right, base_terms, delta, memo, budget),
         )
         .ok(),
         ExprKind::Unary { op, value } => {
-            Some(Expr::unary(*op, shift_stack_relative_memo(value, base_terms, delta, memo)))
+            Some(Expr::unary(*op, shift_stack_relative_memo(value, base_terms, delta, memo, budget)))
         }
         ExprKind::Load { address } => Some(Expr::load(
             expr.width,
-            shift_stack_relative_memo(address, base_terms, delta, memo),
+            shift_stack_relative_memo(address, base_terms, delta, memo, budget),
         )),
         ExprKind::Intrinsic { name, arguments } => Some(Expr::intrinsic(
             expr.width,
             name.clone(),
             arguments
                 .iter()
-                .map(|argument| shift_stack_relative_memo(argument, base_terms, delta, memo))
+                .map(|argument| shift_stack_relative_memo(argument, base_terms, delta, memo, budget))
                 .collect::<Vec<_>>(),
         )),
         _ => None,
@@ -2012,10 +2045,11 @@ fn shift_ancestor_onto_reentry(
     // One memo for the whole state: its cells share subterms heavily, so a
     // per-expression memo would rebuild the same DAG once per cell.
     let memo = std::cell::RefCell::new(ShiftMemo::new());
+    let budget = std::cell::Cell::new(SHIFT_NODE_BUDGET);
     let shift = |expr: &Expr| {
-        shift_stack_relative_memo(expr, &base_terms, delta, &mut memo.borrow_mut())
+        shift_stack_relative_memo(expr, &base_terms, delta, &mut memo.borrow_mut(), &budget)
     };
-    Some(SymbolicVmInitialState {
+    let shifted = SymbolicVmInitialState {
         vsp: shift(&ancestor.vsp),
         flags: shift(&ancestor.flags),
         context_values: ancestor
@@ -2038,7 +2072,11 @@ fn shift_ancestor_onto_reentry(
             })
             .collect(),
         ..ancestor.clone()
-    })
+    };
+    // A shift that ran out of budget is partial, and a partially shifted state
+    // is not a sound over-approximation of the ancestor, so it is discarded
+    // rather than folded against.
+    (budget.get() > 0).then_some(shifted)
 }
 
 /// Diagnostic: the first field in which `ancestor` shifted by its constant VM
@@ -2530,7 +2568,13 @@ fn note_slow(label: &str, start: std::time::Instant) {
         return;
     }
     let ms = start.elapsed().as_millis();
-    if ms >= 5_000 {
+    // `VMPX_SLOW_MS` lowers the threshold: a 43s call made of many short ones
+    // prints nothing at 5s, which hides exactly the distribution that matters.
+    static FLOOR: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("VMPX_SLOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5_000)
+    });
+    if ms >= floor {
         let (live, dead) = crate::expr::interner_census();
         println!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
     }
@@ -3398,7 +3442,10 @@ impl Walker<'_, '_> {
             // recorded phases onto this re-entry's depth — the same substitution
             // the loop HEAD already uses to close a strided back edge — and fold
             // against those instead.
-            if let Some(folded) = self.fold_shifted_phases(key, incoming) {
+            let shifted_at = std::time::Instant::now();
+            let shifted = self.fold_shifted_phases(key, incoming);
+            note_slow("generalize/fold_shifted_phases", shifted_at);
+            if let Some(folded) = shifted {
                 return folded;
             }
         }
@@ -3462,7 +3509,9 @@ impl Walker<'_, '_> {
     /// spike, which is why the per-entry cap never saw it -- the peak is this
     /// scan's own working set, and bounding it is the whole fix.
     fn scan_shifted_phases(&self, key: Va, incoming: &SymbolicVmInitialState) -> ShiftedPhases {
+        let reentry_at = std::time::Instant::now();
         let reentry = canonicalized(incoming);
+        note_slow("scan/canonicalized(incoming)", reentry_at);
         let empty: &[SymbolicVmInitialState] = &[];
         let canonicals = self.widened.get(&key).map_or(empty, Vec::as_slice);
         // A recorded canonical is already a fold of many states, so it is both
