@@ -48,6 +48,7 @@ fn main() {
     emu.hook = Some(Box::new(winapi));
     emu.resolve_undefined_flags = true;
     emu.record_trace = false;
+    emu.accelerate_checksums = std::env::var("ACCEL").is_ok_and(|v| v == "1");
 
     // Sample rip at slice boundaries. Slicing leaves the block path intact, so
     // the rate stays representative while showing whether the run is spinning.
@@ -82,6 +83,10 @@ fn main() {
         p.block_ops,
         pct(p.block_ops),
         p.single
+    );
+    println!(
+        "folded={} folded_iterations={} declined={}",
+        p.folded, p.folded_iterations, p.fold_declined
     );
     #[allow(clippy::cast_precision_loss)]
     if p.blocks > 0 {

@@ -50,6 +50,7 @@
 )]
 
 mod alu;
+mod checksum_loop;
 mod cpu;
 mod detonate;
 mod differential;

@@ -410,7 +410,23 @@ pub struct Emulator {
     gate: Gate,
     /// Dispatch counters, for finding where a long run spends its steps.
     pub prof: Prof,
+    /// DETONATION-only. When `true`, `run`/`run_until` may execute a recognized
+    /// integrity-checksum loop natively instead of interpreting it byte by byte
+    /// (see [`crate::checksum_loop`]). Default `false`, so every sound and test
+    /// path is byte-for-byte unchanged.
+    ///
+    /// A fold retires many guest iterations while charging ONE step, so
+    /// `steps()` stops being an instruction count once this is on. That is the
+    /// point -- a step budget then buys progress rather than checksum arithmetic
+    /// -- and [`Prof::folded_iterations`] records what was skipped.
+    pub accelerate_checksums: bool,
+    /// Recognizer cache, direct-mapped by loop-head rip. `None` records a
+    /// declined address so it is not re-examined every iteration. Keyed by the
+    /// code generation too, so modified code is re-examined.
+    csum: Box<[Option<(u64, u64, Option<crate::checksum_loop::Shape>)>]>,
 }
+
+const CSUM_SLOTS: usize = 256;
 
 /// Where a run's steps went. Plain counters: the interpreter is single-threaded
 /// and an increment is far cheaper than the step it measures.
@@ -425,6 +441,11 @@ pub struct Prof {
     pub block_ops: u64,
     /// Steps taken one at a time because no block was available.
     pub single: u64,
+    /// Checksum loops folded, and guest iterations those folds retired.
+    pub folded: u64,
+    pub folded_iterations: u64,
+    /// Iterations declined because a byte was unreadable.
+    pub fold_declined: u64,
     /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
     pub slow_mn: Box<[u64]>,
 }
@@ -437,6 +458,9 @@ impl Default for Prof {
             blocks: 0,
             block_ops: 0,
             single: 0,
+            folded: 0,
+            folded_iterations: 0,
+            fold_declined: 0,
             slow_mn: vec![0; 2048].into_boxed_slice(),
         }
     }
@@ -616,6 +640,8 @@ impl Emulator {
             bcache: (0..BCACHE_SIZE).map(|_| None).collect(),
             gate: Gate::ALL,
             prof: Prof::default(),
+            accelerate_checksums: false,
+            csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -721,6 +747,141 @@ impl Emulator {
         stop
     }
 
+    /// Folding may only elide events no hook wants. The test is OVERLAP, not
+    /// presence: the detonation hook always registers read and flow spans (for
+    /// `KUSER_SHARED_DATA` and the import stubs), so declining whenever any
+    /// exist would decline every fold.
+    ///
+    /// The fold reads `[pointer, pointer + iterations)` and the 1KiB table, and
+    /// elides the body's own control transfers. Nothing else is skipped: it
+    /// writes no guest memory, so no write interest can be missed.
+    fn fold_elides_wanted_event(
+        &self,
+        shape: &crate::checksum_loop::Shape,
+        pointer: u64,
+        iterations: u64,
+        table: u64,
+    ) -> bool {
+        if self.gate.read_all || self.gate.flow_all || self.gate.flow_pages {
+            return true;
+        }
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        for span in self.gate.read {
+            if overlaps(span, pointer, iterations) || overlaps(span, table, 256 * 4) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if span.0 == span.1 {
+                continue;
+            }
+            for (from, to) in &shape.flow_sites[..usize::from(shape.flow_site_count)] {
+                if (*from >= span.0 && *from < span.1) || (*to >= span.0 && *to < span.1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The checksum shape at `rip`, recognized once and cached per code
+    /// generation. `None` means "not this loop"; it is cached too, so a hot
+    /// non-matching address is not re-decoded on every pass.
+    fn checksum_shape(&mut self, rip: u64) -> Option<crate::checksum_loop::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        if let Some((cached_rip, cached_epoch, shape)) = self.csum[slot]
+            && cached_rip == rip
+            && cached_epoch == epoch
+        {
+            return shape;
+        }
+        let mem = &self.mem;
+        let shape = crate::checksum_loop::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder =
+                Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.csum[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized checksum loop natively, leaving its LAST iteration to
+    /// the interpreter so the exit state (flags included) is produced by the
+    /// ordinary instruction semantics.
+    ///
+    /// Returns the guest iterations retired, or 0 when nothing was folded (too
+    /// few iterations left, a register the shape names is unavailable, or the
+    /// very first byte is unreadable) -- in which case the caller just
+    /// interprets as usual.
+    fn fold_checksum(&mut self, shape: &crate::checksum_loop::Shape) -> u64 {
+        use crate::checksum_loop::Shape;
+        let Some(counter) = self.cpu.reg(shape.counter) else {
+            return 0;
+        };
+        // Leave at least one iteration, which also means a 1-iteration loop is
+        // never folded and the trip count cannot underflow.
+        let Some(iterations) = counter.checked_sub(1).filter(|n| *n > 0) else {
+            return 0;
+        };
+        let (Some(pointer), Some(table), Some(accumulator)) = (
+            self.cpu.reg(shape.pointer),
+            self.cpu.reg(shape.table),
+            self.cpu.reg(shape.accumulator),
+        ) else {
+            return 0;
+        };
+        if self.fold_elides_wanted_event(shape, pointer, iterations, table) {
+            return 0;
+        }
+        let mut accumulator = accumulator as u32;
+        let mut entry = 0u32;
+        let mut done = 0u64;
+        // State after `done - 1` iterations, for the rollback below.
+        let mut previous = (accumulator, entry);
+        let mut declined = false;
+        while done < iterations {
+            let Ok(input) = self.mem.read_uint(pointer.wrapping_add(done), 1) else {
+                declined = true;
+                break;
+            };
+            let input = input as u8;
+            let index = u64::from(Shape::index(accumulator, input));
+            let Ok(loaded) = self.mem.read_uint(table.wrapping_add(index * 4), 4) else {
+                declined = true;
+                break;
+            };
+            previous = (accumulator, entry);
+            entry = loaded as u32;
+            accumulator = shape.step(accumulator, input, entry);
+            done += 1;
+        }
+        if declined {
+            // A fault makes the PREVIOUS iteration's flags observable, and this
+            // fold writes no flags. Give that iteration back to the interpreter
+            // so it produces them, then let it fault where it would have.
+            self.prof.fold_declined += 1;
+            done = done.saturating_sub(1);
+            (accumulator, entry) = previous;
+        }
+        if done == 0 {
+            return 0;
+        }
+        // 32-bit writes zero-extend, which `set_reg` applies for a 32-bit name.
+        self.cpu.set_reg(shape.accumulator, u64::from(accumulator));
+        self.cpu.set_reg(shape.scratch, u64::from(entry));
+        self.cpu.set_reg(shape.pointer, pointer.wrapping_add(done));
+        self.cpu.set_reg(shape.counter, counter - done);
+        self.prof.folded += 1;
+        self.prof.folded_iterations += done;
+        done
+    }
+
     #[allow(clippy::collapsible_if)]
     fn run_loop(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
         let mut left = max_steps;
@@ -730,6 +891,17 @@ impl Emulator {
             let rip = self.cpu.rip;
             if target == Some(rip) {
                 return Stop::Reached;
+            }
+            if self.accelerate_checksums && blocks {
+                if let Some(shape) = self.checksum_shape(rip)
+                    && self.fold_checksum(&shape) > 0
+                {
+                    // One step for the whole fold: the budget now buys progress
+                    // instead of checksum arithmetic.
+                    self.steps += 1;
+                    left -= 1;
+                    continue;
+                }
             }
             if blocks {
                 if let Some((slot, b)) = self.block_for(rip) {
