@@ -1691,6 +1691,29 @@ impl Emulator {
         }
     }
 
+    /// Two-operand `imul r, r`: the same `alu::imul_n` and flag application the
+    /// generic path uses, with the operands already resolved.
+    #[inline(always)]
+    fn imul_rr(&mut self, p: &Pre) {
+        let a = self.rreg(&p.a);
+        let b = self.rreg(&p.b);
+        let (r, fl) = alu::imul_n(a, b, u32::from(p.n));
+        self.wreg(&p.a, r);
+        self.apply(fl);
+    }
+
+    /// Two-operand `imul r, m`.
+    #[inline(always)]
+    fn imul_rm(&mut self, p: &Pre) -> Result<(), Trap> {
+        let a = self.rreg(&p.a);
+        let ea = self.ea_of(&p.b);
+        let b = self.load(ea, u32::from(p.n))?;
+        let (r, fl) = alu::imul_n(a, b, u32::from(p.n));
+        self.wreg(&p.a, r);
+        self.apply(fl);
+        Ok(())
+    }
+
     #[inline(always)]
     fn alu_rm<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Trap> {
         let a = self.rreg(&p.a);
@@ -1800,6 +1823,8 @@ impl Emulator {
                 let a = self.ea_of(&p.b);
                 self.wdst(&p.a, p.n, a);
             }
+            K::ImulRR => self.imul_rr(p),
+            K::ImulRM => self.imul_rm(p)?,
             K::AddRR => self.alu_rr::<0, true>(p),
             K::AddRI => self.alu_ri::<0, true>(p),
             K::AddRM => self.alu_rm::<0, true>(p)?,
@@ -2879,6 +2904,9 @@ mod tests {
             0x50, 0x51, 0x58, 0x59, 0xc3, 0xc7, 0xc6, 0x88, 0x8a, 0xf8, 0xf9, 0xf5, 0x9c, 0x98,
             0x99, 0xa9, 0xa8, 0xc0, 0xd0, 0x87, 0x0f, 0xc1, 0xc8, 0xbc, 0xbd, 0xa3, 0xab, 0xba,
             0x00, 0x04, 0x24, 0x44, 0x80, 0x84, 0x05, 0x15, 0x1d, 0xe8, 0xe9, 0x6a, 0x68, 0xb8,
+            // `imul`: 0F AF (two-operand, now on the fast path) and 69/6B (the
+            // three-operand forms, which must still take the generic path).
+            0xaf, 0x69, 0x6b,
         ];
         let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut mem = Memory::new();

@@ -33,6 +33,10 @@ const P_UN: u8 = 14;
 
 pub struct Renderer<'a> {
     pub names: &'a BTreeMap<String, String>,
+    /// Subtrees that have been given a local name (see [`crate::cse`]). Any
+    /// expression in here renders AS that name instead of being printed again,
+    /// which is what keeps a shared value from appearing ten times in one line.
+    pub temps: &'a std::collections::HashMap<Expr, String>,
 }
 
 fn hex(width: BitWidth, v: u64) -> String {
@@ -86,7 +90,22 @@ impl Renderer<'_> {
     /// Renders `e`; `ring_ok` means the consumer only looks at the low bits (an
     /// assignment into a narrow variable, or a parent low-bits-only operator),
     /// so a narrow ring operation need not truncate itself.
+    /// Renders `e`, substituting any named subtree for its name.
     pub fn rx(&self, e: &Expr, ring_ok: bool) -> (String, u8) {
+        if let Some(name) = self.temps.get(e) {
+            return (name.clone(), P_ATOM);
+        }
+        self.rx_body(e, ring_ok)
+    }
+
+    /// Renders a temporary's DEFINITION: the root is printed in full (or the
+    /// definition would be `t3 = t3`), while nested named subtrees still
+    /// substitute.
+    pub fn define(&self, e: &Expr) -> String {
+        self.rx_body(e, true).0
+    }
+
+    fn rx_body(&self, e: &Expr, ring_ok: bool) -> (String, u8) {
         let narrow = e.width.bits() < 32;
         match &e.kind {
             ExprKind::Const { value } => (hex(e.width, *value), P_ATOM),

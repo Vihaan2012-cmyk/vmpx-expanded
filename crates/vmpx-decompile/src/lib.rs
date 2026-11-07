@@ -1,8 +1,13 @@
-//! Decompilation SPIKE: raises already-recovered IR (native CFG blocks, or the
+﻿//! Decompilation SPIKE: raises already-recovered IR (native CFG blocks, or the
 //! recovered VM CFG) to C-like pseudocode. Fail-closed: a shape the structurer
 //! cannot prove falls back to labelled gotos, never to guessed structure.
 #![allow(clippy::pedantic, clippy::all, dead_code)]
 
+/// Smallest subtree worth a line of its own. Below this, naming a value
+/// costs more attention than the repetition it removes.
+const CSE_MIN_NODES: usize = 6;
+
+pub mod cse;
 pub mod ctext;
 pub mod exec;
 pub mod ir;
@@ -325,7 +330,19 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     ret_width(&body, &mut rw);
     let ret_ty = rw.map_or("void", ty);
 
-    let mut ctx = Ctx { r: Renderer { names: &names }, out: String::new(), log: Vec::new() };
+    // Give every subtree that is used more than once a name. The IR is a DAG
+    // and rendering flattens it, so without this a value computed once and used
+    // ten times is PRINTED ten times -- which is most of why the output reads as
+    // a wall rather than as code.
+    let taken: std::collections::HashSet<String> = names.values().cloned().collect();
+    let mut all_stmts: Vec<opt::Stmt> = prologue.clone();
+    all_stmts.extend(body.iter().cloned());
+    let temps = cse::extract(&all_stmts, 2, CSE_MIN_NODES, &taken);
+    let mut ctx = Ctx {
+        r: Renderer { names: &names, temps: &temps.map },
+        out: String::new(),
+        log: Vec::new(),
+    };
     let (mut loops, mut ifs, mut gotos) = (0, 0, 0);
     count(&body, &mut loops, &mut ifs, &mut gotos);
     let mut text = String::new();
@@ -339,6 +356,19 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     }
     for (t, vs) in by_ty {
         text.push_str(&format!("    {t} {};\n", vs.join(", ")));
+    }
+    if !temps.is_empty() {
+        text.push('\n');
+        for (name, definition) in &temps.order {
+            // Smaller definitions come first, so a definition only ever
+            // references names already introduced above it.
+            text.push_str(&format!(
+                "    {} {name} = {};\n",
+                ty(definition.width),
+                ctx.r.define(definition)
+            ));
+        }
+        text.push('\n');
     }
     ctx.stmts(&prologue, 1, rw);
     ctx.stmts(&body, 1, rw);
