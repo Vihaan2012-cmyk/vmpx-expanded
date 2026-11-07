@@ -7,6 +7,7 @@
 /// costs more attention than the repetition it removes.
 const CSE_MIN_NODES: usize = 6;
 
+pub mod annotate;
 pub mod cse;
 pub mod ctext;
 pub mod exec;
@@ -349,6 +350,11 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     let mut all_stmts: Vec<opt::Stmt> = prologue.clone();
     all_stmts.extend(body.iter().cloned());
     let temps = cse::extract(&all_stmts, 2, CSE_MIN_NODES, &taken);
+    // Labels for the protector machinery, so a reader can tell self-defence
+    // from work. `said` is threaded through the hoisted definitions first and
+    // the body second, so a tag lands on the line that earns it and is never
+    // repeated.
+    let mut said: Vec<annotate::Tag> = Vec::new();
     let mut ctx = Ctx {
         r: Renderer { names: &names, temps: &temps.map },
         out: String::new(),
@@ -373,6 +379,12 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         for (name, definition) in &temps.order {
             // Smaller definitions come first, so a definition only ever
             // references names already introduced above it.
+            for tag in annotate::tags_for(definition) {
+                if !said.contains(&tag) {
+                    said.push(tag);
+                    text.push_str(&format!("    /* {} */\n", tag.text()));
+                }
+            }
             text.push_str(&format!(
                 "    {} {name} = {};\n",
                 ty(definition.width),
@@ -381,6 +393,8 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         }
         text.push('\n');
     }
+    annotate::annotate_with(&mut prologue, &mut said);
+    annotate::annotate_with(&mut body, &mut said);
     ctx.stmts(&prologue, 1, rw);
     ctx.stmts(&body, 1, rw);
     text.push_str(&ctx.out);
