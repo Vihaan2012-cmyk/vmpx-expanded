@@ -105,6 +105,10 @@ pub struct DetonateOptions {
     /// rather than stopping. Observed/quarantined tier — never sound static
     /// output. Set `false` to reproduce the sound fail-closed stop.
     pub resolve_undefined_flags: bool,
+    /// Execute recognized protector integrity/copy loops natively rather than
+    /// interpreting them byte by byte (see [`crate::Emulator::accelerate_checksums`]).
+    /// Default `true` for the detonation, which is Observed tier already.
+    pub accelerate_protector_loops: bool,
     /// Region watched for import-slot fills (see [`DetonationResult::iat_fill`]).
     pub iat_region: IatRegion,
     /// After the entry returns, drive the X-Plane plugin lifecycle in the same emulator
@@ -152,6 +156,7 @@ impl Default for DetonateOptions {
             export_reference: BTreeMap::new(),
             dump: true,
             resolve_undefined_flags: true,
+            accelerate_protector_loops: true,
             iat_region: IatRegion::Auto,
             lifecycle: None,
             start_from_snapshot: None,
@@ -484,6 +489,13 @@ fn detonate_with(
     emu.resolve_undefined_flags = opts.resolve_undefined_flags;
     // Only the retired count is consumed; skip the per-step trace allocation.
     emu.record_trace = false;
+    // Run the protector byte-at-a-time integrity and copy loops natively. The
+    // detonation is Observed tier by construction and these folds are gated on
+    // reaching the same state the interpreter would (see `checksum_loop` and
+    // `copy_loop`), so the budget buys progress instead of LZMA bookkeeping:
+    // measured on systems.xpl, 161MB of copies and rip-sample concentration
+    // falling from 99.7% to 5.9% inside the same 20B steps.
+    emu.accelerate_checksums = opts.accelerate_protector_loops;
     let stop = if let Some(snap) = &opts.start_from_snapshot {
         let (c, m) = crate::snapshot::load(snap).map_err(|e| DetonateError::Snapshot(e.kind()))?;
         emu.cpu = c;

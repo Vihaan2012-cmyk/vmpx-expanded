@@ -85,8 +85,8 @@ fn main() {
         p.single
     );
     println!(
-        "folded={} folded_iterations={} declined={}",
-        p.folded, p.folded_iterations, p.fold_declined
+        "folded={} folded_iterations={} copies={} copied_bytes={} declined={}",
+        p.folded, p.folded_iterations, p.copies_folded, p.copied_bytes, p.fold_declined
     );
     #[allow(clippy::cast_precision_loss)]
     if p.blocks > 0 {

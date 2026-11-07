@@ -424,6 +424,8 @@ pub struct Emulator {
     /// declined address so it is not re-examined every iteration. Keyed by the
     /// code generation too, so modified code is re-examined.
     csum: Box<[Option<(u64, u64, Option<crate::checksum_loop::Shape>)>]>,
+    /// Recognizer cache for the copy loop, same scheme as `csum`.
+    cpyc: Box<[Option<(u64, u64, Option<crate::copy_loop::Shape>)>]>,
 }
 
 const CSUM_SLOTS: usize = 256;
@@ -444,6 +446,9 @@ pub struct Prof {
     /// Checksum loops folded, and guest iterations those folds retired.
     pub folded: u64,
     pub folded_iterations: u64,
+    /// Copy loops folded, and the bytes those folds moved.
+    pub copies_folded: u64,
+    pub copied_bytes: u64,
     /// Iterations declined because a byte was unreadable.
     pub fold_declined: u64,
     /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
@@ -460,6 +465,8 @@ impl Default for Prof {
             single: 0,
             folded: 0,
             folded_iterations: 0,
+            copies_folded: 0,
+            copied_bytes: 0,
             fold_declined: 0,
             slow_mn: vec![0; 2048].into_boxed_slice(),
         }
@@ -642,6 +649,7 @@ impl Emulator {
             prof: Prof::default(),
             accelerate_checksums: false,
             csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            cpyc: vec![None; CSUM_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -882,6 +890,137 @@ impl Emulator {
         done
     }
 
+    /// The copy shape at `rip`, cached like [`Emulator::checksum_shape`].
+    fn copy_shape(&mut self, rip: u64) -> Option<crate::copy_loop::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        if let Some((cached_rip, cached_epoch, shape)) = self.cpyc[slot]
+            && cached_rip == rip
+            && cached_epoch == epoch
+        {
+            return shape;
+        }
+        let mem = &self.mem;
+        let shape = crate::copy_loop::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder = Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.cpyc[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized copy loop natively. Unlike the checksum fold this one
+    /// WRITES, so every byte goes through [`Memory::write`], which enforces page
+    /// permissions and bumps the code generation when the page holds cached
+    /// code; a hook that wants those writes declines the fold.
+    ///
+    /// As with the checksum fold the LAST iteration is left to the interpreter,
+    /// so the exit state and its flags come from the ordinary semantics.
+    fn fold_copy(&mut self, shape: &crate::copy_loop::Shape) -> u64 {
+        let (Some(source), Some(destination), Some(other), Some(counter)) = (
+            self.cpu.reg(shape.source),
+            self.cpu.reg(shape.destination),
+            self.cpu.reg(shape.other),
+            self.cpu.reg(shape.counter),
+        ) else {
+            return 0;
+        };
+        // The counter is 32-bit, and zero would wrap to 2^32 iterations. That is
+        // the interpreter to handle, not a fold.
+        let counter = counter & 0xFFFF_FFFF;
+        let Some(iterations) = counter.checked_sub(1).filter(|n| *n > 0) else {
+            return 0;
+        };
+        // `cmp destination, -1` / `jb head` leaves the loop if the incremented
+        // destination ever reaches u64::MAX, so never fold through that point.
+        let iterations = iterations.min(u64::MAX - destination);
+        if iterations == 0 {
+            return 0;
+        }
+        if self.fold_copy_elides_wanted_event(shape, source, destination, other, iterations) {
+            return 0;
+        }
+        let mut done = 0u64;
+        let mut declined = false;
+        while done < iterations {
+            let Ok(byte) = self.mem.read_uint(source.wrapping_add(done), 1) else {
+                declined = true;
+                break;
+            };
+            let address = shape.store_address(destination.wrapping_add(done + 1), other);
+            #[allow(clippy::cast_possible_truncation)]
+            let byte = byte as u8;
+            if self.mem.write(address, &[byte]).is_err() {
+                declined = true;
+                break;
+            }
+            done += 1;
+        }
+        if declined {
+            // A fault makes the previous iteration flags observable, and this
+            // fold writes none, so hand that iteration back as well.
+            self.prof.fold_declined += 1;
+            done = done.saturating_sub(1);
+        }
+        if done == 0 {
+            return 0;
+        }
+        self.cpu.set_reg(shape.source, source.wrapping_add(done));
+        self.cpu.set_reg(shape.destination, destination.wrapping_add(done));
+        // A 32-bit write zero-extends, matching `sub counter32, 1`.
+        self.cpu.set_reg(shape.counter, counter - done);
+        self.prof.copies_folded += 1;
+        self.prof.copied_bytes += done;
+        done
+    }
+
+    /// As [`Emulator::fold_elides_wanted_event`], plus the write range.
+    fn fold_copy_elides_wanted_event(
+        &self,
+        shape: &crate::copy_loop::Shape,
+        source: u64,
+        destination: u64,
+        other: u64,
+        iterations: u64,
+    ) -> bool {
+        if self.gate.read_all
+            || self.gate.write_all
+            || self.gate.flow_all
+            || self.gate.write_pages
+            || self.gate.flow_pages
+        {
+            return true;
+        }
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        let first_store = shape.store_address(destination.wrapping_add(1), other);
+        for span in self.gate.read {
+            if overlaps(span, source, iterations) {
+                return true;
+            }
+        }
+        for span in self.gate.write {
+            if overlaps(span, first_store, iterations) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if span.0 == span.1 {
+                continue;
+            }
+            for (from, to) in &shape.flow_sites[..usize::from(shape.flow_site_count)] {
+                if (*from >= span.0 && *from < span.1) || (*to >= span.0 && *to < span.1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     #[allow(clippy::collapsible_if)]
     fn run_loop(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
         let mut left = max_steps;
@@ -893,11 +1032,16 @@ impl Emulator {
                 return Stop::Reached;
             }
             if self.accelerate_checksums && blocks {
-                if let Some(shape) = self.checksum_shape(rip)
-                    && self.fold_checksum(&shape) > 0
-                {
+                let folded = match self.checksum_shape(rip) {
+                    Some(shape) => self.fold_checksum(&shape),
+                    None => match self.copy_shape(rip) {
+                        Some(shape) => self.fold_copy(&shape),
+                        None => 0,
+                    },
+                };
+                if folded > 0 {
                     // One step for the whole fold: the budget now buys progress
-                    // instead of checksum arithmetic.
+                    // instead of byte-at-a-time protector bookkeeping.
                     self.steps += 1;
                     left -= 1;
                     continue;
