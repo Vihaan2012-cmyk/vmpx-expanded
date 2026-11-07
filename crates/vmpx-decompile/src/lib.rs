@@ -11,6 +11,7 @@ pub mod cse;
 pub mod ctext;
 pub mod exec;
 pub mod ir;
+pub mod mba;
 pub mod native;
 pub mod opt;
 pub mod render;
@@ -269,7 +270,7 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         }
     }
 
-    let (body, structured, fallback_reason) =
+    let (mut body, structured, fallback_reason) =
         match structure::Structurer::new(&seqs, f.entry).run() {
             Ok(b) => (b, true, None),
             Err(why) => (flat(&seqs, f.entry), false, Some(why)),
@@ -330,6 +331,16 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     ret_width(&body, &mut rw);
     let ret_ty = rw.map_or("void", ty);
 
+    // Collapse the MBA identities VMProtect rewrites plain arithmetic into, so
+    // the text says `a - 1` where the recovered IR says `~(~a + 1)`. Done BEFORE
+    // naming shared subtrees, so the names cover the simplified forms, and
+    // before the cross-check below, which replays the original function against
+    // these statements and so validates every rewrite made here.
+    {
+        let mut memo = std::collections::HashMap::new();
+        mba::simplify_stmts(&mut prologue, &mut memo);
+        mba::simplify_stmts(&mut body, &mut memo);
+    }
     // Give every subtree that is used more than once a name. The IR is a DAG
     // and rendering flattens it, so without this a value computed once and used
     // ten times is PRINTED ten times -- which is most of why the output reads as
