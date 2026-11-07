@@ -51,6 +51,20 @@ fn children(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
+/// A read from a fixed address: a global. The address carries no meaning
+/// inline -- `*(u64 *)(0x378154c16ULL)` buried mid-expression is just noise --
+/// so these are hoisted into named locals even when used only once, which moves
+/// every raw address out of the body and into one block of definitions.
+fn global_load(expr: &Expr) -> Option<u64> {
+    let ExprKind::Load { address } = &expr.kind else {
+        return None;
+    };
+    match address.kind {
+        ExprKind::Const { value } => Some(value),
+        _ => None,
+    }
+}
+
 /// Never worth a line of its own, however often it appears: naming these would
 /// add noise rather than remove it.
 fn trivial(expr: &Expr) -> bool {
@@ -169,8 +183,13 @@ pub fn extract(
     roots(stmts, &mut rs);
     let (uses, size) = survey(&rs);
 
-    let mut chosen: Vec<(usize, String, Expr)> = Vec::new();
+    let mut chosen: Vec<(usize, Expr)> = Vec::new();
+    let mut globals: Vec<(u64, Expr)> = Vec::new();
     for (expr, count) in &uses {
+        if let Some(address) = global_load(expr) {
+            globals.push((address, expr.clone()));
+            continue;
+        }
         if *count < min_uses || trivial(expr) {
             continue;
         }
@@ -178,21 +197,35 @@ pub fn extract(
         if nodes < min_size {
             continue;
         }
-        chosen.push((nodes, String::new(), expr.clone()));
+        chosen.push((nodes, expr.clone()));
     }
+    // Globals first and in address order: they depend on nothing, and sorting
+    // by address makes the block scan like a memory map.
+    globals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.width.bits().cmp(&b.1.width.bits())));
+    globals.dedup_by(|a, b| a.1 == b.1);
     // Smaller subtrees first: a temporary can only contain strictly smaller
     // subtrees, so size order IS a dependency order. `{expr:?}` breaks ties so
     // the output does not depend on hash iteration order.
-    chosen.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.2).cmp(&format!("{:?}", b.2))));
+    chosen.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
 
-    let mut prefix = "t".to_owned();
-    while (0..chosen.len()).any(|i| taken.contains(&format!("{prefix}{i}"))) {
-        prefix.push('_');
-    }
+    let free = |stem: &str, count: usize| {
+        let mut prefix = stem.to_owned();
+        while (0..count).any(|i| taken.contains(&format!("{prefix}{i}"))) {
+            prefix.push('_');
+        }
+        prefix
+    };
+    let global_prefix = free("g", globals.len());
+    let temp_prefix = free("t", chosen.len());
 
     let mut temps = Temps::default();
-    for (index, (_, _, expr)) in chosen.into_iter().enumerate() {
-        let name = format!("{prefix}{index}");
+    for (index, (_, expr)) in globals.into_iter().enumerate() {
+        let name = format!("{global_prefix}{index}");
+        temps.map.insert(expr.clone(), name.clone());
+        temps.order.push((name, expr));
+    }
+    for (index, (_, expr)) in chosen.into_iter().enumerate() {
+        let name = format!("{temp_prefix}{index}");
         temps.map.insert(expr.clone(), name.clone());
         temps.order.push((name, expr));
     }
@@ -268,6 +301,31 @@ mod tests {
         let taken: HashSet<String> = ["t0".to_owned()].into_iter().collect();
         let temps = extract(&stmts, 2, 2, &taken);
         assert!(temps.order.iter().all(|(n, _)| !taken.contains(n)));
+    }
+
+    #[test]
+    fn a_global_is_named_even_when_it_is_read_only_once() {
+        let global = Expr::load(BitWidth::W64, Expr::constant(BitWidth::W64, 0x3781_54c1_6));
+        let stmts = vec![Stmt::Assign("x".to_owned(), add(global.clone(), reg("a")))];
+        let temps = extract(&stmts, 2, 6, &HashSet::new());
+        let name = temps.map.get(&global).expect("a global earns a name on first use");
+        assert!(name.starts_with('g'), "globals get their own prefix, got {name}");
+    }
+
+    #[test]
+    fn globals_are_defined_before_the_temporaries_that_use_them() {
+        let global = Expr::load(BitWidth::W64, Expr::constant(BitWidth::W64, 0x3781_54c1_6));
+        let shared = add(global.clone(), reg("a"));
+        let stmts = vec![
+            Stmt::Assign("x".to_owned(), add(shared.clone(), reg("b"))),
+            Stmt::Assign("y".to_owned(), add(shared.clone(), reg("c"))),
+        ];
+        let temps = extract(&stmts, 2, 2, &HashSet::new());
+        let position = |e: &Expr| temps.order.iter().position(|(_, d)| d == e);
+        let (Some(g), Some(t)) = (position(&global), position(&shared)) else {
+            panic!("both should be named");
+        };
+        assert!(g < t, "a global must be defined before anything that reads it");
     }
 
     #[test]
