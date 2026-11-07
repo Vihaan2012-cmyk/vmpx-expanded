@@ -1000,6 +1000,16 @@ pub fn analyze_clean_with_image(
             export_reference,
             max_steps,
             capture_globals,
+            // The VM observer is caller-driven: with no dispatcher configured,
+            // `observed branch-target edges` and `observed loop depths` are
+            // structurally 0 no matter how far the run gets -- measured at a 20B
+            // step budget, with the run well past the protector LZMA init
+            // (rip-sample concentration 5.9%). `vm_discover` runs the structural
+            // survey pass first and builds the specs from it, which is what
+            // makes those two seed channels able to report anything at all. It
+            // costs a second detonation; Observed tier only, so the sound path
+            // and its blockers are untouched.
+            vm_discover: true,
             ..base
         };
         match vmpx_emulate::detonate(&input_pe, &opts) {
