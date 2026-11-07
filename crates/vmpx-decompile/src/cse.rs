@@ -20,6 +20,9 @@ use vmpx_vm::{Expr, ExprKind};
 use crate::ir::{Cond, Store};
 use crate::opt::Stmt;
 
+/// A branch operand at least this big is named even if read once.
+const COND_MIN_NODES: usize = 12;
+
 /// Subtrees worth naming, and the order to define them in.
 #[derive(Default)]
 pub struct Temps {
@@ -80,15 +83,36 @@ fn trivial(expr: &Expr) -> bool {
     }
 }
 
+/// Whether a subtree has already been chosen, so a condition operand that is
+/// also shared is not named twice.
+fn temps_contains(chosen: &[(usize, Expr)], expr: &Expr) -> bool {
+    chosen.iter().any(|(_, e)| e == expr)
+}
+
 /// Every expression a statement list reads, roots only (children come from the
 /// walk). Nested statement lists are included.
 fn roots(stmts: &[Stmt], out: &mut Vec<Expr>) {
-    let mut cond = |c: &Cond, out: &mut Vec<Expr>| match c {
+    roots_and_conditions(stmts, out, &mut Vec::new());
+}
+
+/// As [`roots`], also collecting the operands of every branch condition.
+///
+/// A guard is read once, so the use-count rule leaves it inline -- and a guard
+/// is exactly where an inline expression hurts most, because the reader has to
+/// hold all of it to see what the branch tests. On vm_c447739 the four longest
+/// lines in the function were all `if` conditions of 367-376 characters.
+fn roots_and_conditions(stmts: &[Stmt], out: &mut Vec<Expr>, conditions: &mut Vec<Expr>) {
+    let mut cond = |c: &Cond, out: &mut Vec<Expr>, conditions: &mut Vec<Expr>| match c {
         Cond::Cmp { a, b, .. } => {
             out.push(a.clone());
             out.push(b.clone());
+            conditions.push(a.clone());
+            conditions.push(b.clone());
         }
-        Cond::Opaque { args, .. } => out.extend(args.iter().cloned()),
+        Cond::Opaque { args, .. } => {
+            out.extend(args.iter().cloned());
+            conditions.extend(args.iter().cloned());
+        }
     };
     for stmt in stmts {
         match stmt {
@@ -99,16 +123,16 @@ fn roots(stmts: &[Stmt], out: &mut Vec<Expr>) {
             }
             Stmt::Return(values) => out.extend(values.iter().map(|(_, e)| e.clone())),
             Stmt::If { cond: c, then, els } => {
-                cond(c, out);
-                roots(then, out);
-                roots(els, out);
+                cond(c, out, conditions);
+                roots_and_conditions(then, out, conditions);
+                roots_and_conditions(els, out, conditions);
             }
             Stmt::While { cond: c, body } | Stmt::DoWhile { body, cond: c } => {
-                cond(c, out);
-                roots(body, out);
+                cond(c, out, conditions);
+                roots_and_conditions(body, out, conditions);
             }
-            Stmt::IfGoto { cond: c, .. } => cond(c, out),
-            Stmt::Loop(body) => roots(body, out),
+            Stmt::IfGoto { cond: c, .. } => cond(c, out, conditions),
+            Stmt::Loop(body) => roots_and_conditions(body, out, conditions),
             Stmt::Break
             | Stmt::Continue
             | Stmt::Label(_)
@@ -193,7 +217,8 @@ pub fn extract_with(
     symbols: &crate::symbols::Symbols,
 ) -> Temps {
     let mut rs = Vec::new();
-    roots(stmts, &mut rs);
+    let mut conditions = Vec::new();
+    roots_and_conditions(stmts, &mut rs, &mut conditions);
     let (uses, size) = survey(&rs);
 
     let mut chosen: Vec<(usize, Expr)> = Vec::new();
@@ -211,6 +236,18 @@ pub fn extract_with(
             continue;
         }
         chosen.push((nodes, expr.clone()));
+    }
+    // A branch operand big enough to dominate its line is named whatever its
+    // use count, for the same reason a global is: what costs the reader is the
+    // length in place, not the repetition.
+    for expr in &conditions {
+        if trivial(expr) || temps_contains(&chosen, expr) || global_load(expr).is_some() {
+            continue;
+        }
+        let nodes = size.get(expr).copied().unwrap_or(1);
+        if nodes >= COND_MIN_NODES {
+            chosen.push((nodes, expr.clone()));
+        }
     }
     // Globals first and in address order: they depend on nothing, and sorting
     // by address makes the block scan like a memory map.
@@ -342,6 +379,45 @@ mod tests {
             panic!("both should be named");
         };
         assert!(g < t, "a global must be defined before anything that reads it");
+    }
+
+    #[test]
+    fn a_big_branch_condition_is_named_even_though_it_is_read_once() {
+        // Build a condition operand large enough to clear COND_MIN_NODES.
+        let mut big = add(reg("a"), reg("b"));
+        for i in 0..12 {
+            big = add(big, reg(&format!("v{i}")));
+        }
+        let stmts = vec![Stmt::If {
+            cond: crate::ir::Cond::Cmp {
+                op: crate::ir::Cmp::Eq,
+                a: big.clone(),
+                b: Expr::constant(BitWidth::W64, 7),
+            },
+            then: vec![Stmt::Break],
+            els: Vec::new(),
+        }];
+        let temps = extract(&stmts, 2, 6, &HashSet::new());
+        assert!(
+            temps.map.contains_key(&big),
+            "a guard that dominates its line should get a name"
+        );
+    }
+
+    #[test]
+    fn a_small_branch_condition_stays_inline() {
+        let small = add(reg("a"), reg("b"));
+        let stmts = vec![Stmt::If {
+            cond: crate::ir::Cond::Cmp {
+                op: crate::ir::Cmp::Eq,
+                a: small.clone(),
+                b: Expr::constant(BitWidth::W64, 7),
+            },
+            then: vec![Stmt::Break],
+            els: Vec::new(),
+        }];
+        let temps = extract(&stmts, 2, 6, &HashSet::new());
+        assert!(!temps.map.contains_key(&small), "a short guard reads better inline");
     }
 
     #[test]

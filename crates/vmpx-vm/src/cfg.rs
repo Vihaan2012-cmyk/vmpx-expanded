@@ -2374,6 +2374,18 @@ struct Walker<'a, 'p> {
 /// Builds the memory source for a symbolic call: the sound read-only image
 /// overlaid with the observed seed (which is empty on the sound path, so the
 /// overlay is then behaviourally identical to a bare [`ReadOnlyImage`]).
+/// Opt-in: offer the labeled disjointness retry to EVERY tainted block, not
+/// only one ending in an unconditional branch.
+///
+/// The restriction was never about soundness -- the retry's result carries the
+/// same unproven `AssumesExternalStoresDisjointFromVmStack` label whatever the
+/// boundary -- so widening it trades nothing but the number of entries that get
+/// the chance. Off by default so the measured baseline is reproducible.
+fn retry_every_tainted_block() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_RETRY_TAINTED_ALL").is_ok_and(|v| v == "1"))
+}
+
 fn observed_source<'a, 'p>(
     walker: &Walker<'a, 'p>,
 ) -> crate::ObservedImage<'a, 'p> {
@@ -3677,7 +3689,8 @@ impl Walker<'_, '_> {
         ) {
             Ok(report)
                 if report.memory_tainted
-                    && boundary == Some(VmHandlerSemantic::UnconditionalBranch)
+                    && (boundary == Some(VmHandlerSemantic::UnconditionalBranch)
+                        || retry_every_tainted_block())
                     // Only the OBSERVED escape bars this retry. A loop
                     // generalization that conceded privacy has not shown the
                     // frame is aliased, and the retry's own result is labeled
