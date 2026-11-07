@@ -126,8 +126,14 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
     })??;
     let low = vmpx_decompile::vm::lower(&rolled, name)?;
     let d = vmpx_decompile::decompile_with(&low.func, &image_symbols(pe))?;
-    for n in &low.notes {
-        println!("// note: {n}");
+    // The lifter records a note per path it lowered, so the same caveat arrives
+    // once for every path that hit it -- 20 lines for 8 distinct notes on
+    // vm_c447739. Say each one once, in the order first seen.
+    let mut said = std::collections::HashSet::new();
+    for note in &low.notes {
+        if said.insert(note.as_str()) {
+            println!("// note: {note}");
+        }
     }
     print!("{}", d.text);
     println!(
