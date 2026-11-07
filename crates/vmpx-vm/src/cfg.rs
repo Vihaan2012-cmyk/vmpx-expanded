@@ -1286,6 +1286,11 @@ fn symbolic_failure_class(message: &str) -> &'static str {
 /// text of a heavily shared address DAG outgrows `SITE_KEY_BYTES`.
 fn site_key(address: &Expr) -> String {
     use std::hash::BuildHasher;
+    // MEASURED: lowering this to 8 KiB changed peak RSS not at all (12.26 GB vs
+    // 11.29 GB on entry 0xc43d80e at an 8192 instruction limit), so the key
+    // RENDERING is not what holds the memory -- `bounded_debug` already streams
+    // into a bounded writer and stops. Left at 4 MiB rather than carrying a
+    // behaviour change (more hash collisions merging sites) that bought nothing.
     const SITE_KEY_BYTES: usize = 4 << 20;
     crate::semantic_exec::bounded_debug(address, SITE_KEY_BYTES)
         .unwrap_or_else(|| format!("#{:016x}", crate::expr::FxBuild::default().hash_one(address)))
@@ -1744,9 +1749,21 @@ fn fold_states<'s>(
     key: Va,
     states: impl IntoIterator<Item = &'s SymbolicVmInitialState>,
     incoming: &SymbolicVmInitialState,
+    deadline: Option<Instant>,
 ) -> Result<SymbolicVmInitialState, String> {
     let mut acc = incoming.clone();
     for state in states {
+        // The walk's own deadline bounds the gaps BETWEEN worklist items, not
+        // the work inside one, and this fold is inside one. Measured on
+        // systems.xpl at an 8192 instruction limit: a single `generalize_across`
+        // ran 43s and took resident memory from 550MB to 13GB while every
+        // counter the walker charges stayed flat (states 336->337,
+        // interner_live 1542->1551, charged 249MB->250MB). Unbounded here is
+        // what made raising the instruction limit an out-of-memory risk rather
+        // than a slower sweep.
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err("generalization exceeded the per-entry wall-clock budget".to_owned());
+        }
         if let Some(widened) = widen_state(key, &acc, state)? {
             acc = widened;
         }
@@ -2333,6 +2350,9 @@ struct Walker<'a, 'p> {
     total_instructions: usize,
     /// Running over-estimate of live walker bytes; see `VmCfgLimits::max_memory_bytes`.
     live_bytes: usize,
+    /// Per-entry wall-clock deadline, so the generalization loops inside a
+    /// single worklist item are bounded too (see `fold_states`).
+    deadline: Option<Instant>,
     /// Observed runtime memory seed for the experimental tier (empty on the
     /// sound path). Consulted only to resolve provably-null image reads.
     observed: &'a crate::ObservedMemory,
@@ -3392,7 +3412,7 @@ impl Walker<'_, '_> {
                     .collect()
             })
             .unwrap_or_default();
-        let folded = match fold_states(key, states.iter().copied(), incoming) {
+        let folded = match fold_states(key, states.iter().copied(), incoming, self.deadline) {
             Ok(widened) => {
                 let hid_frame_pointer =
                     fold_hid_frame_pointer(states.iter().copied().chain([incoming]), &widened);
@@ -3463,6 +3483,11 @@ impl Walker<'_, '_> {
         let budget = self.limits.max_visits_per_block;
         let mut acc: Option<SymbolicVmInitialState> = None;
         for phase in sources.iter().take(budget) {
+            // Bounded for the same reason as `fold_states`: this runs inside one
+            // worklist item, where the walk's own deadline does not reach.
+            if self.deadline.is_some_and(|at| Instant::now() >= at) {
+                return ShiftedPhases::None;
+            }
             let Some(shifted) = shift_ancestor_onto_reentry(phase, incoming) else {
                 continue;
             };
@@ -4750,6 +4775,7 @@ pub fn recover_vm_cfg_with_observed(
         },
         total_instructions: 0,
         live_bytes: 0,
+        deadline: None,
         observed: &observed.memory,
         seeded: &seeded,
         observed_depths: &observed.loop_depths,
@@ -4775,6 +4801,7 @@ pub fn recover_vm_cfg_with_observed(
     // gaps between worklist items, not the work inside one.
     if let Some((start, budget)) = deadline {
         walker.limits.entry.symbolic.deadline = start.checked_add(budget);
+        walker.deadline = start.checked_add(budget);
     }
     while let Some(item) = pending.pop() {
         if deadline.is_some_and(|(start, budget)| start.elapsed() >= budget) {
@@ -4968,6 +4995,7 @@ mod tests {
         Walker {
             pe,
             limits,
+            deadline: None,
             config: entry_stream_config(&base, limits.entry),
             global_table: None,
             profile: base,
@@ -6234,7 +6262,7 @@ mod tests {
             loop_state(0, w64(2)),
         ];
         let incoming = loop_state(0, w64(3));
-        let canonical = fold_states(Va(0x1000), &states, &incoming).expect("folds");
+        let canonical = fold_states(Va(0x1000), &states, &incoming, None).expect("folds");
         assert!(is_havoc(&canonical.context_values[&8]));
         assert_eq!(canonical.context_values[&0], w64(7));
         assert!(matches!(
@@ -6312,7 +6340,7 @@ mod tests {
         // a block whose re-entries move it cannot be folded and fails closed.
         let states = [loop_state(0, w64(0))];
         let incoming = loop_state(8, w64(0));
-        let refusal = fold_states(Va(0x1000), &states, &incoming).expect_err("moves the VSP");
+        let refusal = fold_states(Va(0x1000), &states, &incoming, None).expect_err("moves the VSP");
         assert!(refusal.contains("stack pointer"), "{refusal}");
         // The census needs the drift itself, not just the refusal: a growing VM
         // stack is a different lever from one that merely oscillates, and only
