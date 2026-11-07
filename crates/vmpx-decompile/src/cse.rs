@@ -179,6 +179,19 @@ pub fn extract(
     min_size: usize,
     taken: &HashSet<String>,
 ) -> Temps {
+    extract_with(stmts, min_uses, min_size, taken, &crate::symbols::Symbols::default())
+}
+
+/// As [`extract`], naming a global that is an import slot after the import
+/// itself, so the body says `iat_ws2_32_send` instead of an address.
+#[must_use]
+pub fn extract_with(
+    stmts: &[Stmt],
+    min_uses: usize,
+    min_size: usize,
+    taken: &HashSet<String>,
+    symbols: &crate::symbols::Symbols,
+) -> Temps {
     let mut rs = Vec::new();
     roots(stmts, &mut rs);
     let (uses, size) = survey(&rs);
@@ -219,8 +232,11 @@ pub fn extract(
     let temp_prefix = free("t", chosen.len());
 
     let mut temps = Temps::default();
-    for (index, (_, expr)) in globals.into_iter().enumerate() {
-        let name = format!("{global_prefix}{index}");
+    for (index, (address, expr)) in globals.into_iter().enumerate() {
+        let name = symbols
+            .identifier_at(address)
+            .filter(|n| !taken.contains(n))
+            .unwrap_or_else(|| format!("{global_prefix}{index}"));
         temps.map.insert(expr.clone(), name.clone());
         temps.order.push((name, expr));
     }

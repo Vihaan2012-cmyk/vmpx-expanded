@@ -17,6 +17,7 @@ pub mod native;
 pub mod opt;
 pub mod render;
 pub mod structure;
+pub mod symbols;
 pub mod vm;
 pub mod xu;
 
@@ -225,6 +226,16 @@ pub fn dump_func(f: &Func, depth: u32) -> String {
 
 /// Runs the whole pipeline on `func` (consumed as the reference).
 pub fn decompile(func: &Func) -> Result<Decompiled, String> {
+    decompile_with(func, &symbols::Symbols::default())
+}
+
+/// As [`decompile`], with a symbol table so import slots are named and the
+/// facilities they reach are labelled.
+///
+/// # Errors
+///
+/// As [`decompile`].
+pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompiled, String> {
     let reference = {
         let mut r = func.clone();
         opt::cleanup_all(&mut r);
@@ -349,7 +360,7 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     let taken: std::collections::HashSet<String> = names.values().cloned().collect();
     let mut all_stmts: Vec<opt::Stmt> = prologue.clone();
     all_stmts.extend(body.iter().cloned());
-    let temps = cse::extract(&all_stmts, 2, CSE_MIN_NODES, &taken);
+    let temps = cse::extract_with(&all_stmts, 2, CSE_MIN_NODES, &taken, symbols);
     // Labels for the protector machinery, so a reader can tell self-defence
     // from work. `said` is threaded through the hoisted definitions first and
     // the body second, so a tag lands on the line that earns it and is never
@@ -379,7 +390,7 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         for (name, definition) in &temps.order {
             // Smaller definitions come first, so a definition only ever
             // references names already introduced above it.
-            for tag in annotate::tags_for(definition) {
+            for tag in annotate::tags_for_with(definition, symbols) {
                 if !said.contains(&tag) {
                     said.push(tag);
                     text.push_str(&format!("    /* {} */\n", tag.text()));
@@ -393,8 +404,8 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         }
         text.push('\n');
     }
-    annotate::annotate_with(&mut prologue, &mut said);
-    annotate::annotate_with(&mut body, &mut said);
+    annotate::annotate_with_symbols(&mut prologue, &mut said, symbols);
+    annotate::annotate_with_symbols(&mut body, &mut said, symbols);
     ctx.stmts(&prologue, 1, rw);
     ctx.stmts(&body, 1, rw);
     text.push_str(&ctx.out);

@@ -35,6 +35,15 @@ pub enum Tag {
     /// A branch comparing a computed value against a constant, whose body
     /// returns a constant: the shape of a guard.
     ConstantGate,
+    /// Reaches the network, by an import this function names.
+    Network,
+    /// Licensing: VMProtect's serial API, or a gate on an integrity or
+    /// environment check -- the shape a licence/anti-tamper decision has.
+    License,
+    /// Inspects the process for a debugger.
+    AntiDebug,
+    /// Resolves or loads code at run time.
+    DynamicLoad,
 }
 
 impl Tag {
@@ -49,6 +58,22 @@ impl Tag {
             Self::ImportCall => "PAYLOAD -> uses the result of an imported call",
             Self::FreshAllocation => "PAYLOAD -> uses a freshly allocated address",
             Self::ConstantGate => "GATE -> compares against a constant and returns a constant",
+            Self::Network => "NETWORK -> calls an imported network function",
+            Self::License => "LICENSE -> licensing api, or a gate on an integrity/environment check",
+            Self::AntiDebug => "ANTI-DEBUG -> inspects the process for a debugger",
+            Self::DynamicLoad => "DYNAMIC LOAD -> resolves or loads code at run time",
+        }
+    }
+}
+
+impl From<crate::symbols::Facility> for Tag {
+    fn from(facility: crate::symbols::Facility) -> Self {
+        use crate::symbols::Facility;
+        match facility {
+            Facility::Network => Self::Network,
+            Facility::License => Self::License,
+            Facility::AntiDebug => Self::AntiDebug,
+            Facility::DynamicLoad => Self::DynamicLoad,
         }
     }
 }
@@ -69,6 +94,41 @@ fn tag_of_intrinsic(name: &str) -> Option<Tag> {
         Some(Tag::ImportCall)
     } else {
         None
+    }
+}
+
+/// Every tag the expression's terms imply, including the facilities of any
+/// import whose IAT slot address appears as a constant.
+fn tags_of_with(expr: &Expr, symbols: &crate::symbols::Symbols, out: &mut Vec<Tag>) {
+    let mut pending = vec![expr.clone()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        match &current.kind {
+            ExprKind::Const { value } => {
+                if let Some(facility) = symbols.facility_at(*value) {
+                    out.push(facility.into());
+                }
+            }
+            ExprKind::Register { .. } => {}
+            ExprKind::Intrinsic { name, arguments } => {
+                if let Some(tag) = tag_of_intrinsic(name) {
+                    out.push(tag);
+                }
+                pending.extend(arguments.iter().cloned());
+            }
+            ExprKind::Load { address: value }
+            | ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push((**value).clone()),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat { high: left, low: right } => {
+                pending.push((**left).clone());
+                pending.push((**right).clone());
+            }
+        }
     }
 }
 
@@ -145,9 +205,27 @@ fn dedup(mut tags: Vec<Tag>) -> Vec<Tag> {
 /// outside the statement list (a hoisted global or shared subtree).
 #[must_use]
 pub fn tags_for(expr: &Expr) -> Vec<Tag> {
+    tags_for_with(expr, &crate::symbols::Symbols::default())
+}
+
+/// As [`tags_for`], also resolving import slots through `symbols`.
+#[must_use]
+pub fn tags_for_with(expr: &Expr, symbols: &crate::symbols::Symbols) -> Vec<Tag> {
     let mut tags = Vec::new();
-    tags_of(expr, &mut tags);
-    dedup(tags)
+    tags_of_with(expr, symbols, &mut tags);
+    dedup(promote_license(tags))
+}
+
+/// A gate whose decision rests on an integrity or environment check IS the
+/// licence/anti-tamper shape, so it is reported as one. Stated as a promotion
+/// of two tags that are both present, not as a guess about a lone comparison.
+fn promote_license(mut tags: Vec<Tag>) -> Vec<Tag> {
+    let gated = tags.contains(&Tag::ConstantGate);
+    let checked = tags.contains(&Tag::Integrity) || tags.contains(&Tag::Fingerprint);
+    if gated && checked {
+        tags.push(Tag::License);
+    }
+    tags
 }
 
 /// Inserts a comment above every statement whose terms carry evidence.
@@ -156,28 +234,41 @@ pub fn tags_for(expr: &Expr) -> Vec<Tag> {
 /// checksum stays derived from it for the rest of the function, and repeating
 /// the label on every line would be the noise this pass exists to remove.
 pub fn annotate(stmts: &mut Vec<Stmt>) {
-    annotate_inner(stmts, &mut Vec::new());
+    annotate_inner(stmts, &mut Vec::new(), &crate::symbols::Symbols::default());
 }
 
 /// As [`annotate`], but skipping tags `already` said elsewhere -- used so a
 /// label printed on a hoisted definition is not repeated in the body.
 pub fn annotate_with(stmts: &mut Vec<Stmt>, already: &mut Vec<Tag>) {
-    annotate_inner(stmts, already);
+    annotate_inner(stmts, already, &crate::symbols::Symbols::default());
 }
 
-fn annotate_inner(stmts: &mut Vec<Stmt>, already: &mut Vec<Tag>) {
+/// As [`annotate_with`], also resolving import slots through `symbols`.
+pub fn annotate_with_symbols(
+    stmts: &mut Vec<Stmt>,
+    already: &mut Vec<Tag>,
+    symbols: &crate::symbols::Symbols,
+) {
+    annotate_inner(stmts, already, symbols);
+}
+
+fn annotate_inner(
+    stmts: &mut Vec<Stmt>,
+    already: &mut Vec<Tag>,
+    symbols: &crate::symbols::Symbols,
+) {
     let mut out: Vec<Stmt> = Vec::with_capacity(stmts.len());
     for stmt in stmts.drain(..) {
         let mut tags = Vec::new();
         match &stmt {
-            Stmt::Assign(_, e) => tags_of(e, &mut tags),
+            Stmt::Assign(_, e) => tags_of_with(e, symbols, &mut tags),
             Stmt::Store(Store { address, value }) => {
-                tags_of(address, &mut tags);
-                tags_of(value, &mut tags);
+                tags_of_with(address, symbols, &mut tags);
+                tags_of_with(value, symbols, &mut tags);
             }
             Stmt::Return(values) => {
                 for (_, e) in values {
-                    tags_of(e, &mut tags);
+                    tags_of_with(e, symbols, &mut tags);
                 }
             }
             Stmt::If { cond, then, els } => {
@@ -195,8 +286,10 @@ fn annotate_inner(stmts: &mut Vec<Stmt>, already: &mut Vec<Tag>) {
             Stmt::IfGoto { cond, .. } => cond_tags(cond, &mut tags),
             _ => {}
         }
-        let fresh: Vec<Tag> =
-            dedup(tags).into_iter().filter(|t| !already.contains(t)).collect();
+        let fresh: Vec<Tag> = dedup(promote_license(tags))
+            .into_iter()
+            .filter(|t| !already.contains(t))
+            .collect();
         for tag in &fresh {
             out.push(Stmt::Comment(tag.text().to_owned()));
             already.push(*tag);
@@ -206,11 +299,11 @@ fn annotate_inner(stmts: &mut Vec<Stmt>, already: &mut Vec<Tag>) {
         let mut stmt = stmt;
         match &mut stmt {
             Stmt::If { then, els, .. } => {
-                annotate_inner(then, already);
-                annotate_inner(els, already);
+                annotate_inner(then, already, symbols);
+                annotate_inner(els, already, symbols);
             }
             Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::Loop(body) => {
-                annotate_inner(body, already);
+                annotate_inner(body, already, symbols);
             }
             _ => {}
         }

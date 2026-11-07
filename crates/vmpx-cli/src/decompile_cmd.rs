@@ -16,6 +16,26 @@ pub(crate) struct Options {
     pub instruction_limit: usize,
 }
 
+/// Import slots from the image's own import directory, so the decompiler can
+/// name an IAT address instead of printing it, and label what the import
+/// reaches (network, licensing, anti-debug, dynamic loading).
+fn image_symbols(pe: &PeImage<'_>) -> vmpx_decompile::symbols::Symbols {
+    let report = pe.report();
+    vmpx_decompile::symbols::Symbols::from_imports(
+        report.optional.image_base.0,
+        report.imports.iter().map(|module| {
+            (
+                module.name.clone(),
+                module
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.iat_rva.0, entry.name.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    )
+}
+
 pub(crate) fn run(o: Options) -> Result<()> {
     std::thread::Builder::new()
         .stack_size(1 << 30)
@@ -105,7 +125,7 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         vmpx_vmlift::roll_decoded_cfg(input, 200_000)
     })??;
     let low = vmpx_decompile::vm::lower(&rolled, name)?;
-    let d = vmpx_decompile::decompile(&low.func)?;
+    let d = vmpx_decompile::decompile_with(&low.func, &image_symbols(pe))?;
     for n in &low.notes {
         println!("// note: {n}");
     }

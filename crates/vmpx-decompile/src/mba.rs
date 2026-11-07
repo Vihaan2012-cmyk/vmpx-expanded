@@ -127,12 +127,82 @@ fn twos_complement(expr: &Expr) -> Option<Expr> {
     }
 }
 
+/// Width-change chains that cancel. VMProtect's lifter emits a cast per VM
+/// operand, so a single byte read arrives as `(u16)(u8)((u16)x >> 8)` and a
+/// 64-bit value is rebuilt one byte at a time. Each rule below is an identity
+/// about widths, not a guess:
+///
+/// - a resize to the width a value already has is nothing
+/// - truncating back to the width a value had before it was extended is nothing
+/// - two truncations, or two extensions of the same kind, are one
+/// - extracting a value's whole width from bit 0 is nothing
+fn collapse_casts(expr: &Expr) -> Option<Expr> {
+    use vmpx_vm::ResizeOp;
+
+    match &expr.kind {
+        ExprKind::Resize { op, value } => {
+            // Any resize to the width the value already has.
+            if value.width == expr.width {
+                return Some((**value).clone());
+            }
+            let ExprKind::Resize { op: inner_op, value: inner } = &value.kind else {
+                return None;
+            };
+            match (op, inner_op) {
+                // Truncate(Extend(x)) back to x's own width is x itself. Only
+                // when the target width is exactly x's: a narrower truncation
+                // still discards bits, and a wider one is not this rule.
+                (ResizeOp::Truncate, ResizeOp::ZeroExtend | ResizeOp::SignExtend)
+                    if inner.width == expr.width =>
+                {
+                    Some((**inner).clone())
+                }
+                // Two truncations collapse to the narrower one.
+                (ResizeOp::Truncate, ResizeOp::Truncate) => {
+                    Expr::resize(ResizeOp::Truncate, expr.width, (**inner).clone()).ok()
+                }
+                // Two extensions of the SAME kind collapse to the wider one.
+                // Mixing zero- and sign-extension does not: the inner one
+                // decides the bits the outer then copies.
+                (ResizeOp::ZeroExtend, ResizeOp::ZeroExtend) => {
+                    Expr::resize(ResizeOp::ZeroExtend, expr.width, (**inner).clone()).ok()
+                }
+                (ResizeOp::SignExtend, ResizeOp::SignExtend) => {
+                    Expr::resize(ResizeOp::SignExtend, expr.width, (**inner).clone()).ok()
+                }
+                _ => None,
+            }
+        }
+        // Extracting the whole of a value, from bit 0, is the value.
+        ExprKind::Extract { value, lsb: 0 } if value.width == expr.width => {
+            Some((**value).clone())
+        }
+        // A zero-extended value has nothing but zeros above its own width, so
+        // shifting those bits down leaves zero. This is what makes
+        // `(u16)(u8)((u16)byte >> 8)` -- a shape the lifter emits constantly --
+        // collapse to a constant instead of surviving as four casts.
+        ExprKind::Binary { op: vmpx_vm::BinaryOp::Shr, left, right } => {
+            let ExprKind::Const { value: amount } = right.kind else {
+                return None;
+            };
+            let ExprKind::Resize { op: ResizeOp::ZeroExtend, value: inner } = &left.kind else {
+                return None;
+            };
+            (amount >= u64::from(inner.width.bits()))
+                .then(|| Expr::constant(expr.width, 0))
+        }
+        _ => None,
+    }
+}
+
 /// One simplification attempt on a node whose children are already simplified.
 /// Keeps a result only when it reads better by [`cost`].
 fn attempt(expr: &Expr) -> Expr {
+    // Cast collapsing is cheap and always worth trying, whatever the size.
+    let expr = &settle_casts(expr);
     let size = expr.node_count_bounded(ATTEMPT_LIMIT);
     if size >= ATTEMPT_LIMIT || size < 3 {
-        // Still worth the cheap structural identity on a small node.
+        // Still worth the cheap structural identities on a small node.
         return twos_complement(expr).unwrap_or_else(|| expr.clone());
     }
     let mut best = expr.clone();
@@ -144,6 +214,7 @@ fn attempt(expr: &Expr) -> Expr {
         // Identities can expose each other: `~(~a + 1)` becomes `~(-a)` first,
         // and only then `a - 1`.
         let candidate = twos_complement(&candidate).unwrap_or(candidate);
+        let candidate = settle_casts(&candidate);
         let candidate_cost = cost(&candidate);
         if candidate_cost < best_cost {
             best = candidate;
@@ -151,6 +222,20 @@ fn attempt(expr: &Expr) -> Expr {
         }
     }
     best
+}
+
+/// Applies [`collapse_casts`] until it stops firing: removing one cast can
+/// expose the next, as it does in `(u16)(u8)((u16)x >> 8)`.
+fn settle_casts(expr: &Expr) -> Expr {
+    let mut current = expr.clone();
+    // Each step strictly removes a node, so the bound is only a safety net.
+    for _ in 0..16 {
+        match collapse_casts(&current) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    current
 }
 
 /// Simplifies `root` bottom-up, memoizing per node so a shared subtree is
@@ -290,6 +375,90 @@ mod tests {
             !rendered.contains("Not"),
             "the nested identity should be gone: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_resize_to_the_width_a_value_already_has_is_removed() {
+        use vmpx_vm::ResizeOp;
+        let a = Expr::register(BitWidth::W32, "a");
+        let same = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, a.clone()).expect("resize");
+        let mut memo = HashMap::new();
+        assert_eq!(simplify(&same, &mut memo), a);
+    }
+
+    #[test]
+    fn truncating_back_to_the_width_a_value_was_extended_from_is_removed() {
+        use vmpx_vm::ResizeOp;
+        let a = Expr::register(BitWidth::W8, "a");
+        let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, a.clone()).expect("zext");
+        let back = Expr::resize(ResizeOp::Truncate, BitWidth::W8, wide).expect("trunc");
+        let mut memo = HashMap::new();
+        assert_eq!(simplify(&back, &mut memo), a);
+    }
+
+    #[test]
+    fn a_narrower_truncation_of_an_extension_is_kept() {
+        // `(u8)((u32)x)` where x is 16 bits still discards eight bits, so the
+        // pair is NOT a no-op and must survive.
+        use vmpx_vm::ResizeOp;
+        let a = Expr::register(BitWidth::W16, "a");
+        let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, a.clone()).expect("zext");
+        let narrow = Expr::resize(ResizeOp::Truncate, BitWidth::W8, wide).expect("trunc");
+        let mut memo = HashMap::new();
+        let out = simplify(&narrow, &mut memo);
+        assert_ne!(out, a, "the truncation to 8 bits is not removable");
+        assert_eq!(out.width, BitWidth::W8);
+    }
+
+    #[test]
+    fn mixed_sign_and_zero_extension_does_not_collapse() {
+        // zext(sext(x)) is not sext(x) widened: the inner sign-extension
+        // decides the bits the outer copies.
+        use vmpx_vm::ResizeOp;
+        let a = Expr::register(BitWidth::W8, "a");
+        let inner = Expr::resize(ResizeOp::SignExtend, BitWidth::W16, a).expect("sext");
+        let outer = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, inner.clone()).expect("zext");
+        let mut memo = HashMap::new();
+        let out = simplify(&outer, &mut memo);
+        assert!(
+            format!("{out:?}").contains("SignExtend"),
+            "the sign-extension must survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_casts_settles_in_one_pass() {
+        use vmpx_vm::ResizeOp;
+        let a = Expr::register(BitWidth::W8, "a");
+        let one = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W16, a.clone()).expect("1");
+        let two = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, one).expect("2");
+        let three = Expr::resize(ResizeOp::Truncate, BitWidth::W8, two).expect("3");
+        let mut memo = HashMap::new();
+        assert_eq!(simplify(&three, &mut memo), a, "three casts cancel to nothing");
+    }
+
+    #[test]
+    fn shifting_a_zero_extended_value_past_its_own_width_is_zero() {
+        use vmpx_vm::ResizeOp;
+        // `(u16)byte >> 8`: the high half of a zero-extended byte is all zero.
+        let byte = Expr::register(BitWidth::W8, "b");
+        let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W16, byte).expect("zext");
+        let shifted = Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 8))
+            .expect("shr");
+        let mut memo = HashMap::new();
+        assert_eq!(simplify(&shifted, &mut memo), Expr::constant(BitWidth::W16, 0));
+    }
+
+    #[test]
+    fn a_shift_that_stays_inside_the_value_is_kept() {
+        use vmpx_vm::ResizeOp;
+        let byte = Expr::register(BitWidth::W8, "b");
+        let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W16, byte).expect("zext");
+        let shifted = Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 4))
+            .expect("shr");
+        let mut memo = HashMap::new();
+        let out = simplify(&shifted, &mut memo);
+        assert_ne!(out, Expr::constant(BitWidth::W16, 0), "a shift of 4 keeps real bits");
     }
 
     #[test]
