@@ -2380,7 +2380,14 @@ struct Walker<'a, 'p> {
 /// The restriction was never about soundness -- the retry's result carries the
 /// same unproven `AssumesExternalStoresDisjointFromVmStack` label whatever the
 /// boundary -- so widening it trades nothing but the number of entries that get
-/// the chance. Off by default so the measured baseline is reproducible.
+/// the chance.
+///
+/// MEASURED on systems.xpl with `--serve-ro`: +0. N1 stays at 658/814 and the
+/// incomplete set stays at 154 (`BlockVisits` 5, stall 149), identical with the
+/// knob on and off. The 20 remaining "branch target follows an imprecise
+/// external-memory store" stalls are not reached by this retry, so widening the
+/// boundary was not what held them back. Left off by default and kept only so
+/// the next attempt starts from the measurement rather than the hypothesis.
 fn retry_every_tainted_block() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VMPX_RETRY_TAINTED_ALL").is_ok_and(|v| v == "1"))
