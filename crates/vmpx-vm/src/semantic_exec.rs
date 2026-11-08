@@ -1726,6 +1726,28 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
         // The NAME, not just the kind: closing this class means proving
         // `f(vsp + k) = vsp + g(k)` for the specific functions VMProtect emits,
         // so which ones they are is the whole scope of that work.
+        // For an opaque read, also classify WHERE it read from: that separates
+        // a cell a havoc discarded from one never written.
+        ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
+            let site = arguments.first().map_or("none", |address| {
+                if matches!(address.kind, ExprKind::Const { .. }) {
+                    "image-const"
+                } else if pointer_offset(address).is_some() {
+                    "vsp-rooted"
+                } else if address.dependencies().contains("vsp_initial") {
+                    "vsp-derived"
+                } else if unbounded_node_kind(address)
+                    .is_some_and(|kind| kind.starts_with("Intrinsic:memory_load_epoch_"))
+                {
+                    "opaque-chain"
+                } else {
+                    "other"
+                }
+            });
+            return Some(Box::leak(
+                format!("Intrinsic:memory_load_epoch@{site}").into_boxed_str(),
+            ));
+        }
         ExprKind::Intrinsic { name, .. } => return Some(Box::leak(
             format!("Intrinsic:{name}").into_boxed_str(),
         )),
@@ -1798,32 +1820,54 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
         ExprKind::Concat { high, low } if matches!(high.kind, ExprKind::Const { value: 0 }) => {
             address_bounds(low)
         }
-        // `concat(c, low)` for ANY constant `c` is `(c << width(low)) + low`,
-        // because the halves do not overlap. That addend is a constant, so the
-        // low half's root and offsets both survive -- which is the whole point:
-        // a bound that keeps the root can reach `proven_store_byte_range`,
-        // and the earlier attempt at bounding an unsupported node by its own
-        // width measured +0 precisely because it dropped the root.
-        //
-        // Measured: `Concat` stops the bound in 17 of 123 occurrences of the
-        // imprecise-external-store stall.
+        // `concat(high, low)` is `(high << width(low)) + low`: the halves do not
+        // overlap. A rootless bounded high half therefore contributes a bounded
+        // displacement and the low half's root survives, which is what
+        // `proven_store_byte_range` needs. A wider range is still sound here --
+        // it preserves fewer cells, never more.
         ExprKind::Concat { high, low } => {
-            let ExprKind::Const { value: high_value } = high.kind else {
-                return None;
-            };
-            let inner = address_bounds(low)?;
-            // The shift must be representable, and the shifted constant must
-            // fit a signed offset, or this is not a constant displacement.
             let width = u32::from(low.width.bits());
             if width >= 64 {
                 return None;
             }
-            let shifted = high_value.checked_shl(width)?;
-            let shifted = i64::try_from(shifted).ok()?;
+            let high = address_bounds(high)?;
+            if high.root.is_some() {
+                return None;
+            }
+            let low = address_bounds(low)?;
+            // `checked_shl` validates only the shift amount, not value
+            // overflow, so a wide high half would wrap into a WRONG bound --
+            // and a wrong bound preserves cells the store can reach.
+            let scale = 1i64.checked_shl(width)?;
+            let shift = |value: i64| value.checked_mul(scale);
             Some(AddressBounds {
-                root: inner.root,
-                lo: inner.lo.checked_add(shifted)?,
-                hi: inner.hi.checked_add(shifted)?,
+                root: low.root,
+                lo: shift(high.lo)?.checked_add(low.lo)?,
+                hi: shift(high.hi)?.checked_add(low.hi)?,
+            })
+        }
+        // `x >> c` on a rootless non-negative range. A rooted operand is
+        // refused: shifting a root is not `root + constant`.
+        ExprKind::Binary {
+            op: BinaryOp::Shr,
+            left,
+            right,
+        } => {
+            let ExprKind::Const { value: shift } = right.kind else {
+                return None;
+            };
+            let shift = u32::try_from(shift).ok()?;
+            if shift >= 64 {
+                return None;
+            }
+            let base = address_bounds(left)?;
+            if base.root.is_some() || base.lo < 0 {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: base.lo >> shift,
+                hi: base.hi >> shift,
             })
         }
         ExprKind::Binary {
