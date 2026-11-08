@@ -70,6 +70,10 @@ fn full(register: Register) -> Register {
     register.full_register()
 }
 
+/// How many pads a walk follows before the first stage matches. Past this an
+/// address is treated as not being this loop at all.
+const PRE_MATCH_STEPS: u32 = 8;
+
 impl Shape {
     /// Matches the recurrence starting at `head`, following unconditional jumps
     /// and ignoring flag noise. `decode` yields the instruction at an address.
@@ -99,6 +103,19 @@ impl Shape {
         // bound keeps a mismatched address from walking the whole section.
         while steps < 64 {
             steps += 1;
+            // Give up early while nothing has matched yet.
+            //
+            // `run_loop` probes a shape at every block start, and the protector
+            // pads its code with `jmp +0` and flag-only junk, both of which this
+            // walk follows. At a non-matching address that meant chasing the
+            // padding to the step cap before failing, so a MISS cost about as
+            // much as a hit: measured on systems.xpl's init, the probes were
+            // taking the emulator from 192M to 110M steps/s. A real loop reaches
+            // its first operation within a few pads, so capping the chase before
+            // the first match keeps every other address cheap.
+            if stage == 0 && steps > PRE_MATCH_STEPS {
+                return None;
+            }
             let instruction = decode(address)?;
             let length = u64::from(u32::try_from(instruction.len()).ok()?);
             let next = address.wrapping_add(length);

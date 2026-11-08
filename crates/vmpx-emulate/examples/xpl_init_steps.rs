@@ -33,6 +33,16 @@ fn folds(prof: &vmpx_emulate::Prof) -> String {
         prof.literals_folded,
         prof.literal_bits,
         prof.fold_declined
+    ) + &format!(
+        " | probes={} walks={} ({:.1}%) stale={}",
+        prof.shape_probes,
+        prof.shape_walks,
+        if prof.shape_probes == 0 {
+            0.0
+        } else {
+            100.0 * prof.shape_walks as f64 / prof.shape_probes as f64
+        },
+        prof.shape_stale
     )
 }
 
@@ -84,6 +94,25 @@ impl Profile {
             let share = (*hits as f64) * 100.0 / (samples as f64);
             let steps = (*hits as f64) * (self.slice as f64);
             println!("  {rip:#x}  {share:6.2}%  ~{:.2}e9 steps", steps / 1e9);
+        }
+        // How much of the run is CONTAINED, which is the only number that caps
+        // what any fold of a region can be worth. A flat per-address profile
+        // says nothing on its own: 1229 addresses each under 0.5% is what both
+        // "one routine, fully unrolled" and "sweeping the whole image" look
+        // like, and those need opposite work. The window shares separate them.
+        let hottest = top[0].0;
+        for window in [0x800u64, 0x2000, 0x8000, 0x4_0000, 0x100_0000] {
+            let inside: u64 = self
+                .hits
+                .iter()
+                .filter(|(rip, _)| rip.abs_diff(hottest) <= window)
+                .map(|(_, hits)| *hits)
+                .sum();
+            let share = (inside as f64) * 100.0 / (samples as f64);
+            let distinct = self.hits.keys().filter(|rip| rip.abs_diff(hottest) <= window).count();
+            println!(
+                "  within {window:#010x} of {hottest:#x}: {share:6.2}%  ({distinct} addresses)"
+            );
         }
     }
 }
@@ -190,6 +219,7 @@ fn main() {
     //
     // `XPL_NOACCEL=1` restores byte-by-byte interpretation for an A/B.
     emu.accelerate_checksums = std::env::var_os("XPL_NOACCEL").is_none();
+    emu.accelerate_literals = std::env::var_os("XPL_NOLZMA").is_none();
     // Load-bearing, not an observer: `WinApiHook` IMPLEMENTS the Win32/XPLM
     // emulation, so dropping it to save per-write dispatch stops the run at the
     // first API call (measured: 122 steps).

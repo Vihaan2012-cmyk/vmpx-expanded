@@ -368,6 +368,20 @@ impl Shape {
         head: u64,
         mut decode: impl FnMut(u64) -> Option<Instruction>,
     ) -> Option<Self> {
+        // Reject at the cheapest possible point. `run_loop` probes a shape at
+        // every block start, and the first version of this walked the whole
+        // path -- up to WALK_CAP decodes plus the allocation to hold them --
+        // before testing anything, so a MISS cost as much as a hit. Measured on
+        // systems.xpl's init that was ~11us per miss and took the emulator from
+        // 112M to 30M steps/s, losing far more than the folding won.
+        //
+        // The head is `movsxd index, symbol`. One decode settles almost every
+        // address in the image, and only a plausible head reaches the walk.
+        let first = decode(head)?;
+        if first.code() != Code::Movsxd_r64_rm32 || first.op1_kind() != OpKind::Register {
+            return None;
+        }
+
         let mut extent = (u64::MAX, 0u64);
         let (main, _) = walk(head, &[], &mut decode, &mut extent)?;
 

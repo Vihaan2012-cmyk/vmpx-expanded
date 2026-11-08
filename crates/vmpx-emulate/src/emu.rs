@@ -420,6 +420,9 @@ pub struct Emulator {
     /// point -- a step budget then buys progress rather than checksum arithmetic
     /// -- and [`Prof::folded_iterations`] records what was skipped.
     pub accelerate_checksums: bool,
+    /// Whether to also try the LZMA literal decoder, separately from the other
+    /// folds so its cost and its benefit can be measured against them.
+    pub accelerate_literals: bool,
     /// Recognizer cache, direct-mapped by loop-head rip. `None` records a
     /// declined address so it is not re-examined every iteration. Keyed by the
     /// code generation too, so modified code is re-examined.
@@ -428,9 +431,45 @@ pub struct Emulator {
     cpyc: Box<[Option<(u64, u64, Option<crate::copy_loop::Shape>)>]>,
     /// Recognizer cache for the LZMA literal decoder, same scheme as `csum`.
     lzmc: Box<[Option<(u64, u64, Option<crate::lzma_literal::Shape>)>]>,
+    /// Addresses known to hold no shape of any kind, one word each.
+    ///
+    /// The three caches above each answer "is there a shape at this rip", and
+    /// almost always the answer is no: a 400M-step init probes them 47M times
+    /// and finds a shape for 0.2% of those. Paying three random accesses into
+    /// three tables of ~100-byte entries for that answer costs more than the
+    /// walks it avoids -- widening those tables cut walks 14x and moved the rate
+    /// by 3%, which is what said the probe itself was the cost.
+    ///
+    /// This table holds one `u64` per slot, so the whole thing stays in L2, and
+    /// a hit settles all three caches with a single load. The stored key mixes
+    /// in the code generation, so a guest code write invalidates it the same way
+    /// it invalidates the caches.
+    absent: Box<[u64]>,
 }
 
-const CSUM_SLOTS: usize = 256;
+// Slots in each shape-recognizer cache. The protector flattens its
+// decompressor over ~960 hot addresses and `run_loop` probes a shape at
+// every block start, so 256 slots had hot heads evicting each other and
+// re-walking: 2.05M walks over a 400M-step init, against a hot set that
+// fits several times over in this many.
+const CSUM_SLOTS: usize = 4096;
+
+/// Slots in the negative filter. One `u64` each, so this is 32KiB and stays
+/// resident; it is consulted on every block start.
+const ABSENT_SLOTS: usize = 4096;
+
+/// The filter's stored key for `rip` under code generation `epoch`.
+///
+/// Never zero, which is the empty marker, and it mixes the epoch in so a code
+/// write cannot leave a stale "nothing here" behind.
+fn absent_key(rip: u64, epoch: u64) -> u64 {
+    (rip ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1
+}
+
+/// Which filter slot `rip` falls in.
+fn absent_slot(rip: u64) -> usize {
+    ((rip ^ (rip >> 13)) as usize) & (ABSENT_SLOTS - 1)
+}
 
 /// Where a run's steps went. Plain counters: the interpreter is single-threaded
 /// and an increment is far cheaper than the step it measures.
@@ -478,6 +517,18 @@ pub struct Prof {
     pub literal_bits: u64,
     /// Iterations declined because a byte was unreadable.
     pub fold_declined: u64,
+    /// Shape-cache probes, and the ones that had to run a recognizer walk.
+    ///
+    /// Recognition decodes and walks up to a few hundred instructions, so the
+    /// walk rate decides whether the folds pay for themselves at all. These two
+    /// counters separate the only two reasons a probe misses -- a hot head
+    /// evicted by another (raise the cache) and a cached head invalidated by a
+    /// guest code write (the epoch is too coarse) -- which need opposite fixes.
+    pub shape_probes: u64,
+    pub shape_walks: u64,
+    /// Probes that missed because the code generation moved, not because the
+    /// slot held a different address.
+    pub shape_stale: u64,
     /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
     pub slow_mn: Box<[u64]>,
 }
@@ -500,6 +551,9 @@ impl Default for Prof {
             literals_folded: 0,
             literal_bits: 0,
             fold_declined: 0,
+            shape_probes: 0,
+            shape_walks: 0,
+            shape_stale: 0,
             slow_mn: vec![0; 2048].into_boxed_slice(),
         }
     }
@@ -682,9 +736,11 @@ impl Emulator {
             gate: Gate::ALL,
             prof: Prof::default(),
             accelerate_checksums: false,
+            accelerate_literals: true,
             csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
             cpyc: vec![None; CSUM_SLOTS].into_boxed_slice(),
             lzmc: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            absent: vec![0u64; ABSENT_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -835,12 +891,16 @@ impl Emulator {
     fn checksum_shape(&mut self, rip: u64) -> Option<crate::checksum_loop::Shape> {
         let epoch = self.mem.code_gen();
         let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
-        if let Some((cached_rip, cached_epoch, shape)) = self.csum[slot]
-            && cached_rip == rip
-            && cached_epoch == epoch
-        {
-            return shape;
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.csum[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
         }
+        self.prof.shape_walks += 1;
         let mem = &self.mem;
         let shape = crate::checksum_loop::Shape::recognize(rip, |address| {
             let mut buf = [0u8; 15];
@@ -929,12 +989,16 @@ impl Emulator {
     fn copy_shape(&mut self, rip: u64) -> Option<crate::copy_loop::Shape> {
         let epoch = self.mem.code_gen();
         let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
-        if let Some((cached_rip, cached_epoch, shape)) = self.cpyc[slot]
-            && cached_rip == rip
-            && cached_epoch == epoch
-        {
-            return shape;
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.cpyc[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
         }
+        self.prof.shape_walks += 1;
         let mem = &self.mem;
         let shape = crate::copy_loop::Shape::recognize(rip, |address| {
             let mut buf = [0u8; 15];
@@ -1061,12 +1125,16 @@ impl Emulator {
     fn lzma_shape(&mut self, rip: u64) -> Option<crate::lzma_literal::Shape> {
         let epoch = self.mem.code_gen();
         let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
-        if let Some((cached_rip, cached_epoch, shape)) = self.lzmc[slot]
-            && cached_rip == rip
-            && cached_epoch == epoch
-        {
-            return shape;
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.lzmc[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
         }
+        self.prof.shape_walks += 1;
         let mem = &self.mem;
         let shape = crate::lzma_literal::Shape::recognize(rip, |address| {
             let mut buf = [0u8; 15];
@@ -1228,15 +1296,23 @@ impl Emulator {
                 return Stop::Reached;
             }
             if self.accelerate_checksums && blocks {
-                let folded = match self.checksum_shape(rip) {
-                    Some(shape) => self.fold_checksum(&shape),
-                    None => match self.copy_shape(rip) {
-                        Some(shape) => self.fold_copy(&shape),
-                        None => match self.lzma_shape(rip) {
-                            Some(shape) => self.fold_lzma_literal(&shape),
-                            None => 0,
-                        },
-                    },
+                let key = absent_key(rip, self.mem.code_gen());
+                let slot = absent_slot(rip);
+                let folded = if self.absent[slot] == key {
+                    0
+                } else if let Some(shape) = self.checksum_shape(rip) {
+                    self.fold_checksum(&shape)
+                } else if let Some(shape) = self.copy_shape(rip) {
+                    self.fold_copy(&shape)
+                } else if let Some(shape) =
+                    if self.accelerate_literals { self.lzma_shape(rip) } else { None }
+                {
+                    self.fold_lzma_literal(&shape)
+                } else {
+                    // No shape of any kind here, which is the common case and
+                    // the one worth remembering cheaply.
+                    self.absent[slot] = key;
+                    0
                 };
                 if folded > 0 {
                     // One step for the whole fold: the budget now buys progress
