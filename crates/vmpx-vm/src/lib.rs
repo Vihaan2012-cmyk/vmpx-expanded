@@ -115,7 +115,8 @@ pub use entry_profile::{
 pub use exception_flow::{
     ExceptionContinuationResolution, ExceptionContinuationSource, ExceptionStackSledReport,
     VmFaultUnwindCoverage, VmMemoryExceptionCoverageReport, analyze_exception_stack_sled,
-    analyze_vm_memory_exception_coverage, analyze_vm_memory_exception_coverage_with_state,
+    analyze_fault_site_exception_coverage, analyze_vm_memory_exception_coverage,
+    analyze_vm_memory_exception_coverage_with_state,
 };
 pub use expr::{
     BinaryOp, Expr, ExprError, ExprKind, ExprRef, ResizeOp, UnaryOp, distinct_node_count_bounded,

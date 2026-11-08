@@ -3259,6 +3259,33 @@ impl Walker<'_, '_> {
     /// re-enters code this walk would have to follow, and guessing it would
     /// invent control flow. Those keep stalling, with the source named.
     ///
+    /// MEASURED, AND CURRENTLY UNREACHABLE. Step 3 cannot be satisfied today:
+    /// `resolve_stack_sled_continuation` has exactly two exits, `Failed` and
+    /// `PartiallyRecovered`, and no variant of `ExceptionContinuationSource` is
+    /// constructed anywhere in the crate -- so `source` is always `None`. On a
+    /// 60-entry sample every refusal here reads "no zero-seed-unwind
+    /// continuation", with resolutions of `Failed/None` and
+    /// `PartiallyRecovered/None`.
+    ///
+    /// Steps 1 and 2 DO pass, which is the part worth keeping: the fault sites
+    /// come from the handler's own trace -- the recovery's `effects` list is
+    /// empty for exactly these handlers, since their recovery is what failed --
+    /// and SEH coverage over them is proven from the image's own exception
+    /// directory. The fault is therefore known to be CAUGHT; only where control
+    /// resumes is unknown.
+    ///
+    /// Closing the block anyway would overclaim. `BlockExit::VmExit` asserts
+    /// the VM was left, and if the handler resumes inside the VM that is a false
+    /// statement about control flow. A labeled tier makes a concession explicit;
+    /// it does not license an untrue one.
+    ///
+    /// What unblocks it: the handler reads its seed and cursor from native stack
+    /// slots (`CONTEXT.Rsp + 0xC0` and `+ 0xC8`), and
+    /// `analyze_vm_memory_exception_coverage_with_state` already takes a
+    /// `_symbolic` report that it never uses. Reading those two slots from the
+    /// pre-fault state is the missing piece, and a ZERO seed is precisely the
+    /// unwind-to-caller case this gate is waiting for.
+    ///
     /// Returns the evidence on success. The caller only needs to know whether
     /// the block closed; the evidence is returned so a future diagnostic can
     /// carry it without re-running the analysis.
@@ -3267,38 +3294,106 @@ impl Walker<'_, '_> {
         key: Va,
         error: &crate::SymbolicExecutionError,
         instructions: &[DecodedVmInstruction],
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         if !null_read_seh_exit_enabled() {
-            return None;
+            return Err("disabled".to_owned());
         }
-        if symbolic_failure_class(&error.message) != "null-read"
-            || error.semantic != VmHandlerSemantic::MemoryLoad
-        {
-            return None;
+        if symbolic_failure_class(&error.message) != "null-read" {
+            return Err("not a null read".to_owned());
         }
-        let handler = instructions.get(error.instruction_index)?.state_before.handler;
-        let recovery = self.cache.recoveries.get(&handler)?;
-        let coverage = crate::analyze_vm_memory_exception_coverage_with_state(
-            self.pe, recovery, None,
+        if error.semantic != VmHandlerSemantic::MemoryLoad {
+            return Err(format!("handler semantic is {:?}, not a memory load", error.semantic));
+        }
+        let handler = instructions
+            .get(error.instruction_index)
+            .ok_or_else(|| {
+                format!("instruction {} is outside the block", error.instruction_index)
+            })?
+            .state_before
+            .handler;
+        let handler_rva = self
+            .pe
+            .optional
+            .image_base
+            .checked_rva_of(handler)
+            .ok_or_else(|| format!("handler {handler} is outside the image"))?;
+        // Locate the faulting reads in the handler itself.
+        //
+        // Deriving them from the recovery's `effects` list cannot work here: it
+        // is empty precisely for the handlers whose recovery failed, and those
+        // are the ones that stall. The handler's trace has the instructions, so
+        // every memory-reading one in it becomes a fault site. Requiring ALL of
+        // them to be covered is stronger than covering whichever one faults,
+        // and it does not need to know which that is.
+        let trace = trace_direct_jump_fragments(
+            self.pe,
+            handler_rva,
+            DirectJumpTraceLimits::default(),
         )
-        .ok()?;
-        if !coverage.all_fault_sites_have_language_handler {
-            return None;
+        .map_err(|error| format!("handler trace failed: {error}"))?;
+        let mut fault_sites: Vec<Rva> = trace
+            .instructions()
+            .filter(|decoded| {
+                (0..decoded.instruction.op_count()).any(|operand| {
+                    decoded.instruction.op_kind(operand) == iced_x86::OpKind::Memory
+                }) && decoded.instruction.mnemonic() != iced_x86::Mnemonic::Lea
+            })
+            .map(|decoded| decoded.rva)
+            .collect();
+        fault_sites.sort_unstable();
+        fault_sites.dedup();
+        if fault_sites.is_empty() {
+            return Err("handler trace has no memory-reading instruction".to_owned());
         }
-        let unwound = coverage.continuation_resolutions.iter().find(|resolution| {
-            resolution.status == RecoveryStatus::Recovered
-                && resolution.source == Some(crate::ExceptionContinuationSource::ZeroSeedUnwind)
-        })?;
+        let site_count = fault_sites.len();
+        let coverage = crate::analyze_fault_site_exception_coverage(
+            self.pe,
+            handler_rva,
+            fault_sites,
+        )
+        .map_err(|error| format!("exception metadata unreadable: {error}"))?;
+        if !coverage.all_fault_sites_have_language_handler {
+            return Err(format!(
+                "not every fault site is SEH-covered ({site_count} site(s), {} covered): {}",
+                coverage.coverage.len(),
+                coverage.diagnostics.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+            ));
+        }
+        let unwound = coverage
+            .continuation_resolutions
+            .iter()
+            .find(|resolution| {
+                resolution.status == RecoveryStatus::Recovered
+                    && resolution.source
+                        == Some(crate::ExceptionContinuationSource::ZeroSeedUnwind)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no zero-seed-unwind continuation ({} resolution(s): {})",
+                    coverage.continuation_resolutions.len(),
+                    coverage
+                        .continuation_resolutions
+                        .iter()
+                        .take(3)
+                        .map(|r| format!("{:?}/{:?}", r.status, r.source))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            })?;
         let sled = unwound.handler;
         // The block is already inserted as `Stalled`; the fault turns it into an
         // exit. No `vm_exit` layout is attached, because none was recovered --
         // the exit is through an unwind, not through a VM exit handler whose
         // restore layout could be read off.
-        self.cfg.blocks.get_mut(&key)?.exit = BlockExit::VmExit;
+        self.cfg
+            .blocks
+            .get_mut(&key)
+            .ok_or_else(|| "the faulting block is not in the graph".to_owned())?
+            .exit = BlockExit::VmExit;
         self.cfg
             .assumptions
             .insert(VmCfgAssumption::AssumesNullReadFaultExitsViaSeh);
-        Some(format!(
+        Ok(format!(
             "handler {handler:?} fault sites all SEH-covered ({} site(s), {} covered), \
              zero-seed unwind via sled handler {sled:?}",
             coverage.fault_sites.len(),
@@ -4102,17 +4197,16 @@ impl Walker<'_, '_> {
                 // A proven null read is not necessarily a dead end: the
                 // protector reads address 0 on purpose and the fault carries
                 // control out of the VM. Try that before giving up.
-                if self
-                    .close_null_read_as_seh_exit(key, &error, &instructions)
-                    .is_some()
-                {
+                let seh = self.close_null_read_as_seh_exit(key, &error, &instructions);
+                if seh.is_ok() {
                     return;
                 }
+                let refusal = seh.unwrap_err();
                 self.stall(
                     key,
                     error.vip,
                     format!(
-                        "symbolic execution failed [{}]: {error}",
+                        "symbolic execution failed [{}]: {error} [seh-exit refused: {refusal}]",
                         symbolic_failure_class(&error.message)
                     ),
                 );

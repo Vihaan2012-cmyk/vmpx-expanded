@@ -592,6 +592,31 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
         diagnostics.push("no proven external native read site was recovered".to_owned());
     }
 
+    let mut report = analyze_fault_site_exception_coverage(pe, handler.entry, fault_sites)?;
+    report.diagnostics.splice(0..0, diagnostics);
+    Ok(report)
+}
+
+/// Exception coverage for fault sites the CALLER located.
+///
+/// The entry point above reads its sites from a handler recovery's `effects`
+/// list, which is empty for exactly the handlers whose recovery failed -- and
+/// those are the ones that stall, so the report could never claim coverage for
+/// them. A caller that knows where the faulting reads are (from the handler's
+/// own trace, say) supplies them here instead.
+///
+/// # Errors
+///
+/// Propagates malformed or unmapped exception/unwind metadata errors.
+pub fn analyze_fault_site_exception_coverage(
+    pe: &PeImage<'_>,
+    vm_handler: Rva,
+    fault_sites: Vec<Rva>,
+) -> Result<VmMemoryExceptionCoverageReport, PeError> {
+    let mut diagnostics = Vec::new();
+    if fault_sites.is_empty() {
+        diagnostics.push("no fault site was supplied".to_owned());
+    }
     let mut coverage = Vec::new();
     let mut language_handlers = BTreeSet::new();
     let mut all_fault_sites_have_language_handler = !fault_sites.is_empty();
@@ -649,7 +674,7 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
     }
     Ok(VmMemoryExceptionCoverageReport {
         schema_version: 2,
-        vm_handler: handler.entry,
+        vm_handler,
         fault_sites,
         coverage,
         all_fault_sites_have_language_handler,
