@@ -1793,6 +1793,34 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
         ExprKind::Concat { high, low } if matches!(high.kind, ExprKind::Const { value: 0 }) => {
             address_bounds(low)
         }
+        // `concat(c, low)` for ANY constant `c` is `(c << width(low)) + low`,
+        // because the halves do not overlap. That addend is a constant, so the
+        // low half's root and offsets both survive -- which is the whole point:
+        // a bound that keeps the root can reach `proven_store_byte_range`,
+        // and the earlier attempt at bounding an unsupported node by its own
+        // width measured +0 precisely because it dropped the root.
+        //
+        // Measured: `Concat` stops the bound in 17 of 123 occurrences of the
+        // imprecise-external-store stall.
+        ExprKind::Concat { high, low } => {
+            let ExprKind::Const { value: high_value } = high.kind else {
+                return None;
+            };
+            let inner = address_bounds(low)?;
+            // The shift must be representable, and the shifted constant must
+            // fit a signed offset, or this is not a constant displacement.
+            let width = u32::from(low.width.bits());
+            if width >= 64 {
+                return None;
+            }
+            let shifted = high_value.checked_shl(width)?;
+            let shifted = i64::try_from(shifted).ok()?;
+            Some(AddressBounds {
+                root: inner.root,
+                lo: inner.lo.checked_add(shifted)?,
+                hi: inner.hi.checked_add(shifted)?,
+            })
+        }
         ExprKind::Binary {
             op: op @ (BinaryOp::Add | BinaryOp::Sub),
             left,
@@ -3738,6 +3766,39 @@ mod tests {
     // The concession is recorded separately, and only when a cell was actually
     // retained, so an entry with no allocation-rooted cells behaves exactly as
     // it did before and carries no new label.
+    // `concat(c, vsp + k)` is still `vsp + constant`, so the bound must keep the
+    // root -- that is the only reason this arm is worth having. A bound without
+    // a root cannot reach `proven_store_byte_range`, which is why bounding an
+    // unsupported node by its own width measured +0 before.
+    #[test]
+    fn a_constant_high_concat_keeps_the_root_and_shifts_the_offset() {
+        let low = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("same-width pointer expression");
+        let address = Expr::concat(Expr::constant(BitWidth::W32, 3), low).expect("concat");
+        let bounds = address_bounds(&address).expect("bounded");
+        // The halves do not overlap, so the value is (3 << 32) + vsp + 8.
+        let shifted = 3i64 << 32;
+        assert_eq!(bounds.lo, shifted + 8);
+        assert_eq!(bounds.hi, shifted + 8);
+        assert!(bounds.root.is_some(), "the root must survive the concat");
+    }
+
+    // A non-constant high half is not a constant displacement, so it must still
+    // refuse rather than invent a bound from the low half alone.
+    #[test]
+    fn a_symbolic_high_concat_is_not_bounded() {
+        let address = Expr::concat(
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::register(BitWidth::W32, "vsp_initial"),
+        )
+        .expect("concat");
+        assert!(address_bounds(&address).is_none());
+    }
+
     #[test]
     fn narrowed_havoc_preserves_fresh_allocation_cells_under_its_own_label() {
         let mut machine = default_machine();
