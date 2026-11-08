@@ -1,6 +1,6 @@
 //! Native execution of the LZMA literal decoder the protector's init runs.
 //!
-//! VMProtect decompresses its packed sections with LZMA, and the literal
+//! `VMProtect` decompresses its packed sections with LZMA, and the literal
 //! decoder is where the init actually goes: profiling the first TLS callback
 //! puts almost every sample in one ~150-byte loop, and 120 billion interpreted
 //! steps were not enough to finish it. Each output byte costs eight bit
@@ -119,7 +119,7 @@ pub(crate) struct Shape {
     pub head: u64,
     /// The address range a fold stays inside, as `[start, end)`.
     ///
-    /// This replaces a list of elided `(from, to)` transfers. VMProtect splits
+    /// This replaces a list of elided `(from, to)` transfers. `VMProtect` splits
     /// the body with `jmp +0` padding -- six of them in the observed loop, more
     /// in the arms -- so an exact list is both large and no more useful than the
     /// range containing it: the only consumer asks whether a hook wants flow
@@ -808,7 +808,7 @@ mod tests {
                     i32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().unwrap());
                 let target = HEAD
                     .wrapping_add(offset as u64 + 6)
-                    .wrapping_add(displacement as i64 as u64);
+                    .wrapping_add(i64::from(displacement) as u64);
                 if target == HEAD {
                     at = Some(offset);
                     break;
@@ -833,6 +833,143 @@ mod tests {
         bytes[9] = 0x90;
         bytes[10] = 0x90;
         assert!(Shape::recognize(HEAD, decoder_over(&bytes, HEAD)).is_none());
+    }
+
+    /// Where the reachable tail's back edge sits, and what follows it.
+    ///
+    /// The fixture holds two copies of the one-arm and two tails; the dead copy
+    /// branches to `head - 0xff`. The reachable back edge is the 6-byte `jl`
+    /// whose target IS the head, so the instruction after it is where the loop
+    /// leaves -- which is the only address a differential can stop both runs at.
+    fn loop_exit(bytes: &[u8], head: u64) -> u64 {
+        for offset in 0..bytes.len() - 6 {
+            if bytes[offset] != 0x0f || bytes[offset + 1] != 0x8c {
+                continue;
+            }
+            let displacement =
+                i32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().unwrap());
+            let after = head.wrapping_add(offset as u64 + 6);
+            if after.wrapping_add(i64::from(displacement) as u64) == head {
+                return after;
+            }
+        }
+        panic!("no back edge to the head");
+    }
+
+    const GUEST_CODE: u64 = 0x0001_0000;
+    const GUEST_PROBS: u64 = 0x0002_0000;
+    const GUEST_INPUT: u64 = 0x0003_0000;
+
+    /// The sample's decoder in a contained guest, with `seed` choosing the coder
+    /// state so different runs take different arms.
+    fn guest(seed: u64, accelerate: bool) -> crate::emu::Emulator {
+        let mut mem = crate::memory::Memory::new();
+        mem.map(GUEST_CODE, crate::memory::PAGE_SIZE, crate::memory::Perm::RX).unwrap();
+        mem.map(GUEST_PROBS, crate::memory::PAGE_SIZE, crate::memory::Perm::RW).unwrap();
+        mem.map(GUEST_INPUT, crate::memory::PAGE_SIZE, crate::memory::Perm::RW).unwrap();
+        mem.poke(GUEST_CODE, REAL).unwrap();
+
+        // Probabilities spread across the legal range, so the comparison against
+        // `bound` lands on both sides and both arms get exercised.
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut probabilities = Vec::new();
+        for _ in 0..0x100u32 {
+            let value = 1 + (next() % 2046) as u16;
+            probabilities.extend_from_slice(&value.to_le_bytes());
+        }
+        mem.poke(GUEST_PROBS, &probabilities).unwrap();
+        let input: Vec<u8> = (0..0x200u32).map(|_| next() as u8).collect();
+        mem.poke(GUEST_INPUT, &input).unwrap();
+
+        let mut cpu = crate::cpu::Cpu::new(GUEST_CODE);
+        // Junk in the body reads rbp, rsi, r11, r12, r14 and the stack pointer's
+        // low byte, so everything is given a defined value.
+        for register in &mut cpu.regs {
+            *register = next() & 0xFFFF;
+        }
+        cpu.regs[3] = GUEST_PROBS; // rbx: probability array
+        cpu.regs[5] = u64::from(1u32); // rbp, kept small
+        cpu.regs[7] = next() & 0xFFFF_FFFF; // rdi: code
+        cpu.regs[8] = if seed.is_multiple_of(3) { 0x00FF_FFFF } else { 0xFFFF_FFFF }; // r8: range
+        cpu.regs[9] = GUEST_INPUT; // r9: input
+        cpu.regs[10] = 1; // r10: symbol starts at 1
+        cpu.regs[13] = GUEST_INPUT + 0x200; // r13: one past the last input byte
+        cpu.rflags = 2;
+        let mut emulator = crate::emu::Emulator::new(cpu, mem);
+        emulator.accelerate_checksums = accelerate;
+        emulator.resolve_undefined_flags = true;
+        emulator.record_trace = false;
+        emulator
+    }
+
+    /// Folding the sample's own decoder must leave exactly the state the
+    /// interpreter leaves.
+    ///
+    /// This is the check the unit tests above cannot make. They prove the
+    /// arithmetic and prove the matcher accepts the right bytes; neither proves
+    /// that executing the fold and executing the instructions agree -- on the
+    /// registers the fold does not model, on the probabilities it writes, or on
+    /// the flags it deliberately leaves alone. Two of the three bugs in building
+    /// this fold would have survived the unit tests and died here.
+    #[test]
+    fn folding_the_sample_matches_interpreting_it() {
+        let exit = loop_exit(REAL, GUEST_CODE);
+        let mut folded_runs = 0u64;
+        let mut arms = (0u64, 0u64);
+        let mut normalised = 0u64;
+        for seed in 1..96u64 {
+            let mut interpreted = guest(seed, false);
+            let mut accelerated = guest(seed, true);
+            let want = interpreted.run_until(exit, 100_000);
+            let got = accelerated.run_until(exit, 100_000);
+            assert_eq!(want, got, "seed {seed} stop");
+            assert_eq!(
+                interpreted.cpu, accelerated.cpu,
+                "seed {seed} cpu: folded {:?}",
+                accelerated.prof.literals_folded
+            );
+            assert!(
+                interpreted.mem.pages().eq(accelerated.mem.pages()),
+                "seed {seed} memory"
+            );
+            folded_runs += accelerated.prof.literals_folded;
+            // Normalisation is a separate path through the fold, including the
+            // guest read it performs, so it has to be shown to happen.
+            normalised += u64::from(interpreted.cpu.regs[9] > GUEST_INPUT);
+            // The decoded byte tells which way the bits went, so a run of
+            // all-zero or all-one arms would show up as a degenerate spread.
+            let symbol = interpreted.cpu.regs[10] & 0xFF;
+            arms.0 += u64::from(symbol.count_zeros() - 56);
+            arms.1 += u64::from(symbol.count_ones());
+        }
+        assert!(folded_runs > 0, "nothing folded, so nothing was compared");
+        assert!(arms.0 > 0 && arms.1 > 0, "only one arm exercised: {arms:?}");
+        assert!(normalised > 0, "no run pulled an input byte");
+    }
+
+    /// A read-only probability array must decline rather than fault or skip.
+    #[test]
+    fn an_unwritable_probability_array_declines_the_fold() {
+        let exit = loop_exit(REAL, GUEST_CODE);
+        let mut interpreted = guest(7, false);
+        let mut accelerated = guest(7, true);
+        for emulator in [&mut interpreted, &mut accelerated] {
+            emulator
+                .mem
+                .protect(GUEST_PROBS, crate::memory::PAGE_SIZE, crate::memory::Perm::R)
+                .unwrap();
+        }
+        let want = interpreted.run_until(exit, 100_000);
+        let got = accelerated.run_until(exit, 100_000);
+        assert_eq!(want, got, "stop");
+        assert_eq!(interpreted.cpu, accelerated.cpu, "cpu");
+        assert_eq!(accelerated.prof.literals_folded, 0, "folded an unwritable array");
     }
 
     #[test]
