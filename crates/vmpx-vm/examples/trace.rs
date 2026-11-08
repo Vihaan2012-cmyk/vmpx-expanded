@@ -30,6 +30,8 @@ fn main() -> ExitCode {
         Rva(rva),
         DirectJumpTraceLimits {
             follow_conditional_fallthrough: false,
+            follow_conditional_target: false,
+            max_conditional_continuations: 1,
             max_fragments: 4_096,
             max_instructions: 65_536,
             max_instructions_per_fragment: 4_096,

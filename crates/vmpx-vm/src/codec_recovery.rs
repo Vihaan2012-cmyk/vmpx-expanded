@@ -262,24 +262,42 @@ fn apply_keyless_reentry_facts(
 #[allow(clippy::too_many_lines)]
 /// Recovers a handler's codecs.
 ///
-/// NOT retried through conditional branches. A handler whose fragments are
-/// joined by junk predicates leaves the trace stopping at the first of them,
-/// with no specification, and every entry using it stalls as "undecodable
-/// opcode" -- ~150 stall occurrences across 48 entries on systems.xpl. Walking
-/// on along the fallthrough was tried and reverted: `postlude_dispatch`'s
-/// `inexact_postlude_shapes_are_not_recognized` then recovers a dispatch
-/// candidate for a shape it is supposed to refuse. Stitching a postlude across
-/// an arm can recognise a shape no execution performs, so the result is not a
-/// labeled specification but a WRONG one, which is worse than none.
+/// The trace is NOT continued past a conditional branch, and two ways of doing
+/// that have been tried and reverted. Both were caught by
+/// `postlude_dispatch::inexact_postlude_shapes_are_not_recognized`.
 ///
-/// `DirectJumpTraceLimits::follow_conditional_fallthrough` still exists for a
-/// future attempt; whatever uses it has to bound what may be recovered past the
-/// arm, not merely label it.
+/// 1. Walk one arm and label the result. A postlude can then be stitched out of
+///    instructions no execution runs, so the specification is WRONG rather than
+///    unproven.
+/// 2. Walk both arms and accept only what they agree on. With at most one
+///    conditional the two arms are every path, so agreement does prove the
+///    decoded stream is path-insensitive -- but it discards WHICH arm the
+///    predicate selects, and the stack-check postlude recogniser depends on
+///    exactly that. It accepted `jb` where the shape requires `ja`.
+///
+/// So the trace stopping at a conditional is load-bearing, not a limitation: a
+/// VMProtect handler's conditional is sometimes a junk predicate joining two
+/// fragments and sometimes a real guard the recogniser reads, and nothing in the
+/// trace alone separates them. A fix has to prove a given predicate is opaque
+/// before crossing it, rather than crossing all of them.
+///
+/// This is the largest single blocker left -- 162 of 197 handler refusals stop
+/// at a ConditionalBranch, and "no popped-target transition recovered" (171) and
+/// "trace does not terminate through the recovered handler register" (128) are
+/// symptoms of the same truncation.
 ///
 /// # Errors
 ///
 /// Propagates a decode failure at the handler entry.
 pub fn recover_handler_codecs(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    config: &HandlerCodecRecoveryConfig,
+) -> Result<HandlerCodecRecoveryReport, DisasmError> {
+    recover_handler_codecs_once(pe, entry, config)
+}
+
+fn recover_handler_codecs_once(
     pe: &PeImage<'_>,
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,

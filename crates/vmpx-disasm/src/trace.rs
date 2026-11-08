@@ -25,6 +25,16 @@ pub struct DirectJumpTraceLimits {
     /// reaches the handler's dispatch tail -- measured on systems.xpl, this is
     /// what leaves ~150 handler-spec refusals and blocks 48 entries.
     pub follow_conditional_fallthrough: bool,
+    /// With `follow_conditional_fallthrough`, continue along the branch's TAKEN
+    /// target instead of its fallthrough. The two together give the only two
+    /// paths through a single conditional, which is what makes agreement
+    /// between them a proof rather than a guess.
+    pub follow_conditional_target: bool,
+    /// How many conditional branches may be walked through. Beyond one, the two
+    /// arm-choices stop covering every path -- with two branches the pair
+    /// all-fallthrough / all-taken is 2 of 4 -- so agreement proves nothing and
+    /// the default of 1 keeps the guarantee.
+    pub max_conditional_continuations: usize,
 }
 
 impl Default for DirectJumpTraceLimits {
@@ -34,6 +44,8 @@ impl Default for DirectJumpTraceLimits {
             max_instructions: 50_000,
             max_instructions_per_fragment: 10_000,
             follow_conditional_fallthrough: false,
+            follow_conditional_target: false,
+            max_conditional_continuations: 1,
         }
     }
 }
@@ -248,9 +260,15 @@ pub fn trace_direct_jump_fragments(
                 FlowControl::ConditionalBranch => {
                     // Walking on means picking an arm, which is not a proof; the
                     // site is recorded so the caller can label what it recovers.
+                    let arm = if limits.follow_conditional_target {
+                        direct_target
+                    } else {
+                        next
+                    };
                     if limits.follow_conditional_fallthrough
-                        && let Some(fallthrough) =
-                            next.filter(|rva| is_executable_rva(pe, *rva))
+                        && conditional_continuations.len()
+                            < limits.max_conditional_continuations
+                        && let Some(fallthrough) = arm.filter(|rva| is_executable_rva(pe, *rva))
                     {
                         conditional_continuations.push(instruction_rva);
                         push_fragment(
@@ -407,6 +425,8 @@ mod tests {
             Rva(0x1000),
             DirectJumpTraceLimits {
                 follow_conditional_fallthrough: false,
+                follow_conditional_target: false,
+                max_conditional_continuations: 1,
                 max_fragments: 0,
                 max_instructions: 0,
                 max_instructions_per_fragment: 0,
