@@ -2465,6 +2465,27 @@ struct Walker<'a, 'p> {
 /// external-memory store" stalls are not reached by this retry, so widening the
 /// boundary was not what held them back. Left off by default and kept only so
 /// the next attempt starts from the measurement rather than the hypothesis.
+/// `VMPX_RETRY_FRAME_LOST`: let the labeled disjointness retry run even after a
+/// frame pointer has been LOST somewhere in this entry.
+///
+/// The gate's own comment says "only the OBSERVED escape bars this retry", but
+/// the code also bars `frame_pointer_lost`, which is accumulated over the whole
+/// entry rather than established for the block being retried. Measured on
+/// systems.xpl, that one gate is true in 100% of the imprecise-store stalls
+/// (45 of 45 occurrences) while the observed escape is false in 38 of them, so
+/// it alone blocks all 31 entries this cause leaves incomplete.
+///
+/// Relaxing it is a real relaxation, not a bookkeeping fix: a frame pointer that
+/// reached untracked memory earlier can come back from an opaque read later,
+/// where `is_frame_pointer_value` cannot recognise it. The per-BLOCK check
+/// inside the executor (`vm_stack_pointer_lost`) still applies, so this only
+/// widens the entry-accumulated gate. Anything it recovers carries
+/// `AssumesExternalStoresDisjointFromVmStack` and never reaches N2.
+fn retry_when_frame_pointer_lost() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_RETRY_FRAME_LOST").is_some())
+}
+
 fn retry_every_tainted_block() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VMPX_RETRY_TAINTED_ALL").is_ok_and(|v| v == "1"))
@@ -3881,7 +3902,7 @@ impl Walker<'_, '_> {
                     // the same unproven tier, so denying it bought nothing and
                     // cost every entry that closed a strided loop.
                     && !self.frame_not_private
-                    && !self.frame_pointer_lost =>
+                    && (!self.frame_pointer_lost || retry_when_frame_pointer_lost()) =>
             {
                 // A tainted branch block stalls; retry it once with loaded-data
                 // store addresses under the labeled disjointness assumption.
@@ -4032,10 +4053,21 @@ impl Walker<'_, '_> {
             return;
         };
         if symbolic.memory_tainted {
+            // Say WHICH gate kept the labeled disjointness retry from running.
+            // The retry exists (see `decode_block`) but is gated on the boundary
+            // kind and on the frame not having escaped, and without this the
+            // stall text cannot tell those cases apart -- so the 31 entries
+            // blocked here look like one cause when they may be three.
             self.stall(
                 key,
                 vip,
-                "branch target follows an imprecise external-memory store",
+                format!(
+                    "branch target follows an imprecise external-memory store                      (retry gates: frame_not_private={} frame_pointer_lost={}                      frame_escape_seen={} frame_privacy_conceded={})",
+                    self.frame_not_private,
+                    self.frame_pointer_lost,
+                    self.frame_escape_seen,
+                    self.frame_privacy_conceded,
+                ),
             );
             return;
         }

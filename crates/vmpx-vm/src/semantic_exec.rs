@@ -951,7 +951,16 @@ impl<'a> SymbolicMachine<'a> {
             self.memory_tainted = true;
             self.memory_havocs.push(SymbolicMemoryHavoc {
                 instruction_index,
-                cause: "external store address may alias tracked VM memory".to_owned(),
+                // Which sub-condition refused: the entry-level retry gate can be
+                // widened without effect while this one still holds, so the two
+                // have to be distinguishable from the stall text alone.
+                cause: format!(
+                    "external store address may alias tracked VM memory                      (assume_disjoint={} is_frame_ptr={} stack_escapes={} ptr_lost={})",
+                    self.assume_loaded_store_addresses_disjoint,
+                    is_frame_pointer_value(address),
+                    self.vm_stack_address_escapes,
+                    self.vm_stack_pointer_lost,
+                ),
             });
             return Ok(());
         }
