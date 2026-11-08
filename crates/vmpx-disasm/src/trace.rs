@@ -195,6 +195,16 @@ fn stop(
 /// the class: these handlers genuinely BRANCH, and codec recovery models a
 /// linear handler via a backward slice of a linear trace. No way of tracing
 /// further fixes that -- it needs a handler model that admits control flow.
+/// Whether any operand is a memory reference.
+///
+/// A logical op reading memory still clears CF and OF, but the trace treats a
+/// memory operand as a reason to learn nothing: the same conservatism the rest
+/// of this module applies, so a faulting or protector-rewritten operand cannot
+/// decide a branch.
+fn touches_memory(instruction: &Instruction) -> bool {
+    (0..instruction.op_count()).any(|op| instruction.op_kind(op) == OpKind::Memory)
+}
+
 #[derive(Clone, Copy, Default)]
 struct FlagState {
     cf: Option<bool>,
@@ -234,6 +244,25 @@ impl FlagState {
                 self.zf = Some(true);
                 self.sf = Some(false);
                 self.of = Some(false);
+                return;
+            }
+            // A logical operation CLEARS CF and OF, by definition, whatever its
+            // operands hold -- the architecture says so for `and`, `or`, `xor`
+            // and `test`. So an unsigned-carry or overflow predicate after one
+            // is decided even though the value tested is entirely unknown, and
+            // VMProtect's padding is full of them.
+            //
+            // This is reached only by the forms the exact arm above did not
+            // already settle, so `xor r,r` keeps its stronger result. ZF and SF
+            // genuinely depend on the value and stay unknown, which is what
+            // leaves a real `jz`/`js` guard still stopping the trace.
+            Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Test
+                if !touches_memory(instruction) =>
+            {
+                self.cf = Some(false);
+                self.of = Some(false);
+                self.zf = None;
+                self.sf = None;
                 return;
             }
             _ => {}
@@ -497,6 +526,59 @@ pub fn trace_direct_jump_fragments(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_logical_operation_decides_carry_and_overflow_predicates() {
+        use iced_x86::code_asm::{CodeAssembler, eax, ecx};
+        // `test eax,ecx` tells us nothing about the value, but CF and OF are
+        // cleared by definition, so `jae` and `jno` are decided and `je` is not.
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.test(eax, ecx).expect("test");
+        let bytes = a.assemble(0x1000).expect("assemble");
+        let mut decoder = iced_x86::Decoder::with_ip(64, &bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+        let instruction = decoder.decode();
+
+        let mut flags = FlagState::default();
+        flags.apply(&instruction);
+        assert_eq!(flags.decides(ConditionCode::ae), Some(true));
+        assert_eq!(flags.decides(ConditionCode::b), Some(false));
+        assert_eq!(flags.decides(ConditionCode::no), Some(true));
+        assert_eq!(flags.decides(ConditionCode::o), Some(false));
+        // The value is still unknown, so a real zero/sign guard must not decide.
+        assert_eq!(flags.decides(ConditionCode::e), None);
+        assert_eq!(flags.decides(ConditionCode::s), None);
+        // And a signed comparison needs OF *and* SF, so it stays undecided.
+        assert_eq!(flags.decides(ConditionCode::l), None);
+    }
+
+    #[test]
+    fn a_logical_operation_on_memory_decides_nothing() {
+        use iced_x86::code_asm::{CodeAssembler, dword_ptr, eax, rbx};
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.test(dword_ptr(rbx), eax).expect("test mem");
+        let bytes = a.assemble(0x1000).expect("assemble");
+        let mut decoder = iced_x86::Decoder::with_ip(64, &bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        let mut flags = FlagState::default();
+        flags.apply(&instruction);
+        assert_eq!(flags.decides(ConditionCode::ae), None);
+        assert_eq!(flags.decides(ConditionCode::no), None);
+    }
+
+    #[test]
+    fn xor_on_one_register_still_gives_the_stronger_result() {
+        use iced_x86::code_asm::{CodeAssembler, eax};
+        let mut a = CodeAssembler::new(64).expect("asm");
+        a.xor(eax, eax).expect("xor");
+        let bytes = a.assemble(0x1000).expect("assemble");
+        let mut decoder = iced_x86::Decoder::with_ip(64, &bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        let mut flags = FlagState::default();
+        flags.apply(&instruction);
+        // The general logical rule would leave ZF unknown; the exact arm must win.
+        assert_eq!(flags.decides(ConditionCode::e), Some(true));
+        assert_eq!(flags.decides(ConditionCode::ae), Some(true));
+    }
+
     use super::*;
 
     fn executable_pe64(code: &[u8]) -> Vec<u8> {

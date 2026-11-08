@@ -2532,9 +2532,42 @@ fn transition_prefix_scale() -> usize {
     })
 }
 
+/// Whether an observed frame escape -- and only that -- bars the tainted-block
+/// retry.
+///
+/// `VMPX_NO_WIDER_TAINT_RETRY=1` restores the older, stricter pair of gates
+/// (`frame_not_private` here and a default-off lost-pointer retry), so the
+/// change can be measured against itself in one build.
+fn wider_taint_retry_disabled_by_escape(walker: &Walker<'_, '_>) -> bool {
+    if wider_taint_retry_disabled() {
+        return walker.frame_not_private;
+    }
+    walker.frame_escape_seen
+}
+
+fn wider_taint_retry_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("VMPX_NO_WIDER_TAINT_RETRY").is_some())
+}
+
+/// Whether a lost frame pointer still allows the tainted-block retry.
+///
+/// This defaulted OFF, and every one of the 124 measured occurrences of the
+/// imprecise-external-store stall has `frame_pointer_lost` set -- so the gate
+/// above could be loosened to exactly its documented intent and still refuse
+/// every one of them. A lost frame pointer means a cell holding one was
+/// discarded by a havoc, so a later loaded-data address COULD be that pointer;
+/// the retry's result is labeled `AssumesExternalStoresDisjointFromVmStack`
+/// either way and never reaches N2, which is what makes conceding it here an
+/// N1 question rather than a soundness one.
 fn retry_when_frame_pointer_lost() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VMPX_RETRY_FRAME_LOST").is_some())
+    *ON.get_or_init(|| {
+        if wider_taint_retry_disabled() {
+            return std::env::var_os("VMPX_RETRY_FRAME_LOST").is_some();
+        }
+        std::env::var_os("VMPX_NO_RETRY_FRAME_LOST").is_none()
+    })
 }
 
 fn retry_every_tainted_block() -> bool {
@@ -4023,7 +4056,20 @@ impl Walker<'_, '_> {
                     // frame is aliased, and the retry's own result is labeled
                     // the same unproven tier, so denying it bought nothing and
                     // cost every entry that closed a strided loop.
-                    && !self.frame_not_private
+                    //
+                    // That is what the condition now says. It used to say
+                    // `!frame_not_private`, which is
+                    // `vm_stack_address_escapes || past_frame` -- so a store
+                    // above the frame's high-water mark barred the retry too,
+                    // contradicting the sentence above it. Measured over the
+                    // imprecise-external-store class, that is the dominant
+                    // state: 82 of 124 occurrences have `frame_not_private`
+                    // set with `frame_escape_seen` CLEAR, i.e. refused for a
+                    // reason the comment says is not a reason. A store past
+                    // the frame bound says the VM wrote above the region this
+                    // analysis modelled; it does not say anything external
+                    // aliases the VM stack, which is what the retry concedes.
+                    && !wider_taint_retry_disabled_by_escape(self)
                     && (!self.frame_pointer_lost || retry_when_frame_pointer_lost()) =>
             {
                 // A tainted branch block stalls; retry it once with loaded-data

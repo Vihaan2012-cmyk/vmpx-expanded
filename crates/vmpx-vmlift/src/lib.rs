@@ -780,6 +780,7 @@ mod tests {
             memory_tainted: true,
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
             served_read_only_image: false,
             protection_may_have_changed: false,
             vm_stack_address_escapes: false,
