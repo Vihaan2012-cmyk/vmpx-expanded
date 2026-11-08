@@ -903,6 +903,20 @@ struct Scan {
     /// when `collect` is set; never read by recovery.
     collect: bool,
     all_refusals: Vec<RawLeaf>,
+    /// Nodes already scanned.
+    ///
+    /// `Expr` is hash-consed, so a target whose subtree is shared N ways was
+    /// walked N times: the scan was exponential in SHARING rather than linear in
+    /// nodes. Measured on entry 0xc48d670, `infer_branch_input_domains` did not
+    /// return in 540s against a 120s budget -- the spin recorded at
+    /// `ReportOptions::new` ("around entry index 385-388, rva ~0xc82b466"), which
+    /// is why the default per-block instruction limit is pinned at 512.
+    ///
+    /// Scanning a node twice does nothing the first scan did not: every handler
+    /// is a function of the node itself, `direct_mask` is OR-accumulated and a
+    /// refusal is sticky. Hashing is O(1) (each node caches its structural hash)
+    /// and equality is a pointer test, so the set costs nothing per node.
+    seen: std::collections::HashSet<Expr, crate::expr::FxBuild>,
 }
 
 /// One offending leaf as the scan saw it (diagnostic).
@@ -949,6 +963,9 @@ impl Scan {
     }
 
     fn visit(&mut self, expr: &Expr) {
+        if !self.seen.insert(expr.clone()) {
+            return;
+        }
         match &expr.kind {
             ExprKind::Const { .. } => {}
             ExprKind::Load { address } => {
@@ -1536,6 +1553,7 @@ pub fn infer_branch_input_domains(
         refusal: None,
         collect: false,
         all_refusals: Vec::new(),
+        seen: std::collections::HashSet::default(),
     };
     scan.visit(target);
     if let Some(refusal) = scan.refusal {
@@ -1722,6 +1740,7 @@ pub fn diagnose_branch_refusals(target: &Expr, limits: InputDomainLimits) -> Vec
         refusal: None,
         collect: true,
         all_refusals: Vec::new(),
+        seen: std::collections::HashSet::default(),
     };
     scan.visit(&abstracted);
     let mut leaves: Vec<(&'static str, RawLeaf)> = std::mem::take(&mut scan.all_refusals)

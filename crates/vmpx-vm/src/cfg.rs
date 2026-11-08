@@ -2575,6 +2575,10 @@ pub(crate) fn bind_preferred_base_registers_except(
 /// Distinct flag bits the ordinary flag-fork fallback enumerates.
 const DEFAULT_MAX_FLAGS: usize = 2;
 
+/// Node evaluations one branch-target enumeration may cost (combinations x
+/// expression nodes). See the refusal in [`resolve_over_inputs_capped`].
+const MAX_ENUMERATION_WORK: usize = 4_000_000;
+
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
 /// Diagnostic: with `VMPX_MEM_TRACE=1`, names any single call that ran longer
@@ -2626,7 +2630,9 @@ fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool
 }
 
 fn resolve_targets_inner(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    phase("rt/simplify");
     let simplified = target.simplify();
+    phase("rt/simplified");
     if let ExprKind::Const { value } = simplified.kind {
         return Ok((vec![value], false));
     }
@@ -2648,6 +2654,7 @@ pub(crate) fn resolve_over_inputs_capped(
     limits: VmCfgLimits,
     max_flags: usize,
 ) -> Result<(Vec<u64>, bool), String> {
+    phase("rt/infer_branch_input_domains");
     let inferred = match infer_branch_input_domains(simplified, limits.input_domain) {
         Ok(inferred) => inferred,
         Err(refusal) => {
@@ -2655,6 +2662,7 @@ pub(crate) fn resolve_over_inputs_capped(
             // of flag bits the affine-domain path cannot characterize still
             // forks exactly when every input reaches the target through a
             // boolean, by enumerating that boolean over {0, 1}.
+            phase("rt/flagfork(after infer refusal)");
             return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!(
@@ -2670,7 +2678,41 @@ pub(crate) fn resolve_over_inputs_capped(
             .max(limits.input_domain.max_values_per_variable),
         ..limits.domain
     };
-    let report = match enumerate_symbolic_value(simplified, &inferred.domains, domain) {
+    // Bound the enumeration's WORK, not just its two factors.
+    //
+    // `enumerate_symbolic_value` evaluates the target once per input combination,
+    // so its cost is combinations x nodes. `max_combinations` (4096) bounds one
+    // factor and `max_expression_nodes` (200_000) the other, and nothing bounded
+    // the product: a single branch could cost ~8e8 node evaluations with no
+    // wall-clock check inside it. Measured on entry 0xc48d670, one call did not
+    // return in 540s against a 120s budget.
+    //
+    // This is the spin recorded at `ReportOptions::new`: "one entry spins
+    // indefinitely (observed 62 minutes with no progress, around entry index
+    // 385-388, rva ~0xc82b466) and the per-entry wall-clock limit does not bound
+    // it". It is why the default instruction limit is pinned at 512.
+    //
+    // A deterministic work budget rather than a deadline: the same input must
+    // give the same answer on every run, which a clock cannot promise. Refusing
+    // takes the flag-fork fallback already used when the cross-product is
+    // infeasible, and failing that the branch stalls -- incomplete, never unsound.
+    let combinations = inferred
+        .domains
+        .values()
+        .try_fold(1_usize, |acc, values| acc.checked_mul(values.len().max(1)))
+        .unwrap_or(usize::MAX);
+    let nodes = simplified.node_count_bounded(domain.max_expression_nodes);
+    let work = combinations.saturating_mul(nodes);
+    phase("rt/enumerate");
+    let enumerated = if work > MAX_ENUMERATION_WORK {
+        Err(format!(
+            "enumeration would cost {combinations} combinations x {nodes} nodes"
+        ))
+    } else {
+        enumerate_symbolic_value(simplified, &inferred.domains, domain)
+            .map_err(|error| format!("{error}"))
+    };
+    let report = match enumerated {
         Ok(report) => report,
         Err(error) => {
             // The full input cross-product is infeasible (too many independent
@@ -2679,6 +2721,7 @@ pub(crate) fn resolve_over_inputs_capped(
             // real target set is tiny. Enumerate those flags over {0, 1} instead.
             // Sound: each substituted flag is proven single-bit, and any residual
             // input dependence fails the branch closed rather than guessing.
+            phase("rt/flagfork(after enumerate refusal)");
             return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!("target enumeration failed: {error} [flagfork={why}]")),
@@ -3889,14 +3932,17 @@ impl Walker<'_, '_> {
         let boundary_at = std::time::Instant::now();
         match boundary {
             Some(VmHandlerSemantic::VmExit) => {
+                phase("boundary/follow_nested_entry");
                 self.follow_nested_entry(key, final_state.vip, &symbolic, pending);
                 note_slow("follow_nested_entry", boundary_at);
             }
             Some(VmHandlerSemantic::UnconditionalBranch) => {
+                phase("boundary/follow_branch");
                 self.follow_branch(key, final_state, &symbolic, pending);
                 note_slow("follow_branch", boundary_at);
             }
             Some(VmHandlerSemantic::NativeCall) => {
+                phase("boundary/follow_native_call");
                 self.follow_native_call(key, final_state, &symbolic, pending);
                 note_slow("follow_native_call", boundary_at);
             }
@@ -3949,6 +3995,13 @@ impl Walker<'_, '_> {
     /// Resolves a computed branch whose next-VIP reads a read-only image
     /// jump/const table at a proven-finite index, returning the exact concrete
     /// targets or `None` when no sound read-only table recovery applies.
+    /// [`resolve_targets`] with the phase marker, so a walk stuck in the target
+    /// enumeration is identifiable from the trace alone.
+    fn resolve_branch_targets(&self, bound_target: &Expr) -> Result<(Vec<u64>, bool), String> {
+        phase("branch/resolve_targets");
+        resolve_targets(bound_target, self.limits)
+    }
+
     fn resolve_readonly_image_table(&self, bound_target: &Expr) -> Option<Vec<u64>> {
         let limits = ImageTableBranchLimits {
             input_domain: self.limits.input_domain,
@@ -4005,7 +4058,7 @@ impl Walker<'_, '_> {
         let mut gate_route = None;
         let mut primary_resolved = false;
         let (targets, guarded, bound_registers, mut environment_gate) =
-            match resolve_targets(&bound_target, self.limits) {
+            match self.resolve_branch_targets(&bound_target) {
                 Ok((targets, guarded)) => {
                     primary_resolved = true;
                     if diagnostics_enabled() {
@@ -4017,12 +4070,16 @@ impl Walker<'_, '_> {
                     // A VMProtect CPUID / timestamp-counter anti-analysis gate
                     // stalls here because the environment value is statically
                     // unknown: resolve it by a sound both-target over-approximation.
+                    phase("branch/resolve_environment_gate");
                     if let Some((targets, guarded, gate_registers)) =
                         resolve_environment_gate(target, &is_image_va, self.limits)
                     {
                         gate_route = Some(EnvironmentGateRoute::LegacyGate);
                         (targets, guarded, gate_registers, true)
-                    } else if let Some(targets) = self.resolve_readonly_image_table(&bound_target) {
+                    } else if let Some(targets) = {
+                        phase("branch/resolve_readonly_image_table");
+                        self.resolve_readonly_image_table(&bound_target)
+                    } {
                         // A jump/const-table branch whose next-VIP reads a
                         // read-only image table at a proven-finite index: the
                         // table bytes are definitive, so enumerate the exact
@@ -4096,6 +4153,7 @@ impl Walker<'_, '_> {
         let mut observed_consulted = false;
         let mut observed_followed = false;
         let section = self.ctx_section();
+        phase(&format!("branch/targets_loop n={}", targets.len()));
         for value in targets {
             let target_va = Va(value);
             if section.is_none() || bytecode_section(self.pe, target_va) != section {
