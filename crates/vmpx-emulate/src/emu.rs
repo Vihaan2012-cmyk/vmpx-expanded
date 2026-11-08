@@ -446,8 +446,25 @@ pub struct Prof {
     /// Ops that are a direct `jmp` fused onto the previous op. They still
     /// occupy an op slot, so each costs a step and a flow-interest check while
     /// doing nothing but moving `rip` -- VMProtect scatters a handler across
-    /// fragments joined by these, so the share is worth knowing.
+    /// fragments joined by these, so the share is worth knowing. Measured at
+    /// 14-16% of all steps on systems.xpl.
+    ///
+    /// Dropping them at block build was tried twice and must not be: a step
+    /// budget is a CONTRACT that k steps are k guest instructions, and
+    /// `fast_paths_match_reference_interpreter` enforces it by requiring
+    /// `run_until(target, k)` to behave exactly as k reference steps. Eliding
+    /// lets the block path outrun the reference inside the same budget, so it
+    /// reaches the target where the reference stops at the limit. It also
+    /// bought no wall-clock -- the fused path is already nearly free -- so the
+    /// only thing it changed was the meaning of a step.
     pub fused_jumps: u64,
+    /// `Jcc` ops whose immediately preceding op in the block is the flag
+    /// producer they read. Fusing the pair would let the condition come
+    /// straight from the operands, skipping the rflags materialisation, the
+    /// undefined-flag guard and the `cc_val` read.
+    pub cmp_jcc_pairs: u64,
+    /// `Jcc` ops in total, for the share.
+    pub jcc_total: u64,
     /// Checksum loops folded, and guest iterations those folds retired.
     pub folded: u64,
     pub folded_iterations: u64,
@@ -469,6 +486,8 @@ impl Default for Prof {
             block_ops: 0,
             single: 0,
             fused_jumps: 0,
+            cmp_jcc_pairs: 0,
+            jcc_total: 0,
             folded: 0,
             folded_iterations: 0,
             copies_folded: 0,
@@ -520,6 +539,7 @@ struct Block {
     /// One bit per `bloom_bit(op rip)`: a `run_until` target absent from it is
     /// not any op's address.
     bloom: u64,
+
 }
 
 /// A contiguous run of guest code inside a [`Block`].
@@ -583,7 +603,8 @@ impl Block {
     #[inline]
     fn has(&self, target: Option<u64>) -> bool {
         target.is_some_and(|t| {
-            self.bloom >> bloom_bit(t) & 1 != 0 && self.ops[1..].iter().any(|p| p.rip == t)
+            self.bloom >> bloom_bit(t) & 1 != 0
+                && self.ops[1..].iter().any(|p| p.rip == t)
         })
     }
 }
@@ -1172,6 +1193,25 @@ impl Emulator {
                 && j.rip == p.rip.wrapping_add(u64::from(p.len))
                 && t.rip == j.a.v;
             b.ops[i].fj = fuse;
+        }
+        // A `Jcc` is pairable with the nearest preceding op that WRITES flags,
+        // not merely the adjacent one: VMProtect puts a direct `jmp` (and other
+        // flag-neutral junk) between the producer and the consumer, so adjacency
+        // alone finds almost none of them.
+        for i in 1..b.ops.len() {
+            if b.ops[i].kind != K::Jcc {
+                continue;
+            }
+            for j in (0..i).rev() {
+                let k = b.ops[j].kind;
+                if k == K::Slow {
+                    break;
+                }
+                if flag_def(k).is_some() || matches!(k, K::AdcSbbRR | K::AdcSbbRI | K::Cmc) {
+                    b.ops[i].pairable = flag_prod(k).is_some();
+                    break;
+                }
+            }
         }
         mark_dead_flags(&mut b.ops);
         for p in &mut b.ops {
@@ -1960,6 +2000,10 @@ impl Emulator {
                 return Ok(t);
             }
             K::Jcc => {
+                self.prof.jcc_total += 1;
+                if p.pairable {
+                    self.prof.cmp_jcc_pairs += 1;
+                }
                 let und = self.cpu.undef_flags & u64::from(p.m);
                 if und != 0 {
                     return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: und }));

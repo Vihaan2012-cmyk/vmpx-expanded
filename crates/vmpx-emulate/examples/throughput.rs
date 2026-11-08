@@ -91,6 +91,17 @@ fn main() {
             p.fused_jumps,
             pct(p.fused_jumps)
         );
+        let pair_share = if p.jcc_total == 0 {
+            0.0
+        } else {
+            100.0 * p.cmp_jcc_pairs as f64 / p.jcc_total as f64
+        };
+        println!(
+            "jcc={} cmp+jcc pairs={} ({pair_share:.1}% of jcc, {:.1}% of steps)",
+            p.jcc_total,
+            p.cmp_jcc_pairs,
+            pct(p.cmp_jcc_pairs)
+        );
     }
     println!(
         "folded={} folded_iterations={} copies={} copied_bytes={} declined={}",

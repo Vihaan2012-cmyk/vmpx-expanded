@@ -154,6 +154,9 @@ pub(crate) struct Pre {
     /// The flags this op produces are overwritten, unobserved, by a later op in
     /// its block (set when placed in a block).
     pub nf: bool,
+    /// This `Jcc`'s flags come from the op immediately before it in the block,
+    /// so the pair could be evaluated as one.
+    pub pairable: bool,
     /// May write memory or run a hook (so guest code may have changed after it).
     pub chk: bool,
     pub a: Opnd,
@@ -175,6 +178,7 @@ impl Pre {
         flow: false,
         fj: false,
         nf: false,
+        pairable: false,
         chk: true,
         a: NONE,
         b: NONE,
