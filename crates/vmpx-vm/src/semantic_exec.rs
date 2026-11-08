@@ -55,6 +55,13 @@ const WIN64_ARGUMENT_REGISTERS: [&str; 4] = ["RCX", "RDX", "R8", "R9"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SymbolicExecutionLimits {
+    /// Top of the entry stub's fresh frame, in `vsp_initial` coordinates.
+    ///
+    /// A tracked cell at or above this is NOT in the VM's private allocation --
+    /// it is caller memory an external pointer may alias -- so the narrowed
+    /// havoc discards it. That makes the discharge's "every cell lies inside the
+    /// frame" obligation hold directly.
+    pub private_frame_hi: Option<i64>,
     pub max_instructions: usize,
     pub max_memory_bytes: usize,
     pub max_expression_nodes: usize,
@@ -91,6 +98,7 @@ pub struct SymbolicExecutionLimits {
 impl Default for SymbolicExecutionLimits {
     fn default() -> Self {
         Self {
+            private_frame_hi: None,
             max_instructions: 4_096,
             max_memory_bytes: 1_048_576,
             max_expression_nodes: 200_000,
@@ -556,6 +564,7 @@ struct SymbolicMachine<'a> {
     vm_stack_pointer_lost: bool,
     frame_pointer_in_memory: bool,
     vm_stack_store_hi: Option<i64>,
+    limits_private_frame_hi: Option<i64>,
     checksum_byte_limit: usize,
 }
 
@@ -656,6 +665,7 @@ impl<'a> SymbolicMachine<'a> {
                 .iter()
                 .any(|(_, value)| is_frame_pointer_value(value)),
             vm_stack_store_hi: None,
+            limits_private_frame_hi: limits.private_frame_hi,
             checksum_byte_limit: limits.max_memory_bytes,
         };
         for (offset, value) in &initial.context_values {
@@ -1019,13 +1029,21 @@ impl<'a> SymbolicMachine<'a> {
         // stack, and because the VM-stack assumption is discharged for a
         // provably private frame -- which says nothing about an allocation
         // whose pointer the frame may have handed out.
+        // Out-of-frame vsp-rooted cells are caller memory; an external store
+        // may alias them, so they cannot be preserved on trust.
+        let frame_hi = frame_scoped_retain()
+            .then_some(self.limits_private_frame_hi)
+            .flatten();
+        let in_frame = move |address: &Expr| {
+            frame_hi.is_none_or(|hi| pointer_offset(address).is_some_and(|off| off < hi))
+        };
         let keep_allocations = retain_fresh_allocations();
         let retained_fresh_allocation = keep_allocations
             && self.memory.iter().any(|(address, _)| {
                 pointer_offset(address).is_none() && fresh_allocation_offset(address).is_some()
             });
         self.retain_memory(|cell_address| {
-            pointer_offset(cell_address).is_some()
+            (pointer_offset(cell_address).is_some() && in_frame(cell_address))
                 || (keep_allocations && fresh_allocation_offset(cell_address).is_some())
         });
         self.image_reads_suppressed = true;
@@ -1587,6 +1605,18 @@ pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
 fn serve_read_only_when_tainted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VMPX_NO_SERVE_RO_TAINTED").is_none())
+}
+
+/// Whether the narrowed havoc keeps only cells inside the private frame.
+///
+/// OPT-IN (`VMPX_FRAME_SCOPED_RETAIN=1`), because on its own it measured N1
+/// 733 -> 732 and N2 unchanged: discarding out-of-frame cells costs precision
+/// and buys nothing until the discharge stops using `past_frame` as its proxy
+/// for "every cell lies inside the frame". It exists because it is the
+/// prerequisite for that change, which is worth 119 entries on N2.
+fn frame_scoped_retain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_FRAME_SCOPED_RETAIN").is_ok_and(|v| v == "1"))
 }
 
 fn retain_fresh_allocations() -> bool {

@@ -4895,6 +4895,17 @@ impl Walker<'_, '_> {
         // Data read from the frame is benign only if no cell holding a frame
         // pointer was discarded (an untracked load could otherwise return it).
         let derived_leak = self.frame_pointer_lost && self.frame_derived_escape;
+        // NOT relaxed to `frame_escape_seen`, though the measurement is
+        // tempting: 119 CFG-complete entries are refused on `past_frame` alone,
+        // and the narrowed havoc now discards out-of-frame cells, which makes
+        // the "every cell lies inside the frame" obligation hold directly.
+        //
+        // Left as-is because discharging moves an entry into N2 = PROVEN, and
+        // `vm_stack_assumption_discharges_only_when_the_frame_is_provably_private`
+        // asserts a write past the frame must block it. That test cannot observe
+        // the retention invariant (it drives the discharge with synthetic
+        // reports), so relaxing here would remove a guard with nothing checking
+        // the replacement.
         if self.private_frame_hi.is_some()
             && !self.frame_not_private
             && !self.frame_privacy_conceded
@@ -5363,6 +5374,7 @@ pub fn recover_vm_cfg_with_observed(
             DIAG_FRAME_HI.with(|hi| hi.set(Some(frame_hi)));
             if !exposed {
                 private_frame_hi = Some(frame_hi.cast_signed());
+                limits.entry.symbolic.private_frame_hi = private_frame_hi;
             }
             (initial, known, None)
         }
