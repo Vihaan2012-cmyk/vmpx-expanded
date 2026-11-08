@@ -159,6 +159,7 @@ fn tier(a: &[VmCfgAssumption]) -> &'static str {
             | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => 3,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
             | VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations
+            | VmCfgAssumption::AssumesStalledBlockExits
             | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
             | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable

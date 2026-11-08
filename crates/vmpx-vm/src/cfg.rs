@@ -359,6 +359,22 @@ pub enum VmCfgAssumption {
     /// address 0 always raises -- and so is the SEH coverage, which comes from
     /// the image's own exception directory.
     AssumesNullReadFaultExitsViaSeh,
+    /// A block that STALLED was closed as a VM exit anyway, because
+    /// `VMPX_ASSUME_STALLED_BLOCKS_EXIT` was set.
+    ///
+    /// Deliberately unsound, and named so that no report can show it without
+    /// saying so. It exists to measure the N1 ceiling and to put a counted
+    /// label on every blocker that remains, so the work of discharging them has
+    /// a denominator. An entry carrying this has an unresolved branch, an
+    /// unrecovered handler or an unproven continuation that was simply declared
+    /// to be an exit.
+    ///
+    /// It can never reach N2: any assumption excludes an entry from the proven
+    /// tier, so the sound number is unaffected by construction. And it converts
+    /// a stall into a labeled exit rather than inventing an edge, a value or a
+    /// handler specification, so nothing downstream consumes a fabricated fact
+    /// -- the graph is honestly incomplete, just no longer counted as such.
+    AssumesStalledBlockExits,
     /// Generalizing or closing a loop conceded that nothing outside the VM
     /// aliases the VM stack frame. A widened state, or one re-expressed at a
     /// moved stack base, describes the same concrete memory only under that
@@ -1317,6 +1333,18 @@ fn cell_token(address: &str) -> String {
 fn null_read_seh_exit_enabled() -> bool {
     static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_NULL_READ_SEH_EXIT").is_none())
+}
+
+/// Whether a stalled block is closed as a labeled exit instead of stalling.
+///
+/// Off unless `VMPX_ASSUME_STALLED_BLOCKS_EXIT=1`. See
+/// [`VmCfgAssumption::AssumesStalledBlockExits`] for why this is safe to have
+/// and not safe to trust.
+fn assume_stalled_blocks_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VMPX_ASSUME_STALLED_BLOCKS_EXIT").is_ok_and(|value| value == "1")
+    })
 }
 
 /// Short class of a symbolic-execution failure, so the stall histogram separates
@@ -2433,6 +2461,9 @@ struct Walker<'a, 'p> {
     cache: LinearDecodeCache,
     decoded: BTreeMap<Va, DecodedBlock>,
     explored: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
+    /// Stalls a ceiling run closed as labeled exits, kept so the run still
+    /// reports WHICH blocker each assumption stood in for.
+    assumed_exits: Vec<CfgStall>,
     /// Per-block running over-approximation used once a block has hit the
     /// `max_visits_per_block` cap with distinct states that no path-local loop
     /// generalizes (blocks re-reached through many sibling paths, whose only drift
@@ -3446,6 +3477,26 @@ impl Walker<'_, '_> {
     }
 
     fn stall(&mut self, block: Va, vip: Va, reason: impl Into<String>) {
+        if assume_stalled_blocks_exit() {
+            // Record what was given up, then close the block. The reason is
+            // kept as a note so the ceiling run still says WHICH blocker each
+            // assumption stood in for; it just no longer counts as a stall.
+            self.assumed_exits.push(CfgStall {
+                block,
+                vip,
+                reason: reason.into(),
+            });
+            if let Some(existing) = self.cfg.blocks.get_mut(&block) {
+                existing.exit = BlockExit::VmExit;
+            }
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesStalledBlockExits);
+            // A ceiling run must also drop the limit, or `is_complete` still
+            // refuses on `BlockVisits`.
+            self.cfg.limit_hit = None;
+            return;
+        }
         self.cfg.stalls.push(CfgStall {
             block,
             vip,
@@ -5341,6 +5392,7 @@ pub fn recover_vm_cfg_with_observed(
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
         explored: BTreeMap::new(),
+        assumed_exits: Vec::new(),
         widened: BTreeMap::new(),
         cfg: VmCfg {
             entry: setup.first_state.vip,
@@ -5602,6 +5654,7 @@ mod tests {
             cache: LinearDecodeCache::default(),
             decoded: BTreeMap::new(),
             explored: BTreeMap::new(),
+            assumed_exits: Vec::new(),
             widened: BTreeMap::new(),
             cfg: VmCfg {
                 entry: Va(crate::immutable_image::tests::RDATA_VA),

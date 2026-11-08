@@ -947,7 +947,8 @@ fn main() {
                     | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => "OBSERVED",
                     VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
                     | VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations
-                    | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
+                    | VmCfgAssumption::AssumesStalledBlockExits
+            | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
                     | VmCfgAssumption::AssumesVmStackFramePrivate
                     | VmCfgAssumption::AssumesImageProtectionStable
                     | VmCfgAssumption::AssumesCrossVmSectionContinuation => "UNPROVEN-ASSUMPTION",
