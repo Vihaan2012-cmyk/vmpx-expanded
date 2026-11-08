@@ -254,6 +254,44 @@ fn transition_scale() -> usize {
     env_scale("VMPX_TRANSITION_BUDGET")
 }
 
+/// Diagnostic: with `VMPX_ENTRY_TRACE=<file>` set, appends a line when each
+/// entry is picked up and another when it finishes, with how long it took.
+///
+/// Without this, per-entry cost is only inferrable from aggregate CPU, and an
+/// entry that overruns its wall budget is invisible until the whole sweep ends
+/// -- which it may never do. A sweep that plateaus is the case this exists for:
+/// the `start` lines with no matching `done` line name the entries still
+/// running, and the elapsed times say whether the per-entry wall is holding.
+fn trace_entry(
+    entry: &VmEntryCandidate,
+    index: usize,
+    finished: Option<(std::time::Duration, &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>)>,
+) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("VMPX_ENTRY_TRACE") else { return };
+    let rva = format!("{:#x}", entry.rva.0);
+    let line = match finished {
+        None => format!("start {index} {rva}"),
+        Some((took, result)) => {
+            let outcome = match result {
+                Err(_) => "panic".to_owned(),
+                Ok(Err(_)) => "error".to_owned(),
+                Ok(Ok(cfg)) if cfg.all_paths_reach_vm_exit() => {
+                    format!("complete assumptions={}", cfg.assumptions.len())
+                }
+                Ok(Ok(cfg)) => cfg
+                    .limit_hit
+                    .map_or_else(|| "stall".to_owned(), |hit| format!("{hit:?}")),
+            };
+            format!("done  {index} {rva} {:.1}s {outcome}", took.as_secs_f64())
+        }
+    };
+    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Diagnostic: with `VMPX_STALL_DUMP=<file>` set, appends one JSON line per
 /// incomplete entry (rva, limit hit, stalls in discovery order), on the base
 /// sweep as well as during a budget pass.
@@ -392,10 +430,13 @@ fn recover_all(
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(entry) = entries.get(index) else { break };
+                        let began = std::time::Instant::now();
+                        trace_entry(entry, index, None);
                         let result = panic::catch_unwind(AssertUnwindSafe(|| match observed {
                             Some(run) => recover_vm_cfg_with_observed(pe, entry, limits, run),
                             None => recover_vm_cfg(pe, entry, limits),
                         }));
+                        trace_entry(entry, index, Some((began.elapsed(), &result)));
                         dump_stalls(entry, &result);
                         if let Ok(Ok(cfg)) = &result {
                             dump_discharge(entry, cfg);

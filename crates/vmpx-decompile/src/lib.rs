@@ -18,6 +18,7 @@ pub mod opt;
 pub mod render;
 pub mod structure;
 pub mod symbols;
+pub mod tidy;
 pub mod vm;
 pub mod xu;
 
@@ -353,6 +354,13 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
         mba::simplify_stmts(&mut prologue, &mut memo);
         mba::simplify_stmts(&mut body, &mut memo);
     }
+    // Drop the branches that decide nothing. VMProtect fans one logical path out
+    // across many dispatch selectors, so the structurer produces nests whose arms
+    // are identical; naming shared subtrees below cannot help with duplication at
+    // the STATEMENT level. Before the cross-check, which replays the original
+    // function against these statements and so validates the rewrite.
+    tidy::tidy_stmts(&mut prologue);
+    tidy::tidy_stmts(&mut body);
     // Give every subtree that is used more than once a name. The IR is a DAG
     // and rendering flattens it, so without this a value computed once and used
     // ten times is PRINTED ten times -- which is most of why the output reads as
@@ -366,8 +374,11 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     // the body second, so a tag lands on the line that earns it and is never
     // repeated.
     let mut said: Vec<annotate::Tag> = Vec::new();
+    // The exit components every return agrees on: reported once below instead of
+    // on each return line.
+    let exit_common = render::common_exit_components(&all_stmts);
     let mut ctx = Ctx {
-        r: Renderer { names: &names, temps: &temps.map },
+        r: Renderer { names: &names, temps: &temps.map, exit_common: &exit_common },
         out: String::new(),
         log: Vec::new(),
     };
@@ -376,6 +387,16 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     let mut text = String::new();
     for n in f.notes.iter().chain(func.notes.iter()) {
         text.push_str(&format!("// {n}\n"));
+    }
+    // What every exit path agrees on, so the per-return notes carry only what the
+    // branch actually decided.
+    if !exit_common.is_empty() {
+        let same = exit_common
+            .iter()
+            .map(|(name, value)| format!("{name}={}", ctx.r.rx(value, true).0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!("// exit, same on every path: {same}\n"));
     }
     text.push_str(&format!("{ret_ty} {}({})\n{{\n", func.name, sig.join(", ")));
     let mut by_ty: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();

@@ -2581,6 +2581,21 @@ const DEFAULT_MAX_FLAGS: usize = 2;
 /// than five seconds. The walker-level trace samples between worklist items, so
 /// it cannot fire while the walk is inside one call -- which is where the 11.7 GB
 /// transient on entry 0xdb9023d lives.
+/// Unconditional phase marker, enabled by `VMPX_TRACE_PHASES`.
+///
+/// `note_slow` prints only once a call RETURNS and only past a floor, so a call
+/// that never returns prints nothing -- indistinguishable from one that was
+/// fast. That ambiguity is what made a hung entry hard to locate. These markers
+/// pair with the `note_slow` line that follows the same call, so the last
+/// `enter` with no matching timing line names exactly where a walk is stuck.
+fn phase(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VMPX_TRACE_PHASES").is_some()) {
+        return;
+    }
+    eprintln!("[enter] {label}");
+}
+
 fn note_slow(label: &str, start: std::time::Instant) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VMPX_MEM_TRACE").is_some()) {
@@ -2595,7 +2610,11 @@ fn note_slow(label: &str, start: std::time::Instant) {
     });
     if ms >= floor {
         let (live, dead) = crate::expr::interner_census();
-        println!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
+        // stderr, not stdout: Rust BLOCK-buffers stdout when it is redirected to
+        // a file, so probe lines sit unflushed and a hung process looks silent --
+        // which reads exactly like "still inside the call that never returned".
+        // stderr is unbuffered, so these appear as they happen.
+        eprintln!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
     }
 }
 
@@ -3213,7 +3232,9 @@ impl Walker<'_, '_> {
     /// Charges the symbolic state each newly queued successor carries.
     fn account_pending(&mut self, items: &mut [Item]) -> bool {
         for item in items {
+            let sb_at = std::time::Instant::now();
             let bytes = self.state_bytes(&item.symbolic);
+            note_slow("account/state_bytes", sb_at);
             item.bytes = bytes;
             let vip = item.start.vip;
             if !self.charge(bytes, vip, vip) {
@@ -3617,7 +3638,10 @@ impl Walker<'_, '_> {
     }
 
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
+        phase("visit/mem_trace");
+        let mt_at = std::time::Instant::now();
         self.mem_trace();
+        note_slow("visit/mem_trace", mt_at);
         // Walk this block (and the successors it queues) under its profile.
         // `None` is the base profile, so the sound path is unchanged.
         self.active.clone_from(&item.profile);
@@ -3634,13 +3658,18 @@ impl Walker<'_, '_> {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
         }
+        phase("enter_loop");
         let at = std::time::Instant::now();
         let entered = self.enter_loop(item);
         note_slow("enter_loop", at);
         let Some(mut symbolic_in) = entered else {
             return;
         };
-        if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
+        phase("visit/explored_contains");
+        let seen_at = std::time::Instant::now();
+        let already = self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in));
+        note_slow("visit/explored_contains", seen_at);
+        if already {
             return;
         }
         let visited = self.explored.get(&key).map_or(0, Vec::len);
@@ -3656,6 +3685,7 @@ impl Walker<'_, '_> {
                 self.stall(key, key, "symbolic state keeps changing at this block: ceiling");
                 return;
             }
+            phase("generalize_across");
             let at = std::time::Instant::now();
             let across = self.generalize_across(key, &symbolic_in);
             note_slow("generalize_across", at);
@@ -3682,13 +3712,23 @@ impl Walker<'_, '_> {
                     symbolic_in = widened;
                 }
             }
-            if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
+            let seen2_at = std::time::Instant::now();
+            let already2 =
+                self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in));
+            note_slow("visit/explored_contains2", seen2_at);
+            if already2 {
                 return;
             }
         }
         // Held in `explored` and the path node (which clones the containers).
+        phase("visit/state_bytes");
+        let sb_at = std::time::Instant::now();
         let held = self.state_bytes(&symbolic_in).saturating_mul(2);
-        if !self.charge(held, key, key) {
+        note_slow("visit/state_bytes", sb_at);
+        let charge_at = std::time::Instant::now();
+        let ok = self.charge(held, key, key);
+        note_slow("visit/charge", charge_at);
+        if !ok {
             return;
         }
         self.explored.entry(key).or_default().push(symbolic_in.clone());
@@ -3698,6 +3738,7 @@ impl Walker<'_, '_> {
             state: symbolic_in.clone(),
             parent: item.path.clone(),
         }));
+        phase("decode_block");
         let at = std::time::Instant::now();
         let decoded_ok = self.decode_block(item);
         note_slow("decode_block", at);
@@ -3844,15 +3885,20 @@ impl Walker<'_, '_> {
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
+        phase("boundary_dispatch");
+        let boundary_at = std::time::Instant::now();
         match boundary {
             Some(VmHandlerSemantic::VmExit) => {
                 self.follow_nested_entry(key, final_state.vip, &symbolic, pending);
+                note_slow("follow_nested_entry", boundary_at);
             }
             Some(VmHandlerSemantic::UnconditionalBranch) => {
                 self.follow_branch(key, final_state, &symbolic, pending);
+                note_slow("follow_branch", boundary_at);
             }
             Some(VmHandlerSemantic::NativeCall) => {
                 self.follow_native_call(key, final_state, &symbolic, pending);
+                note_slow("follow_native_call", boundary_at);
             }
             other => self.stall(
                 key,
@@ -4782,17 +4828,39 @@ pub fn recover_vm_cfg_with_observed_memory(
 pub fn recover_vm_cfg_with_observed(
     pe: &PeImage<'_>,
     entry: &VmEntryCandidate,
-    limits: VmCfgLimits,
+    mut limits: VmCfgLimits,
     observed: &ObservedRun,
 ) -> Result<VmCfg, CfgError> {
+    // The per-entry wall has to cover ENTRY SETUP, not just the walk.
+    //
+    // The deadline used to be built after `prepare_entry_stream`, so that call's
+    // symbolic execution ran with `deadline: None` -- untimed. Measured on entry
+    // 0xc48d670: setup alone ran past 540s against a 120s budget, printing
+    // nothing and never returning. That is why a sweep plateaued near 800/814
+    // under BOTH a 20s and a 400s wall -- a handful of entries were stuck in a
+    // phase no budget reached, so they never finished and never reported
+    // WallClock either.
+    //
+    // A setup that runs out of budget fails closed as an entry error (there is no
+    // profile, so there is no CFG to return and report as incomplete). That is
+    // one honest error instead of a sweep that never ends.
+    let began = Instant::now();
+    if let Some(budget) = limits.max_wall_time {
+        limits.entry.symbolic.deadline = began.checked_add(budget);
+    }
+    let setup_at = began;
     let setup = prepare_entry_stream(pe, entry, limits.entry)?;
+    note_slow("setup/prepare_entry_stream", setup_at);
     let mut private_frame_hi = None;
-    let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
+    let frame_at = Instant::now();
+    let frame = recover_entry_frame(
         pe,
         entry.rva,
         setup.profile.effect_roles.vsp,
         limits.entry.trace,
-    ) {
+    );
+    note_slow("setup/recover_entry_frame", frame_at);
+    let (initial, frame_cells_known, frame_note) = match frame {
         Ok((cells, top_offset, exposed)) => {
             let (initial, known) = frame_initial_state(&cells, top_offset);
             let frame_hi = top_offset.wrapping_add((cells.len() as u64).wrapping_mul(8));
@@ -4864,7 +4932,7 @@ pub fn recover_vm_cfg_with_observed(
         path: None,
         profile: None,
     }];
-    let deadline = limits.max_wall_time.map(|budget| (Instant::now(), budget));
+    let deadline = limits.max_wall_time.map(|budget| (began, budget));
     // Hand the same instant to the symbolic executor: the check below bounds the
     // gaps between worklist items, not the work inside one.
     if let Some((start, budget)) = deadline {
@@ -4883,8 +4951,15 @@ pub fn recover_vm_cfg_with_observed(
         }
         walker.live_bytes = walker.live_bytes.saturating_sub(item.bytes);
         let queued = pending.len();
+        phase("loop/visit");
+        let visit_at = Instant::now();
         walker.visit(&item, &mut pending);
+        note_slow("loop/visit", visit_at);
+        let ap_at = Instant::now();
+        let ap_n = pending.len().saturating_sub(queued);
+        phase("loop/account_pending");
         walker.account_pending(&mut pending[queued..]);
+        note_slow(&format!("loop/account_pending n={ap_n}"), ap_at);
         if walker
             .cfg
             .limit_hit
@@ -4893,7 +4968,9 @@ pub fn recover_vm_cfg_with_observed(
             break;
         }
     }
+    note_slow("walk/loop-total", began);
     walker.discharge_vm_stack_assumption();
+    note_slow("walk/pre-return", began);
     Ok(walker.cfg)
 }
 

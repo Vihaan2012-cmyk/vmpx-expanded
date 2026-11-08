@@ -37,6 +37,47 @@ pub struct Renderer<'a> {
     /// expression in here renders AS that name instead of being printed again,
     /// which is what keeps a shared value from appearing ten times in one line.
     pub temps: &'a std::collections::HashMap<Expr, String>,
+    /// Exit components every `return` agrees on, stated once for the function
+    /// instead of on each return. See [`common_exit_components`].
+    pub exit_common: &'a BTreeMap<String, Expr>,
+}
+
+/// The exit components (past the C return value) that every `return` in the
+/// function agrees on.
+///
+/// Those say nothing about which branch was taken, and there are many of them:
+/// on vm_c43d80e each return carries 15, of which 1 to 3 differ. Printing all 15
+/// on every line buries the one that matters, so the agreed ones are reported
+/// once for the whole function and dropped from the individual returns.
+pub fn common_exit_components(stmts: &[Stmt]) -> BTreeMap<String, Expr> {
+    let mut common: Option<BTreeMap<String, Expr>> = None;
+    for_each_return(stmts, &mut |vals| {
+        let here: BTreeMap<String, Expr> = vals.iter().skip(1).cloned().collect();
+        common = Some(match common.take() {
+            None => here,
+            Some(prev) => prev
+                .into_iter()
+                .filter(|(name, value)| here.get(name) == Some(value))
+                .collect(),
+        });
+    });
+    common.unwrap_or_default()
+}
+
+fn for_each_return(stmts: &[Stmt], visit: &mut impl FnMut(&[(String, Expr)])) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return(vals) => visit(vals),
+            Stmt::If { then, els, .. } => {
+                for_each_return(then, visit);
+                for_each_return(els, visit);
+            }
+            Stmt::Loop(body) | Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                for_each_return(body, visit);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn hex(width: BitWidth, v: u64) -> String {
@@ -454,7 +495,21 @@ impl Ctx<'_> {
                 let (_, first) = &vals[0];
                 let e = self.lexpr(first);
                 let _ = ret_w;
-                self.line(depth, &format!("return {e};"));
+                // `vals[1..]` are the function's other exit components (callee-saved
+                // registers and the like). They used to be dropped, which made
+                // branch arms that differ ONLY in them print as identical code: on
+                // vm_c43d80e one 4-line block appeared 12 times and nothing in the
+                // text said why the branches existed.
+                let rest = vals[1..]
+                    .iter()
+                    .filter(|(name, value)| self.r.exit_common.get(name) != Some(value))
+                    .map(|(name, value)| format!("{name}={}", self.lexpr(value)))
+                    .collect::<Vec<_>>();
+                if rest.is_empty() {
+                    self.line(depth, &format!("return {e};"));
+                } else {
+                    self.line(depth, &format!("return {e};  // exit: {}", rest.join(", ")));
+                }
             }
             Stmt::Label(n) => self.line(0, &format!("L_{n:x}:")),
             Stmt::Goto(n) => self.line(depth, &format!("goto L_{n:x};")),
