@@ -1,4 +1,4 @@
-// In-process devirt coverage sweep over ALL VM entries of a (possibly packed)
+﻿// In-process devirt coverage sweep over ALL VM entries of a (possibly packed)
 // VMProtect image. Loads/unpacks the analysis image ONCE, discovers every VM
 // entry, recovers each entry's CFG with a bounded per-entry budget (mirroring
 // the `cfgdiag` example), catches per-entry panics, and tallies completeness

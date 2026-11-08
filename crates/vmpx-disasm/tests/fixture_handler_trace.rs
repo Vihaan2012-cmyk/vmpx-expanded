@@ -21,6 +21,7 @@ fn traces_ida_verified_fragmented_add_handler_to_dispatch() {
         &pe,
         entry,
         DirectJumpTraceLimits {
+            follow_conditional_fallthrough: false,
             max_fragments: 1_024,
             max_instructions: 50_000,
             max_instructions_per_fragment: 10_000,

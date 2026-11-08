@@ -115,6 +115,12 @@ pub struct HandlerCodecRecoveryReport {
     #[serde(skip)]
     pub table_dispatch: Option<TableDispatchFacts>,
     pub confidence: u8,
+    /// Conditional branches the trace walked through by taking the fallthrough,
+    /// when the clean attempt failed and the labeled retry succeeded. Non-empty
+    /// means this specification holds only on those arms, so every entry that
+    /// decodes through it carries
+    /// [`crate::VmCfgAssumption::AssumesHandlerConditionalArm`].
+    pub conditional_arms: Vec<Rva>,
     pub diagnostics: Vec<String>,
 }
 
@@ -254,12 +260,32 @@ fn apply_keyless_reentry_facts(
 /// Propagates invalid entry, decode, or postlude-proof setup errors. Ordinary
 /// extraction failures remain diagnostics with a non-recovered status.
 #[allow(clippy::too_many_lines)]
+/// Recovers a handler's codecs.
+///
+/// NOT retried through conditional branches. A handler whose fragments are
+/// joined by junk predicates leaves the trace stopping at the first of them,
+/// with no specification, and every entry using it stalls as "undecodable
+/// opcode" -- ~150 stall occurrences across 48 entries on systems.xpl. Walking
+/// on along the fallthrough was tried and reverted: `postlude_dispatch`'s
+/// `inexact_postlude_shapes_are_not_recognized` then recovers a dispatch
+/// candidate for a shape it is supposed to refuse. Stitching a postlude across
+/// an arm can recognise a shape no execution performs, so the result is not a
+/// labeled specification but a WRONG one, which is worse than none.
+///
+/// `DirectJumpTraceLimits::follow_conditional_fallthrough` still exists for a
+/// future attempt; whatever uses it has to bound what may be recovered past the
+/// arm, not merely label it.
+///
+/// # Errors
+///
+/// Propagates a decode failure at the handler entry.
 pub fn recover_handler_codecs(
     pe: &PeImage<'_>,
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,
 ) -> Result<HandlerCodecRecoveryReport, DisasmError> {
     let trace = trace_direct_jump_fragments(pe, entry, config.trace_limits)?;
+    let conditional_arms = trace.conditional_continuations.clone();
     let slice = backward_slice_handler_trace(
         &trace,
         &HandlerSliceConfig {
@@ -876,6 +902,7 @@ pub fn recover_handler_codecs(
         decode_spec,
         table_dispatch,
         confidence,
+        conditional_arms,
         diagnostics,
     })
 }

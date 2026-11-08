@@ -1,4 +1,4 @@
-// User-function devirt coverage: measures the EXPORTED virtualized functions
+﻿// User-function devirt coverage: measures the EXPORTED virtualized functions
 // (export -> [jmp ->] `push <seed>; call <wrapper>` stub), not the VMProtect
 // runtime scaffold that `discover_vm_entries` / `xpl_coverage` sweeps.
 // Static only. Per-entry wall-clock cap via XPL_ENTRY_TIMEOUT_SECS (default 60).

@@ -1798,6 +1798,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::IndirectBranch,
                 at: terminal_rva,
@@ -1951,6 +1952,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::ConditionalBranch,
                 at: terminal_rva,

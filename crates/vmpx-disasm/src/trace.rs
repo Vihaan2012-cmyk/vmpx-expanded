@@ -11,6 +11,20 @@ pub struct DirectJumpTraceLimits {
     pub max_fragments: usize,
     pub max_instructions: usize,
     pub max_instructions_per_fragment: usize,
+    /// Continue through a conditional branch along its FALLTHROUGH instead of
+    /// stopping there, recording each site in
+    /// [`DirectJumpTrace::conditional_continuations`].
+    ///
+    /// Off by default, because choosing an arm is not a proof: the other arm may
+    /// do something different, so anything recovered downstream of one is
+    /// conditional on that arm being the real path. A caller that enables this
+    /// must label whatever it recovers.
+    ///
+    /// It exists because VMProtect splits a handler across fragments joined by
+    /// junk predicates, and a trace that stops at the first of them never
+    /// reaches the handler's dispatch tail -- measured on systems.xpl, this is
+    /// what leaves ~150 handler-spec refusals and blocks 48 entries.
+    pub follow_conditional_fallthrough: bool,
 }
 
 impl Default for DirectJumpTraceLimits {
@@ -19,6 +33,7 @@ impl Default for DirectJumpTraceLimits {
             max_fragments: 1_024,
             max_instructions: 50_000,
             max_instructions_per_fragment: 10_000,
+            follow_conditional_fallthrough: false,
         }
     }
 }
@@ -60,6 +75,11 @@ pub struct DirectJumpTrace {
     pub fragments: Vec<DirectJumpFragment>,
     pub stop: DirectJumpTraceStop,
     pub decoded_instructions: usize,
+    /// Conditional branches the trace walked THROUGH, by taking the fallthrough
+    /// (see `DirectJumpTraceLimits::follow_conditional_fallthrough`). Empty
+    /// unless that was enabled. Non-empty means everything recovered from this
+    /// trace holds only on the fallthrough arm of each site listed.
+    pub conditional_continuations: Vec<Rva>,
 }
 
 impl DirectJumpTrace {
@@ -141,6 +161,7 @@ pub fn trace_direct_jump_fragments(
     decode_one(pe, entry)?;
 
     let mut fragments = Vec::new();
+    let mut conditional_continuations = Vec::new();
     let mut visited = BTreeSet::new();
     let mut decoded_instructions = 0_usize;
     let mut fragment_start = entry;
@@ -225,6 +246,22 @@ pub fn trace_direct_jump_fragments(
                     );
                 }
                 FlowControl::ConditionalBranch => {
+                    // Walking on means picking an arm, which is not a proof; the
+                    // site is recorded so the caller can label what it recovers.
+                    if limits.follow_conditional_fallthrough
+                        && let Some(fallthrough) =
+                            next.filter(|rva| is_executable_rva(pe, *rva))
+                    {
+                        conditional_continuations.push(instruction_rva);
+                        push_fragment(
+                            &mut fragments,
+                            fragment_start,
+                            instructions,
+                            Some(fallthrough),
+                        );
+                        fragment_start = fallthrough;
+                        continue 'trace;
+                    }
                     push_fragment(&mut fragments, fragment_start, instructions, None);
                     break 'trace stop(
                         DirectJumpTraceStopKind::ConditionalBranch,
@@ -286,6 +323,7 @@ pub fn trace_direct_jump_fragments(
         fragments,
         stop: terminal,
         decoded_instructions,
+        conditional_continuations,
     })
 }
 
@@ -368,6 +406,7 @@ mod tests {
             &pe,
             Rva(0x1000),
             DirectJumpTraceLimits {
+                follow_conditional_fallthrough: false,
                 max_fragments: 0,
                 max_instructions: 0,
                 max_instructions_per_fragment: 0,
