@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, RflagsBits};
+use iced_x86::{
+    ConditionCode, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
+    OpKind, Register, RflagsBits,
+};
 use serde::Serialize;
 use vmpx_pe::{PeImage, Rva};
 
@@ -195,6 +198,49 @@ fn stop(
 /// the class: these handlers genuinely BRANCH, and codec recovery models a
 /// linear handler via a backward slice of a linear trace. No way of tracing
 /// further fixes that -- it needs a handler model that admits control flow.
+/// How many register constants the trace remembers. VMProtect sets up one or two
+/// per predicate; a small fixed set keeps [`FlagState`] `Copy`.
+const TRACKED_CONSTANTS: usize = 4;
+
+/// The 64-bit container, so `r8w` and `r8` share a slot.
+fn container(register: Register) -> Register {
+    register.full_register()
+}
+
+/// Low `bytes * 8` bits of `value`.
+fn masked(value: u64, bytes: u32) -> u64 {
+    if bytes >= 8 {
+        value
+    } else {
+        value & ((1u64 << (bytes * 8)) - 1)
+    }
+}
+
+/// The flags a `cmp a, b` at `bytes` width produces, by the architecture's own
+/// definitions. `a` and `b` are the full container values; only the low
+/// `bytes` participate, which is what makes `cmp r8w, imm` exact given `r8`.
+fn compare_flags(a: u64, b: u64, bytes: u32) -> (bool, bool, bool, bool) {
+    let width = bytes * 8;
+    let (a, b) = (masked(a, bytes), masked(b, bytes));
+    let result = masked(a.wrapping_sub(b), bytes);
+    let sign = 1u64 << (width - 1);
+    let carry = a < b;
+    let zero = result == 0;
+    let negative = result & sign != 0;
+    // Signed overflow: the operands differed in sign and the result took the
+    // subtrahend's sign.
+    let overflow = ((a ^ b) & (a ^ result) & sign) != 0;
+    (carry, zero, negative, overflow)
+}
+
+/// The flags a logical `and` of `a` and `b` at `bytes` width produces. `test`
+/// is that without the write-back, and CF and OF are cleared.
+fn logical_flags(a: u64, b: u64, bytes: u32) -> (bool, bool, bool, bool) {
+    let width = bytes * 8;
+    let result = masked(masked(a, bytes) & masked(b, bytes), bytes);
+    (false, result == 0, result & (1u64 << (width - 1)) != 0, false)
+}
+
 /// Whether any operand is a memory reference.
 ///
 /// A logical op reading memory still clears CF and OF, but the trace treats a
@@ -211,6 +257,162 @@ struct FlagState {
     zf: Option<bool>,
     sf: Option<bool>,
     of: Option<bool>,
+    /// Registers whose exact value is known, by 64-bit container.
+    ///
+    /// Only an immediate load records one, and any other write clears it, so a
+    /// slot is either the value the register provably holds or absent. This is
+    /// what lets a real comparison -- `cmp r8w, 98EAh`, the branch that stops
+    /// the dominant blocked handler -- be decided instead of stopping the trace.
+    constants: [Option<(Register, u64)>; TRACKED_CONSTANTS],
+}
+
+impl FlagState {
+    /// The value `register` provably holds, if known.
+    fn constant(&self, register: Register) -> Option<u64> {
+        let want = container(register);
+        self.constants
+            .iter()
+            .flatten()
+            .find(|(slot, _)| *slot == want)
+            .map(|(_, value)| *value)
+    }
+
+    /// Records that `register` provably holds `value`.
+    fn set_constant(&mut self, register: Register, value: u64) {
+        let want = container(register);
+        self.forget(register);
+        for slot in &mut self.constants {
+            if slot.is_none() {
+                *slot = Some((want, value));
+                return;
+            }
+        }
+        // Full: drop the oldest rather than keep a stale set. Losing a constant
+        // only costs a decision; keeping a wrong one would cost soundness.
+        self.constants.rotate_left(1);
+        self.constants[TRACKED_CONSTANTS - 1] = Some((want, value));
+    }
+
+    /// Forgets `register`'s value.
+    fn forget(&mut self, register: Register) {
+        let want = container(register);
+        for slot in &mut self.constants {
+            if slot.is_some_and(|(held, _)| held == want) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// An operand's provable value: an immediate, or a register we track.
+    fn operand_value(&self, instruction: &Instruction, operand: u32) -> Option<u64> {
+        match instruction.op_kind(operand) {
+            OpKind::Register => self.constant(instruction.op_register(operand)),
+            OpKind::Immediate8 => Some(u64::from(instruction.immediate8())),
+            OpKind::Immediate16 => Some(u64::from(instruction.immediate16())),
+            OpKind::Immediate32 => Some(u64::from(instruction.immediate32())),
+            OpKind::Immediate64 => Some(instruction.immediate64()),
+            OpKind::Immediate8to16 => Some(u64::from(instruction.immediate8to16() as u16)),
+            OpKind::Immediate8to32 => Some(u64::from(instruction.immediate8to32() as u32)),
+            OpKind::Immediate8to64 => Some(instruction.immediate8to64() as u64),
+            OpKind::Immediate32to64 => Some(instruction.immediate32to64() as u64),
+            _ => None,
+        }
+    }
+
+    /// Folds an exactly-evaluated comparison or test, when both operands are
+    /// known. Returns whether it applied.
+    fn fold_known_compare(&mut self, instruction: &Instruction) -> bool {
+        if touches_memory(instruction) || instruction.op_count() != 2 {
+            return false;
+        }
+        let logical = match instruction.mnemonic() {
+            Mnemonic::Cmp => false,
+            Mnemonic::Test => true,
+            _ => return false,
+        };
+        if instruction.op0_kind() != OpKind::Register {
+            return false;
+        }
+        let Ok(bytes) = u32::try_from(instruction.op0_register().size()) else {
+            return false;
+        };
+        if !matches!(bytes, 1 | 2 | 4 | 8) {
+            return false;
+        }
+        let (Some(left), Some(right)) = (
+            self.operand_value(instruction, 0),
+            self.operand_value(instruction, 1),
+        ) else {
+            return false;
+        };
+        let (cf, zf, sf, of) = if logical {
+            logical_flags(left, right, bytes)
+        } else {
+            compare_flags(left, right, bytes)
+        };
+        self.cf = Some(cf);
+        self.zf = Some(zf);
+        self.sf = Some(sf);
+        self.of = Some(of);
+        true
+    }
+
+    /// Updates the tracked constants for one instruction.
+    fn track_constants(&mut self, instruction: &Instruction) {
+        // An immediate load into a 32- or 64-bit register fully defines the
+        // container (a 32-bit write zero-extends); a narrower one leaves the
+        // upper bits, so the value is no longer known.
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && !touches_memory(instruction)
+        {
+            let destination = instruction.op0_register();
+            let wide = matches!(destination.size(), 4 | 8);
+            let value = self.operand_value(instruction, 1);
+            match (wide, value) {
+                (true, Some(value)) => {
+                    let bytes = u32::try_from(destination.size()).unwrap_or(8);
+                    self.set_constant(destination, masked(value, bytes));
+                    return;
+                }
+                _ => {
+                    self.forget(destination);
+                    return;
+                }
+            }
+        }
+        // `xor r,r` / `sub r,r` on a 32- or 64-bit register is a proven zero.
+        if matches!(instruction.mnemonic(), Mnemonic::Xor | Mnemonic::Sub)
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == instruction.op1_register()
+            && matches!(instruction.op0_register().size(), 4 | 8)
+        {
+            self.set_constant(instruction.op0_register(), 0);
+            return;
+        }
+        // Anything else that writes a tracked register invalidates it. Read off
+        // iced's access info so an implicit destination counts.
+        let mut factory = InstructionInfoFactory::new();
+        let written: Vec<Register> = factory
+            .info(instruction)
+            .used_registers()
+            .iter()
+            .filter(|used| {
+                matches!(
+                    used.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+            })
+            .map(|used| used.register())
+            .collect();
+        for register in written {
+            self.forget(register);
+        }
+    }
 }
 
 impl FlagState {
@@ -220,6 +422,13 @@ impl FlagState {
     /// exactly; every other flag write makes the flags it touches unknown, which
     /// is what keeps this from deciding a branch it has not actually proven.
     fn apply(&mut self, instruction: &Instruction) {
+        // An exactly-evaluated comparison beats every rule below it: it gives
+        // all four flags rather than the two a logical op clears.
+        if self.fold_known_compare(instruction) {
+            self.track_constants(instruction);
+            return;
+        }
+        self.track_constants(instruction);
         match instruction.mnemonic() {
             Mnemonic::Clc => {
                 self.cf = Some(false);
@@ -526,6 +735,153 @@ pub fn trace_direct_jump_fragments(
 
 #[cfg(test)]
 mod tests {
+    /// Decode one assembled instruction, for the flag tests below.
+    fn one(build: impl FnOnce(&mut iced_x86::code_asm::CodeAssembler)) -> Instruction {
+        let mut assembler =
+            iced_x86::code_asm::CodeAssembler::new(64).expect("assembler");
+        build(&mut assembler);
+        let bytes = assembler.assemble(0x1000).expect("assemble");
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, &bytes, 0x1000, iced_x86::DecoderOptions::NONE);
+        decoder.decode()
+    }
+
+    /// `compare_flags` must agree with the architecture's definition of `cmp`,
+    /// computed independently here in signed/unsigned arithmetic.
+    ///
+    /// This is the test that matters most in this module: every other rule only
+    /// ever gives up, while a wrong flag here would DECIDE a branch wrongly and
+    /// put a path in a CFG that the program never takes.
+    #[test]
+    fn compare_flags_match_an_independent_reference() {
+        for bytes in [1u32, 2, 4, 8] {
+            let width = bytes * 8;
+            let interesting: Vec<u64> = vec![
+                0,
+                1,
+                2,
+                0x7f,
+                0x80,
+                0xff,
+                0x7fff,
+                0x8000,
+                0xffff,
+                0x98ea,
+                0x7fff_ffff,
+                0x8000_0000,
+                0xffff_ffff,
+                u64::MAX,
+                u64::MAX - 1,
+            ];
+            for &a in &interesting {
+                for &b in &interesting {
+                    let (cf, zf, sf, of) = compare_flags(a, b, bytes);
+                    let (ma, mb) = (masked(a, bytes), masked(b, bytes));
+                    // Unsigned borrow.
+                    assert_eq!(cf, ma < mb, "CF {a:#x} {b:#x} w{width}");
+                    assert_eq!(zf, ma == mb, "ZF {a:#x} {b:#x} w{width}");
+                    // Sign of the truncated difference.
+                    let result = masked(ma.wrapping_sub(mb), bytes);
+                    assert_eq!(sf, result >> (width - 1) == 1, "SF {a:#x} {b:#x} w{width}");
+                    // Signed overflow, via i128 so it cannot itself wrap.
+                    let sign = 1i128 << (width - 1);
+                    let to_signed = |v: u64| {
+                        let v = i128::from(v);
+                        if v >= sign { v - (sign << 1) } else { v }
+                    };
+                    let exact = to_signed(ma) - to_signed(mb);
+                    assert_eq!(
+                        of,
+                        exact < -sign || exact >= sign,
+                        "OF {a:#x} {b:#x} w{width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tracked_constant_decides_the_comparison_that_blocks_the_sample() {
+        use iced_x86::code_asm::{r8d, r8w};
+        // The shape at 0xf0aeec4: the register is loaded from an immediate and
+        // then compared at 16 bits. 0x1234 <= 0x98ea unsigned, so `jbe` is taken.
+        let mut flags = FlagState::default();
+        flags.apply(&one(|a| {
+            a.mov(r8d, 0x1234u32).expect("mov");
+        }));
+        flags.apply(&one(|a| {
+            a.cmp(r8w, 0x98eai32).expect("cmp");
+        }));
+        assert_eq!(flags.decides(ConditionCode::be), Some(true));
+        assert_eq!(flags.decides(ConditionCode::a), Some(false));
+        assert_eq!(flags.decides(ConditionCode::e), Some(false));
+    }
+
+    #[test]
+    fn an_untracked_write_forgets_the_constant_and_the_branch_stops() {
+        use iced_x86::code_asm::{ecx, r8d, r8w};
+        let mut flags = FlagState::default();
+        flags.apply(&one(|a| {
+            a.mov(r8d, 0x1234u32).expect("mov");
+        }));
+        // An opaque write must invalidate the slot, or the comparison after it
+        // would be decided from a value the register no longer holds.
+        flags.apply(&one(|a| {
+            a.add(r8d, ecx).expect("add");
+        }));
+        flags.apply(&one(|a| {
+            a.cmp(r8w, 0x98eai32).expect("cmp");
+        }));
+        assert_eq!(flags.decides(ConditionCode::be), None);
+    }
+
+    #[test]
+    fn a_narrow_immediate_load_does_not_define_the_container() {
+        use iced_x86::code_asm::{r8w};
+        let mut flags = FlagState::default();
+        // `mov r8w, 5` leaves the upper 48 bits as they were, so the container
+        // value is NOT known and a later 16-bit compare must not be decided
+        // from it -- even though the low half would have been enough.
+        flags.apply(&one(|a| {
+            a.mov(r8w, 5i32).expect("mov");
+        }));
+        flags.apply(&one(|a| {
+            a.cmp(r8w, 5i32).expect("cmp");
+        }));
+        assert_eq!(flags.decides(ConditionCode::e), None);
+    }
+
+    #[test]
+    fn a_zeroing_xor_is_a_tracked_constant() {
+        use iced_x86::code_asm::{eax};
+        let mut flags = FlagState::default();
+        flags.apply(&one(|a| {
+            a.xor(eax, eax).expect("xor");
+        }));
+        assert_eq!(flags.constant(iced_x86::Register::RAX), Some(0));
+        flags.apply(&one(|a| {
+            a.cmp(eax, 0i32).expect("cmp");
+        }));
+        assert_eq!(flags.decides(ConditionCode::e), Some(true));
+    }
+
+    #[test]
+    fn a_known_test_decides_zero_and_sign_too() {
+        use iced_x86::code_asm::{eax};
+        let mut flags = FlagState::default();
+        flags.apply(&one(|a| {
+            a.mov(eax, 0x8000_0000u32).expect("mov");
+        }));
+        flags.apply(&one(|a| {
+            a.test(eax, eax).expect("test");
+        }));
+        // The value is known, so unlike the flag-only rule this gives all four.
+        assert_eq!(flags.decides(ConditionCode::e), Some(false));
+        assert_eq!(flags.decides(ConditionCode::s), Some(true));
+        assert_eq!(flags.decides(ConditionCode::ae), Some(true));
+        assert_eq!(flags.decides(ConditionCode::no), Some(true));
+    }
+
     #[test]
     fn a_logical_operation_decides_carry_and_overflow_predicates() {
         use iced_x86::code_asm::{CodeAssembler, eax, ecx};

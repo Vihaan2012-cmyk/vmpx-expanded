@@ -2528,7 +2528,14 @@ fn transition_prefix_scale() -> usize {
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|scale| *scale >= 1)
-            .unwrap_or(1)
+            // Default 4, not 1. The comment at the cap already says hitting it
+            // is a symptom of recovering MORE -- the linear VM stream runs
+            // further before meeting an unrecovered handler, so the prefix
+            // grows -- and deciding more opaque predicates pushes it further
+            // still. Measured: 14 occurrences over 8 entries refused on this
+            // cap alone, so it is a cap doing the refusing, not a missing
+            // capability.
+            .unwrap_or(4)
     })
 }
 

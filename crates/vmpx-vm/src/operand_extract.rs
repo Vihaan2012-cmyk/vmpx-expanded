@@ -15,6 +15,49 @@ use crate::{
     },
 };
 
+/// Sites inside `active` where `register` is written but the value written is
+/// DEAD: a later instruction in the interval overwrites the whole register
+/// before anything reads it.
+///
+/// VMProtect pads handlers with writes whose results never reach a consumer.
+/// Refusing a codec because of one discards a handler that is otherwise fully
+/// recovered, and the pad is identifiable rather than guessed at: the overwrite
+/// has to be present in the same interval, and a read between the two -- which
+/// includes a read-modify-write like `add key, imm` -- means the first value
+/// did reach a consumer and the site is not dead.
+///
+/// A sub-32-bit destination is never a kill: writing `ax` or `al` preserves the
+/// rest of the register, while any write of 32 bits or more fully defines the
+/// 64-bit container on x86-64.
+fn dead_write_sites(
+    active: &[&vmpx_disasm::DecodedInstruction],
+    register: iced_x86::Register,
+    width: crate::BitWidth,
+) -> BTreeSet<Rva> {
+    let mut dead = BTreeSet::new();
+    let mut factory = InstructionInfoFactory::new();
+    for (index, decoded) in active.iter().enumerate() {
+        if !writes_register(&mut factory, &decoded.instruction, register) {
+            continue;
+        }
+        for later in active.iter().skip(index + 1) {
+            // Checked BEFORE the overwrite test, so a read-modify-write stops
+            // the walk instead of counting as a kill.
+            if reads_register_value(&mut factory, &later.instruction, register, width) {
+                break;
+            }
+            let kills = later.instruction.op0_kind() == OpKind::Register
+                && canonical(later.instruction.op0_register()) == canonical(register)
+                && later.instruction.op0_register().size() >= 4;
+            if kills {
+                dead.insert(decoded.rva);
+                break;
+            }
+        }
+    }
+    dead
+}
+
 /// Sites inside `active` where `register` is written while SPILLED, and whose
 /// writes therefore do not change its value.
 ///
@@ -384,6 +427,13 @@ fn attempt_operand(
     }
     let mut allowed_key_writes = BTreeSet::from([update.completion_rva]);
     allowed_key_writes.extend(spilled_write_sites(active, canonical(roles.rolling_key)));
+    // A write whose value never reaches a consumer changes nothing about the
+    // key, so it cannot disqualify the codec.
+    allowed_key_writes.extend(dead_write_sites(
+        active,
+        canonical(roles.rolling_key),
+        width,
+    ));
     if active.iter().any(|decoded| {
         writes_register(
             &mut factory,
