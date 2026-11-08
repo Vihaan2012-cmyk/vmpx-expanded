@@ -115,7 +115,8 @@ pub use entry_profile::{
 pub use exception_flow::{
     ExceptionContinuationResolution, ExceptionContinuationSource, ExceptionStackSledReport,
     VmFaultUnwindCoverage, VmMemoryExceptionCoverageReport, analyze_exception_stack_sled,
-    analyze_fault_site_exception_coverage, analyze_vm_memory_exception_coverage,
+    VmContextSeedSource, analyze_fault_site_exception_coverage,
+    analyze_fault_site_exception_coverage_with_context, analyze_vm_memory_exception_coverage,
     analyze_vm_memory_exception_coverage_with_state,
 };
 pub use expr::{

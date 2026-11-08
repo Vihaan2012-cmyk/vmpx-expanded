@@ -3294,6 +3294,7 @@ impl Walker<'_, '_> {
         key: Va,
         error: &crate::SymbolicExecutionError,
         instructions: &[DecodedVmInstruction],
+        symbolic_in: &crate::SymbolicVmInitialState,
     ) -> Result<String, String> {
         if !null_read_seh_exit_enabled() {
             return Err("disabled".to_owned());
@@ -3376,10 +3377,23 @@ impl Walker<'_, '_> {
             return Err("handler trace has no external memory read".to_owned());
         }
         let site_count = fault_sites.len();
-        let coverage = crate::analyze_fault_site_exception_coverage(
+        // The seed the language handler reads at `CONTEXT.Rsp + 0xC0` is a VM
+        // context slot, because this protector addresses its context off rsp
+        // (`entry_profile.rs` sets `context_base: Register::RSP` in both
+        // production recoveries) and the fault is the handler's FIRST
+        // instruction, so `CONTEXT.Rsp` IS that rsp. The equality is passed
+        // down rather than assumed, so a profile with another context base
+        // cannot inherit it.
+        let context_base_is_rsp =
+            self.ctx_profile().effect_roles.context_base.full_register() == iced_x86::Register::RSP;
+        let coverage = crate::analyze_fault_site_exception_coverage_with_context(
             self.pe,
             handler_rva,
             fault_sites,
+            Some(crate::VmContextSeedSource {
+                context_values: &symbolic_in.context_values,
+                context_base_is_rsp,
+            }),
         )
         .map_err(|error| format!("exception metadata unreadable: {error}"))?;
         if !coverage.all_fault_sites_have_language_handler {
@@ -4227,7 +4241,8 @@ impl Walker<'_, '_> {
                 // A proven null read is not necessarily a dead end: the
                 // protector reads address 0 on purpose and the fault carries
                 // control out of the VM. Try that before giving up.
-                let seh = self.close_null_read_as_seh_exit(key, &error, &instructions);
+                let seh =
+                    self.close_null_read_as_seh_exit(key, &error, &instructions, &symbolic_in);
                 if seh.is_ok() {
                     return;
                 }
