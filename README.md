@@ -175,8 +175,36 @@ an error — just a worse number:
   the `xpl_init_steps` example and `XPL_SNAPSHOT_OUT`; it takes a few minutes.
   Raise `XPL_STACK_KB` while doing so — at the 8 MiB default the init overflows
   the guest stack and the snapshot captures a truncated state.
+- **The accelerators are on by default and the init needs them.** The protector
+  spends its init decompressing with LZMA, and `XPL_NOACCEL=1` / `XPL_NOLZMA=1`
+  turn off the folds that make that finish.
 - **`VMPX_INSTRUCTION_LIMIT` is a multiplier, not an absolute**, and `report`'s
   base is 512 while `decompile`'s is 100000.
+
+### Emulator throughput, and why a step is not the unit
+
+The init is one routine. Profiling the first TLS callback puts **98.3% of its
+steps inside a single 0x4000-byte window**, spread over 963 distinct addresses —
+VMProtect's LZMA decompressor, flattened and padded with `jmp +0` and flag-only
+junk. Three loop folds (`accelerate_checksums`, plus `accelerate_literals` for
+the literal decoder) run the recognized loops natively.
+
+Two things about measuring this are easy to get wrong, and both were got wrong
+before they were measured:
+
+- **Steps are not comparable across configurations.** A fold retires one step
+  for an arbitrary number of guest instructions, so the steps/s figure *falls*
+  when a fold starts working. On a 400M-step init the folded run does ~1,021M
+  guest instructions in 3.5s where the unfolded run does 400M in 2.0s — 292M
+  against 197M guest instructions per second. Compare decompressed output per
+  wall-clock second, which is what `bytes=` in the fold line reports.
+- **Recognition is probed at every block start, so a MISS has to be cheap.**
+  Each recognizer originally walked the loop before testing anything, which cost
+  more than the folding bought: the literal fold measured +22% progress per step
+  and 35% *slower* in wall-clock. Rejecting on the first instruction's opcode,
+  capping the pre-match padding chase, and a 32KiB negative filter in front of
+  the shape caches took the same configuration from 145k to 544k output bytes/s
+  with byte-identical output.
 
 ## Crates
 
