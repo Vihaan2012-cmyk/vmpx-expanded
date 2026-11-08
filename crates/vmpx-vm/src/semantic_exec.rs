@@ -961,8 +961,12 @@ impl<'a> SymbolicMachine<'a> {
                     self.vm_stack_address_escapes,
                     self.vm_stack_pointer_lost,
                 ) + &format!(
-                    " offset={:?}",
-                    pointer_offset(address).map(|offset| format!("{offset:#x}"))
+                    " offset={:?} unbounded_at={}",
+                    pointer_offset(address).map(|offset| format!("{offset:#x}")),
+                    // Which node kind `address_bounds` has no arm for. The
+                    // address renders to more than 400 bytes, so the text is
+                    // useless; the failing kind is the actionable part.
+                    unbounded_node_kind(address).unwrap_or("<bounded>"),
                 ),
             });
             return Ok(());
@@ -1582,6 +1586,58 @@ fn unsigned_width_range(width: BitWidth) -> Option<(i64, i64)> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// The kind of the first node `address_bounds` has no arm for, or `None` when
+/// the whole address bounds.
+///
+/// `address_bounds` is structural: one unsupported node anywhere makes the whole
+/// address unbounded, and the store then havocs memory. These addresses render
+/// past any sane budget, so the failing KIND is the only part worth printing --
+/// it names the arm to add.
+fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
+    if address_bounds(expression).is_some() {
+        return None;
+    }
+    let children: Vec<&Expr> = match &expression.kind {
+        ExprKind::Binary { left, right, .. } => vec![left, right],
+        ExprKind::Unary { value, .. } | ExprKind::Resize { value, .. } => vec![value],
+        ExprKind::Concat { high, low } => vec![high, low],
+        ExprKind::Extract { value, .. } => vec![value],
+        ExprKind::Load { address } => vec![address],
+        _ => Vec::new(),
+    };
+    // Deepest unsupported node first: a parent only fails because a child did.
+    for child in children {
+        if let Some(kind) = unbounded_node_kind(child) {
+            return Some(kind);
+        }
+    }
+    Some(match &expression.kind {
+        ExprKind::Binary { op, .. } => match op {
+            BinaryOp::Add => "Add",
+            BinaryOp::Sub => "Sub",
+            BinaryOp::Mul => "Mul",
+            BinaryOp::Shl => "Shl",
+            BinaryOp::And => "And",
+            BinaryOp::Or => "Or",
+            BinaryOp::Xor => "Xor",
+            _ => "Binary(other)",
+        },
+        ExprKind::Unary { .. } => "Unary",
+        ExprKind::Resize { op, .. } => match op {
+            ResizeOp::SignExtend => "SignExtend",
+            ResizeOp::ZeroExtend => "ZeroExtend",
+            ResizeOp::Truncate => "Truncate",
+        },
+        ExprKind::Load { .. } => "Load",
+        ExprKind::Intrinsic { .. } => "Intrinsic",
+        ExprKind::Extract { .. } => "Extract",
+        ExprKind::Concat { .. } => "Concat",
+        ExprKind::Register { .. } => "Register",
+        ExprKind::Const { .. } => "Const",
+        _ => "other",
+    })
+}
+
 fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
     match &expression.kind {
         ExprKind::Register { name } if name == "vsp_initial" => Some(AddressBounds {
@@ -1721,6 +1777,18 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 hi,
             })
         }
+        // No arm, deliberately. Bounding an unsupported node by its own width
+        // was tried and reverted: it is sound as a VALUE bound but it discards
+        // the ROOT, and `proven_store_byte_range` needs one, so it cannot reach
+        // the proof path and measured +0.
+        //
+        // It could not have worked. Measured on systems.xpl, the node that stops
+        // the bound is an `Intrinsic` in 31 of 45 occurrences (then
+        // Binary(other) 7, Concat 6, Register 1), and in these addresses
+        // `vsp_initial` sits INSIDE that intrinsic. The address is therefore
+        // `f(frame_pointer)` for an opaque `f`, which has no provable byte range
+        // relative to the VM stack root at all. The havoc those stores take is
+        // not conservative, it is the only sound answer without knowing `f`.
         _ => None,
     }
 }
