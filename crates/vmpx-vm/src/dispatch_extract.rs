@@ -1397,7 +1397,17 @@ pub fn extract_relative_dispatch_codecs_with_stack_check(
                     postlude_proof: Some(proof),
                 });
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // "Not this shape" is the normal answer, but a trace that ends
+                // in a `ja` after a register compare looks exactly like the
+                // guard, so say which condition refused it.
+                if let Some(reason) = stack_check_refusal(trace, roles, check) {
+                    stack_check_rejection = Some(DispatchExtractionRejection {
+                        encoded_load: trace.stop.at,
+                        reason: format!("stack-check postlude unmatched: {reason}"),
+                    });
+                }
+            }
             Err(reason) => {
                 stack_check_rejection = Some(DispatchExtractionRejection {
                     encoded_load: trace.stop.at,
@@ -1457,6 +1467,81 @@ struct StackCheckShape {
 /// Matches the exact tail `lea tmp,[ctx+disp]; cmp vsp,tmp; ja head`. Only
 /// direct jumps may separate `cmp` from `ja` (they leave flags intact) and only
 /// direct jumps or carry-flag junk may precede `cmp` (it rewrites every flag).
+/// Why [`match_stack_check`] did not recognize a trace, for the diagnostic.
+///
+/// The matcher itself returns `Option` because "not this shape" is the normal
+/// answer for most handlers. But when a trace DOES end in a `ja` after a
+/// register compare -- which is what the guard looks like -- knowing which
+/// condition then refused is the difference between a lever and a guess.
+fn stack_check_refusal(
+    trace: &DirectJumpTrace,
+    roles: HandlerRegisterRoles,
+    check: StackCheckRoles,
+) -> Option<String> {
+    if trace.stop.kind != DirectJumpTraceStopKind::ConditionalBranch {
+        return None;
+    }
+    let instructions: Vec<_> = trace.instructions().collect();
+    let branch = instructions.last()?;
+    if branch.instruction.mnemonic() != Mnemonic::Ja {
+        return Some(format!(
+            "terminal branch is {:?}, not `ja`",
+            branch.instruction.mnemonic()
+        ));
+    }
+    if trace.stop.direct_target.is_none() {
+        return Some("the guard branch has no direct target".to_owned());
+    }
+    if trace.stop.fallthrough.is_none() {
+        return Some("the guard branch has no fall-through".to_owned());
+    }
+    let mut index = instructions.len() - 1;
+    let cmp_index = loop {
+        index = index.checked_sub(1)?;
+        if !is_direct_jump(&instructions[index].instruction) {
+            break index;
+        }
+    };
+    let cmp = &instructions[cmp_index].instruction;
+    if cmp.mnemonic() != Mnemonic::Cmp {
+        return Some(format!("the guard reads {:?}, not a `cmp`", cmp.mnemonic()));
+    }
+    if cmp.op0_kind() != OpKind::Register || cmp.op1_kind() != OpKind::Register {
+        return Some("the guard compare is not register-to-register".to_owned());
+    }
+    if cmp.op0_register() != canonical(check.vsp) {
+        return Some(format!(
+            "the guard compares {:?}, but the resolved VSP is {:?}",
+            cmp.op0_register(),
+            canonical(check.vsp)
+        ));
+    }
+    if cmp.op0_register().size() != 8 || cmp.op1_register().size() != 8 {
+        return Some("the guard compare is not full width".to_owned());
+    }
+    let tmp = cmp.op1_register();
+    if tmp != canonical(tmp) {
+        return Some(format!("the guard scratch {tmp:?} is not a full register"));
+    }
+    if [check.vsp, roles.vip]
+        .into_iter()
+        .any(|register| canonical(register) == tmp)
+    {
+        return Some(format!(
+            "the guard scratch {tmp:?} aliases the VSP or the VIP"
+        ));
+    }
+    // Past here the shape held up to the `lea`, so the matcher's own result is
+    // the answer; a `None` from it now means the `lea` test refused.
+    if match_stack_check(trace, roles, check).is_none() {
+        return Some(format!(
+            "the `lea` establishing {tmp:?} from the context base {:?} was not found",
+            canonical(check.context_base)
+        ));
+    }
+    None
+}
+
 fn match_stack_check(
     trace: &DirectJumpTrace,
     roles: HandlerRegisterRoles,

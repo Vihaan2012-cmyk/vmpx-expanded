@@ -673,7 +673,7 @@ fn resolve_stack_sled_continuation(
 pub fn analyze_vm_memory_exception_coverage_with_state(
     pe: &PeImage<'_>,
     handler: &HandlerCodecRecoveryReport,
-    _symbolic: Option<&SymbolicVmExecutionReport>,
+    symbolic: Option<&SymbolicVmExecutionReport>,
 ) -> Result<VmMemoryExceptionCoverageReport, PeError> {
     let mut diagnostics = Vec::new();
     if handler
@@ -696,7 +696,35 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
         diagnostics.push("no proven external native read site was recovered".to_owned());
     }
 
-    let mut report = analyze_fault_site_exception_coverage(pe, handler.entry, fault_sites)?;
+    // The symbolic report finally earns its parameter. Its `context_cells` are
+    // keyed by VM context slot, and this protector addresses its context off
+    // rsp (`entry_profile.rs` sets `context_base: Register::RSP` in both
+    // production recoveries), so a slot IS the `CONTEXT.Rsp`-relative native
+    // slot the language handler reads its seed from.
+    //
+    // `context_base_is_rsp` is hard-coded true here only because this entry
+    // point has no profile to consult; the CFG walker, which does, passes the
+    // measured value. If a profile with another context base ever reaches this
+    // path, the seed it resolves would be a different slot -- so this is the
+    // one place in the chain carrying an assumption rather than a check, and it
+    // is recorded in the report's diagnostics.
+    let seed_source = symbolic.map(|report| VmContextSeedSource {
+        context_values: &report.context_cells,
+        context_base_is_rsp: true,
+    });
+    if seed_source.is_some() {
+        diagnostics.push(
+            "continuation seed read from VM context slots, assuming the profile's context base \
+             is rsp"
+                .to_owned(),
+        );
+    }
+    let mut report = analyze_fault_site_exception_coverage_with_context(
+        pe,
+        handler.entry,
+        fault_sites,
+        seed_source,
+    )?;
     report.diagnostics.splice(0..0, diagnostics);
     Ok(report)
 }

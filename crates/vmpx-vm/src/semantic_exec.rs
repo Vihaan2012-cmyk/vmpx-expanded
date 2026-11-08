@@ -1709,7 +1709,12 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
             BinaryOp::And => "And",
             BinaryOp::Or => "Or",
             BinaryOp::Xor => "Xor",
-            _ => "Binary(other)",
+            // The OP, not just "other". Naming the intrinsic is what turned
+            // this diagnostic actionable once already; a bare "Binary(other)"
+            // hides which arm `address_bounds` is missing.
+            other => {
+                return Some(Box::leak(format!("Binary:{other:?}").into_boxed_str()));
+            }
         },
         ExprKind::Unary { .. } => "Unary",
         ExprKind::Resize { op, .. } => match op {
