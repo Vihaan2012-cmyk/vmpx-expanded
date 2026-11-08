@@ -193,6 +193,19 @@ fn main() {
             "resumed: ran {ran} steps stop={s:?} rip={:#x} rax={:#x} api_calls={} wall={:.1}s",
             emu.cpu.rip, emu.cpu.regs[0], b.calls.values().sum::<u64>(), t.elapsed().as_secs_f64()
         );
+        // The resume path used to end here, so a continued init could not be
+        // saved and every attempt had to restart from zero. The phase budget is
+        // the binding cost -- 120B steps did not finish even the first TLS
+        // callback -- so continuing has to be able to checkpoint.
+        if let Ok(path) = std::env::var("XPL_SNAPSHOT_OUT") {
+            let p = std::path::Path::new(&path);
+            vmpx_emulate::snapshot::save(&emu.cpu, &emu.mem, p).expect("snapshot save");
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "snapshot saved -> {path} ({size} bytes) rip={:#x} ran={ran}",
+                emu.cpu.rip
+            );
+        }
         return;
     }
 
