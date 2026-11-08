@@ -1531,11 +1531,25 @@ fn canonical_affine(expr: &Expr) -> Expr {
     let mut constant = 0_u64;
     collect(&expr.simplify(), true, &mut terms, &mut constant);
     terms.retain(|(_, coefficient)| *coefficient != 0);
-    // A stable order independent of how the expression was written. Ordering on
-    // the interned hash instead measured +0 on the entry it was meant to help,
-    // and it changes the canonical form, so the Debug text stays: a behavioural
-    // change with no measured benefit is not worth the risk to N1.
-    terms.sort_by_cached_key(|(term, _)| format!("{term:?}"));
+    // A stable order independent of how the expression was written, keyed on the
+    // interned structural hash.
+    //
+    // This was `format!("{term:?}")`. `Debug` prints a shared DAG as a TREE, so
+    // one term renders to megabytes, and `canonical_affine` runs over every
+    // memory cell of every canonicalized state: measured on entry 0xc43d80e at a
+    // 2048 instruction limit, `canonicalized` was 237s of a 255s walk with this
+    // line inside it. An earlier note here recorded hash ordering as "+0" -- that
+    // was +0 on the N1 COUNT, which is the thing it must not change; it was never
+    // measured against time, which is the thing it fixes.
+    //
+    // Unlike the sort in `canonicalized`, this order IS the canonical form, so a
+    // hash collision would leave two terms in input order and could cost a fold.
+    // At 64 bits that is negligible, and it is a precision risk only: the rebuilt
+    // sum is the same terms at the same width whatever their order.
+    terms.sort_by_cached_key(|(term, _)| {
+        use std::hash::BuildHasher;
+        crate::expr::FxBuild::default().hash_one(term)
+    });
 
     let mut accumulated: Option<Expr> = None;
     for (term, coefficient) in terms {
@@ -1889,18 +1903,23 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
         .iter()
         .map(|(address, value)| (canonical_affine(address), canonical_affine(value)))
         .collect();
-    // `site_key`, not `format!("{address:?}")`: Debug prints a shared DAG as a
-    // TREE, so one heavily shared address renders to gigabytes and this sort key
-    // was unbounded. Measured on entry 0xc43d80e at an 8192 instruction limit,
-    // this single line was 40.8s of a 40.9s `generalize_across` and took
-    // resident memory past 13GB, while every counter the walker charges stayed
-    // flat -- which is why the per-entry memory cap never fired.
+    // The interned structural hash, not rendered address text. `Debug` prints a
+    // shared DAG as a TREE, so an address renders to megabytes; bounding that
+    // render (`site_key`) fixed the resulting 13GB of resident memory but left
+    // the cost of producing it. Measured on entry 0xc43d80e at a 2048
+    // instruction limit, this one line was 225s of a 244s walk.
     //
-    // `site_key` is the same bounded rendering the memory-union keys already
-    // use: a bounded prefix, falling back to a structural hash when the address
-    // outgrows it. The order stays deterministic, which is all a canonical form
-    // needs.
-    memory_values.sort_by_cached_key(|(address, _)| site_key(address));
+    // Every node caches its structural hash at intern time and `ExprRef`'s
+    // `Hash` writes that one u64, so hashing an `Expr` composes its children's
+    // cached hashes: a full structural key, O(1) and allocation-free.
+    //
+    // This is only a SORT key -- `memory_union` builds its own site identity --
+    // so a collision leaves two cells in input order. That costs a missed fold,
+    // never correctness.
+    memory_values.sort_by_cached_key(|(address, _)| {
+        use std::hash::BuildHasher;
+        crate::expr::FxBuild::default().hash_one(address)
+    });
     SymbolicVmInitialState {
         vsp: canonical_affine(&state.vsp),
         flags: canonical_affine(&state.flags),
