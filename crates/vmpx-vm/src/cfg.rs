@@ -329,6 +329,36 @@ pub enum VmCfgAssumption {
     /// it). Image-source reads remain withheld, so the narrowing only recovers
     /// the VM-stack-rooted VIP; it does not otherwise trust the store.
     AssumesExternalStoresDisjointFromVmStack,
+    /// An external store to an opaque address was narrowed to preserve the
+    /// tracked cells rooted at an allocation THIS FRAME made, as well as the
+    /// VM-stack-rooted ones, under the assumption that external stores do not
+    /// alias those allocations either.
+    ///
+    /// Separate from `AssumesExternalStoresDisjointFromVmStack` because it is a
+    /// separate concession with a different discharge condition, and because
+    /// the VM-stack one IS discharged for a provably private frame -- which
+    /// says nothing about an allocation whose pointer the frame may well have
+    /// handed out. Nothing discharges this one yet, so an entry carrying it
+    /// reaches N1 and never N2.
+    ///
+    /// Why it is worth taking: the discarded allocation cells are where the
+    /// `memory_load_epoch` cascade starts. A read of a discarded cell returns an
+    /// opaque value, that value lands in the next store's address, the address
+    /// has no provable range, and that store havocs again. Keeping the cells
+    /// that a frame-local allocation roots stops the first link rather than
+    /// trying to bound an address that is already opaque.
+    AssumesExternalStoresDisjointFromFreshAllocations,
+    /// A block whose VM memory-load handler performs a proven null read was
+    /// closed as a VM exit, because every proven external read site in that
+    /// handler is covered by a language handler and the recovered continuation
+    /// is the zero-seed unwind back to the caller.
+    ///
+    /// Labeled rather than proven for one reason: the unwind's own reconstruction
+    /// is a structural recovery of a stack sled, not a proof that the process
+    /// reaches the caller. The fault itself IS certain -- a 1-byte read of
+    /// address 0 always raises -- and so is the SEH coverage, which comes from
+    /// the image's own exception directory.
+    AssumesNullReadFaultExitsViaSeh,
     /// Generalizing or closing a loop conceded that nothing outside the VM
     /// aliases the VM stack frame. A widened state, or one re-expressed at a
     /// moved stack base, describes the same concrete memory only under that
@@ -1278,6 +1308,15 @@ fn cell_token(address: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     address.hash(&mut hasher);
     format!("m{:x}", hasher.finish())
+}
+
+/// Whether a proven null read may be closed as an SEH-covered VM exit.
+///
+/// On by default; `VMPX_NO_NULL_READ_SEH_EXIT=1` restores the stall. The switch
+/// is here so the change can be measured against itself in one build.
+fn null_read_seh_exit_enabled() -> bool {
+    static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_NULL_READ_SEH_EXIT").is_none())
 }
 
 /// Short class of a symbolic-execution failure, so the stall histogram separates
@@ -3156,6 +3195,77 @@ fn flag_fork_analysis(
 }
 
 impl Walker<'_, '_> {
+    /// Closes a block whose only obstacle is a proven null read, when the fault
+    /// is provably caught and provably leaves the VM.
+    ///
+    /// VMProtect reads address 0 deliberately. A 1-byte read of 0 always
+    /// faults, the access violation reaches a registered language handler, and
+    /// the zero-seed path unwinds back through the original native frame to the
+    /// caller's saved return address. From the VM's point of view that is an
+    /// exit, so the block is one -- and the walk stalling there is what leaves
+    /// the CFG incomplete.
+    ///
+    /// Nothing here is assumed. Each step is required:
+    ///
+    /// 1. the failure really is the proven-null-read one, in a handler proven
+    ///    to implement a VM memory load;
+    /// 2. EVERY proven external read site in that handler lies inside a
+    ///    function with a language handler, so the fault is caught rather than
+    ///    crashing the process;
+    /// 3. a continuation resolved, and its source is the zero-seed unwind --
+    ///    the case with no dispatch address, where control reaches the caller.
+    ///
+    /// A continuation that dispatches somewhere instead is NOT closed here: it
+    /// re-enters code this walk would have to follow, and guessing it would
+    /// invent control flow. Those keep stalling, with the source named.
+    ///
+    /// Returns the evidence on success. The caller only needs to know whether
+    /// the block closed; the evidence is returned so a future diagnostic can
+    /// carry it without re-running the analysis.
+    fn close_null_read_as_seh_exit(
+        &mut self,
+        key: Va,
+        error: &crate::SymbolicExecutionError,
+        instructions: &[DecodedVmInstruction],
+    ) -> Option<String> {
+        if !null_read_seh_exit_enabled() {
+            return None;
+        }
+        if symbolic_failure_class(&error.message) != "null-read"
+            || error.semantic != VmHandlerSemantic::MemoryLoad
+        {
+            return None;
+        }
+        let handler = instructions.get(error.instruction_index)?.state_before.handler;
+        let recovery = self.cache.recoveries.get(&handler)?;
+        let coverage = crate::analyze_vm_memory_exception_coverage_with_state(
+            self.pe, recovery, None,
+        )
+        .ok()?;
+        if !coverage.all_fault_sites_have_language_handler {
+            return None;
+        }
+        let unwound = coverage.continuation_resolutions.iter().find(|resolution| {
+            resolution.status == RecoveryStatus::Recovered
+                && resolution.source == Some(crate::ExceptionContinuationSource::ZeroSeedUnwind)
+        })?;
+        let sled = unwound.handler;
+        // The block is already inserted as `Stalled`; the fault turns it into an
+        // exit. No `vm_exit` layout is attached, because none was recovered --
+        // the exit is through an unwind, not through a VM exit handler whose
+        // restore layout could be read off.
+        self.cfg.blocks.get_mut(&key)?.exit = BlockExit::VmExit;
+        self.cfg
+            .assumptions
+            .insert(VmCfgAssumption::AssumesNullReadFaultExitsViaSeh);
+        Some(format!(
+            "handler {handler:?} fault sites all SEH-covered ({} site(s), {} covered), \
+             zero-seed unwind via sled handler {sled:?}",
+            coverage.fault_sites.len(),
+            coverage.coverage.len(),
+        ))
+    }
+
     fn stall(&mut self, block: Va, vip: Va, reason: impl Into<String>) {
         self.cfg.stalls.push(CfgStall {
             block,
@@ -3936,6 +4046,15 @@ impl Walker<'_, '_> {
             }
             Ok(report) => report,
             Err(error) => {
+                // A proven null read is not necessarily a dead end: the
+                // protector reads address 0 on purpose and the fault carries
+                // control out of the VM. Try that before giving up.
+                if self
+                    .close_null_read_as_seh_exit(key, &error, &instructions)
+                    .is_some()
+                {
+                    return;
+                }
                 self.stall(
                     key,
                     error.vip,
@@ -3952,6 +4071,11 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if symbolic.assumed_external_disjoint_from_fresh_allocations {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations);
         }
         if symbolic.served_read_only_image {
             self.cfg
@@ -4849,6 +4973,13 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if symbolic.assumed_external_disjoint_from_fresh_allocations
+            || pop.assumed_external_disjoint_from_fresh_allocations
+        {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations);
         }
         if symbolic.served_read_only_image || pop.served_read_only_image {
             self.cfg

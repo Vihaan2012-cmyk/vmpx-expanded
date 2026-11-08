@@ -169,6 +169,10 @@ pub struct SymbolicVmExecutionReport {
     /// labeled `AssumesExternalStoresDisjointFromVmStack` assumption instead of
     /// the broad havoc. Surfaced so the CFG can record the assumption.
     pub assumed_external_disjoint_from_vm_stack: bool,
+    /// Whether the narrowed havoc preserved a cell rooted at an allocation this
+    /// frame made. Set only when such a cell was actually retained, so with
+    /// none present the run is byte-for-byte what it was before.
+    pub assumed_external_disjoint_from_fresh_allocations: bool,
     /// True when a suppressed constant read was served from a read-only
     /// file-backed page; the CFG records `AssumesImageProtectionStable`.
     pub served_read_only_image: bool,
@@ -539,6 +543,7 @@ struct SymbolicMachine<'a> {
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
+    assumed_external_disjoint_from_fresh_allocations: bool,
     serve_read_only_when_suppressed: bool,
     assume_loaded_store_addresses_disjoint: bool,
     prove_read_only_when_suppressed: bool,
@@ -635,6 +640,7 @@ impl<'a> SymbolicMachine<'a> {
             memory_tainted: initial.memory_tainted,
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
             assume_loaded_store_addresses_disjoint: limits.assume_loaded_store_addresses_disjoint,
             prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
@@ -996,15 +1002,42 @@ impl<'a> SymbolicMachine<'a> {
             });
             return Ok(());
         }
-        // Preserve the provably vsp-rooted cells, discard the rest.
-        self.retain_memory(|cell_address| pointer_offset(cell_address).is_some());
+        // Preserve the cells rooted at a proven region, discard the rest.
+        //
+        // This kept only `vsp_initial`-rooted cells until now, which threw away
+        // every cell rooted at an allocation the frame itself made -- and those
+        // discards are where the `memory_load_epoch` cascade starts: a later
+        // read of a discarded cell returns an opaque value, that value lands in
+        // the next store's address, the address has no provable range, and the
+        // store havocs again. `proven_store_byte_range` already treats a
+        // fresh-allocation return as a proven region root, so this is the same
+        // root set applied to what survives a havoc rather than a new one.
+        //
+        // It is a SEPARATE concession from the VM-stack one and carries its own
+        // label, because an opaque external store could land inside an
+        // allocation this frame made exactly as it could land in the operand
+        // stack, and because the VM-stack assumption is discharged for a
+        // provably private frame -- which says nothing about an allocation
+        // whose pointer the frame may have handed out.
+        let keep_allocations = retain_fresh_allocations();
+        let retained_fresh_allocation = keep_allocations
+            && self.memory.iter().any(|(address, _)| {
+                pointer_offset(address).is_none() && fresh_allocation_offset(address).is_some()
+            });
+        self.retain_memory(|cell_address| {
+            pointer_offset(cell_address).is_some()
+                || (keep_allocations && fresh_allocation_offset(cell_address).is_some())
+        });
         self.image_reads_suppressed = true;
         self.assumed_external_disjoint_from_vm_stack = true;
+        self.assumed_external_disjoint_from_fresh_allocations |= retained_fresh_allocation;
         self.memory_havocs.push(SymbolicMemoryHavoc {
             instruction_index,
-            cause: "external store assumed disjoint from the VM operand stack; non-vsp-rooted \
-                    cells discarded, vsp-rooted cells preserved"
-                .to_owned(),
+            cause: format!(
+                "external store assumed disjoint from the VM operand stack; \
+                 non-region-rooted cells discarded, vsp-rooted cells preserved \
+                 (fresh-allocation cells preserved: {retained_fresh_allocation})"
+            ),
         });
         Ok(())
     }
@@ -1535,6 +1568,34 @@ pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
     expression.register_outside_intrinsic_args("vsp_initial", |name| {
         name.starts_with("memory_load_epoch_")
     })
+}
+
+/// Whether the narrowed havoc keeps allocation-rooted cells.
+///
+/// On by default; `VMPX_NO_FRESH_ALLOC_RETAIN=1` restores the vsp-only
+/// retention. The switch exists so the change can be measured against itself in
+/// one build rather than across two, which is how a change that looked like a
+/// gain on one metric and a loss on another got caught before.
+fn retain_fresh_allocations() -> bool {
+    static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_FRESH_ALLOC_RETAIN").is_none())
+}
+
+/// A cell address's byte offset from a fresh-allocation root, if it has one.
+///
+/// The allocation-rooted counterpart of [`pointer_offset`], which only accepts
+/// `vsp_initial`. Both roots are what [`proven_store_byte_range`] already calls
+/// a proven region root, via `is_proven_region_root`.
+fn fresh_allocation_offset(expression: &Expr) -> Option<i64> {
+    let PointerAffine {
+        root: Some(root),
+        coefficient: 1,
+        constant,
+    } = pointer_affine(expression)?
+    else {
+        return None;
+    };
+    is_fresh_allocation_root(&root).then(|| i64::from_ne_bytes(constant.to_ne_bytes()))
 }
 
 fn pointer_offset(expression: &Expr) -> Option<i64> {
@@ -2811,6 +2872,8 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_external_disjoint_from_fresh_allocations: machine
+            .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,
         protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
@@ -2911,6 +2974,8 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_external_disjoint_from_fresh_allocations: machine
+            .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,
         protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
@@ -3660,6 +3725,93 @@ mod tests {
             .load_memory(Expr::constant(BitWidth::W64, 0x1_4000_1000), BitWidth::W64)
             .expect("load discarded non-vsp cell");
         assert!(is_free_read(&discarded));
+    }
+
+    // The narrowed havoc preserves cells rooted at an allocation this frame
+    // made, not only `vsp_initial`-rooted ones.
+    //
+    // Those discards are where the `memory_load_epoch` cascade starts: a read of
+    // a discarded cell returns an opaque value, that value lands in the next
+    // store's address, the address has no provable range, and the store havocs
+    // again. The point of keeping them is to not start that chain.
+    //
+    // The concession is recorded separately, and only when a cell was actually
+    // retained, so an entry with no allocation-rooted cells behaves exactly as
+    // it did before and carries no new label.
+    #[test]
+    fn narrowed_havoc_preserves_fresh_allocation_cells_under_its_own_label() {
+        let mut machine = default_machine();
+        let allocation = Expr::intrinsic(
+            BitWidth::W64,
+            "fresh_allocation_return_epoch_1".to_owned(),
+            Vec::new(),
+        );
+        assert!(is_fresh_allocation_root(&allocation));
+        let allocation_cell = Expr::binary(
+            BinaryOp::Add,
+            allocation,
+            Expr::constant(BitWidth::W64, 24),
+        )
+        .expect("same-width pointer expression");
+        assert_eq!(fresh_allocation_offset(&allocation_cell), Some(24));
+        machine
+            .store_memory(&allocation_cell, &Expr::constant(BitWidth::W64, 0x77))
+            .expect("seed a cell in this frame's own allocation");
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed a precise VM-stack cell");
+        machine
+            .store_memory(
+                &Expr::constant(BitWidth::W64, 0x1_4000_1000),
+                &Expr::constant(BitWidth::W64, 0x33),
+            )
+            .expect("seed a cell rooted at neither region");
+
+        // An opaque, native-register-rooted address: no vsp dependency, so it
+        // takes the narrowing rather than the broad havoc.
+        let address = Expr::register(BitWidth::W64, "native_rbx_initial");
+        machine
+            .store_external(7, address, Expr::constant(BitWidth::W64, 0x55))
+            .expect("unproven store is over-approximated, not refused");
+
+        assert!(machine.assumed_external_disjoint_from_vm_stack);
+        assert!(machine.assumed_external_disjoint_from_fresh_allocations);
+
+        let kept_allocation = machine
+            .load_memory(allocation_cell, BitWidth::W64)
+            .expect("load the preserved allocation cell");
+        assert!(
+            matches!(kept_allocation.kind, ExprKind::Const { value: 0x77 }),
+            "allocation-rooted cell must survive: {kept_allocation:?}"
+        );
+        let kept_stack = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load the preserved VM-stack cell");
+        assert!(matches!(kept_stack.kind, ExprKind::Const { value: 9 }));
+        // A cell rooted at neither region is still discarded.
+        let discarded = machine
+            .load_memory(Expr::constant(BitWidth::W64, 0x1_4000_1000), BitWidth::W64)
+            .expect("load the discarded cell");
+        assert!(is_free_read(&discarded), "must not survive: {discarded:?}");
+    }
+
+    // With no allocation-rooted cell present, nothing changed and no new label
+    // is taken -- the guard against a concession recorded wider than it is used.
+    #[test]
+    fn narrowed_havoc_takes_no_allocation_label_when_there_is_nothing_to_keep() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed a precise VM-stack cell");
+        machine
+            .store_external(
+                3,
+                Expr::register(BitWidth::W64, "native_rbx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("unproven store is over-approximated, not refused");
+        assert!(machine.assumed_external_disjoint_from_vm_stack);
+        assert!(!machine.assumed_external_disjoint_from_fresh_allocations);
     }
 
     // (b) An external store whose address still references the VM stack pointer
