@@ -46,9 +46,41 @@ incomplete entries by stop reason: {"BlockVisits": 5, "stall": 108}
 ```
 
 Zero `WallClock` and zero `InstructionLimit` — the time-and-budget axis is
-closed, so no increase in any budget will convert them. They need the analysis
-work (exception-flow for proven-null reads, handler-codec recovery, an inductive
-invariant for VM-stack-changing loops), or the Observed tier.
+closed, so no increase in any budget will convert them.
+
+### What blocks the remaining 113
+
+By each entry's first stall:
+
+| blocker | entries | what it needs |
+|---|---|---|
+| handler has no recovered specification | 36 | prove a conditional predicate opaque before crossing it |
+| imprecise external-memory store | 31 | semantics for the address-computation intrinsics |
+| proven-null read | 25 | a post-init snapshot that reaches the slot |
+| branch target depends on unproven input | 18 | memory precision (96 of 98 are reads of havoc'd memory) |
+| VM-stack-stride loop | 1 | — |
+
+Two things are worth knowing before picking one up.
+
+**Three of the four are the same problem.** The imprecise store, the unproven
+branch input and the null read are all memory modelling — 74 of 113 entries.
+Only the handler class is about control flow.
+
+**The cheap fixes are wrong, not weak.** Each of these classes has had several
+plausible fixes tried and reverted, and in every case the result was an
+incorrect CFG rather than a conservatively labeled one:
+
+- Walking a handler trace past a conditional branch (either one arm, or both
+  arms requiring agreement) recovers postlude shapes that no execution performs.
+  The branch is sometimes a junk predicate and sometimes a guard the recogniser
+  reads, and the trace alone does not separate them.
+- Widening the external-store disjointness gates, or bounding an unsupported
+  address node by its own width, buys nothing: those store addresses are
+  `f(frame_pointer)` for an opaque `f`, which has no provable range relative to
+  the VM stack at all.
+
+Each attempt and its measurement is recorded in the code at the place it was
+made, so the next reader meets it rather than repeating it.
 
 Not re-measured since 2026-11-04 and so quoted as of that date: **385** entries
 raised to C, of which **38** pass the IR round-trip self-check. The gap is the
