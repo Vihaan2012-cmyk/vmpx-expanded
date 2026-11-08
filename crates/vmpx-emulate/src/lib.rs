@@ -60,6 +60,7 @@ mod emu;
 mod iat_fill;
 mod hostmodel;
 mod loader;
+mod lzma_literal;
 mod memory;
 mod replay;
 mod ntdll;
