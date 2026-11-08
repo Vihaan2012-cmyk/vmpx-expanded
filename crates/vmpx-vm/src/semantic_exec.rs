@@ -1225,6 +1225,19 @@ impl std::fmt::Write for BoundedKey {
     }
 }
 
+/// Up to `limit` bytes of `expression`'s `Debug` text, stopping there.
+///
+/// `format!("{e:?}").chars().take(n)` renders the WHOLE tree first and then
+/// throws nearly all of it away. `Debug` prints a hash-consed DAG as a tree, so
+/// for a shared expression that is megabytes of text for an n-character
+/// snippet. `BoundedKey` already keeps what it wrote before going over budget.
+pub(crate) fn debug_prefix(expression: &Expr, limit: usize) -> String {
+    use std::fmt::Write;
+    let mut key = BoundedKey { text: String::new(), remaining: limit };
+    let _ = write!(key, "{expression:?}");
+    key.text
+}
+
 /// `Debug` text of `expression`, or `None` when it renders past `limit` bytes.
 pub(crate) fn bounded_debug(expression: &Expr, limit: usize) -> Option<String> {
     use std::fmt::Write;

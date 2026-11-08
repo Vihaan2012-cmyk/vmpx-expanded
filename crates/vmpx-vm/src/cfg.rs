@@ -2125,7 +2125,7 @@ fn vm_stack_shift_mismatch(
         Ok(Some(_)) => {}
     }
     if a.vsp != r.vsp {
-        let shown = |e: &Expr| format!("{e:?}").chars().take(150).collect::<String>();
+        let shown = |e: &Expr| crate::semantic_exec::debug_prefix(e, 150);
         return format!(
             "shifted vsp still differs: shifted {} vs reentry {}",
             shown(&a.vsp),
@@ -2133,7 +2133,7 @@ fn vm_stack_shift_mismatch(
         );
     }
     if !covers(Some(&a.flags), Some(&r.flags)) {
-        let shown = |e: &Expr| format!("{e:?}").chars().take(100).collect::<String>();
+        let shown = |e: &Expr| crate::semantic_exec::debug_prefix(e, 100);
         return format!("flags: shifted {} vs reentry {}", shown(&a.flags), shown(&r.flags));
     }
     // NOT compared: `widen_state` folds the epoch with `max` and never counts it
@@ -2176,7 +2176,7 @@ fn vm_stack_shift_mismatch(
             .iter()
             .any(|(held, got)| held == address && covers(Some(value), Some(got)))
     }) {
-        let shown = format!("{address:?}").chars().take(90).collect::<String>();
+        let shown = crate::semantic_exec::debug_prefix(address, 90);
         return format!("memory cell not covered at {shown}");
     }
     "nothing (would have closed)".to_owned()
@@ -4601,7 +4601,7 @@ impl Walker<'_, '_> {
                     "popped branch target is not a constant: {}",
                     pop.branch_target.as_ref().map_or_else(
                         || "none".to_owned(),
-                        |target| format!("{target:?}").chars().take(110).collect::<String>(),
+                        |target| crate::semantic_exec::debug_prefix(target, 110),
                     )
                 ));
                 return false;
