@@ -3331,19 +3331,49 @@ impl Walker<'_, '_> {
             DirectJumpTraceLimits::default(),
         )
         .map_err(|error| format!("handler trace failed: {error}"))?;
+        // Only the EXTERNAL data read can fault on a null address. A memory-load
+        // handler also reads the bytecode through the VIP, the operand stack
+        // through the VSP and native spills through RSP/RBP, and taking all of
+        // them measured 5 sites over SIX language handlers for one handler --
+        // five of which fail to classify, while `continuation_recovered`
+        // requires every resolution to be recovered. That over-broad set was
+        // itself the refusal.
+        let roles = self.active.as_ref().map_or(&self.config, |context| &context.config);
+        let role_registers = [
+            roles.roles.vip,
+            roles.roles.rolling_key,
+            roles.roles.handler,
+            iced_x86::Register::RSP,
+            iced_x86::Register::RBP,
+        ];
         let mut fault_sites: Vec<Rva> = trace
             .instructions()
             .filter(|decoded| {
-                (0..decoded.instruction.op_count()).any(|operand| {
-                    decoded.instruction.op_kind(operand) == iced_x86::OpKind::Memory
-                }) && decoded.instruction.mnemonic() != iced_x86::Mnemonic::Lea
+                let instruction = &decoded.instruction;
+                if instruction.mnemonic() == iced_x86::Mnemonic::Lea {
+                    return false;
+                }
+                let reads_memory = (0..instruction.op_count())
+                    .any(|operand| instruction.op_kind(operand) == iced_x86::OpKind::Memory);
+                if !reads_memory {
+                    return false;
+                }
+                let base = instruction.memory_base();
+                if base == iced_x86::Register::None {
+                    // An absolute address is not a null-dereference candidate.
+                    return false;
+                }
+                let full = base.full_register();
+                !role_registers
+                    .iter()
+                    .any(|role| role.full_register() == full)
             })
             .map(|decoded| decoded.rva)
             .collect();
         fault_sites.sort_unstable();
         fault_sites.dedup();
         if fault_sites.is_empty() {
-            return Err("handler trace has no memory-reading instruction".to_owned());
+            return Err("handler trace has no external memory read".to_owned());
         }
         let site_count = fault_sites.len();
         let coverage = crate::analyze_fault_site_exception_coverage(
@@ -3369,7 +3399,7 @@ impl Walker<'_, '_> {
             })
             .ok_or_else(|| {
                 format!(
-                    "no zero-seed-unwind continuation ({} resolution(s): {})",
+                    "no zero-seed-unwind continuation for handler {handler_rva} ({} resolution(s): {})",
                     coverage.continuation_resolutions.len(),
                     coverage
                         .continuation_resolutions
