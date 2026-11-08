@@ -1,4 +1,4 @@
-//! Desktop front-end for the `vmpx` CLI. All analysis is done by the CLI binary;
+﻿//! Desktop front-end for the `vmpx` CLI. All analysis is done by the CLI binary;
 //! this app only builds argument lists, runs the process and renders its output.
 
 mod runner;
@@ -132,24 +132,16 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("vmpx").size(21.0).strong());
+            ui.label(RichText::new("VMProtect research console").weak());
+        });
+        ui.add_space(6.0);
         egui::Grid::new("globals")
             .num_columns(4)
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("Target PE").strong());
                 let width = (ui.available_width() - 330.0).max(160.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.target)
-                        .desired_width(width)
-                        .hint_text("path to the protected image (or drop a file here)"),
-                );
-                if ui.button("Browse").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_file()
-                {
-                    self.target = path.display().to_string();
-                }
-                ui.end_row();
-
                 ui.label(RichText::new("Launcher").strong());
                 ui.add_enabled(
                     !self.use_cargo,
@@ -203,8 +195,26 @@ impl App {
 
     fn options_panel(&mut self, ui: &mut egui::Ui) {
         let action = self.action;
+
+        // 1. The binary, first, because nothing else can be decided without it.
+        theme::section(ui, "1. Target binary");
         ui.horizontal(|ui| {
-            ui.heading(action.label());
+            let width = (ui.available_width() - 130.0).max(200.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.target)
+                    .desired_width(width)
+                    .hint_text("path to the protected image, or drop a file anywhere on this window"),
+            );
+            if ui.button("Browse...").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_file()
+            {
+                self.target = path.display().to_string();
+            }
+        });
+
+        theme::section(ui, "2. Command");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(action.label()).size(16.0).strong());
             ui.label(
                 RichText::new(format!("vmpx {}", action.subcommand()))
                     .monospace()
@@ -212,7 +222,8 @@ impl App {
             );
         });
         ui.label(RichText::new(action.description()).weak());
-        theme::section(ui, "OPTIONS");
+
+        theme::section(ui, "3. Options");
         let o = &mut self.opts;
         egui::Grid::new("options")
             .num_columns(3)
@@ -232,6 +243,238 @@ impl App {
                         o.compare_right = path.display().to_string();
                     }
                     ui.end_row();
+                }
+                Action::DiffOriginal | Action::GenericUnpack | Action::Strip => {
+                    let label = action.second_positional().unwrap_or("Output");
+                    let save = action != Action::DiffOriginal;
+                    theme::path_row(
+                        ui,
+                        label,
+                        &mut o.second_output,
+                        save,
+                        if save {
+                            "written by this command"
+                        } else {
+                            "the unprotected original of the same binary"
+                        },
+                    );
+                    if action == Action::Strip {
+                        theme::value_row(
+                            ui,
+                            "--remove",
+                            &mut o.remove,
+                            ".vmp0, .vmp1",
+                            "section names to remove; at least one is required",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--drop-directory",
+                            &mut o.drop_directory,
+                            "e.g. 9, 11",
+                            "only a directory wholly inside a removed section may be dropped",
+                        );
+                    }
+                    if action == Action::DiffOriginal {
+                        theme::value_row(
+                            ui,
+                            "--function",
+                            &mut o.function,
+                            "export names",
+                            "restrict to these exports; blank = all",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--instruction-limit",
+                            &mut o.instruction_limit,
+                            "100000",
+                            "entry-stream recovery budget",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--exhaustive-bits",
+                            &mut o.exhaustive_bits,
+                            "16",
+                            "free input bits the built-in backend enumerates",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--timeout-ms",
+                            &mut o.timeout_ms,
+                            "60000",
+                            "per-cell wall-clock limit per backend",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--max-blocks",
+                            &mut o.max_blocks,
+                            "200000",
+                            "block-execution budget per side",
+                        );
+                        theme::value_row(
+                            ui,
+                            "--max-paths",
+                            &mut o.max_paths,
+                            "64",
+                            "path budget for the recovered side",
+                        );
+                        theme::flag_row(
+                            ui,
+                            "--strict-gates",
+                            &mut o.strict_gates,
+                            "treat excluded environment-gate arms as unproven",
+                        );
+                        theme::flag_row(
+                            ui,
+                            "--control",
+                            &mut o.control,
+                            "negative control: every verdict must come back REFUTED",
+                        );
+                    }
+                }
+                Action::Report => {
+                    theme::flag_row(
+                        ui,
+                        "--all",
+                        &mut o.all_entries,
+                        "sweep every discovered entry; off uses --sample",
+                    );
+                    if !o.all_entries {
+                        theme::value_row(
+                            ui,
+                            "--sample",
+                            &mut o.sample,
+                            "50",
+                            "entries to sweep",
+                        );
+                    }
+                    theme::value_row(
+                        ui,
+                        "--threads",
+                        &mut o.threads,
+                        "16",
+                        "worker threads; default is logical CPUs capped at 16",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--serve-ro",
+                        &mut o.serve_ro,
+                        "serve read-only image bytes; raises N1, never counts toward N2",
+                    );
+                    theme::opt_row(
+                        ui,
+                        "--volatility-snapshot",
+                        &mut o.volatility_snapshot,
+                        "post-init VMPXSNP1 snapshot; build it with xpl_init_steps",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--serve-observed-ro",
+                        &mut o.serve_observed_ro,
+                        "needs the snapshot; carries ObservedGlobal",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--dynamic",
+                        &mut o.dynamic,
+                        "contained detonation + Observed-tier re-sweep; needs the snapshot",
+                    );
+                }
+                Action::Decompile => {
+                    theme::value_row(
+                        ui,
+                        "--rva",
+                        &mut o.rva,
+                        "0xc43d80e",
+                        "VM entry RVAs, comma separated",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--function",
+                        &mut o.function,
+                        "export names",
+                        "restrict to these exports",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--instruction-limit",
+                        &mut o.instruction_limit,
+                        "100000",
+                        "entry-stream recovery budget",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--native",
+                        &mut o.native,
+                        "input is an unprotected PE; decompile its native CFG",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--probe",
+                        &mut o.probe,
+                        "print the recovered path/loop structure instead of code",
+                    );
+                    theme::opt_row(
+                        ui,
+                        "--original",
+                        &mut o.original,
+                        "unprotected original, to cross-check against",
+                    );
+                }
+                Action::VerifyEquiv => {
+                    theme::value_row(
+                        ui,
+                        "--rva",
+                        &mut o.rva,
+                        "0xc43d80e",
+                        "VM entry RVAs, comma separated",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--max-functions",
+                        &mut o.max_functions,
+                        "blank = all",
+                        "stop after this many recovered functions",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--exhaustive-bits",
+                        &mut o.exhaustive_bits,
+                        "16",
+                        "free input bits the built-in backend enumerates",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--timeout-ms",
+                        &mut o.timeout_ms,
+                        "10000",
+                        "per-cell wall-clock limit per backend",
+                    );
+                    theme::value_row(
+                        ui,
+                        "--instruction-limit",
+                        &mut o.instruction_limit,
+                        "512",
+                        "entry-stream recovery budget",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--solver",
+                        &mut o.solver,
+                        "also consult z3/bitwuzla/cvc5 from PATH",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--no-optimize",
+                        &mut o.no_optimize,
+                        "check the unoptimized lowering",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--strict-memory",
+                        &mut o.strict_memory,
+                        "a load after a possibly-aliasing store counts as unproven",
+                    );
+                    theme::flag_row(ui, "--verbose", &mut o.verbose, "one line per function");
                 }
                 Action::Clean => {
                     theme::path_row(
@@ -253,6 +496,30 @@ impl App {
                         "--experimental",
                         &mut o.experimental,
                         "unverified devirtualized image",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--decoded-lift",
+                        &mut o.decoded_lift,
+                        "with --experimental; lift from decoded handler streams (slow)",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--dynamic",
+                        &mut o.clean_dynamic,
+                        "with --experimental; feed Observed-tier resolved imports",
+                    );
+                    theme::opt_row(
+                        ui,
+                        "--dump-pe",
+                        &mut o.dump_pe,
+                        "with --dynamic; standalone PE from the detonation dump",
+                    );
+                    theme::flag_row(
+                        ui,
+                        "--strip",
+                        &mut o.clean_strip,
+                        "with --experimental; strip protector sections if the checker approves",
                     );
                 }
                 Action::Unpack => {
@@ -284,10 +551,77 @@ impl App {
                 }
                 _ => {}
             });
-        if !matches!(action, Action::Unpack | Action::Clean) {
-            ui.checkbox(&mut o.json, "--json")
-                .on_hover_text("Structured output; off prints the CLI's text report.");
+        if matches!(
+            action,
+            Action::Detect
+                | Action::Info
+                | Action::Verify
+                | Action::Compare
+                | Action::Imports
+                | Action::VmList
+                | Action::Oep
+                | Action::Report
+        ) {
+            theme::section(ui, "4. Output style");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut o.json, true, "Structured (--json)");
+                ui.radio_value(&mut o.json, false, "Plain text report");
+            });
+            ui.label(
+                RichText::new(
+                    "Structured output is parsed into the summary below; plain text is shown as the CLI printed it. Either can be saved from the results pane.",
+                )
+                .size(12.5)
+                .weak(),
+            );
+        } else {
+            theme::section(ui, "4. Output style");
+            ui.label(
+                RichText::new(
+                    "This command writes files rather than a report. Its destinations are set above; the run log is shown below and can be saved from the results pane.",
+                )
+                .size(12.5)
+                .weak(),
+            );
         }
+        // The environment is where most of the behaviour lives, so it is shown
+        // beside the flags rather than left to the shell.
+        theme::group(ui, "5. Environment", |ui| {
+            ui.label(
+                RichText::new(
+                    "Tick a variable to pass it to the run. It is included in the command line below.",
+                )
+                .size(12.5)
+                .weak(),
+            );
+            ui.add_space(6.0);
+            // Fixed sizes, not desired widths: in a grid the help column's long
+            // text competes for space and squeezes the name field down to
+            // "VMPX_". `add_sized` pins the two inputs and the help label
+            // truncates into whatever is left.
+            egui::Grid::new("env")
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    for row in &mut o.env {
+                        ui.checkbox(&mut row.enabled, "");
+                        ui.add_sized(
+                            [290.0, 26.0],
+                            egui::TextEdit::singleline(&mut row.name).hint_text("VMPX_..."),
+                        );
+                        ui.add_sized(
+                            [120.0, 26.0],
+                            egui::TextEdit::singleline(&mut row.value).hint_text("value"),
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(row.help).size(12.5).weak())
+                                .truncate(),
+                        )
+                        .on_hover_text(row.help);
+                        ui.end_row();
+                    }
+                });
+        });
         if matches!(action, Action::Unpack | Action::Clean) {
             ui.label(
                 RichText::new(
@@ -303,15 +637,16 @@ impl App {
 
     fn run_row(&mut self, ui: &mut egui::Ui) {
         let blocked = self.blocked();
+        theme::section(ui, "6. Run");
         ui.horizontal(|ui| {
             let run = egui::Button::new(
                 RichText::new("Run")
-                    .size(16.0)
+                    .size(15.0)
                     .strong()
-                    .color(egui::Color32::BLACK),
+                    .color(egui::Color32::WHITE),
             )
             .fill(ACCENT)
-            .min_size(egui::vec2(110.0, 32.0));
+            .min_size(egui::vec2(120.0, 34.0));
             let response = ui.add_enabled(blocked.is_none(), run);
             let hotkey = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
             if blocked.is_none() && (response.clicked() || hotkey) {
@@ -347,9 +682,10 @@ impl App {
             }
         });
         egui::Frame::none()
-            .fill(egui::Color32::from_rgb(16, 18, 22))
-            .rounding(5.0)
-            .inner_margin(8.0)
+            .fill(egui::Color32::from_rgb(249, 249, 249))
+            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 214, 214)))
+            .rounding(4.0)
+            .inner_margin(10.0)
             .show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut line.as_str())
@@ -401,12 +737,41 @@ impl eframe::App for App {
             .show(ctx, |ui| self.top_bar(ui));
         egui::SidePanel::left("commands")
             .resizable(false)
-            .exact_width(168.0)
+            .exact_width(210.0)
             .frame(theme::panel(BG_SIDE, 12.0, 12.0))
             .show(ctx, |ui| self.sidebar(ui));
+        // The control panel is a single top-to-bottom sequence — binary, command,
+        // options, output, environment, run — so it scrolls as one page rather
+        // than being clipped by a fixed-height panel.
         egui::TopBottomPanel::top("options")
-            .frame(theme::panel(theme::BG_MAIN, 16.0, 12.0))
-            .show(ctx, |ui| self.options_panel(ui));
+            .resizable(true)
+            .default_height(ctx.screen_rect().height() * 0.62)
+            .frame(theme::panel(theme::BG_MAIN, 20.0, 12.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.options_panel(ui));
+            });
+        egui::TopBottomPanel::bottom("status")
+            .frame(theme::panel(theme::BG_MAIN, 6.0, 3.0))
+            .show(ctx, |ui| {
+                let state = if self.running.is_some() {
+                    "Running...".to_owned()
+                } else if let Some(why) = self.blocked() {
+                    why.to_owned()
+                } else {
+                    "Ready".to_owned()
+                };
+                let set = self
+                    .opts
+                    .env
+                    .iter()
+                    .filter(|row| row.enabled && !row.name.trim().is_empty())
+                    .count();
+                let env = format!("{set} env set");
+                let cmd = format!("vmpx {}", self.action.subcommand());
+                theme::status_bar(ui, &[(&state, 0.0), (&cmd, 150.0), (&env, 86.0)]);
+            });
         egui::CentralPanel::default()
             .frame(theme::panel(theme::BG_MAIN, 16.0, 6.0))
             .show(ctx, |ui| self.results(ui));

@@ -18,6 +18,58 @@ use vmpx_pe::PeImage;
 
 const SLICE: u64 = 1_000_000;
 
+/// Sampling profiler over guest `rip`.
+///
+/// There was no way to see WHERE the init spends its steps, only how many it
+/// spends, so every speed decision was a guess -- and the first guess (the
+/// protector-loop folds) measured 90M steps/s against a 116M/s baseline with no
+/// step reduction at all, because those folds never matched this code.
+///
+/// `XPL_PROFILE=<slice>` runs in slices of that many steps and records `rip`
+/// between them. Reading a register between slices costs nothing per step, so
+/// the profile is free; at a 20k slice a 39B-step init yields ~2M samples.
+#[derive(Default)]
+struct Profile {
+    slice: u64,
+    hits: BTreeMap<u64, u64>,
+}
+
+impl Profile {
+    fn from_env() -> Self {
+        let slice = std::env::var("XPL_PROFILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Self { slice, hits: BTreeMap::new() }
+    }
+
+    fn on(&self) -> bool {
+        self.slice > 0
+    }
+
+    fn sample(&mut self, rip: u64) {
+        *self.hits.entry(rip).or_default() += 1;
+    }
+
+    fn report(&self, total_steps: u64) {
+        if !self.on() || self.hits.is_empty() {
+            return;
+        }
+        let samples: u64 = self.hits.values().sum();
+        let mut top: Vec<(u64, u64)> = self.hits.iter().map(|(k, v)| (*k, *v)).collect();
+        top.sort_by_key(|(_, hits)| std::cmp::Reverse(*hits));
+        println!(
+            "profile: {samples} samples over {total_steps} steps, {} distinct rip",
+            self.hits.len()
+        );
+        for (rip, hits) in top.iter().take(25) {
+            let share = (*hits as f64) * 100.0 / (samples as f64);
+            let steps = (*hits as f64) * (self.slice as f64);
+            println!("  {rip:#x}  {share:6.2}%  ~{:.2}e9 steps", steps / 1e9);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     base_steps: u64,
@@ -111,6 +163,18 @@ fn main() {
     let watch = Watch { inner: winapi, stubs: img.import_stubs.clone(), sh: Rc::clone(&sh), idata };
     println!("entry={entry:#x} tls={tls:x?} idata={idata:x?} max_steps={max_total}");
     let mut emu = img.prepare(entry, &[]).unwrap();
+    // Match the detonation path, which sets `accelerate_protector_loops: true` by
+    // default. This example drives the emulator directly instead of going through
+    // `detonate`, so it inherited `Emulator`'s `false` and interpreted every
+    // VMProtect integrity and copy loop byte by byte. Those folds replace N
+    // iterations with one closed-form step, and the init is tens of BILLIONS of
+    // steps, so this is a step-COUNT lever, not a step-rate one.
+    //
+    // `XPL_NOACCEL=1` restores byte-by-byte interpretation for an A/B.
+    emu.accelerate_checksums = std::env::var_os("XPL_NOACCEL").is_none();
+    // Load-bearing, not an observer: `WinApiHook` IMPLEMENTS the Win32/XPLM
+    // emulation, so dropping it to save per-write dispatch stops the run at the
+    // first API call (measured: 122 steps).
     emu.hook = Some(Box::new(watch));
     emu.resolve_undefined_flags = true;
     emu.record_trace = false;
@@ -141,6 +205,8 @@ fn main() {
         phases.retain(|(l, _, _)| want.split(',').any(|w| w == l));
     }
 
+    let mut prof = Profile::from_env();
+    let slice = if prof.on() { prof.slice } else { SLICE };
     let t0 = Instant::now();
     let mut total = 0u64;
     'outer: for (label, f, args) in &phases {
@@ -154,19 +220,22 @@ fn main() {
         let start = total;
         let stop = loop {
             sh.borrow_mut().base_steps = total;
-            let budget = SLICE.min(max_total.saturating_sub(total));
+            let budget = slice.min(max_total.saturating_sub(total));
             if budget == 0 {
                 break Stop::StepLimit;
             }
             let before = emu.steps();
             let s = emu.run_until(sentinel, budget);
             total += emu.steps() - before;
+            if prof.on() {
+                prof.sample(emu.cpu.rip);
+            }
             {
                 let b = sh.borrow();
                 if let Some(c) = csv.as_mut() {
                     let _ = writeln!(c, "{label},{total},{:#x},{},{},{:#x}", emu.cpu.rip, b.idata_writes, b.calls.values().sum::<u64>(), emu.cpu.regs[4]);
                 }
-                if (total / SLICE) % 100 == 0 {
+                if (total / slice) % (100 * SLICE / slice).max(1) == 0 {
                     println!(
                         "[{label}] steps={total} rip={:#x} idata_w={} api_calls={} distinct_api={} wall={:.0}s",
                         emu.cpu.rip, b.idata_writes, b.calls.values().sum::<u64>(), b.calls.len(), t0.elapsed().as_secs_f64()
@@ -196,6 +265,7 @@ fn main() {
         let sz = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         println!("snapshot saved -> {path} ({sz} bytes) rip={:#x} total_steps={total} wall={:.0}s", emu.cpu.rip, t0.elapsed().as_secs_f64());
     }
+    prof.report(total);
     let s = sh.borrow();
     println!("idata writes={} first_at={:?} last_at={}", s.idata_writes, s.idata_first, s.idata_last);
     println!("first-seen imports (steps, name):");

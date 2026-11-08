@@ -11,32 +11,56 @@ and application import set are proven. This fork implements that remaining work 
 sound, independently testable stages, and now recovers control-flow graphs and
 raises virtualized functions to C-like pseudocode.
 
-Everything here is **static**. The protected sample is never executed natively.
+The default path is **static**. A contained software emulator supplies the
+separate Observed tier, and that is the only thing that runs the code. **The
+protected sample is never executed natively.**
 
 ## Where it stands
 
-Measured 2026-11-04 on one VMProtect 3.11-protected x64 binary with 814 discovered
-VM entry stubs, under `--serve-ro`:
+Measured 2026-11-08 on one VMProtect 3.11-protected x64 binary, sweeping all 814
+discovered VM entry stubs under `--serve-ro` with
+`VMPX_FOLLOW_CROSS_VMP_SECTION=1` and `VMPX_INSTRUCTION_LIMIT=2048`:
 
 | | count |
 |---|---|
 | VM entry stubs discovered | 814 |
-| **N1** — CFG-complete under any labeled assumption | **581** |
-| **N2** — complete with an *empty* assumption set | **248** |
-| entries raised to devirtualized C | **385** |
-| of those, passing the IR round-trip self-check | **38** |
+| **N1** — CFG-complete under any labeled assumption | **699** (85.9%) |
+| **N2** — complete with an *empty* assumption set | **253** (31.1%) |
+| incomplete | 113 |
+| errors / panics | 2 / 0 |
 
-Read those last two rows together, because the gap is the point: of the 385
-functions emitted, 38 are confirmed by the round-trip check and **346 fail only
-because the checker cannot evaluate an unknown** (an opaque intrinsic such as a
-timestamp read or an untracked memory load). Zero fail from an actual
-disagreement. So the decompiler does not currently contradict its own IR
-anywhere — but most of its output is unverified, and we label it that way rather
-than counting it as proven.
+This is the first sweep to reach 814/814. Earlier runs stopped near 800 because a
+single entry spun without ever returning, and the per-entry wall-clock budget did
+not bound it; the cause was an input-domain scan with no visited set, walking a
+hash-consed expression DAG as a tree.
+
+Of the 699, **253 carry no assumption and 446 rest on
+`AssumesExternalStoresDisjointFromVmStack`**, which is labeled unproven. That
+split matters more than the headline: N1 can always be raised by widening the
+assumption set, so N2 is the number that carries weight.
+
+Every one of the 113 incomplete entries is a *semantic* stall:
+
+```
+incomplete entries by stop reason: {"BlockVisits": 5, "stall": 108}
+```
+
+Zero `WallClock` and zero `InstructionLimit` — the time-and-budget axis is
+closed, so no increase in any budget will convert them. They need the analysis
+work (exception-flow for proven-null reads, handler-codec recovery, an inductive
+invariant for VM-stack-changing loops), or the Observed tier.
+
+Not re-measured since 2026-11-04 and so quoted as of that date: **385** entries
+raised to C, of which **38** pass the IR round-trip self-check. The gap is the
+point — 346 fail only because the checker cannot evaluate an unknown (an opaque
+intrinsic such as a timestamp read, or an untracked load), and **zero** fail from
+an actual disagreement. The decompiler does not contradict its own IR anywhere,
+but most of its output is unverified and is labeled that way rather than counted
+as proven.
 
 This is one sample, not a benchmark. `--serve-ro` serves read-only image bytes
-under a labeled assumption, which raises N1 and suppresses N2; the sound-mode
-figures move accordingly and are not quoted here because they are not current.
+under a labeled assumption, which raises N1 and suppresses N2; without it N1 on
+this sample falls to roughly half.
 
 ## The three tiers
 
@@ -84,16 +108,43 @@ Useful entry points:
 
 ```bash
 # tiered report over every discovered VM entry
-vmpx report <image> --all --threads 8
+vmpx report <image> --all --threads 16 --serve-ro
 
 # raise recovered functions to C-like pseudocode
-vmpx decompile <image> --rva 0x...
+VMPX_DECOMPILE_SERVE_RO=1 vmpx decompile <image> --rva 0x...
 
 # discover VM entry stubs and bootstrap profiles
 vmpx vm-list <image>
 ```
 
 `report` and `decompile` write nothing and execute nothing; they analyse.
+
+There is also a desktop front end, `vmpx-ui`, which drives the CLI and renders
+its JSON reports — pick a binary, tick the flags, set the environment, run:
+
+```bash
+cargo run --release -p vmpx-ui
+```
+
+### Settings whose absence costs results silently
+
+Several knobs are not implied by anything, and leaving one out does not produce
+an error — just a worse number:
+
+- **`report` needs `--serve-ro`.** Without it N1 on the sample above falls from
+  658 to 359. `VMPX_DECOMPILE_SERVE_RO` does *not* apply to `report`.
+- **`decompile` needs `VMPX_DECOMPILE_SERVE_RO=1`.** Without it the CFG reads as
+  incomplete and you get one line saying so instead of code. There is no
+  `--serve-ro` flag on `decompile`.
+- **`--dynamic` needs `--volatility-snapshot`.** Without the snapshot it takes
+  the bare-detonation branch, which never finishes the multi-billion-step init
+  and so observes nothing — reporting a silent zero rather than failing.
+- **No snapshot exists by default, and no subcommand writes one.** Build it with
+  the `xpl_init_steps` example and `XPL_SNAPSHOT_OUT`; it takes a few minutes.
+  Raise `XPL_STACK_KB` while doing so — at the 8 MiB default the init overflows
+  the guest stack and the snapshot captures a truncated state.
+- **`VMPX_INSTRUCTION_LIMIT` is a multiplier, not an absolute**, and `report`'s
+  base is 512 while `decompile`'s is 100000.
 
 ## Crates
 

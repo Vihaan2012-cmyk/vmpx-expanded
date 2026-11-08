@@ -17,11 +17,17 @@ pub enum Action {
     Imports,
     VmList,
     Oep,
+    Report,
+    Decompile,
+    VerifyEquiv,
+    DiffOriginal,
     Unpack,
+    GenericUnpack,
+    Strip,
     Clean,
 }
 
-pub const GROUPS: [(&str, &[Action]); 3] = [
+pub const GROUPS: [(&str, &[Action]); 4] = [
     (
         "INSPECT",
         &[
@@ -33,7 +39,24 @@ pub const GROUPS: [(&str, &[Action]); 3] = [
         ],
     ),
     ("DISCOVER", &[Action::VmList, Action::Oep]),
-    ("RECOVER", &[Action::Unpack, Action::Clean]),
+    (
+        "ANALYSE",
+        &[
+            Action::Report,
+            Action::Decompile,
+            Action::VerifyEquiv,
+            Action::DiffOriginal,
+        ],
+    ),
+    (
+        "RECOVER",
+        &[
+            Action::Unpack,
+            Action::GenericUnpack,
+            Action::Strip,
+            Action::Clean,
+        ],
+    ),
 ];
 
 impl Action {
@@ -46,7 +69,13 @@ impl Action {
             Self::Imports => "Imports",
             Self::VmList => "VM list",
             Self::Oep => "OEP",
+            Self::Report => "Report",
+            Self::Decompile => "Decompile",
+            Self::VerifyEquiv => "Verify equiv",
+            Self::DiffOriginal => "Diff original",
             Self::Unpack => "Unpack",
+            Self::GenericUnpack => "Generic unpack",
+            Self::Strip => "Strip",
             Self::Clean => "Clean",
         }
     }
@@ -60,7 +89,13 @@ impl Action {
             Self::Imports => "imports",
             Self::VmList => "vm-list",
             Self::Oep => "oep",
+            Self::Report => "report",
+            Self::Decompile => "decompile",
+            Self::VerifyEquiv => "verify-equiv",
+            Self::DiffOriginal => "diff-original",
             Self::Unpack => "unpack",
+            Self::GenericUnpack => "generic-unpack",
+            Self::Strip => "strip",
             Self::Clean => "clean",
         }
     }
@@ -74,13 +109,47 @@ impl Action {
             Self::Imports => "Inventory imports and direct native RIP-relative IAT references.",
             Self::VmList => "Discover evidence-scored VM entry stubs and bootstrap profiles.",
             Self::Oep => "Rank module-entry evidence without trusting the protected header entry.",
+            Self::Report => {
+                "Tiered N1/N2/N3 report over the discovered VM entries. Writes nothing."
+            }
+            Self::Decompile => "Raise a recovered function to C-like pseudocode.",
+            Self::VerifyEquiv => {
+                "Equivalence gate: proves, refutes or leaves unproven each recovered function."
+            }
+            Self::DiffOriginal => {
+                "Ground-truth differential against the unprotected original binary."
+            }
             Self::Unpack => "Recover packed sections into an RVA-layout analysis image.",
+            Self::GenericUnpack => {
+                "Non-VMProtect packer (UPX/ASPack/PECompact/MPRESS/FSG): bounded unpack to OEP."
+            }
+            Self::Strip => "Remove named sections when the dangling-ref checker approves.",
             Self::Clean => "Proof-gated recovery pipeline; emits a clean PE only when safe.",
         }
     }
 
+    /// The label for the second positional path, when the subcommand takes one.
+    pub fn second_positional(self) -> Option<&'static str> {
+        match self {
+            Self::Compare => Some("Second image"),
+            Self::DiffOriginal => Some("Original (unprotected)"),
+            Self::GenericUnpack | Self::Strip => Some("Output"),
+            _ => None,
+        }
+    }
+
     fn has_json_flag(self) -> bool {
-        !matches!(self, Self::Unpack | Self::Clean)
+        matches!(
+            self,
+            Self::Detect
+                | Self::Info
+                | Self::Verify
+                | Self::Compare
+                | Self::Imports
+                | Self::VmList
+                | Self::Oep
+                | Self::Report
+        )
     }
 }
 
@@ -101,6 +170,64 @@ impl PathOpt {
     }
 }
 
+/// One environment variable row.
+///
+/// Much of what changes a run lives in the environment rather than on the
+/// command line, and several of those knobs move the result materially, so the
+/// UI surfaces them as first-class options instead of leaving them invisible.
+#[derive(Clone, Debug)]
+pub struct EnvRow {
+    pub enabled: bool,
+    pub name: String,
+    pub value: String,
+    pub help: &'static str,
+}
+
+impl EnvRow {
+    fn new(name: &str, value: &str, help: &'static str) -> Self {
+        Self {
+            enabled: false,
+            name: name.to_owned(),
+            value: value.to_owned(),
+            help,
+        }
+    }
+}
+
+/// The knobs worth one click, pre-filled with the value usually wanted. The long
+/// tail stays reachable: the final row is blank and editable.
+fn default_env() -> Vec<EnvRow> {
+    vec![
+        EnvRow::new(
+            "VMPX_FOLLOW_CROSS_VMP_SECTION",
+            "1",
+            "Follow a branch target in another executable section (labels the CFG)",
+        ),
+        EnvRow::new(
+            "VMPX_INSTRUCTION_LIMIT",
+            "4",
+            "Multiplier on the per-block VM instruction budget; report's base is 512",
+        ),
+        EnvRow::new("VMPX_WALL_SECS", "400", "Per-entry wall-clock budget in seconds"),
+        EnvRow::new(
+            "VMPX_DECOMPILE_SERVE_RO",
+            "1",
+            "Serve-RO for decompile; report has its own --serve-ro flag instead",
+        ),
+        EnvRow::new("VMPX_ONLY_ENTRIES", "", "Comma-separated hex entry RVAs to restrict the sweep"),
+        EnvRow::new("VMPX_PROGRESS", "", "File given running done/n1/n2/incomplete counts"),
+        EnvRow::new("VMPX_STALL_DUMP", "", "JSONL, one line per incomplete entry"),
+        EnvRow::new("VMPX_ENTRY_TRACE", "", "Per-entry start/done with elapsed and outcome"),
+        EnvRow::new("VMPX_TRACE_PHASES", "1", "Phase markers; the last unpaired one names a hang"),
+        EnvRow::new("VMPX_MEM_TRACE", "1", "Enable the [slow] timing probes"),
+        EnvRow::new("VMPX_SLOW_MS", "200", "Timing-probe floor in ms; the default is 5000"),
+        EnvRow::new("VMPX_BUDGET_PASSES", "", "tb,visits,total,instr multipliers; passes split by ;"),
+        EnvRow::new("VMPX_CFG_AUDIT", "", "Record any complete CFG with a dangling successor"),
+        EnvRow::new("VMPX_DISCHARGE_DUMP", "", "Why a complete entry could not reach N2"),
+        EnvRow::new("", "", "Any other variable"),
+    ]
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub json: bool,
@@ -110,9 +237,41 @@ pub struct Options {
     pub clean_report: PathOpt,
     pub reconstructed: PathOpt,
     pub experimental: PathOpt,
+    pub decoded_lift: bool,
+    pub clean_dynamic: bool,
+    pub dump_pe: PathOpt,
+    pub clean_strip: bool,
     pub unpack_output: String,
     pub unpack_report: PathOpt,
     pub conventional: PathOpt,
+    pub all_entries: bool,
+    pub sample: String,
+    pub threads: String,
+    pub serve_ro: bool,
+    pub serve_observed_ro: bool,
+    pub dynamic: bool,
+    pub volatility_snapshot: PathOpt,
+    pub rva: String,
+    pub function: String,
+    pub instruction_limit: String,
+    pub exhaustive_bits: String,
+    pub timeout_ms: String,
+    pub native: bool,
+    pub probe: bool,
+    pub original: PathOpt,
+    pub max_functions: String,
+    pub no_optimize: bool,
+    pub solver: bool,
+    pub strict_memory: bool,
+    pub verbose: bool,
+    pub strict_gates: bool,
+    pub max_blocks: String,
+    pub max_paths: String,
+    pub control: bool,
+    pub remove: String,
+    pub drop_directory: String,
+    pub second_output: String,
+    pub env: Vec<EnvRow>,
 }
 
 impl Default for Options {
@@ -125,9 +284,41 @@ impl Default for Options {
             clean_report: PathOpt::default(),
             reconstructed: PathOpt::default(),
             experimental: PathOpt::default(),
+            decoded_lift: false,
+            clean_dynamic: false,
+            dump_pe: PathOpt::default(),
+            clean_strip: false,
             unpack_output: String::new(),
             unpack_report: PathOpt::default(),
             conventional: PathOpt::default(),
+            all_entries: true,
+            sample: String::new(),
+            threads: String::new(),
+            serve_ro: true,
+            serve_observed_ro: false,
+            dynamic: false,
+            volatility_snapshot: PathOpt::default(),
+            rva: String::new(),
+            function: String::new(),
+            instruction_limit: String::new(),
+            exhaustive_bits: String::new(),
+            timeout_ms: String::new(),
+            native: false,
+            probe: false,
+            original: PathOpt::default(),
+            max_functions: String::new(),
+            no_optimize: false,
+            solver: false,
+            strict_memory: false,
+            verbose: false,
+            strict_gates: false,
+            max_blocks: String::new(),
+            max_paths: String::new(),
+            control: false,
+            remove: String::new(),
+            drop_directory: String::new(),
+            second_output: String::new(),
+            env: default_env(),
         }
     }
 }
@@ -148,6 +339,18 @@ impl Options {
             }
             Action::Unpack if self.unpack_report.incomplete() || self.conventional.incomplete() => {
                 Some("an enabled output path is empty")
+            }
+            Action::DiffOriginal if self.second_output.trim().is_empty() => {
+                Some("choose the unprotected original image")
+            }
+            Action::GenericUnpack | Action::Strip if self.second_output.trim().is_empty() => {
+                Some("choose the output path")
+            }
+            Action::Strip if self.remove.trim().is_empty() => {
+                Some("--remove needs at least one section name")
+            }
+            Action::Report if self.dynamic && !self.volatility_snapshot.enabled => {
+                Some("--dynamic observes nothing without --volatility-snapshot")
             }
             _ => None,
         }
@@ -191,6 +394,8 @@ impl JobResult {
 struct Plan {
     program: OsString,
     args: Vec<OsString>,
+    /// Environment the child runs with, from the enabled `EnvRow`s.
+    env: Vec<(String, String)>,
     /// Report file to parse after the run, when the command writes one.
     report: Option<PathBuf>,
     scratch: Vec<PathBuf>,
@@ -223,8 +428,96 @@ fn plan(job: &Job) -> Plan {
         args.push(name.into());
         args.push(value.into());
     };
+    // Repeatable value flags take a comma- or space-separated list in the UI.
+    let many = |args: &mut Vec<OsString>, name: &str, text: &str| {
+        for part in text.split([',', ' ', '\t']).filter(|p| !p.trim().is_empty()) {
+            args.push(name.into());
+            args.push(part.trim().into());
+        }
+    };
+    let value = |args: &mut Vec<OsString>, name: &str, text: &str| {
+        let text = text.trim();
+        if !text.is_empty() {
+            args.push(name.into());
+            args.push(text.into());
+        }
+    };
     match job.action {
         Action::Compare => args.push(opts.compare_right.trim().into()),
+        Action::DiffOriginal => {
+            args.push(opts.second_output.trim().into());
+            many(&mut args, "--function", &opts.function);
+            value(&mut args, "--exhaustive-bits", &opts.exhaustive_bits);
+            value(&mut args, "--timeout-ms", &opts.timeout_ms);
+            value(&mut args, "--instruction-limit", &opts.instruction_limit);
+            value(&mut args, "--max-blocks", &opts.max_blocks);
+            value(&mut args, "--max-paths", &opts.max_paths);
+            if opts.strict_gates {
+                args.push("--strict-gates".into());
+            }
+            if opts.control {
+                args.push("--control".into());
+            }
+        }
+        Action::GenericUnpack => args.push(opts.second_output.trim().into()),
+        Action::Strip => {
+            args.push(opts.second_output.trim().into());
+            many(&mut args, "--remove", &opts.remove);
+            many(&mut args, "--drop-directory", &opts.drop_directory);
+        }
+        Action::Report => {
+            if opts.all_entries {
+                args.push("--all".into());
+            } else {
+                value(&mut args, "--sample", &opts.sample);
+            }
+            value(&mut args, "--threads", &opts.threads);
+            if opts.serve_ro {
+                args.push("--serve-ro".into());
+            }
+            if let Some(path) = opts.volatility_snapshot.value() {
+                flag(&mut args, "--volatility-snapshot", Path::new(path));
+            }
+            if opts.serve_observed_ro {
+                args.push("--serve-observed-ro".into());
+            }
+            if opts.dynamic {
+                args.push("--dynamic".into());
+            }
+        }
+        Action::Decompile => {
+            many(&mut args, "--rva", &opts.rva);
+            many(&mut args, "--function", &opts.function);
+            if opts.native {
+                args.push("--native".into());
+            }
+            if let Some(path) = opts.original.value() {
+                flag(&mut args, "--original", Path::new(path));
+            }
+            if opts.probe {
+                args.push("--probe".into());
+            }
+            value(&mut args, "--instruction-limit", &opts.instruction_limit);
+        }
+        Action::VerifyEquiv => {
+            value(&mut args, "--max-functions", &opts.max_functions);
+            many(&mut args, "--rva", &opts.rva);
+            value(&mut args, "--exhaustive-bits", &opts.exhaustive_bits);
+            value(&mut args, "--timeout-ms", &opts.timeout_ms);
+            value(&mut args, "--instruction-limit", &opts.instruction_limit);
+            if opts.no_optimize {
+                args.push("--no-optimize".into());
+            }
+            if opts.solver {
+                args.push("--solver".into());
+            }
+            if opts.strict_memory {
+                args.push("--strict-memory".into());
+            }
+            if opts.verbose {
+                args.push("--verbose".into());
+            }
+        }
         Action::Clean | Action::Unpack => {
             let (output, report_opt, extras) = if job.action == Action::Clean {
                 (
@@ -267,6 +560,20 @@ fn plan(job: &Job) -> Plan {
                     flag(&mut args, name, Path::new(path));
                 }
             }
+            if job.action == Action::Clean {
+                if opts.decoded_lift {
+                    args.push("--decoded-lift".into());
+                }
+                if opts.clean_dynamic {
+                    args.push("--dynamic".into());
+                }
+                if let Some(path) = opts.dump_pe.value() {
+                    flag(&mut args, "--dump-pe", Path::new(path));
+                }
+                if opts.clean_strip {
+                    args.push("--strip".into());
+                }
+            }
         }
         _ => {}
     }
@@ -276,9 +583,16 @@ fn plan(job: &Job) -> Plan {
     if job.action == Action::VmList && opts.no_scan {
         args.push("--no-scan".into());
     }
+    let env = opts
+        .env
+        .iter()
+        .filter(|row| row.enabled && !row.name.trim().is_empty())
+        .map(|row| (row.name.trim().to_owned(), row.value.trim().to_owned()))
+        .collect();
     Plan {
         program,
         args,
+        env,
         report,
         scratch,
     }
@@ -296,11 +610,19 @@ fn quote(arg: &std::ffi::OsStr) -> String {
 /// The exact command line `run` will execute.
 pub fn command_line(job: &Job) -> String {
     let plan = plan(job);
-    std::iter::once(&plan.program)
-        .chain(&plan.args)
-        .map(|arg| quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    // The environment is part of the command: a line pasted into a shell without
+    // it does not reproduce the run.
+    let mut parts: Vec<String> = plan
+        .env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    parts.extend(
+        std::iter::once(&plan.program)
+            .chain(&plan.args)
+            .map(|arg| quote(arg)),
+    );
+    parts.join(" ")
 }
 
 fn run_inner(job: &Job, result: &mut JobResult) -> Result<()> {
@@ -313,6 +635,7 @@ fn run_inner(job: &Job, result: &mut JobResult) -> Result<()> {
     let started = SystemTime::now();
     let output = Command::new(&plan.program)
         .args(&plan.args)
+        .envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .output()
         .with_context(|| format!("failed to launch {}", result.command_line))?;
     result.exit_code = output.status.code();
