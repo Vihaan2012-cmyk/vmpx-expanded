@@ -2481,6 +2481,18 @@ struct Walker<'a, 'p> {
 /// inside the executor (`vm_stack_pointer_lost`) still applies, so this only
 /// widens the entry-accumulated gate. Anything it recovers carries
 /// `AssumesExternalStoresDisjointFromVmStack` and never reaches N2.
+/// Multiplier on the transition-prefix cap, from `VMPX_TRANSITION_PREFIX`.
+fn transition_prefix_scale() -> usize {
+    static SCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VMPX_TRANSITION_PREFIX")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|scale| *scale >= 1)
+            .unwrap_or(1)
+    })
+}
+
 fn retry_when_frame_pointer_lost() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VMPX_RETRY_FRAME_LOST").is_some())
@@ -4672,8 +4684,15 @@ impl Walker<'_, '_> {
         // A genuine transition handler ends a short handler-stream block; a very
         // long prefix is not a clean transition and symbolic-executing it would
         // allocate a large state for nothing. Fail closed past a modest cap.
+        // `VMPX_TRANSITION_PREFIX` scales it. The cap became the binding one once
+        // the native trace stopped truncating at opaque predicates: handlers that
+        // used to have no specification now decode, so the linear VM stream runs
+        // further before meeting an unrecovered one and the prefix grows. Hitting
+        // this cap is therefore a symptom of recovering MORE, not of a longer
+        // handler.
         const MAX_TRANSITION_PREFIX: usize = 512;
-        if instructions.len() > MAX_TRANSITION_PREFIX {
+        let max_prefix = MAX_TRANSITION_PREFIX.saturating_mul(transition_prefix_scale());
+        if instructions.len() > max_prefix {
             {
                 self.transition_refusal = Some("prefix too long for a clean transition".to_owned());
                 return false;

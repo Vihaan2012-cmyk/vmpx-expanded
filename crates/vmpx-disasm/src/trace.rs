@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use iced_x86::FlowControl;
+use iced_x86::{ConditionCode, FlowControl, Instruction, Mnemonic, OpKind, RflagsBits};
 use serde::Serialize;
 use vmpx_pe::{PeImage, Rva};
 
@@ -159,6 +159,109 @@ fn stop(
 /// Later decode and mapping failures are represented by the returned stop
 /// reason so partial evidence remains available.
 #[allow(clippy::too_many_lines)]
+
+/// The x86 status flags this tracks, each known or not.
+///
+/// MEASURED +0 on systems.xpl: it decides none of the 162 conditionals that stop
+/// a handler trace there, because VMProtect does not build those predicates out
+/// of constant flags. The flag write and the branch are separated by real
+/// arithmetic on symbolic registers:
+///
+/// ```text
+///     clc                  ; carry cleared
+///     add  r11,r8          ; and immediately clobbered
+///     jmp  r11
+///     ja   <target>        ; needs CF=0 and ZF=0, both unknown
+/// ```
+///
+/// So the refusal is correct and deciding these needs the register VALUES, i.e.
+/// native symbolic execution of the handler, not local flag tracking. Kept
+/// because it is a proof rather than an assumption and costs one byte of state
+/// per flag, and because a predicate that IS constant must not stop a trace;
+/// documented so the next reader does not re-derive the measurement.
+#[derive(Clone, Copy, Default)]
+struct FlagState {
+    cf: Option<bool>,
+    zf: Option<bool>,
+    sf: Option<bool>,
+    of: Option<bool>,
+}
+
+impl FlagState {
+    /// Folds one instruction's effect on the flags.
+    ///
+    /// Only the forms VMProtect uses to build an opaque predicate are tracked
+    /// exactly; every other flag write makes the flags it touches unknown, which
+    /// is what keeps this from deciding a branch it has not actually proven.
+    fn apply(&mut self, instruction: &Instruction) {
+        match instruction.mnemonic() {
+            Mnemonic::Clc => {
+                self.cf = Some(false);
+                return;
+            }
+            Mnemonic::Stc => {
+                self.cf = Some(true);
+                return;
+            }
+            Mnemonic::Cmc => {
+                self.cf = self.cf.map(|carry| !carry);
+                return;
+            }
+            // `cmp r,r` / `sub r,r` / `xor r,r` on the SAME register: the result
+            // is zero whatever the register holds.
+            Mnemonic::Cmp | Mnemonic::Sub | Mnemonic::Xor
+                if instruction.op0_kind() == OpKind::Register
+                    && instruction.op1_kind() == OpKind::Register
+                    && instruction.op0_register() == instruction.op1_register() =>
+            {
+                self.cf = Some(false);
+                self.zf = Some(true);
+                self.sf = Some(false);
+                self.of = Some(false);
+                return;
+            }
+            _ => {}
+        }
+        let modified = instruction.rflags_modified();
+        if modified & RflagsBits::CF != 0 {
+            self.cf = None;
+        }
+        if modified & RflagsBits::ZF != 0 {
+            self.zf = None;
+        }
+        if modified & RflagsBits::SF != 0 {
+            self.sf = None;
+        }
+        if modified & RflagsBits::OF != 0 {
+            self.of = None;
+        }
+    }
+
+    /// Whether this conditional branch is taken, when every flag it reads is
+    /// known. `None` means undecided, and the caller must not cross it.
+    fn decides(self, condition: ConditionCode) -> Option<bool> {
+        let (cf, zf, sf, of) = (self.cf, self.zf, self.sf, self.of);
+        match condition {
+            ConditionCode::b => cf,
+            ConditionCode::ae => cf.map(|c| !c),
+            ConditionCode::e => zf,
+            ConditionCode::ne => zf.map(|z| !z),
+            ConditionCode::be => Some(cf? || zf?),
+            ConditionCode::a => Some(!cf? && !zf?),
+            ConditionCode::s => sf,
+            ConditionCode::ns => sf.map(|s| !s),
+            ConditionCode::o => of,
+            ConditionCode::no => of.map(|o| !o),
+            ConditionCode::l => Some(sf? != of?),
+            ConditionCode::ge => Some(sf? == of?),
+            ConditionCode::le => Some(zf? || sf? != of?),
+            ConditionCode::g => Some(!zf? && sf? == of?),
+            // Parity is not tracked; nothing VMProtect builds here needs it.
+            _ => None,
+        }
+    }
+}
+
 pub fn trace_direct_jump_fragments(
     pe: &PeImage<'_>,
     entry: Rva,
@@ -173,6 +276,13 @@ pub fn trace_direct_jump_fragments(
     decode_one(pe, entry)?;
 
     let mut fragments = Vec::new();
+    // Flags carry ACROSS fragments, not per fragment. Fragments are joined by
+    // unconditional jumps, which do not touch the flags, so resetting at each
+    // boundary would throw away the `clc`/`stc` that sets up an opaque
+    // predicate -- and VMProtect routinely puts the flag write and the branch
+    // that reads it in different fragments. Resetting measured +0 for exactly
+    // that reason.
+    let mut flags = FlagState::default();
     let mut conditional_continuations = Vec::new();
     let mut visited = BTreeSet::new();
     let mut decoded_instructions = 0_usize;
@@ -234,6 +344,10 @@ pub fn trace_direct_jump_fragments(
             };
             decoded_instructions = decoded_instructions.saturating_add(1);
             let flow = decoded.instruction.flow_control();
+            let decided = (flow == FlowControl::ConditionalBranch)
+                .then(|| flags.decides(decoded.instruction.condition_code()))
+                .flatten();
+            flags.apply(&decoded.instruction);
             let next = decoded.next_rva();
             let direct_target = decoded.direct_target_rva(pe);
             let instruction_rva = decoded.rva;
@@ -258,6 +372,26 @@ pub fn trace_direct_jump_fragments(
                     );
                 }
                 FlowControl::ConditionalBranch => {
+                    // A predicate whose flags are all known is decided here, and
+                    // the arm it selects is the ONLY reachable one -- so taking
+                    // it is a proof and the other arm is dead. VMProtect builds
+                    // these out of `stc`/`clc`/`cmc` and `cmp r,r` to split a
+                    // handler across fragments; a real guard (the stack-check
+                    // postlude's `ja` after `cmp vsp,limit`) has unknown flags
+                    // and still stops the trace.
+                    if let Some(taken) = decided {
+                        let arm = if taken { direct_target } else { next };
+                        if let Some(arm) = arm.filter(|rva| is_executable_rva(pe, *rva)) {
+                            push_fragment(
+                                &mut fragments,
+                                fragment_start,
+                                instructions,
+                                Some(arm),
+                            );
+                            fragment_start = arm;
+                            continue 'trace;
+                        }
+                    }
                     // Walking on means picking an arm, which is not a proof; the
                     // site is recorded so the caller can label what it recovers.
                     let arm = if limits.follow_conditional_target {
