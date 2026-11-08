@@ -280,6 +280,18 @@ fn differing_cells(a: &SymbolicVmInitialState, b: &SymbolicVmInitialState) -> Re
     Ok(out)
 }
 
+/// Instruction count before a proven-null-read failure in a `VmExit` block.
+///
+/// The fault leaves the VM, so the prefix is the block's semantics. `None` for
+/// any other failure, or a block the walk did not close as an exit.
+fn null_read_prefix(
+    error: &vmpx_vm::SymbolicExecutionError,
+    exit: BlockExit,
+) -> Option<usize> {
+    (exit == BlockExit::VmExit && error.message.contains("null memory read"))
+        .then_some(error.instruction_index)
+}
+
 impl Walker<'_, '_> {
     fn successors(&self, key: Va) -> Vec<(u64, Va)> {
         let cfg = self.input.cfg;
@@ -349,14 +361,30 @@ impl Walker<'_, '_> {
             BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
             BlockExit::Stalled => return Err(format!("block {key} did not reach a boundary")),
         };
-        let mut report = execute_symbolic_linear_block_with_initial_state(
+        let mut report = match execute_symbolic_linear_block_with_initial_state(
             &block.instructions,
             Some(boundary),
             SymbolicExecutionLimits::default(),
             state,
             self.input.memory,
-        )
-        .map_err(|e| format!("block {key} symbolic execution failed: {e}"))?;
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                // The fault leaves the VM; lower the prefix that does run.
+                let prefix = null_read_prefix(&error, block.exit)
+                    .ok_or_else(|| format!("block {key} symbolic execution failed: {error}"))?;
+                execute_symbolic_linear_block_with_initial_state(
+                    &block.instructions[..prefix],
+                    None,
+                    SymbolicExecutionLimits::default(),
+                    state,
+                    self.input.memory,
+                )
+                .map_err(|e| {
+                    format!("block {key} symbolic execution failed before the null read: {e}")
+                })?
+            }
+        };
         // Parity with the CFG walk, which already retries a tainted block once
         // with loaded-data store addresses treated as opaque pointers. Taint is
         // the broad fallback for a store address that still mentions

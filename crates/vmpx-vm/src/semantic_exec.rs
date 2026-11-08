@@ -793,7 +793,7 @@ impl<'a> SymbolicMachine<'a> {
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
             } else if let ExprKind::Const { value } = byte_address.kind
                 && self.serve_read_only_when_suppressed
-                && !self.memory_tainted
+                && (!self.memory_tainted || serve_read_only_when_tainted())
                 && let Some(byte) = self
                     .memory_source
                     .and_then(|source| source.read_only_byte(Va(value)))
@@ -1576,6 +1576,19 @@ pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
 /// retention. The switch exists so the change can be measured against itself in
 /// one build rather than across two, which is how a change that looked like a
 /// gain on one metric and a loss on another got caught before.
+/// Whether a read-only image byte is still served after a BROAD havoc.
+///
+/// A store to a non-writable page faults, so only a protection change could
+/// have altered it -- which is exactly what `AssumesImageProtectionStable`
+/// already concedes for the suppressed case. Measured: this is the sole
+/// remaining blocker on 5 store-class entries, whose broad havoc sets
+/// `memory_tainted` and so stops their constant image reads being served.
+/// `VMPX_NO_SERVE_RO_TAINTED=1` restores the stricter gate.
+fn serve_read_only_when_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_SERVE_RO_TAINTED").is_none())
+}
+
 fn retain_fresh_allocations() -> bool {
     static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_FRESH_ALLOC_RETAIN").is_none())
