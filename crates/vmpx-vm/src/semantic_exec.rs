@@ -728,6 +728,21 @@ impl<'a> SymbolicMachine<'a> {
                 // null read. EXPERIMENTAL, observed-labeled (not sound output);
                 // a non-zero image byte is genuinely resolvable and never
                 // overridden.
+                //
+                // MEASURED: this does NOT reach the null reads that block 25
+                // entries on systems.xpl. Their slots (0x378135cd4, 0x377e387a2,
+                // 0x377fcdf9c) are in .vmp2, which is read-only and so eligible
+                // for the seed -- and the seed still does not carry them. Two
+                // post-init snapshots, one at 39.1B steps and one at 120B, give
+                // a byte-identical seed (7365 bytes over 1559 ranges), because
+                // the protector finishes writing its read-only sections early
+                // (idata writes stop at 16.8B). The slots are zero at every
+                // depth, so they are not runtime-initialized globals at all.
+                //
+                // Those reads are therefore real null dereferences -- VMProtect
+                // reading address 0 on purpose -- and the refusal's own wording
+                // is the prescription: they need exception-flow analysis, not a
+                // deeper snapshot. The observed bridge cannot close them.
                 let seeded = if image_byte.is_none_or(|byte| byte == 0) {
                     self.memory_source
                         .and_then(|source| source.observed_byte(byte_va))
