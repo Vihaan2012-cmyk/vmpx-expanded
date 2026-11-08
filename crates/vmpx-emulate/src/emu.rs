@@ -426,6 +426,8 @@ pub struct Emulator {
     csum: Box<[Option<(u64, u64, Option<crate::checksum_loop::Shape>)>]>,
     /// Recognizer cache for the copy loop, same scheme as `csum`.
     cpyc: Box<[Option<(u64, u64, Option<crate::copy_loop::Shape>)>]>,
+    /// Recognizer cache for the LZMA literal decoder, same scheme as `csum`.
+    lzmc: Box<[Option<(u64, u64, Option<crate::lzma_literal::Shape>)>]>,
 }
 
 const CSUM_SLOTS: usize = 256;
@@ -471,6 +473,9 @@ pub struct Prof {
     /// Copy loops folded, and the bytes those folds moved.
     pub copies_folded: u64,
     pub copied_bytes: u64,
+    /// LZMA literal symbols folded, and the bit decodes those folds retired.
+    pub literals_folded: u64,
+    pub literal_bits: u64,
     /// Iterations declined because a byte was unreadable.
     pub fold_declined: u64,
     /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
@@ -492,6 +497,8 @@ impl Default for Prof {
             folded_iterations: 0,
             copies_folded: 0,
             copied_bytes: 0,
+            literals_folded: 0,
+            literal_bits: 0,
             fold_declined: 0,
             slow_mn: vec![0; 2048].into_boxed_slice(),
         }
@@ -677,6 +684,7 @@ impl Emulator {
             accelerate_checksums: false,
             csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
             cpyc: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            lzmc: vec![None; CSUM_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -1048,6 +1056,167 @@ impl Emulator {
         false
     }
 
+    /// The LZMA literal-decoder shape at `rip`, cached like
+    /// [`Emulator::checksum_shape`].
+    fn lzma_shape(&mut self, rip: u64) -> Option<crate::lzma_literal::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        if let Some((cached_rip, cached_epoch, shape)) = self.lzmc[slot]
+            && cached_rip == rip
+            && cached_epoch == epoch
+        {
+            return shape;
+        }
+        let mem = &self.mem;
+        let shape = crate::lzma_literal::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder = Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.lzmc[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized LZMA literal decoder natively, one bit per step
+    /// instead of the ~30 interpreted instructions a bit costs.
+    ///
+    /// Two properties make this cheaper to get right than the other folds.
+    ///
+    /// First, no rollback is needed. Nothing is committed until the whole fold
+    /// is done: `range`, `code` and `symbol` are local, and an iteration that
+    /// cannot read its input byte or probability, or cannot store the updated
+    /// probability, simply ends the fold with that iteration not counted. The
+    /// interpreter then resumes at the head and faults exactly where the guest
+    /// would. The other folds hand an iteration BACK so the faulting state's
+    /// flags come from real instruction semantics; here that is unnecessary,
+    /// because `cmp range, kTopValue` at the head overwrites every arithmetic
+    /// flag before anything reads one -- flags are dead across the head, which
+    /// the matched shape proves rather than assumes.
+    ///
+    /// Second, the stopping point is structural. The symbol doubles each bit
+    /// and the loop leaves when it reaches `0x100`, so folding while it stays
+    /// below `0x80` leaves the LAST bit to the interpreter -- which is what
+    /// produces the exit flags and takes the fall-through out of the loop.
+    ///
+    /// Returns the bit decodes retired, or 0 when nothing was folded.
+    fn fold_lzma_literal(&mut self, shape: &crate::lzma_literal::Shape) -> u64 {
+        use crate::lzma_literal::Shape;
+        let (Some(symbol), Some(probs), Some(range), Some(code), Some(input), Some(input_end)) = (
+            self.cpu.reg(shape.symbol),
+            self.cpu.reg(shape.probs),
+            self.cpu.reg(shape.range),
+            self.cpu.reg(shape.code),
+            self.cpu.reg(shape.input),
+            self.cpu.reg(shape.input_end),
+        ) else {
+            return 0;
+        };
+        let mut symbol = symbol as u32;
+        let mut range = range as u32;
+        let mut code = code as u32;
+        // Entered with the symbol already at or past the halfway mark, the only
+        // bit left is the one the interpreter must run anyway.
+        if symbol == 0 || Shape::complete(symbol << 1) {
+            return 0;
+        }
+        if self.fold_lzma_elides_wanted_event(shape, input, probs) {
+            return 0;
+        }
+        let mut cursor = input;
+        let mut index = 0u64;
+        let mut scratch = (0u32, 0u32);
+        let mut done = 0u64;
+        // Fold while the next doubling still leaves the symbol inside the
+        // tree, which is precisely "this is not the last bit".
+        while !Shape::complete(symbol << 1) {
+            if Shape::needs_normalise(range) {
+                // The guest leaves the loop when the input runs out; that exit
+                // is outside the matched shape, so stop and let it happen.
+                if cursor == input_end {
+                    break;
+                }
+                let Ok(byte) = self.mem.read_uint(cursor, 1) else {
+                    break;
+                };
+                (range, code) = Shape::normalise(range, code, byte as u8);
+                cursor = cursor.wrapping_add(1);
+            }
+            let slot = probs.wrapping_add(u64::from(symbol) * 2);
+            let Ok(probability) = self.mem.read_uint(slot, 2) else {
+                break;
+            };
+            let step = Shape::step(range, code, symbol, probability as u16);
+            if self.mem.write(slot, &step.probability.to_le_bytes()).is_err() {
+                break;
+            }
+            // `movsxd index, symbol` runs at the head, so the index the guest
+            // holds on re-entry is the one this iteration used.
+            index = i64::from(symbol as i32) as u64;
+            range = step.range;
+            code = step.code;
+            symbol = step.symbol;
+            scratch = (step.scratch_a, step.scratch_c);
+            done += 1;
+        }
+        if done == 0 {
+            return 0;
+        }
+        self.cpu.set_reg(shape.symbol, u64::from(symbol));
+        self.cpu.set_reg(shape.range, u64::from(range));
+        self.cpu.set_reg(shape.code, u64::from(code));
+        self.cpu.set_reg(shape.input, cursor);
+        self.cpu.set_reg(shape.index, index);
+        self.cpu.set_reg(shape.scratch_a, u64::from(scratch.0));
+        self.cpu.set_reg(shape.scratch_c, u64::from(scratch.1));
+        self.prof.literals_folded += 1;
+        self.prof.literal_bits += done;
+        done
+    }
+
+    /// As [`Emulator::fold_elides_wanted_event`], for the literal decoder.
+    ///
+    /// The read span is bounded without knowing the trip count: at most seven
+    /// bits are folded, so at most seven input bytes are pulled, and the symbol
+    /// stays below `0x100`, so every probability slot lies in the first 512
+    /// bytes of the array. That array is both read and written.
+    fn fold_lzma_elides_wanted_event(
+        &self,
+        shape: &crate::lzma_literal::Shape,
+        input: u64,
+        probs: u64,
+    ) -> bool {
+        if self.gate.read_all
+            || self.gate.write_all
+            || self.gate.flow_all
+            || self.gate.write_pages
+            || self.gate.flow_pages
+        {
+            return true;
+        }
+        const PROB_BYTES: u64 = 0x200;
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        for span in self.gate.read {
+            if overlaps(span, input, 7) || overlaps(span, probs, PROB_BYTES) {
+                return true;
+            }
+        }
+        for span in self.gate.write {
+            if overlaps(span, probs, PROB_BYTES) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if overlaps(span, shape.body.0, shape.body.1 - shape.body.0) {
+                return true;
+            }
+        }
+        false
+    }
+
     #[allow(clippy::collapsible_if)]
     fn run_loop(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
         let mut left = max_steps;
@@ -1063,7 +1232,10 @@ impl Emulator {
                     Some(shape) => self.fold_checksum(&shape),
                     None => match self.copy_shape(rip) {
                         Some(shape) => self.fold_copy(&shape),
-                        None => 0,
+                        None => match self.lzma_shape(rip) {
+                            Some(shape) => self.fold_lzma_literal(&shape),
+                            None => 0,
+                        },
                     },
                 };
                 if folded > 0 {

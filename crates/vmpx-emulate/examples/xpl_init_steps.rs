@@ -18,6 +18,24 @@ use vmpx_pe::PeImage;
 
 const SLICE: u64 = 1_000_000;
 
+/// What the protector-loop folds actually did.
+///
+/// Without this, a fold that never matches looks exactly like a fold that
+/// matches and does not help -- which is how the first attempt at speeding the
+/// init up went unexplained for a session.
+fn folds(prof: &vmpx_emulate::Prof) -> String {
+    format!(
+        "folds: checksum={} iters={} copies={} bytes={} literals={} bits={} declined={}",
+        prof.folded,
+        prof.folded_iterations,
+        prof.copies_folded,
+        prof.copied_bytes,
+        prof.literals_folded,
+        prof.literal_bits,
+        prof.fold_declined
+    )
+}
+
 /// Sampling profiler over guest `rip`.
 ///
 /// There was no way to see WHERE the init spends its steps, only how many it
@@ -193,6 +211,7 @@ fn main() {
             "resumed: ran {ran} steps stop={s:?} rip={:#x} rax={:#x} api_calls={} wall={:.1}s",
             emu.cpu.rip, emu.cpu.regs[0], b.calls.values().sum::<u64>(), t.elapsed().as_secs_f64()
         );
+        println!("{}", folds(&emu.prof));
         // The resume path used to end here, so a continued init could not be
         // saved and every attempt had to restart from zero. The phase budget is
         // the binding cost -- 120B steps did not finish even the first TLS
@@ -253,6 +272,7 @@ fn main() {
                         "[{label}] steps={total} rip={:#x} idata_w={} api_calls={} distinct_api={} wall={:.0}s",
                         emu.cpu.rip, b.idata_writes, b.calls.values().sum::<u64>(), b.calls.len(), t0.elapsed().as_secs_f64()
                     );
+                    println!("   {}", folds(&emu.prof));
                     let _ = std::io::stdout().flush();
                 }
             }
@@ -279,6 +299,7 @@ fn main() {
         println!("snapshot saved -> {path} ({sz} bytes) rip={:#x} total_steps={total} wall={:.0}s", emu.cpu.rip, t0.elapsed().as_secs_f64());
     }
     prof.report(total);
+    println!("{}", folds(&emu.prof));
     let s = sh.borrow();
     println!("idata writes={} first_at={:?} last_at={}", s.idata_writes, s.idata_first, s.idata_last);
     println!("first-seen imports (steps, name):");
