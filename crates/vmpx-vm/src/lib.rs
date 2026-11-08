@@ -175,7 +175,7 @@ pub use neutralize::{
     DetectedWhen, INTEGRITY_CHECKSUM_INTRINSIC, NeutralizeAction, NeutralizeConstruct,
     NeutralizeOptions, RecoveredGuard, TIMESTAMP_COUNTER_INTRINSIC_PREFIX, neutralize,
 };
-pub use oep::{OepDecision, decide_oep};
+pub use oep::{OepDecision, decide_oep, decide_oep_with_returns};
 pub use operand_extract::{
     KeyedOperandCodecCandidate, KeyedOperandCodecRejection, KeyedOperandCodecReport,
     extract_keyed_operand_codecs, extract_keyed_operand_codecs_direction,

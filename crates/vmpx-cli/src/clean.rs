@@ -12,7 +12,8 @@ use vmpx_vm::{
     NativeContinuationLimits, NativeContinuationReport, RecoveryStatus, VmDiscoveryLimits,
     VmEntrySource, VmMemoryExceptionCoverageReport, VmProfileChainStop, VmProfileExplorerLimits,
     analyze_native_continuation, analyze_vm_entry_at,
-    analyze_vm_memory_exception_coverage_with_state, continue_through_native_vm_entry, decide_oep,
+    analyze_vm_memory_exception_coverage_with_state, continue_through_native_vm_entry,
+    decide_oep_with_returns,
     discover_vm_entries, recover_entry_paths, recover_modulo_image_targets,
 };
 use vmpx_vmlift::audit_entry_effect_liveness;
@@ -1116,6 +1117,10 @@ pub fn analyze_clean_with_image(
     let mut header_entry_candidate: Option<vmpx_vm::VmEntryCandidate> = None;
     // Per header path: its single-resolved continuation RVA, or None.
     let mut oep_paths: Vec<Option<Rva>> = Vec::new();
+    // Positional against `oep_paths`: a path whose VM exit is a proven
+    // zero-seed exception unwind returns to its caller and never transfers into
+    // original native code, so it supplies no entry-point candidate.
+    let mut oep_path_returns: Vec<bool> = Vec::new();
     // Unknown counts as incomplete: a group only skips its dispatcher fallback
     // when its family was proven complete.
     let mut header_family_complete = false;
@@ -1155,6 +1160,33 @@ pub fn analyze_clean_with_image(
                             continuation_targets
                                 .as_ref()
                                 .and_then(single_continuation_rva),
+                        );
+                        // A path whose exit resolves to NO image target and
+                        // whose fault provably unwinds to the caller is a
+                        // RETURN, not an unresolved transfer.
+                        //
+                        // The test is the absent continuation target, not an
+                        // absent native exit: measured on this sample all four
+                        // paths report `native_exit_recovered = true`, and the
+                        // two unwinding ones differ by having no image target
+                        // for their return address -- which is the caller's,
+                        // and therefore not in this image at all.
+                        oep_path_returns.push(
+                            continuation_targets
+                                .as_ref()
+                                .and_then(single_continuation_rva)
+                                .is_none()
+                                && exception_coverage_for_chain(&pe, &path.chain).iter().any(
+                                    |coverage| {
+                                        coverage.continuation_resolutions.iter().any(|resolution| {
+                                            resolution.status == RecoveryStatus::Recovered
+                                                && resolution.source
+                                                    == Some(
+                                                        vmpx_vm::ExceptionContinuationSource::ZeroSeedUnwind,
+                                                    )
+                                        })
+                                    },
+                                ),
                         );
                         let mut issues = live.issues.clone();
                         if path.chain.stop_reason == VmProfileChainStop::SymbolicExecutionFailure {
@@ -2081,9 +2113,12 @@ pub fn analyze_clean_with_image(
     }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
         && protection.image_layout == ImageLayout::ConventionalFile;
-    let oep_decision = decide_oep(&oep_paths, header_family_complete, |rva| {
-        is_native_continuation(&pe, rva)
-    });
+    let oep_decision = decide_oep_with_returns(
+        &oep_paths,
+        &oep_path_returns,
+        header_family_complete,
+        |rva| is_native_continuation(&pe, rva),
+    );
     if let (Some(bytes), Some(oep), false) = (
         reintegrated.as_mut(),
         oep_decision.recovered_entry,
