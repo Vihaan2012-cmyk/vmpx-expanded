@@ -530,6 +530,12 @@ struct SymbolicMachine<'a> {
     /// byte cannot change a different concrete byte, so it must not rename that
     /// byte's loads.
     byte_versions: BTreeMap<u64, u64>,
+    /// Address of the most recent image byte served as ZERO with no observed
+    /// seed behind it. A pointer slot that is zero in the file but initialised
+    /// at run time produces the null-read stall several instructions later, by
+    /// which point the address is just `0` and the slot is unrecoverable -- so
+    /// the slot is recorded here and reported with the refusal.
+    last_zero_image_read: Option<u64>,
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
@@ -625,6 +631,7 @@ impl<'a> SymbolicMachine<'a> {
             memory_epoch: initial.memory_epoch,
             opaque_store_epoch: initial.memory_epoch,
             byte_versions: BTreeMap::new(),
+            last_zero_image_read: None,
             memory_tainted: initial.memory_tainted,
             image_reads_suppressed: initial.image_reads_suppressed,
             assumed_external_disjoint_from_vm_stack: false,
@@ -733,6 +740,9 @@ impl<'a> SymbolicMachine<'a> {
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else if let Some(byte) = image_byte {
                     all_unknown = false;
+                    if byte == 0 {
+                        self.last_zero_image_read = Some(value);
+                    }
                     note_served_read(value, SERVED_UNSUPPRESSED);
                     self.resolved_image_addresses.insert(byte_va);
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
@@ -988,8 +998,11 @@ impl<'a> SymbolicMachine<'a> {
         let address = canonicalize_pointer(address);
         if matches!(address.kind, ExprKind::Const { value: 0 }) {
             return Err(format!(
-                "proven null memory read of {} byte(s) requires exception-flow analysis",
-                width.bytes()
+                "proven null memory read of {} byte(s) requires exception-flow analysis \
+                 [zero slot {}]",
+                width.bytes(),
+                self.last_zero_image_read
+                    .map_or_else(|| "none".to_owned(), |slot| format!("{slot:#x}")),
             ));
         }
         self.load_memory(address, width)
