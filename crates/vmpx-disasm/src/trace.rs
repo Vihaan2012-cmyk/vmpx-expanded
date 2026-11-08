@@ -160,6 +160,7 @@ fn stop(
 /// reason so partial evidence remains available.
 #[allow(clippy::too_many_lines)]
 
+
 /// The x86 status flags this tracks, each known or not.
 ///
 /// MEASURED +0 on systems.xpl: it decides none of the 162 conditionals that stop
@@ -179,6 +180,21 @@ fn stop(
 /// because it is a proof rather than an assumption and costs one byte of state
 /// per flag, and because a predicate that IS constant must not stop a trace;
 /// documented so the next reader does not re-derive the measurement.
+///
+/// A fourth approach was tried and reverted too: resume at the point where the
+/// two arms REJOIN, taking no instruction from either, which is sound for a
+/// recogniser reading the stream provided both arms change nothing but flags.
+/// They do not. The fallthrough of the conditional that stops these traces is
+///
+/// ```text
+///     ja   <target>
+///     mov  rax,rsp        ; fallthrough does real work
+/// ```
+///
+/// so the arms are not junk and skipping them would drop effects. Which settles
+/// the class: these handlers genuinely BRANCH, and codec recovery models a
+/// linear handler via a backward slice of a linear trace. No way of tracing
+/// further fixes that -- it needs a handler model that admits control flow.
 #[derive(Clone, Copy, Default)]
 struct FlagState {
     cf: Option<bool>,
