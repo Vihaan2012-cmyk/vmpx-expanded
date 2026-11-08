@@ -443,6 +443,11 @@ pub struct Prof {
     pub block_ops: u64,
     /// Steps taken one at a time because no block was available.
     pub single: u64,
+    /// Ops that are a direct `jmp` fused onto the previous op. They still
+    /// occupy an op slot, so each costs a step and a flow-interest check while
+    /// doing nothing but moving `rip` -- VMProtect scatters a handler across
+    /// fragments joined by these, so the share is worth knowing.
+    pub fused_jumps: u64,
     /// Checksum loops folded, and guest iterations those folds retired.
     pub folded: u64,
     pub folded_iterations: u64,
@@ -463,6 +468,7 @@ impl Default for Prof {
             blocks: 0,
             block_ops: 0,
             single: 0,
+            fused_jumps: 0,
             folded: 0,
             folded_iterations: 0,
             copies_folded: 0,
@@ -1223,6 +1229,7 @@ impl Emulator {
                 }
                 if p.fj {
                     // Direct `jmp` right after this op, run without a dispatch.
+                    self.prof.fused_jumps += 1;
                     let j = &ops[i];
                     let to = j.a.v;
                     let jnext = next.wrapping_add(u64::from(j.len));

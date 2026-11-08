@@ -84,6 +84,14 @@ fn main() {
         pct(p.block_ops),
         p.single
     );
+    #[allow(clippy::cast_precision_loss)]
+    {
+        println!(
+            "fused_jumps={} ({:.1}% of steps)",
+            p.fused_jumps,
+            pct(p.fused_jumps)
+        );
+    }
     println!(
         "folded={} folded_iterations={} copies={} copied_bytes={} declined={}",
         p.folded, p.folded_iterations, p.copies_folded, p.copied_bytes, p.fold_declined
