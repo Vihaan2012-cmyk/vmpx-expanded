@@ -1657,7 +1657,12 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
             ResizeOp::Truncate => "Truncate",
         },
         ExprKind::Load { .. } => "Load",
-        ExprKind::Intrinsic { .. } => "Intrinsic",
+        // The NAME, not just the kind: closing this class means proving
+        // `f(vsp + k) = vsp + g(k)` for the specific functions VMProtect emits,
+        // so which ones they are is the whole scope of that work.
+        ExprKind::Intrinsic { name, .. } => return Some(Box::leak(
+            format!("Intrinsic:{name}").into_boxed_str(),
+        )),
         ExprKind::Extract { .. } => "Extract",
         ExprKind::Concat { .. } => "Concat",
         ExprKind::Register { .. } => "Register",
@@ -1805,7 +1810,24 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 hi,
             })
         }
-        // No arm, deliberately. Bounding an unsupported node by its own width
+        // No arm, deliberately, and NOT because the missing arm is arithmetic.
+        //
+        // Measured on the affected entries, the node that stops the bound is
+        // `memory_load_epoch_N` in 31 of 45 occurrences -- the opaque value a
+        // read of UNTRACKED memory returns. So the store address is not
+        // `f(vsp + k)` for some VMProtect function f whose semantics could be
+        // modelled; it depends on a value the recovery already lost. There is
+        // no g to prove.
+        //
+        // That makes this class and the "branch target depends on unproven
+        // input" class one cause, not two: 96 of 98 of those refuse on
+        // `OtherLeaf(memory_load_epoch)` as well. And it is circular -- a store
+        // with an unbounded address havocs memory, later reads of it come back
+        // opaque, those reads feed the next store's address, which havocs
+        // again. Closing either class means not starting that cascade, which is
+        // memory precision, not intrinsic semantics.
+        //
+        // Bounding an unsupported node by its own width
         // was tried and reverted: it is sound as a VALUE bound but it discards
         // the ROOT, and `proven_store_byte_range` needs one, so it cannot reach
         // the proof path and measured +0.
