@@ -960,6 +960,9 @@ impl<'a> SymbolicMachine<'a> {
                     is_frame_pointer_value(address),
                     self.vm_stack_address_escapes,
                     self.vm_stack_pointer_lost,
+                ) + &format!(
+                    " offset={:?}",
+                    pointer_offset(address).map(|offset| format!("{offset:#x}"))
                 ),
             });
             return Ok(());

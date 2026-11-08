@@ -4053,16 +4053,29 @@ impl Walker<'_, '_> {
             return;
         };
         if symbolic.memory_tainted {
-            // Say WHICH gate kept the labeled disjointness retry from running.
-            // The retry exists (see `decode_block`) but is gated on the boundary
-            // kind and on the frame not having escaped, and without this the
-            // stall text cannot tell those cases apart -- so the 31 entries
-            // blocked here look like one cause when they may be three.
+            // Carry BOTH halves of the refusal into the stall text, because they
+            // are independent and each can block alone: the walker's gate on the
+            // labeled disjointness retry, and the executor's own per-block check
+            // that refuses even once the retry runs. Measured, the gate is
+            // `frame_pointer_lost` in 45 of 45 occurrences while the observed
+            // escape is false in 38 -- and widening it alone is +0, because the
+            // executor then refuses instead. Without the havoc cause here that
+            // second refusal is invisible: it lives in `memory_havocs`, which no
+            // dump reads.
+            let havoc = symbolic
+                .memory_havocs
+                .iter()
+                .rev()
+                .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                .map_or_else(
+                    || "no aliasing havoc recorded".to_owned(),
+                    |havoc| havoc.cause.clone(),
+                );
             self.stall(
                 key,
                 vip,
                 format!(
-                    "branch target follows an imprecise external-memory store                      (retry gates: frame_not_private={} frame_pointer_lost={}                      frame_escape_seen={} frame_privacy_conceded={})",
+                    "branch target follows an imprecise external-memory store                      (retry gates: frame_not_private={} frame_pointer_lost={}                      frame_escape_seen={} frame_privacy_conceded={}; havoc: {havoc})",
                     self.frame_not_private,
                     self.frame_pointer_lost,
                     self.frame_escape_seen,
