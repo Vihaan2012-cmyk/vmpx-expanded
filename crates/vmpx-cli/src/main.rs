@@ -22,8 +22,11 @@ mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
+mod auto_cmd;
+mod auto_imports;
 mod decompile_cmd;
 mod devirt_cmd;
+mod logkit;
 mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
@@ -223,6 +226,24 @@ enum Command {
         /// VM instruction budget for entry-stream recovery.
         #[arg(long, default_value_t = 100_000)]
         instruction_limit: usize,
+    },
+    /// One command: analyse a mapped VMProtect image and produce a clean PE --
+    /// strip, directory rebuild, OEP, native relocation, guard devirtualization,
+    /// and (with a snapshot) import binding.
+    Auto {
+        /// Mapped analysis image (protector sections present).
+        input: PathBuf,
+        /// Output image name (placed under --dir when relative).
+        output: PathBuf,
+        /// Output directory; created if absent.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Post-init snapshot (VMPXSNP1) for import recovery.
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        /// Print the full per-step trace.
+        #[arg(long)]
+        log: bool,
     },
     /// Devirtualize guard functions to native code and reintegrate them into a
     /// stripped image, folding the integrity checksum to a constant.
@@ -1333,6 +1354,20 @@ fn main() -> Result<()> {
             probe,
             instruction_limit,
         })?,
+        Command::Auto {
+            input,
+            output,
+            dir,
+            snapshot,
+            log,
+        } => auto_cmd::run(auto_cmd::Options {
+            input,
+            output,
+            dir,
+            snapshot,
+            verbose: log,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {
             intact,
             stripped,

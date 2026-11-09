@@ -1,0 +1,148 @@
+//! Import recovery for `vmpx auto`: name the application's encrypted `.idata`
+//! slots from a post-init snapshot and bind them in place with a real import
+//! directory (the loader fills `FirstThunk`, so the encrypted bytes are
+//! overwritten).
+
+use std::collections::BTreeMap;
+
+use vmpx_emulate::snapshot;
+use vmpx_pe::{PeImage, Rva};
+use vmpx_rebuild::{AppendSection, append_section, serialize_import_table};
+use vmpx_rebuild::{ImportModuleSpec, ImportTarget};
+
+use crate::logkit::Log;
+
+const STUB_REGION: u64 = 0x0000_0020_0000_0000;
+const IMPORT_DIRECTORY: usize = 1;
+const IAT_DIRECTORY: usize = 12;
+const DESCRIPTOR_SIZE: usize = 20;
+const FIRST_THUNK_FIELD: usize = 16;
+
+pub fn bind(
+    log: &Log,
+    intact: &PeImage<'_>,
+    intact_bytes: &[u8],
+    stripped: &[u8],
+    snapshot_path: &std::path::Path,
+) -> Result<Vec<u8>, String> {
+    let base = intact.optional.image_base.0;
+    let (_cpu, mem) = snapshot::load(snapshot_path).map_err(|e| format!("snapshot: {e}"))?;
+
+    // The loader's flattened import order assigns each symbol a sentinel.
+    let mut names: Vec<(String, String)> = Vec::new();
+    for module in &intact.report().imports {
+        for sym in &module.entries {
+            names.push((
+                module.name.clone(),
+                sym.name
+                    .clone()
+                    .unwrap_or_else(|| format!("#{}", sym.ordinal.unwrap_or(0))),
+            ));
+        }
+    }
+
+    // Read each .idata slot from the snapshot; a filled slot that holds a
+    // sentinel names its import.
+    let Some(idata) = intact.sections.iter().find(|s| s.name.as_str() == ".idata") else {
+        return Err("no .idata section".to_owned());
+    };
+    let start = idata.virtual_address.0;
+    let size = idata.virtual_size.max(idata.size_of_raw_data);
+    let mut by_module: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
+    for offset in (0..size).step_by(8) {
+        let rva = start + offset;
+        if let Ok(value) = mem.read_uint(base + u64::from(rva), 8)
+            && let Some(index) = value
+                .checked_sub(STUB_REGION)
+                .filter(|d| d % 8 == 0)
+                .map(|d| (d / 8) as usize)
+                .filter(|i| *i < names.len())
+        {
+            let (module, func) = &names[index];
+            by_module.entry(module.clone()).or_default().push((rva, func.clone()));
+        }
+    }
+    let total: usize = by_module.values().map(Vec::len).sum();
+    if total == 0 {
+        return Err("the snapshot resolved no import slots".to_owned());
+    }
+
+    // One descriptor per contiguous run of slots.
+    let mut runs: Vec<(String, u32, Vec<String>)> = Vec::new();
+    for (module, slots) in &by_module {
+        let mut sorted = slots.clone();
+        sorted.sort_by_key(|(rva, _)| *rva);
+        for (rva, func) in sorted {
+            match runs.last_mut() {
+                Some((m, start, funcs))
+                    if *m == *module
+                        && *start + 8 * u32::try_from(funcs.len()).unwrap_or(u32::MAX) == rva =>
+                {
+                    funcs.push(func);
+                }
+                _ => runs.push((module.clone(), rva, vec![func])),
+            }
+        }
+    }
+
+    let specs: Vec<ImportModuleSpec> = runs
+        .iter()
+        .map(|(module, _, funcs)| ImportModuleSpec {
+            name: module.clone(),
+            symbols: funcs
+                .iter()
+                .map(|name| ImportTarget::Name {
+                    name: name.clone(),
+                    hint: 0,
+                })
+                .collect(),
+        })
+        .collect();
+    let section_rva = vmpx_rebuild::next_section_rva(stripped).map_err(|e| e.to_string())?;
+    let table = serialize_import_table(intact.optional.kind, section_rva, &specs)
+        .map_err(|e| format!("serialize: {e}"))?;
+
+    // Point each descriptor's FirstThunk at its existing .idata run.
+    let mut payload = table.bytes.clone();
+    for (index, (_, start, _)) in runs.iter().enumerate() {
+        let at = index * DESCRIPTOR_SIZE + FIRST_THUNK_FIELD;
+        payload
+            .get_mut(at..at + 4)
+            .ok_or("descriptor past payload")?
+            .copy_from_slice(&start.to_le_bytes());
+    }
+    let rebuilt = append_section(
+        stripped,
+        AppendSection {
+            name: *b".vmpximp",
+            data: &payload,
+            characteristics: 0xC000_0040,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut image = rebuilt.bytes;
+
+    // Install directory 1 and point the IAT directory at the .idata span.
+    let pe_off = u32::from_le_bytes(image[0x3c..0x40].try_into().expect("4")) as usize;
+    let dirs = pe_off + 24 + 112;
+    let mut put = |image: &mut Vec<u8>, index: usize, rva: u32, sz: u32| {
+        let at = dirs + index * 8;
+        image[at..at + 4].copy_from_slice(&rva.to_le_bytes());
+        image[at + 4..at + 8].copy_from_slice(&sz.to_le_bytes());
+    };
+    put(&mut image, IMPORT_DIRECTORY, table.import_directory.rva.0, table.import_directory.size);
+    let low = runs.iter().map(|(_, s, _)| *s).min().unwrap_or(0);
+    let high = runs
+        .iter()
+        .map(|(_, s, f)| s + 8 * u32::try_from(f.len()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    put(&mut image, IAT_DIRECTORY, low, high.saturating_sub(low));
+
+    let _ = intact_bytes;
+    log.step(
+        "imports bound",
+        &format!("{total} symbol(s) in {} descriptor(s) over {} module(s)", runs.len(), by_module.len()),
+    );
+    Ok(image)
+}

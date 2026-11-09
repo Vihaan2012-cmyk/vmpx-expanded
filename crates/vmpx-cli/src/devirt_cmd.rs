@@ -117,7 +117,7 @@ fn collect_legit_paths<'a>(
 }
 
 /// Native bytes for one devirtualized guard, built at its final VA.
-fn build_one(
+pub(crate) fn build_one(
     intact: &PeImage<'_>,
     rva: u32,
     instruction_limit: usize,
@@ -270,14 +270,13 @@ fn build_one(
     };
     let replacement = build_replacement(&registers, &config, CodeAddress(va))
         .map_err(|error| format!("build: {error}"))?;
-    eprintln!("  {rva:#x}: folded {folded} intrinsic(s), {} native byte(s)", replacement.compiled.bytes.len());
     Ok(replacement.compiled.bytes)
 }
 
 /// Retarget every direct `.text` transfer into `old` so it reaches `new`,
 /// including transfers from executable bytes `.pdata` does not describe (the
 /// thunk table). Returns the number retargeted.
-fn retarget_sites(
+pub(crate) fn retarget_sites(
     image: &mut Vec<u8>,
     mapping: &BTreeMap<u32, u32>,
 ) -> Result<usize, String> {
@@ -386,6 +385,7 @@ pub fn run(o: Options) -> Result<(), String> {
         let va = base + u64::from(new_rva);
         match build_one(&intact, rva, o.instruction_limit, va) {
             Ok(bytes) => {
+                eprintln!("  {rva:#x}: {} native byte(s)", bytes.len());
                 payload.extend_from_slice(&bytes);
                 mapping.insert(rva, new_rva);
             }
