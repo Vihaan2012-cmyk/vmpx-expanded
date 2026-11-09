@@ -1,19 +1,66 @@
-# vmpx-expanded
+<h1 align="center">vmpx-expanded</h1>
 
-An expansion of [vmpx](https://github.com/skyboundfs/vmpx) — static analysis and
-recovery tooling for VMProtect-protected Windows binaries, written in Rust — aimed
-at taking the pipeline all the way to behavior-preserving devirtualized output.
+<p align="center">
+  <b>Static devirtualization and unpacking for VMProtect-protected x64 Windows binaries.</b><br>
+  Strip the protector, recover the entry point and imports, devirtualize the
+  guards — in one command.
+</p>
 
-The original project recovers a great deal (unpacking, detection, PE modelling,
-disassembly, VM handler discovery, symbolic execution, native continuations) but
-deliberately refuses to emit a devirtualized binary until the original entry point
-and application import set are proven. This fork implements that remaining work in
-sound, independently testable stages, and now recovers control-flow graphs and
-raises virtualized functions to C-like pseudocode.
+<p align="center">
+  <code>Rust</code> · <code>static-first</code> · the sample is never executed natively
+</p>
 
-The default path is **static**. A contained software emulator supplies the
-separate Observed tier, and that is the only thing that runs the code. **The
-protected sample is never executed natively.**
+---
+
+A fork of [vmpx](https://github.com/skyboundfs/vmpx) that takes the pipeline all
+the way to a behaviour-preserving, devirtualized PE. The original recovers a
+great deal but deliberately stops short of emitting a clean binary; this fork
+implements the remaining stages — entry-point recovery, import reconstruction,
+native relocation, guard devirtualization — and wires them into a single command.
+
+## Quick start
+
+```sh
+vmpx auto protected.dll clean.exe --dir out --log
+```
+
+One command runs the whole pipeline and reports each stage:
+
+```
+[vmpx] » ▶ start   Devirtualizing protected.dll
+[vmpx] » i info    27 sections, image base 0x36b9a0000, 1259 import symbol(s)
+[vmpx] » i info    protection: VmprotectLikely
+[vmpx] » ▶ start   Analysing the application's protector references
+[vmpx] » i info    reached 21 protector target(s): 14 guard(s), 7 mutated native(s)
+[vmpx] » ▶ start   Rebuilding directories and stripping the protector   prev 69 ms
+[vmpx] » ▶ start   Relocating mutated native functions                  prev 424 ms
+[vmpx] » ▶ start   Devirtualizing guard functions                       prev 1.4 s
+[vmpx] » ▶ start   Rebuilding the application import table              prev 69.1 s
+[vmpx] » ▶ start   Verifying and writing                                prev 168 ms
+[vmpx] » · file    out/clean.exe                                        204376064 bytes
+[vmpx] » ✓ success clean PE written, 2 residual reference(s)            in 72.4 s
+```
+
+It analyses the binary and **chooses its own settings and targets** — the guard
+and mutated-native addresses are discovered, not supplied. `--log` prints the
+full per-step trace; a complete transcript is always written to `out/clean.log`.
+With a packed input it unpacks first; `--snapshot <VMPXSNP1>` recovers the
+application's imports (otherwise it asks before writing an image that will not
+run). It never executes the protected sample — a contained software emulator
+supplies the separate Observed tier, and that is the only thing that runs code.
+
+### What each stage does
+
+| stage | does |
+|---|---|
+| **unpack** | decompress a packed `.dll`/`.exe` to a mapped analysis image |
+| **analyse** | find every protector reference the application's own code makes |
+| **directories + strip** | rebuild the data directories out of `.vmp*`, remove the protector sections |
+| **entry point** | recover the original `DllEntryPoint` by its CRT obligation, not a signature |
+| **relocate** | move mutated-native functions out of the protector, verbatim, and repoint |
+| **devirtualize** | lift the integrity guards to native, folding the checksum to a constant |
+| **imports** | name the encrypted `.idata` slots from a snapshot and bind them in place |
+| **verify** | prove no reference into removed space remains, then write |
 
 ## Where it stands
 
