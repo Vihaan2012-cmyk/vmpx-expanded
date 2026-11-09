@@ -14,7 +14,7 @@ use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
     BranchingRecoveryLimits, DomainCertificate, EntryPathRecoveryLimits, Expr, NativeExitState,
     RecoveredEntryPath, RecoveredEntryPathFamily, VmDiscoveryLimits, VmEntryCandidate,
-    VmProfileExplorerLimits, X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
+    X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
     exit_closure_violation, input_closure_violation, recover_branching_entry_paths,
     recover_entry_paths,
 };
@@ -107,13 +107,15 @@ fn memory_is_exact(family: &RecoveredEntryPathFamily, path: &RecoveredEntryPath)
 }
 
 fn recovery_limits() -> EntryPathRecoveryLimits {
+    // The same scaled caps `clean.rs` uses. This site drives input-closure and
+    // was the one hardcoded copy left unscaled when the knob was added, which
+    // is why raising it measured +0: the experiment never reached here.
+    //
+    // Note these are TIGHTER than `VmProfileExplorerLimits::default()` (64 /
+    // 4096 / 65536), so input-closure explores less than the explorer's own
+    // default before refusing "entry paths are not complete".
     EntryPathRecoveryLimits {
-        chain: VmProfileExplorerLimits {
-            max_segments: 32,
-            max_instructions_per_segment: 2_048,
-            max_total_instructions: 8_192,
-            ..VmProfileExplorerLimits::default()
-        },
+        chain: crate::clean::chain_limits(),
         ..EntryPathRecoveryLimits::default()
     }
 }
