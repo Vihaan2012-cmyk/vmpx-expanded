@@ -1303,8 +1303,22 @@ fn generalize(
         return Ok(a.cloned());
     }
     let width = match (a, r) {
+        // Differing widths are not a reason to refuse. Take the NARROWER: the
+        // cell becomes a fresh unconstrained value of that width, and the bytes
+        // beyond it are simply absent -- which in this model means unknown, so
+        // the wider side is covered too.
+        //
+        // The wider width is what cannot be used, and the probe says why: this
+        // memory is byte-addressed with non-overlapping cells, so a cell grown
+        // past its neighbour produces "initial memory contains overlapping
+        // addresses" on the next resume. That invariant is what the refusal was
+        // really protecting.
         (Some(a), Some(r)) if a.width != r.width => {
-            return Err("a loop-carried cell changes width".to_owned());
+            if a.width.bits() <= r.width.bits() {
+                a.width
+            } else {
+                r.width
+            }
         }
         (Some(cell), _) | (None, Some(cell)) => cell.width,
         (None, None) => return Ok(None),

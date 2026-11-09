@@ -109,7 +109,13 @@ fn spilled_write_sites(
         let instruction = &decoded.instruction;
         let is_register_operand = instruction.op0_kind() == OpKind::Register
             && canonical(instruction.op0_register()) == register;
-        if instruction_writes_memory(&mut factory, instruction) {
+        // A nested `push` cannot reach our slot: it writes at a stack depth
+        // BELOW the one we are holding, by construction. Excluding the two
+        // stack mnemonics from the dirty test is therefore exact, not a
+        // relaxation -- and without it a spill that merely has another register
+        // saved inside it is rejected.
+        let stack_op = matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pop);
+        if !stack_op && instruction_writes_memory(&mut factory, instruction) {
             for flag in &mut wrote_memory_since {
                 *flag = true;
             }

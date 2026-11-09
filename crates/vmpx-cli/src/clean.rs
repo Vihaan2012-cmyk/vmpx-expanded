@@ -1461,12 +1461,7 @@ pub fn analyze_clean_with_image(
                 .collect(),
         )]);
         let limits = EntryPathRecoveryLimits {
-            chain: VmProfileExplorerLimits {
-                max_segments: 32,
-                max_instructions_per_segment: 2_048,
-                max_total_instructions: 8_192,
-                ..VmProfileExplorerLimits::default()
-            },
+            chain: chain_limits(),
             ..EntryPathRecoveryLimits::default()
         };
         let report = match recover_entry_paths(&pe, entry, &domains, limits) {
@@ -2703,6 +2698,29 @@ fn layout_reintegration_payload(
 const NATIVE_RDX_DOMAIN: std::ops::RangeInclusive<u64> = 0..=3;
 
 /// Reason-domain assignments and limits used to recover a DLL entry's paths.
+/// Integer multiplier from `var`, default 1. Mirrors `report_cmd::env_scale`,
+/// which the CFG caps already use; the entry-path chain had no knob at all.
+pub(crate) fn chain_scale(var: &str) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+/// The chain caps for entry-path recovery, scaled by `VMPX_CHAIN_SEGMENTS` and
+/// `VMPX_CHAIN_INSTRUCTIONS`.
+pub(crate) fn chain_limits() -> VmProfileExplorerLimits {
+    let segments = chain_scale("VMPX_CHAIN_SEGMENTS");
+    let instructions = chain_scale("VMPX_CHAIN_INSTRUCTIONS");
+    VmProfileExplorerLimits {
+        max_segments: 32usize.saturating_mul(segments),
+        max_instructions_per_segment: 2_048usize.saturating_mul(instructions),
+        max_total_instructions: 8_192usize.saturating_mul(instructions),
+        ..VmProfileExplorerLimits::default()
+    }
+}
+
 pub(crate) fn dll_entry_recovery_inputs() -> (BTreeMap<String, Vec<Expr>>, EntryPathRecoveryLimits)
 {
     let domains = BTreeMap::from([(
@@ -2712,12 +2730,7 @@ pub(crate) fn dll_entry_recovery_inputs() -> (BTreeMap<String, Vec<Expr>>, Entry
             .collect(),
     )]);
     let limits = EntryPathRecoveryLimits {
-        chain: VmProfileExplorerLimits {
-            max_segments: 32,
-            max_instructions_per_segment: 2_048,
-            max_total_instructions: 8_192,
-            ..VmProfileExplorerLimits::default()
-        },
+        chain: chain_limits(),
         ..EntryPathRecoveryLimits::default()
     };
     (domains, limits)
