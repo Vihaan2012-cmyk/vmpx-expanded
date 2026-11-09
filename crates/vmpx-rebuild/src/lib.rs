@@ -21,7 +21,8 @@ pub use layout::{
     relayout_conventional, validate_for_loader,
 };
 pub use reintegrate::{
-    ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate, set_tls_callback,
+    ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate,
+    retarget_direct_branch, retarget_rip_relative, set_tls_callback,
 };
 
 pub use unpacked::{
@@ -160,6 +161,17 @@ pub enum RebuildError {
 
     #[error("jmp from {stub:?} to {target:?} does not fit a rel32 displacement")]
     VmStubRel32Range { stub: Rva, target: Rva },
+
+    #[error("retarget site {rva:?} is not decodable, executable and file-backed")]
+    RetargetBadSite { rva: Rva },
+
+    #[error("retarget site {rva:?} is not a {want}: {found}")]
+    RetargetWrongShape { rva: Rva, want: &'static str, found: String },
+
+    #[error(
+        "no length-preserving rewrite at {site:?} reaches {target:?}: the field is out of range or          the re-decode did not match"
+    )]
+    RetargetUnreachable { site: Rva, target: Rva },
 }
 
 fn align_u32(value: u32, alignment: u32, what: &'static str) -> Result<u32, RebuildError> {

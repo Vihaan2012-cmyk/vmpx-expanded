@@ -483,3 +483,182 @@ mod tests {
         assert!(report.entry_redirected);
     }
 }
+
+/// What a retarget rewrites, and how to tell whether it landed.
+enum Field {
+    /// A direct `call`/`jmp rel32`: the branch must end up at the target.
+    Branch,
+    /// A RIP-relative memory operand: it must end up addressing the target.
+    RipOperand,
+}
+
+impl Field {
+    const fn want(&self) -> &'static str {
+        match self {
+            Self::Branch => "direct call/jmp with a rel32 displacement",
+            Self::RipOperand => "instruction with a RIP-relative memory operand",
+        }
+    }
+
+    fn selects(&self, instruction: &iced_x86::Instruction) -> bool {
+        match self {
+            Self::Branch => instruction.near_branch64() != 0,
+            Self::RipOperand => instruction.memory_base() == iced_x86::Register::RIP,
+        }
+    }
+
+    fn reaches(&self, instruction: &iced_x86::Instruction, target: Va) -> bool {
+        match self {
+            Self::Branch => instruction.near_branch64() == target.0,
+            Self::RipOperand => instruction.ip_rel_memory_address() == target.0,
+        }
+    }
+}
+
+/// Rewrites one 32-bit field of the instruction at `site` so that it points at
+/// `target`, without changing the instruction's length.
+///
+/// The field's position is not read off an encoding table. Every 4-byte window
+/// inside the instruction is tried, the result is RE-DECODED, and a window is
+/// accepted only when the decode yields the same mnemonic and length and the
+/// instruction now reaches `target`. A rewrite that survives that check is
+/// correct by construction, whatever the encoding.
+fn retarget(
+    input: &[u8],
+    site: Rva,
+    target: Rva,
+    field: &Field,
+) -> Result<Vec<u8>, RebuildError> {
+    let pe = PeImage::parse(input).map_err(|source| RebuildError::Pe {
+        stage: "input",
+        source,
+    })?;
+    let base = pe.optional.image_base.get();
+    let site_offset = pe
+        .rva_to_file_offset(site)
+        .map_err(|_| RebuildError::RetargetBadSite { rva: site })?;
+    let section = pe
+        .sections
+        .iter()
+        .find(|section| {
+            section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+                && section.contains_mapped_rva(site)
+        })
+        .ok_or(RebuildError::RetargetBadSite { rva: site })?;
+    let start = usize::try_from(site_offset.0).unwrap_or(usize::MAX);
+    let room = usize::try_from(
+        section
+            .size_of_raw_data
+            .saturating_sub(site.0 - section.virtual_address.0),
+    )
+    .unwrap_or(0);
+    let window = input
+        .get(start..start.saturating_add(room.min(16)))
+        .ok_or(RebuildError::RetargetBadSite { rva: site })?;
+
+    let decode = |bytes: &[u8]| {
+        let mut decoder = iced_x86::Decoder::with_ip(
+            64,
+            bytes,
+            base + u64::from(site.0),
+            iced_x86::DecoderOptions::NONE,
+        );
+        decoder.decode()
+    };
+    let original = decode(window);
+    if original.is_invalid() {
+        return Err(RebuildError::RetargetBadSite { rva: site });
+    }
+    if !field.selects(&original) {
+        return Err(RebuildError::RetargetWrongShape {
+            rva: site,
+            want: field.want(),
+            found: format!("{original}"),
+        });
+    }
+    let length = original.len();
+    let target_va = Va(base + u64::from(target.0));
+
+    for at in 0..length.saturating_sub(3) {
+        // The field is relative to the END of the instruction for both shapes,
+        // which is why the candidate is computed from `site + length`.
+        let next = i64::from(site.0) + i64::try_from(length).unwrap_or(i64::MAX);
+        let Ok(value) = i32::try_from(i64::from(target.0) - next) else {
+            continue;
+        };
+        let mut candidate = window.to_vec();
+        let Some(slot) = candidate.get_mut(at..at + 4) else {
+            continue;
+        };
+        slot.copy_from_slice(&value.to_le_bytes());
+        let rewritten = decode(&candidate);
+        if rewritten.is_invalid()
+            || rewritten.len() != length
+            || rewritten.mnemonic() != original.mnemonic()
+            || !field.reaches(&rewritten, target_va)
+        {
+            continue;
+        }
+        let mut output = input.to_vec();
+        write_bytes(
+            &mut output,
+            FileOffset(site_offset.0 + u64::try_from(at).unwrap_or(0)),
+            &value.to_le_bytes(),
+            "retarget field",
+        )?;
+        let reparsed = PeImage::parse(&output).map_err(|source| RebuildError::Pe {
+            stage: "output",
+            source,
+        })?;
+        let landed = reparsed
+            .rva_to_file_offset(site)
+            .map_err(|source| RebuildError::Pe {
+                stage: "output retarget",
+                source,
+            })?;
+        let seen = output
+            .get(usize::try_from(landed.0).unwrap_or(usize::MAX)..)
+            .and_then(|rest| rest.get(..length))
+            .ok_or(RebuildError::RetargetBadSite { rva: site })?;
+        if !field.reaches(&decode(seen), target_va) {
+            return Err(RebuildError::OutputInvariant(
+                "retargeted field does not reach its target after reparse".to_owned(),
+            ));
+        }
+        return Ok(output);
+    }
+    Err(RebuildError::RetargetUnreachable { site, target })
+}
+
+/// Rewrites an existing direct `call`/`jmp rel32` at `site` to transfer to
+/// `target`, keeping the instruction's length.
+///
+/// # Errors
+///
+/// Rejects a site that is not decodable, executable and file-backed, a site
+/// that is not a direct branch, and a target the rel32 cannot reach.
+pub fn retarget_direct_branch(
+    input: &[u8],
+    site: Rva,
+    target: Rva,
+) -> Result<Vec<u8>, RebuildError> {
+    retarget(input, site, target, &Field::Branch)
+}
+
+/// Rewrites the RIP-relative displacement of the instruction at `site` so its
+/// memory operand addresses `target`, keeping the instruction's length.
+///
+/// This is what repoints a `mov rax,[<protector slot>]` at a rebuilt slot: the
+/// slot itself cannot be edited once its section is gone, so the reference is
+/// moved instead.
+///
+/// # Errors
+///
+/// As [`retarget_direct_branch`], but for a RIP-relative operand.
+pub fn retarget_rip_relative(
+    input: &[u8],
+    site: Rva,
+    target: Rva,
+) -> Result<Vec<u8>, RebuildError> {
+    retarget(input, site, target, &Field::RipOperand)
+}
