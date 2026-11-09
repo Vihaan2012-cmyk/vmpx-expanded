@@ -1216,6 +1216,42 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 self.set_carry_flags(tag, &a, &b, &cin, &result);
                 self.write_operand(inst, 0, result)
             }
+            // RFLAGS holds bits this lifter does not model (TF, IF, DF and the
+            // reserved ones), so the pushed value is not a function of the six
+            // flags it does track. Pushing a free term asserts nothing about it,
+            // which keeps DF unobservable and `cld`/`std` sound no-ops above.
+            // The site's IP is an argument so two `pushfq` sites are distinct
+            // terms while the same site is equal to itself across a recovered /
+            // recompiled pair.
+            Mnemonic::Pushfq => {
+                let width = Width::W64;
+                let value = self
+                    .alg
+                    .intrinsic(width, "rflags_opaque", vec![self.k(width, inst.ip())]);
+                let off = self
+                    .tracked_rsp()?
+                    .checked_sub(i64::from(width.bytes()))
+                    .map_or_else(|| unsupported("rsp offset overflow"), Ok)?;
+                let (address, key) = self.stack_slot(off)?;
+                self.set_rsp(off)?;
+                self.store_at(address, key, value);
+                Ok(())
+            }
+            // The restored flags are whatever that free term held, so every
+            // modeled flag becomes unknown. Reading one afterwards refuses at
+            // the read, which is the existing treatment for a clobbered flag.
+            Mnemonic::Popfq => {
+                let width = Width::W64;
+                let off = self.tracked_rsp()?;
+                let (address, key) = self.stack_slot(off)?;
+                let _ = self.load_at(address, &key, width)?;
+                let new = off
+                    .checked_add(i64::from(width.bytes()))
+                    .map_or_else(|| unsupported("rsp offset overflow"), Ok)?;
+                self.set_rsp(new)?;
+                self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+                Ok(())
+            }
             Mnemonic::Push => {
                 Self::expect_ops(inst, 1)?;
                 let width = Self::stack_width(inst, true)?;

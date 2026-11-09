@@ -406,11 +406,44 @@ fn flags_are_modeled_or_marked_clobbered() {
 }
 
 #[test]
+fn pushfq_pushes_an_opaque_value_and_popfq_unknows_the_flags() {
+    // RFLAGS carries bits this lifter does not model, so the pushed value is a
+    // free term: rsp moves by 8 and the slot holds something no evaluation can
+    // pin down.
+    let sem = ok(|a| a.pushfq().unwrap());
+    assert_eq!(sem.writes.len(), 1);
+    assert_eq!(sem.writes[0].address, rsp_off(-8));
+    assert_eq!(
+        eval_with(&sem.writes[0].value, &|name| input_value(0, name)),
+        None
+    );
+
+    // `popfq` restores whatever that was, so every modeled flag is unknown and
+    // a later read of one refuses rather than inventing a value.
+    let round = ok(|a| {
+        a.pushfq().unwrap();
+        a.popfq().unwrap();
+    });
+    assert_eq!(round.regs[&Gpr::Rsp], input("rsp_in"));
+    for flag in [Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of] {
+        assert!(matches!(round.flags[&flag], FlagState::Clobbered), "{flag:?}");
+    }
+    assert!(matches!(
+        lift(|a| {
+            a.pushfq().unwrap();
+            a.popfq().unwrap();
+            a.adc(rax, rcx).unwrap();
+        }),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
+
+#[test]
 fn unmodeled_instructions_fail_closed_naming_the_instruction() {
     type Case = (&'static str, Box<dyn FnOnce(&mut CodeAssembler)>);
     let cases: Vec<Case> = vec![
         ("cpuid", Box::new(|a| a.cpuid().unwrap())),
-        ("pushfq", Box::new(|a| a.pushfq().unwrap())),
+        ("rdtsc", Box::new(|a| a.rdtsc().unwrap())),
     ];
     for (name, build) in cases {
         match lift(build) {
