@@ -117,6 +117,10 @@ pub struct StaticSweep {
     pub n2_proven: usize,
     pub benign_labeled: usize,
     pub unproven_assumption: usize,
+    /// Completions resting on an OBSERVED assumption -- a value from one run.
+    /// Counted in `n1_cfg_complete` like any other labeled completion, and
+    /// broken out so the breakdown always sums to it.
+    pub observed_assumption: usize,
     pub incomplete: usize,
     pub errors: usize,
     pub panics: usize,
@@ -579,7 +583,7 @@ fn tally(outcomes: &[Outcome], discovered: usize, sampled: bool) -> StaticSweep 
                     Tier::Proven => sweep.n2_proven += 1,
                     Tier::BenignLabeled => sweep.benign_labeled += 1,
                     Tier::UnprovenAssumption => sweep.unproven_assumption += 1,
-                    Tier::Observed => {}
+                    Tier::Observed => sweep.observed_assumption += 1,
                 }
                 *sweep
                     .assumption_sets
@@ -1083,13 +1087,18 @@ pub fn render(r: &Report) -> String {
     );
     let _ = writeln!(
         o,
+        "    OBSERVED assumption (one run's value; snapshot-served pass)          : {}",
+        s.observed_assumption
+    );
+    let _ = writeln!(
+        o,
         "  not complete: incomplete {}, errors {}, panics {}",
         s.incomplete, s.errors, s.panics
     );
     for (k, n) in &s.assumption_sets {
         let _ = writeln!(o, "    {n:>4} x {k}");
     }
-    let _ = writeln!(o, "\nEXPERIMENTAL TIERS (never counted in N1/N2/N3)");
+    let _ = writeln!(o, "\nEXPERIMENTAL TIERS (--dynamic is reported separately; snapshot-served completions appear on the OBSERVED line above)");
     let _ = writeln!(
         o,
         "  serve-RO completions : {} ({})",
