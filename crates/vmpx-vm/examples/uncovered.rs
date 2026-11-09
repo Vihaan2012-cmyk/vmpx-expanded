@@ -41,6 +41,12 @@ fn main() {
         .filter(|f| f.end.0 > f.begin.0)
         .map(|f| (f.begin.0, f.end.0))
         .collect();
+    // UNCOVERED_ALL=1 drops the .pdata filter so the scan covers EVERY
+    // executable byte. That cross-checks the linear per-function decode, which
+    // desynchronizes on embedded data and could silently miss sites.
+    if std::env::var_os("UNCOVERED_ALL").is_some() {
+        covered.clear();
+    }
     covered.sort_unstable();
     let mut merged: Vec<(u32, u32)> = Vec::new();
     for (begin, end) in covered {
@@ -161,7 +167,7 @@ fn main() {
         println!("  {entry}");
     }
     println!("\n-- other (byte coincidence unless proven otherwise) --");
-    for entry in validated.iter().take(400) {
+    for entry in validated.iter().take(if std::env::var_os("UNCOVERED_ALL").is_some() { 0 } else { 400 }) {
         println!("  {entry}");
     }
 }
