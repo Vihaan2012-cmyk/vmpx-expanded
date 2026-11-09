@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use vmpx_pe::{PeImage, Rva};
 
 fn main() {
@@ -34,7 +34,10 @@ fn main() {
             .find(|s| s.contains_mapped_rva(Rva(rva)))
             .map(|s| s.name.as_str())
     };
-    let is_protector = |rva: u32| section_of(rva).is_some_and(|n| n.starts_with(".vmp"));
+    // `.vmpx*` are sections WE emit; only the protector's own `.vmp0..3` count.
+    let is_protector = |rva: u32| {
+        section_of(rva).is_some_and(|n| n.starts_with(".vmp") && !n.starts_with(".vmpx"))
+    };
     let qword_at = |rva: u32| -> Option<u64> {
         let offset = pe.rva_to_file_offset(Rva(rva)).ok()?;
         let at = usize::try_from(offset.0).ok()?;
@@ -54,6 +57,7 @@ fn main() {
     let mut stub_candidates: Vec<(u32, u32, u32)> = Vec::new(); // (fn begin, len, target)
     let mut functions = 0_u64;
     let mut size_hist: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut anti: BTreeMap<&str, u64> = BTreeMap::new();
 
     let note_computed = |computed: &mut BTreeMap<u32, u64>, value: u64| {
         if let Some(rva) = value.checked_sub(base).and_then(|v| u32::try_from(v).ok())
@@ -138,6 +142,27 @@ fn main() {
                 }
             }
 
+            // --- anti-analysis primitives, on PROVEN instruction boundaries ---
+            //
+            // A byte scan is worthless here: `0F 31` and `0F A2` are two bytes,
+            // so each appears ~409 times by chance in 26 MB of `.text`, and the
+            // raw counts (237 rdtsc, 99 cpuid, 19 int 2d) come in BELOW that.
+            // Only a decode from a function entry can tell whether any is real.
+            match instruction.mnemonic() {
+                Mnemonic::Cpuid => *anti.entry("cpuid").or_default() += 1,
+                Mnemonic::Rdtsc => *anti.entry("rdtsc").or_default() += 1,
+                Mnemonic::Rdtscp => *anti.entry("rdtscp").or_default() += 1,
+                Mnemonic::Int => {
+                    if instruction.immediate8() == 0x2d {
+                        *anti.entry("int 2dh").or_default() += 1;
+                    }
+                }
+                _ => {}
+            }
+            if instruction.segment_prefix() == Register::GS {
+                *anti.entry("gs-relative access").or_default() += 1;
+            }
+
             // --- 3. stub shape: a direct transfer into a protector section ---
             if matches!(
                 instruction.flow_control(),
@@ -189,6 +214,15 @@ fn main() {
     for (begin, insns, target) in stub_candidates.iter().take(40) {
         println!("    fn {begin:#x} {insns} insn(s) -> {target:#x}");
     }
+    println!("
+=== anti-analysis primitives on proven instruction boundaries ===");
+    if anti.is_empty() {
+        println!("  none in any application function");
+    }
+    for (what, count) in &anti {
+        println!("  {what:>22}: {count}");
+    }
+
     println!("\n  application function size histogram:");
     for (bucket, count) in &size_hist {
         println!("    {bucket:>7} bytes : {count}");

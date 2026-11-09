@@ -273,7 +273,88 @@ fn main() {
     for entry in q_reloc.iter().take(40) {
         println!("    {entry}");
     }
-    let real = on_boundary.len() + q_reloc.len();
+    // ---- 3. STRUCTURAL RVA FIELDS ----
+    //
+    // A PE structure's address fields hold RVAs, not VAs, so the loader never
+    // relocates them -- which means the relocation discriminator above says
+    // nothing about them and would dismiss a real reference as noise. They have
+    // to be checked structurally instead. Resource data entries are the case
+    // that prompted this: VMProtect can move resource data into its own
+    // section, and nothing else here would have noticed.
+    let report = pe.report();
+    let mut structural: Vec<String> = Vec::new();
+    let mut checked = 0_usize;
+    let mut note = |field: &str, rva: u32, out: &mut Vec<String>, checked: &mut usize| {
+        if rva == 0 {
+            return;
+        }
+        *checked += 1;
+        if removed(rva) || (rva < size_of_image && !mapped(rva)) {
+            out.push(format!("{field}: {rva:#x} is not in any section"));
+        }
+    };
+    for function in &report.exception_functions {
+        note("pdata begin", function.begin.0, &mut structural, &mut checked);
+        note("pdata end", function.end.0.saturating_sub(1), &mut structural, &mut checked);
+    }
+    if let Some(exports) = &report.exports {
+        for symbol in &exports.symbols {
+            if symbol.forwarder.is_none() {
+                note("export", symbol.rva.0, &mut structural, &mut checked);
+            }
+        }
+    }
+    if let Some(tls) = &report.tls {
+        for (index, callback) in tls.callbacks.iter().enumerate() {
+            if let Some(rva) = callback.get().checked_sub(base).and_then(|v| u32::try_from(v).ok()) {
+                note(&format!("tls callback {index}"), rva, &mut structural, &mut checked);
+            }
+        }
+    }
+    // The resource tree: walk its three levels and check every data entry.
+    if let Some(dir) = pe.directory(2).filter(|d| d.address != 0) {
+        let root = dir.address;
+        let word = |rva: u32, at: u32| -> Option<u32> {
+            let offset = pe.rva_to_file_offset(Rva(rva.checked_add(at)?)).ok()?;
+            let base = usize::try_from(offset.0).ok()?;
+            bytes
+                .get(base..base.checked_add(4)?)
+                .and_then(|s| s.try_into().ok())
+                .map(u32::from_le_bytes)
+        };
+        let mut stack = vec![(0_u32, 0_u32)];
+        let mut entries = 0_usize;
+        while let Some((offset, depth)) = stack.pop() {
+            let Some(counts) = word(root, offset + 12) else { continue };
+            let total = (counts & 0xffff) + (counts >> 16);
+            for index in 0..total.min(4096) {
+                let at = offset + 16 + index * 8;
+                let Some(to) = word(root, at + 4) else { continue };
+                if to & 0x8000_0000 != 0 {
+                    if depth < 3 {
+                        stack.push((to & 0x7fff_ffff, depth + 1));
+                    }
+                } else if let Some(data) = word(root, to & 0x7fff_ffff) {
+                    entries += 1;
+                    note("resource data", data, &mut structural, &mut checked);
+                }
+            }
+        }
+        println!("
+=== STRUCTURAL RVA fields (never relocated, so checked by shape) ===");
+        println!("  resource data entries walked      : {entries}");
+    } else {
+        println!("
+=== STRUCTURAL RVA fields (never relocated, so checked by shape) ===");
+        println!("  resource directory                : absent");
+    }
+    println!("  structural RVA fields checked     : {checked}");
+    println!("  pointing outside every section    : {}", structural.len());
+    for entry in structural.iter().take(20) {
+        println!("    {entry}");
+    }
+
+    let real = on_boundary.len() + q_reloc.len() + structural.len();
     println!("\nVERDICT: {real} residual reference(s) that are provably real.");
     if real == 0 {
         println!("  No immediate and no relocated word names the removed range, so no");
