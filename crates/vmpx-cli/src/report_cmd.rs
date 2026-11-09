@@ -96,6 +96,7 @@ pub fn tier_of<'a>(assumptions: impl IntoIterator<Item = &'a VmCfgAssumption>) -
             | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
             | VmCfgAssumption::AssumesHandlerConditionalArm
             | VmCfgAssumption::AssumesTaintedBranchStateSufficient
+            | VmCfgAssumption::AssumesIndexedStoreInBounds
             | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable
             | VmCfgAssumption::AssumesCrossVmSectionContinuation => Tier::UnprovenAssumption,

@@ -181,6 +181,9 @@ pub struct SymbolicVmExecutionReport {
     /// frame made. Set only when such a cell was actually retained, so with
     /// none present the run is byte-for-byte what it was before.
     pub assumed_external_disjoint_from_fresh_allocations: bool,
+    /// Whether a store with no upper bound was placed by its LOWER bound alone,
+    /// which holds only if the indexed address does not wrap the address space.
+    pub assumed_indexed_store_in_bounds: bool,
     /// True when a suppressed constant read was served from a read-only
     /// file-backed page; the CFG records `AssumesImageProtectionStable`.
     pub served_read_only_image: bool,
@@ -552,6 +555,7 @@ struct SymbolicMachine<'a> {
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
     assumed_external_disjoint_from_fresh_allocations: bool,
+    assumed_indexed_store_in_bounds: bool,
     serve_read_only_when_suppressed: bool,
     assume_loaded_store_addresses_disjoint: bool,
     prove_read_only_when_suppressed: bool,
@@ -654,6 +658,7 @@ impl<'a> SymbolicMachine<'a> {
             image_reads_suppressed: initial.image_reads_suppressed || initial.memory_tainted,
             assumed_external_disjoint_from_vm_stack: false,
             assumed_external_disjoint_from_fresh_allocations: false,
+            assumed_indexed_store_in_bounds: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
             assume_loaded_store_addresses_disjoint: limits.assume_loaded_store_addresses_disjoint,
             prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
@@ -983,6 +988,32 @@ impl<'a> SymbolicMachine<'a> {
             });
             return Ok(());
         }
+        // No upper bound, but a LOWER one: an indexed store over a proven region
+        // root, where the index is unsigned and so at least zero. Every tracked
+        // cell below that bound is disjoint, and -- the part that matters --
+        // this takes the PROOF path, so memory is not tainted and the branch
+        // after it still resolves.
+        //
+        // Labeled, because the one thing it cannot prove is that the index does
+        // not wrap the address space back around to a low address.
+        if indexed_store_in_bounds()
+            && let Some((root, slo)) = proven_store_lower_bound(address)
+        {
+            let width = i64::from(width.bytes());
+            self.retain_memory(|cell_address| {
+                store_below_disjoint_from_cell(&root, slo, width, cell_address)
+            });
+            self.image_reads_suppressed = true;
+            self.assumed_indexed_store_in_bounds = true;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index,
+                cause: format!(
+                    "external store placed by its lower bound {slo:#x} over a VM-region base; \
+                     cells below it preserved, assuming the index does not wrap"
+                ),
+            });
+            return Ok(());
+        }
         // A frame pointer can only be read back from a tracked cell, so with none
         // lost or escaped an untracked read is caller data, not a frame pointer.
         let loaded_data_address = self.assume_loaded_store_addresses_disjoint
@@ -1006,7 +1037,11 @@ impl<'a> SymbolicMachine<'a> {
                     self.vm_stack_address_escapes,
                     self.vm_stack_pointer_lost,
                 ) + &format!(
-                    " lower_bound={:?} cells={:?} offset={:?} unbounded_at={}",
+                    " ADDR={} lower_bound={:?} cells={:?} offset={:?} unbounded_at={}",
+                    {
+                        let rendered = format!("{address:?}");
+                        rendered.chars().take(700).collect::<String>()
+                    },
                     address_lower_bound(address).map(|bounds| (
                         bounds.root.is_some(),
                         format!("{:#x}", bounds.lo)
@@ -2281,6 +2316,52 @@ fn proven_store_byte_range(address: &Expr, width: BitWidth) -> Option<(Expr, i64
 /// base / distinct fresh allocation) is disjoint by region; everything else
 /// (concrete cells, unprovable roots) is treated as possibly aliasing and
 /// discarded.
+/// A store's lower bound over a proven region root, when no upper bound exists.
+fn proven_store_lower_bound(address: &Expr) -> Option<(Expr, i64)> {
+    // Only when the two-sided bound genuinely failed; otherwise the caller has
+    // already taken the stronger path.
+    if address_bounds(address).is_some() {
+        return None;
+    }
+    let bounds = address_lower_bound(address)?;
+    let root = bounds.root?;
+    is_proven_region_root(&root).then_some((root, bounds.lo))
+}
+
+/// Whether a one-byte tracked cell lies strictly BELOW a store that starts at
+/// `slo` over `store_root` and has no upper bound. A cell in a different proven
+/// region is disjoint by region, as in the two-sided case.
+fn store_below_disjoint_from_cell(
+    store_root: &Expr,
+    slo: i64,
+    width: i64,
+    cell_address: &Expr,
+) -> bool {
+    let Some(PointerAffine {
+        root: Some(cell_root),
+        coefficient: 1,
+        constant,
+    }) = pointer_affine(cell_address)
+    else {
+        return false;
+    };
+    if !is_proven_region_root(&cell_root) {
+        return false;
+    }
+    if &cell_root == store_root {
+        // The cell's own byte must end at or before the store's first byte.
+        i64::from_ne_bytes(constant.to_ne_bytes()).checked_add(width).is_some_and(|end| end <= slo)
+    } else {
+        true
+    }
+}
+
+/// Whether a store with only a lower bound may be placed by it.
+fn indexed_store_in_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_INDEXED_STORE_BOUNDS").is_ok_and(|v| v == "1"))
+}
+
 fn store_range_disjoint_from_cell(
     store_root: &Expr,
     slo: i64,
@@ -3217,6 +3298,7 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_indexed_store_in_bounds: machine.assumed_indexed_store_in_bounds,
         assumed_external_disjoint_from_fresh_allocations: machine
             .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,
@@ -3319,6 +3401,7 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_indexed_store_in_bounds: machine.assumed_indexed_store_in_bounds,
         assumed_external_disjoint_from_fresh_allocations: machine
             .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,

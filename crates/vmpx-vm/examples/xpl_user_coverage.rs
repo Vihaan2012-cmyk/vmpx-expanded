@@ -165,7 +165,8 @@ fn tier(a: &[VmCfgAssumption]) -> &'static str {
             | VmCfgAssumption::AssumesImageProtectionStable
             | VmCfgAssumption::AssumesCrossVmSectionContinuation
             | VmCfgAssumption::AssumesHandlerConditionalArm
-            | VmCfgAssumption::AssumesTaintedBranchStateSufficient => 2,
+            | VmCfgAssumption::AssumesTaintedBranchStateSufficient
+            | VmCfgAssumption::AssumesIndexedStoreInBounds => 2,
             VmCfgAssumption::PreferredImageBase | VmCfgAssumption::OverApproximatedEnvironmentGate => 1,
         });
     }

@@ -376,6 +376,12 @@ pub enum VmCfgAssumption {
     /// loss, so every block after it is reached with less memory than it would
     /// otherwise have had.
     AssumesTaintedBranchStateSufficient,
+    /// A store with no upper bound was placed by its LOWER bound alone: an
+    /// indexed VM-stack write, `vsp + k + (index << s)`, whose unsigned index
+    /// is at least zero. Cells below the bound are genuinely disjoint; what
+    /// cannot be proven is that the index does not WRAP the address space back
+    /// to a low address, which is what this labels.
+    AssumesIndexedStoreInBounds,
     /// A block that STALLED was closed as a VM exit anyway, because
     /// `VMPX_ASSUME_STALLED_BLOCKS_EXIT` was set.
     ///
@@ -4397,6 +4403,11 @@ impl Walker<'_, '_> {
             self.cfg
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        }
+        if symbolic.assumed_indexed_store_in_bounds {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesIndexedStoreInBounds);
         }
         if symbolic.assumed_external_disjoint_from_fresh_allocations {
             self.cfg

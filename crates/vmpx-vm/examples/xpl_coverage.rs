@@ -953,7 +953,8 @@ fn main() {
                     | VmCfgAssumption::AssumesImageProtectionStable
                     | VmCfgAssumption::AssumesCrossVmSectionContinuation
                     | VmCfgAssumption::AssumesHandlerConditionalArm
-                    | VmCfgAssumption::AssumesTaintedBranchStateSufficient => "UNPROVEN-ASSUMPTION",
+                    | VmCfgAssumption::AssumesTaintedBranchStateSufficient
+                    | VmCfgAssumption::AssumesIndexedStoreInBounds => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase
                     | VmCfgAssumption::OverApproximatedEnvironmentGate => "BENIGN-LABELED",
                 };
