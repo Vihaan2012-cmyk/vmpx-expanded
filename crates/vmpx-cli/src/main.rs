@@ -254,6 +254,10 @@ enum Command {
         /// Never prompt; take the default for every optional step.
         #[arg(long = "no-prompt")]
         no_prompt: bool,
+        /// With no snapshot, detonate to recover imports, up to this many steps
+        /// (implies yes to the detonation prompt).
+        #[arg(long = "detonate-steps")]
+        detonate_steps: Option<u64>,
     },
     /// Devirtualize guard functions to native code and reintegrate them into a
     /// stripped image, folding the integrity checksum to a constant.
@@ -1373,6 +1377,7 @@ fn main() -> Result<()> {
             log_file,
             unpack,
             no_prompt,
+            detonate_steps,
         } => auto_cmd::run(auto_cmd::Options {
             input,
             output,
@@ -1382,6 +1387,7 @@ fn main() -> Result<()> {
             log_file,
             unpack,
             yes_to_all_defaults: no_prompt,
+            detonate_steps,
         })
         .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {

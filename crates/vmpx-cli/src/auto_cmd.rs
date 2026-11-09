@@ -41,6 +41,9 @@ pub struct Options {
     pub unpack: bool,
     /// Never prompt; assume "no" for every optional step (for scripts).
     pub yes_to_all_defaults: bool,
+    /// Detonate to recover imports when no snapshot is given, running up to this
+    /// many instructions. `None` leaves detonation to the interactive prompt.
+    pub detonate_steps: Option<u64>,
 }
 
 const EXEC: u32 = 0x2000_0000;
@@ -500,14 +503,39 @@ pub fn run(o: Options) -> Result<(), String> {
     } else {
         log.start("Application import table");
         log.warn("no snapshot: the application's imports are in encrypted .idata");
-        log.info("produce one with `clean --dynamic`, or pass --snapshot <VMPXSNP1>");
-        if !confirm(
-            &log,
-            "write the image WITHOUT recovering imports (it will not run)?",
-            true,
-            o.yes_to_all_defaults,
-        ) {
-            return Err("aborted: run again with --snapshot to bind imports".to_owned());
+        // Detonation can recover them live -- it runs the protector's own init
+        // in a contained emulator and records which import each .idata slot
+        // resolves to. It is minutes of CPU (the init runs billions of steps),
+        // so it is gated.
+        let steps = o.detonate_steps.unwrap_or(20_000_000_000);
+        let detonate = o.detonate_steps.is_some()
+            || confirm(
+                &log,
+                &format!("detonate to recover imports now (~minutes, up to {steps} steps)?"),
+                false,
+                o.yes_to_all_defaults,
+            );
+        if detonate {
+            match detonate_imports(&log, &o.input, &pe, steps) {
+                Ok(slots) if !slots.is_empty() => {
+                    match crate::auto_imports::bind_slots(&log, &pe, &bytes, &image, slots) {
+                        Ok(bound) => image = bound,
+                        Err(reason) => log.warn(&format!("import binding failed: {reason}")),
+                    }
+                }
+                Ok(_) => log.warn("detonation resolved no import slots"),
+                Err(reason) => log.warn(&format!("detonation failed: {reason}")),
+            }
+        } else {
+            log.info("skipping imports; the written image will not run until they are bound");
+            if !confirm(
+                &log,
+                "write the image anyway?",
+                true,
+                o.yes_to_all_defaults,
+            ) {
+                return Err("aborted: run with --snapshot or allow detonation".to_owned());
+            }
         }
     }
 
@@ -534,6 +562,62 @@ pub fn run(o: Options) -> Result<(), String> {
     );
     let _ = base;
     Ok(())
+}
+
+/// Detonate the mapped image in the contained emulator and return each
+/// `.idata` slot's `(rva, module, symbol)` from the imports the run observed.
+/// XPLM is enabled automatically when the image imports it, so an X-Plane
+/// plugin's SDK calls do not stop the run; a generic DLL runs without it.
+fn detonate_imports(
+    log: &Log,
+    input_path: &std::path::Path,
+    pe: &PeImage<'_>,
+    max_steps: u64,
+) -> Result<Vec<(u32, String, String)>, String> {
+    let base = pe.optional.image_base.0;
+    let xplm = pe
+        .report()
+        .imports
+        .iter()
+        .any(|m| {
+            let n = m.name.to_ascii_uppercase();
+            n.starts_with("XPLM") || n.starts_with("XPWIDGETS")
+        });
+    let mut warnings = Vec::new();
+    let export_reference =
+        crate::clean::dynamic_export_reference(&input_path.to_string_lossy(), &mut warnings);
+    for warning in &warnings {
+        log.trace("detonate", warning);
+    }
+    log.step(
+        "detonating",
+        &format!("up to {max_steps} steps, xplm={xplm}, {} reference module(s)", export_reference.len()),
+    );
+    let options = vmpx_emulate::DetonateOptions {
+        export_reference,
+        max_steps,
+        xplm,
+        ..vmpx_emulate::DetonateOptions::default()
+    };
+    let result = vmpx_emulate::detonate(pe, &options).map_err(|e| format!("{e:?}"))?;
+    log.step(
+        "detonated",
+        &format!("{} step(s), stop {:?}, {} import(s) observed", result.steps, result.stop, result.observed.imports.len()),
+    );
+    let slots = result
+        .observed
+        .imports
+        .iter()
+        .filter_map(|import| {
+            let rva = u32::try_from(import.stub_va_or_slot.checked_sub(base)?).ok()?;
+            let symbol = match &import.symbol {
+                vmpx_emulate::SymbolOrOrdinal::Name(name) => name.clone(),
+                vmpx_emulate::SymbolOrOrdinal::Ordinal(ordinal) => format!("#{ordinal}"),
+            };
+            Some((rva, import.module.clone(), symbol))
+        })
+        .collect();
+    Ok(slots)
 }
 
 /// Count references from surviving code into removed (unmapped) space.

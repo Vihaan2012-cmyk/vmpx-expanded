@@ -18,6 +18,8 @@ const IAT_DIRECTORY: usize = 12;
 const DESCRIPTOR_SIZE: usize = 20;
 const FIRST_THUNK_FIELD: usize = 16;
 
+/// Bind imports named from a post-init snapshot: read each `.idata` slot's
+/// sentinel and name it by the loader's flattened import order.
 pub fn bind(
     log: &Log,
     intact: &PeImage<'_>,
@@ -27,28 +29,13 @@ pub fn bind(
 ) -> Result<Vec<u8>, String> {
     let base = intact.optional.image_base.0;
     let (_cpu, mem) = snapshot::load(snapshot_path).map_err(|e| format!("snapshot: {e}"))?;
-
-    // The loader's flattened import order assigns each symbol a sentinel.
-    let mut names: Vec<(String, String)> = Vec::new();
-    for module in &intact.report().imports {
-        for sym in &module.entries {
-            names.push((
-                module.name.clone(),
-                sym.name
-                    .clone()
-                    .unwrap_or_else(|| format!("#{}", sym.ordinal.unwrap_or(0))),
-            ));
-        }
-    }
-
-    // Read each .idata slot from the snapshot; a filled slot that holds a
-    // sentinel names its import.
+    let names = flattened_import_names(intact);
     let Some(idata) = intact.sections.iter().find(|s| s.name.as_str() == ".idata") else {
         return Err("no .idata section".to_owned());
     };
     let start = idata.virtual_address.0;
     let size = idata.virtual_size.max(idata.size_of_raw_data);
-    let mut by_module: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
+    let mut slots: Vec<(u32, String, String)> = Vec::new();
     for offset in (0..size).step_by(8) {
         let rva = start + offset;
         if let Ok(value) = mem.read_uint(base + u64::from(rva), 8)
@@ -59,12 +46,45 @@ pub fn bind(
                 .filter(|i| *i < names.len())
         {
             let (module, func) = &names[index];
-            by_module.entry(module.clone()).or_default().push((rva, func.clone()));
+            slots.push((rva, module.clone(), func.clone()));
         }
+    }
+    bind_slots(log, intact, intact_bytes, stripped, slots)
+}
+
+/// The loader's flattened import order, which assigns each symbol its sentinel.
+fn flattened_import_names(intact: &PeImage<'_>) -> Vec<(String, String)> {
+    let mut names = Vec::new();
+    for module in &intact.report().imports {
+        for sym in &module.entries {
+            names.push((
+                module.name.clone(),
+                sym.name
+                    .clone()
+                    .unwrap_or_else(|| format!("#{}", sym.ordinal.unwrap_or(0))),
+            ));
+        }
+    }
+    names
+}
+
+/// Bind a set of `(slot_rva, module, symbol)` triples -- from a snapshot or a
+/// live detonation -- into a real import directory whose `FirstThunk`s point at
+/// the existing `.idata` runs, so the loader fills the slots the code reads.
+pub fn bind_slots(
+    log: &Log,
+    intact: &PeImage<'_>,
+    intact_bytes: &[u8],
+    stripped: &[u8],
+    slots: Vec<(u32, String, String)>,
+) -> Result<Vec<u8>, String> {
+    let mut by_module: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
+    for (rva, module, func) in slots {
+        by_module.entry(module).or_default().push((rva, func));
     }
     let total: usize = by_module.values().map(Vec::len).sum();
     if total == 0 {
-        return Err("the snapshot resolved no import slots".to_owned());
+        return Err("no import slot resolved".to_owned());
     }
 
     // One descriptor per contiguous run of slots.
