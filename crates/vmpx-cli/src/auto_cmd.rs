@@ -431,8 +431,23 @@ pub fn run(o: Options) -> Result<(), String> {
         .filter(|n| n.starts_with(".vmp"))
         .collect();
     let removed_owned: Vec<String> = removed.iter().map(|s| (*s).to_owned()).collect();
+    log.trace("removing sections", &removed.join(", "));
     let dirs = rebuild_all_directories(&conventional, *b".vmpxdir", &removed)
         .map_err(|e| format!("directory rebuild: {e}"))?;
+    const DIR_NAMES: [&str; 13] = [
+        "export", "import", "resource", "exception", "security", "basereloc",
+        "debug", "architecture", "globalptr", "tls", "load_config", "bound_import", "iat",
+    ];
+    for moved in &dirs.moved {
+        let name = DIR_NAMES.get(moved.index).copied().unwrap_or("directory");
+        log.trace(
+            &format!("  relocate {name}"),
+            &format!("{:#x} -> {:#x} ({} bytes)", moved.from.0, moved.to.0, moved.size),
+        );
+    }
+    log.trace("  exception table", &format!("{} entries", dirs.exception_entries.0));
+    log.trace("  import directory", &format!("{} symbols / {} modules", dirs.import_symbols, dirs.import_modules));
+    log.trace("  tls callbacks", &format!("{}", dirs.tls_callbacks.0));
     log.step(
         "directories relocated",
         &format!(
@@ -686,6 +701,10 @@ fn relocate_natives(
     while let Some(rva) = queue.pop_front() {
         let cfg = recover_native_cfg_pe_with(intact, Rva(rva), options)
             .map_err(|e| format!("native cfg {rva:#x}: {e}"))?;
+        log.trace(
+            &format!("  recover {rva:#x}"),
+            &format!("{} block(s){}", cfg.blocks.len(), if cfg.is_complete() { "" } else { " (incomplete)" }),
+        );
         for block in cfg.blocks.values() {
             blocks.insert(block.start, block.end);
             if let vmpx_mutation::Terminator::Call { target, .. }
