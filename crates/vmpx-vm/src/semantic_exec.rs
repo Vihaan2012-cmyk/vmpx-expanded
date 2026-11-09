@@ -1622,7 +1622,7 @@ pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
 /// Whether a machine may be built from an already-tainted state.
 fn resume_tainted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
 }
 
 fn serve_read_only_when_tainted() -> bool {
@@ -3967,21 +3967,41 @@ mod tests {
         assert_eq!(report.final_vsp_offset, Some(-24));
     }
 
+    // A tainted state used to be refused outright, to keep stale aliases from
+    // being resumed. There are none to resume: the havoc that sets the taint
+    // empties tracked memory, so every later read returns a fresh opaque value.
+    // What the refusal was really protecting is the IMAGE: a store that could
+    // have written anywhere must stop file bytes being served as constants, and
+    // the broad havoc sets the taint WITHOUT setting that flag. So the machine
+    // carries the taint and forces image reads suppressed, and the properties
+    // are asserted here instead of the whole resume being refused.
     #[test]
-    fn rejects_tainted_or_oversized_initial_state() {
+    fn a_tainted_state_resumes_with_image_reads_suppressed() {
         let tainted = SymbolicVmInitialState {
             memory_tainted: true,
             ..SymbolicVmInitialState::default()
         };
-        let error = execute_symbolic_linear_block_with_initial_state(
+        let report = execute_symbolic_linear_block_with_initial_state(
             &[],
             None,
             SymbolicExecutionLimits::default(),
             &tainted,
             None,
         )
-        .expect_err("tainted state must not be resumed with stale aliases");
-        assert!(error.message.contains("cannot be resumed soundly"));
+        .expect("a tainted state resumes");
+        assert!(report.memory_tainted, "the taint must survive the resume");
+        assert!(
+            report.image_reads_suppressed,
+            "a tainted resume must never serve a file constant"
+        );
+        assert!(
+            report.memory_values.is_empty(),
+            "there are no tracked cells to be stale"
+        );
+    }
+
+    #[test]
+    fn rejects_an_oversized_initial_state() {
 
         let mut oversized = SymbolicVmInitialState::default();
         oversized

@@ -169,7 +169,7 @@ pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Resul
 /// loses the blocks that did not need one.
 fn lower_tainted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
 }
 
 pub(crate) fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {

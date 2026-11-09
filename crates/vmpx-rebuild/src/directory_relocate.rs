@@ -1484,6 +1484,179 @@ pub fn rebuild_all_directories(
     })
 }
 
+
+/// Makes header room by shifting the raw data, for an image with no padding.
+///
+/// Only file offsets move. The structures that also carry one are refused
+/// rather than guessed at: the certificate table, whose entry IS a file offset,
+/// and the debug directory, whose entries carry `PointerToRawData`.
+fn shift_for_header_capacity(
+    input: &[u8],
+    at: &At<'_>,
+    headers: u32,
+    table_end: u32,
+    file_alignment: u32,
+) -> Result<(Vec<u8>, HeaderCapacity), DirectoryRelocateError> {
+    const SECURITY_DIRECTORY: usize = 4;
+    const DEBUG_DIRECTORY: usize = 6;
+    for (index, name) in [(SECURITY_DIRECTORY, "certificate table"), (DEBUG_DIRECTORY, "debug")] {
+        if at
+            .pe
+            .directory(index)
+            .is_some_and(|directory| directory.address != 0 && directory.size != 0)
+        {
+            return Err(DirectoryRelocateError::Malformed(format!(
+                "cannot shift raw data while the {name} directory is present: its entries are file offsets"
+            )));
+        }
+    }
+    let shift = file_alignment;
+    let capacity = headers.checked_add(shift).ok_or_else(|| {
+        DirectoryRelocateError::Malformed("header capacity overflows".to_owned())
+    })?;
+    let mut bytes = Vec::with_capacity(input.len() + shift as usize);
+    bytes.extend_from_slice(&input[..headers as usize]);
+    bytes.resize(capacity as usize, 0);
+    bytes.extend_from_slice(&input[headers as usize..]);
+
+    let nt = at.pe.nt_headers_offset.0 as usize;
+    let table = nt + 24 + usize::from(at.pe.coff.size_of_optional_header);
+    for (index, section) in at.pe.sections.iter().enumerate() {
+        let raw = u32::try_from(section.pointer_to_raw_data.0).unwrap_or(0);
+        if raw == 0 {
+            continue;
+        }
+        let field = table + index * 40 + 20;
+        let moved = raw.checked_add(shift).ok_or_else(|| {
+            DirectoryRelocateError::Malformed("section raw offset overflows".to_owned())
+        })?;
+        bytes
+            .get_mut(field..field + 4)
+            .ok_or_else(|| {
+                DirectoryRelocateError::Malformed("section header is outside the image".to_owned())
+            })?
+            .copy_from_slice(&moved.to_le_bytes());
+    }
+    let field = nt + 24 + 60;
+    bytes
+        .get_mut(field..field + 4)
+        .ok_or_else(|| {
+            DirectoryRelocateError::Malformed("SizeOfHeaders is outside the image".to_owned())
+        })?
+        .copy_from_slice(&capacity.to_le_bytes());
+    let grown = At::new(&bytes)?;
+    if grown.pe.optional.size_of_headers != capacity {
+        return Err(DirectoryRelocateError::Malformed(
+            "SizeOfHeaders did not change on reparse".to_owned(),
+        ));
+    }
+    Ok((
+        bytes,
+        HeaderCapacity {
+            size_of_headers: capacity,
+            table_end,
+            free_slots: capacity.saturating_sub(table_end) / 40,
+        },
+    ))
+}
+
+/// How much room a header grow found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderCapacity {
+    pub size_of_headers: u32,
+    pub table_end: u32,
+    pub free_slots: u32,
+}
+
+/// Raises `SizeOfHeaders` into the padding that already sits between the
+/// headers and the first raw section, without moving a single byte of data.
+///
+/// The section table can only grow while it stays inside `SizeOfHeaders`, and
+/// that is what caps the whole directory rebuild: measured on the sample, the
+/// table ends at 0x5c0 with `SizeOfHeaders` 0x600, which is ONE free 40-byte
+/// slot. But the first raw section starts at 0x1000, so 0xa00 bytes between
+/// them are padding and nothing is stored there -- raising the field to 0x1000
+/// yields 25 more slots for free.
+///
+/// Only padding is claimed: every byte from the old `SizeOfHeaders` to the new
+/// one must already be zero, or the grow is refused rather than overwriting
+/// something unrecognised. An image whose first section starts exactly at its
+/// headers (one that has already been relaid out) has no slack and is refused
+/// too -- making room there means shifting every section's file offset, which
+/// is a different operation.
+///
+/// # Errors
+///
+/// A malformed image, no slack, or non-zero bytes in the space to be claimed.
+pub fn grow_header_capacity(input: &[u8]) -> Result<(Vec<u8>, HeaderCapacity), DirectoryRelocateError> {
+    let at = At::new(input)?;
+    let file_alignment = at.pe.optional.file_alignment;
+    if file_alignment == 0 || !file_alignment.is_power_of_two() {
+        return Err(DirectoryRelocateError::Malformed(format!(
+            "file alignment {file_alignment:#x} is not a power of two"
+        )));
+    }
+    let headers = at.pe.optional.size_of_headers;
+    let table_end = u32::try_from(
+        at.pe.nt_headers_offset.0 as usize
+            + 24
+            + usize::from(at.pe.coff.size_of_optional_header)
+            + at.pe.sections.len() * 40,
+    )
+    .map_err(|_| DirectoryRelocateError::Malformed("section table ends past 4 GiB".to_owned()))?;
+
+    let first_raw = at
+        .pe
+        .sections
+        .iter()
+        .map(|section| u32::try_from(section.pointer_to_raw_data.0).unwrap_or(u32::MAX))
+        .filter(|offset| *offset != 0)
+        .min()
+        .unwrap_or(headers);
+    let capacity = first_raw & !(file_alignment - 1);
+    if capacity <= headers {
+        // No padding to claim. Make the room by moving every section's FILE
+        // offset down by one alignment unit; RVAs are untouched, so nothing
+        // that addresses the image at runtime changes.
+        return shift_for_header_capacity(input, &at, headers, table_end, file_alignment);
+    }
+    let claimed = input
+        .get(headers as usize..capacity as usize)
+        .ok_or_else(|| {
+            DirectoryRelocateError::Malformed("header padding is not file-backed".to_owned())
+        })?;
+    if claimed.iter().any(|byte| *byte != 0) {
+        return Err(DirectoryRelocateError::Malformed(format!(
+            "the {} byte(s) between {headers:#x} and {capacity:#x} are not padding",
+            claimed.len()
+        )));
+    }
+
+    let mut bytes = input.to_vec();
+    // PE32+: `SizeOfHeaders` is 60 bytes into the optional header.
+    let field = at.pe.nt_headers_offset.0 as usize + 24 + 60;
+    bytes
+        .get_mut(field..field + 4)
+        .ok_or_else(|| {
+            DirectoryRelocateError::Malformed("SizeOfHeaders is outside the image".to_owned())
+        })?
+        .copy_from_slice(&capacity.to_le_bytes());
+    let grown = At::new(&bytes)?;
+    if grown.pe.optional.size_of_headers != capacity {
+        return Err(DirectoryRelocateError::Malformed(
+            "SizeOfHeaders did not change on reparse".to_owned(),
+        ));
+    }
+    Ok((
+        bytes,
+        HeaderCapacity {
+            size_of_headers: capacity,
+            table_end,
+            free_slots: (capacity.saturating_sub(table_end)) / 40,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests;
 

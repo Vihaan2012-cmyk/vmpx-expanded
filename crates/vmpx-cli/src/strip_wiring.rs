@@ -162,6 +162,21 @@ pub fn run_strip(
     }
     let mut data = crate::read_file(input)?;
     if rebuild_directories {
+        // The section table may only grow while it stays inside SizeOfHeaders,
+        // and that is what caps the rebuild -- one free slot on this sample.
+        // The padding between the headers and the first raw section is free
+        // room; claiming it moves no data. An image with none says so and the
+        // rebuild goes ahead with whatever slots it has.
+        match vmpx_rebuild::directory_relocate::grow_header_capacity(&data) {
+            Ok((grown, capacity)) => {
+                println!(
+                    "[headers] SizeOfHeaders -> {:#x}; section table ends at {:#x}, {} free slot(s)",
+                    capacity.size_of_headers, capacity.table_end, capacity.free_slots
+                );
+                data = grown;
+            }
+            Err(error) => println!("[headers] not grown: {error}"),
+        }
         let names: Vec<&str> = remove.iter().map(String::as_str).collect();
         // The IAT moves with the rest, so the same precondition applies: nothing
         // that survives may reach the old table by address.

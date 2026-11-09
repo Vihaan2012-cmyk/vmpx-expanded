@@ -326,6 +326,16 @@ pub fn recover_exit(
     // Only the entry-frame CLASSIFICATION needs this; every slot below is read
     // through `final_vsp` itself and so does not care what it is rooted at.
     let placed_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial");
+    // The RETURN slot is read strictly, and that distinction is load-bearing:
+    // an untracked return slot means the VM never wrote it, which is a CLEAN
+    // callee return (the arm below matches on exactly that error). Handing back
+    // an opaque load there turns every clean return into a trampoline.
+    let read_strict = |offset: u32| -> Result<Expr, DecodedLiftError> {
+        let address = add_offset(&symbolic.final_vsp, offset)?;
+        symbolic
+            .read_tracked_memory(address, BitWidth::W64)
+            .map_err(|error| fail(error.to_string()))
+    };
     let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
         let address = add_offset(&symbolic.final_vsp, offset)?;
         if restore_untracked_slots()
@@ -383,7 +393,7 @@ pub fn recover_exit(
         // as a trampoline when the value is not the caller's own return address,
         // and keep refusing when it is, because then it IS a return and the
         // unwind amount is exactly what could not be computed.
-        return match read(return_offset) {
+        return match read_strict(return_offset) {
             Ok(value) if !is_caller_return_address(&value) => {
                 Ok(RecoveredExit::Trampoline(TrampolineExit {
                     registers,
@@ -399,7 +409,7 @@ pub fn recover_exit(
         };
     };
     let return_slot = final_offset + i64::from(return_offset);
-    match read(return_offset) {
+    match read_strict(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
         Err(error) => return Err(error),
         // The VM wrote the return slot below the entry stack pointer: the target
@@ -423,21 +433,17 @@ pub fn recover_exit(
                     Expr::constant(BitWidth::W64, (slot - final_offset).cast_unsigned()),
                 )
                 .map_err(|error| fail(error.to_string()))?;
-                // A staged continuation word the havoc discarded is still a
-                // word the VM reads; lower it as the load it is.
-                let word = match symbolic.read_tracked_memory(address.clone(), BitWidth::W64) {
-                    Ok(word) => word,
-                    Err(error) if restore_untracked_slots() => {
-                        let _ = error;
-                        Expr::intrinsic(
-                            BitWidth::W64,
-                            format!("memory_load_epoch_{}", symbolic.memory_epoch),
-                            vec![address],
-                        )
-                    }
-                    Err(error) => return Err(fail(error.to_string())),
-                };
-                staged.push(word);
+                // Strictly tracked, deliberately. A staged word is CONTROL
+                // FLOW -- word zero of a region exit IS the continuation target
+                // -- so an unknown one cannot be lowered as a load the way a
+                // register-restore slot can. Letting one through made
+                // `an_unproven_computed_return_refuses` lift an unproven
+                // computed return, which is exactly what it guards.
+                staged.push(
+                    symbolic
+                        .read_tracked_memory(address, BitWidth::W64)
+                        .map_err(|error| fail(error.to_string()))?,
+                );
             }
             return Ok(RecoveredExit::Region(RegionExit {
                 registers,
@@ -603,7 +609,7 @@ fn is_register(expression: &Expr, name: &str) -> bool {
 /// Whether an untracked register-restore slot is lowered as a load.
 fn restore_untracked_slots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
 }
 
 fn is_caller_return_address(expression: &Expr) -> bool {
