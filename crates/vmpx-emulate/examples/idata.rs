@@ -143,6 +143,73 @@ fn main() {
         for sample in &samples {
             println!("    {sample}");
         }
+        // Can a real import directory bind these slots in place? The loader
+        // fills a run of slots starting at a descriptor's FirstThunk and ending
+        // at a null, so each module's slots must be CONTIGUOUS. `.idata` is
+        // encrypted in the file, so the run boundaries are not readable there --
+        // this infers them from the resolved slots instead.
+        let mut by_module: std::collections::BTreeMap<String, Vec<u32>> =
+            std::collections::BTreeMap::new();
+        for offset in (0..size).step_by(8) {
+            let rva = start + offset;
+            if let Ok(value) = mem.read_uint(base + u64::from(rva), 8)
+                && let Some(index) = value
+                    .checked_sub(STUB_REGION)
+                    .filter(|d| d % 8 == 0)
+                    .map(|d| (d / 8) as usize)
+                    .filter(|i| *i < names.len())
+            {
+                by_module.entry(names[index].0.clone()).or_default().push(rva);
+            }
+        }
+        let mut contiguous = 0_usize;
+        let mut broken: Vec<String> = Vec::new();
+        for (module, slots) in &by_module {
+            let spans_only_itself = slots
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 8);
+            if spans_only_itself {
+                contiguous += 1;
+            } else {
+                let runs = 1 + slots.windows(2).filter(|p| p[1] != p[0] + 8).count();
+                broken.push(format!("{module}: {} slots in {runs} runs", slots.len()));
+            }
+        }
+        println!();
+        println!("  modules: {}", by_module.len());
+        println!("  with all slots in ONE contiguous run : {contiguous}");
+        println!("  split across several runs            : {}", broken.len());
+        for entry in broken.iter().take(8) {
+            println!("    {entry}");
+        }
+
+        // Bank the recovered table. Every downstream step -- in-place binding
+        // or a fresh IAT plus repointing -- needs exactly these triples, and
+        // they cost a 27-billion-step snapshot to obtain, so they are written
+        // out rather than recomputed.
+        if let Some(path) = std::env::args().nth(3) {
+            let mut out = String::from("# slot_rva	module	symbol
+");
+            for (module, slots) in &by_module {
+                for slot in slots {
+                    let index = mem
+                        .read_uint(base + u64::from(*slot), 8)
+                        .ok()
+                        .and_then(|v| v.checked_sub(STUB_REGION))
+                        .map(|d| (d / 8) as usize);
+                    let symbol = index
+                        .and_then(|i| names.get(i))
+                        .map_or("?", |(_, func)| func.as_str());
+                    out.push_str(&format!("{slot:#x}	{module}	{symbol}
+"));
+                }
+            }
+            match std::fs::write(&path, out.as_bytes()) {
+                Ok(()) => println!("  wrote {} binding(s) to {path}", by_module.values().map(Vec::len).sum::<usize>()),
+                Err(error) => println!("  could not write {path}: {error}"),
+            }
+        }
+
         let in_section = |r: &u32| *r >= start && *r < start + size;
         let want: std::collections::BTreeSet<u32> =
             called.iter().copied().filter(in_section).collect();
