@@ -1788,7 +1788,11 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
                 }
             });
             return Some(Box::leak(
-                format!("Intrinsic:memory_load_epoch@{site}").into_boxed_str(),
+                format!(
+                    "Intrinsic:memory_load_epoch@{site}/w{}",
+                    expression.width.bits()
+                )
+                .into_boxed_str(),
             ));
         }
         ExprKind::Intrinsic { name, .. } => return Some(Box::leak(
@@ -1820,6 +1824,19 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 root: None,
                 lo: signed,
                 hi: signed,
+            })
+        }
+        // An opaque load is unknown in VALUE but not in RANGE: it was loaded at
+        // a width, and a load of w bits lies in `[0, 2^w)`. That is the same
+        // argument as the narrow-register arm below, and it is what places a
+        // vsp-rooted store whose displacement runs through one. A 64-bit load
+        // stays unbounded -- `unsigned_width_range` returns `None` for it.
+        ExprKind::Intrinsic { name, .. } if name.starts_with("memory_load_epoch_") => {
+            let (lo, hi) = unsigned_width_range(expression.width)?;
+            Some(AddressBounds {
+                root: None,
+                lo,
+                hi,
             })
         }
         // A bare symbolic register below 64 bits, or any truncation, is an

@@ -1483,9 +1483,12 @@ fn stack_check_refusal(
     }
     let instructions: Vec<_> = trace.instructions().collect();
     let branch = instructions.last()?;
-    if branch.instruction.mnemonic() != Mnemonic::Ja {
+    if !matches!(
+        branch.instruction.mnemonic(),
+        Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe
+    ) {
         return Some(format!(
-            "terminal branch is {:?}, not `ja`",
+            "terminal branch is {:?}, not an unsigned stack-limit compare",
             branch.instruction.mnemonic()
         ));
     }
@@ -1507,7 +1510,15 @@ fn stack_check_refusal(
         return Some(format!("the guard reads {:?}, not a `cmp`", cmp.mnemonic()));
     }
     if cmp.op0_kind() != OpKind::Register || cmp.op1_kind() != OpKind::Register {
-        return Some("the guard compare is not register-to-register".to_owned());
+        return Some(format!(
+            "the guard compare is not register-to-register (op0 {:?} {:?}, op1 {:?} {:?}, mem base {:?} disp {:#x})",
+            cmp.op0_kind(),
+            cmp.op0_register(),
+            cmp.op1_kind(),
+            cmp.op1_register(),
+            cmp.memory_base(),
+            cmp.memory_displacement64(),
+        ));
     }
     if cmp.op0_register() != canonical(check.vsp) {
         return Some(format!(
@@ -1542,6 +1553,28 @@ fn stack_check_refusal(
     None
 }
 
+/// The guard's successors as (dispatch head, relocation path).
+///
+/// `cmp vsp,limit` is followed by either sense: `ja`/`jae` jump to the head when
+/// the VM stack is still inside its region, while `jb`/`jbe` jump to the
+/// overflow path and leave the head as the fall-through. The protector picks the
+/// polarity per handler; demanding `ja` refused 91 of 122 handler-spec stalls.
+///
+/// This only ORDERS the two successors. Which one is really the dispatch head is
+/// proven downstream (`terminal_dispatches_through` on the head, then
+/// `region_reaches_head` from the other), so a wrong polarity fails closed.
+fn stack_check_successors(
+    branch: Mnemonic,
+    direct_target: Rva,
+    fallthrough: Rva,
+) -> Option<(Rva, Rva)> {
+    match branch {
+        Mnemonic::Ja | Mnemonic::Jae => Some((direct_target, fallthrough)),
+        Mnemonic::Jb | Mnemonic::Jbe => Some((fallthrough, direct_target)),
+        _ => None,
+    }
+}
+
 fn match_stack_check(
     trace: &DirectJumpTrace,
     roles: HandlerRegisterRoles,
@@ -1552,11 +1585,14 @@ fn match_stack_check(
     }
     let instructions: Vec<_> = trace.instructions().collect();
     let branch = instructions.last()?;
-    if branch.rva != trace.stop.at || branch.instruction.mnemonic() != Mnemonic::Ja {
+    if branch.rva != trace.stop.at {
         return None;
     }
-    let head = trace.stop.direct_target?;
-    let fallthrough = trace.stop.fallthrough?;
+    let (head, fallthrough) = stack_check_successors(
+        branch.instruction.mnemonic(),
+        trace.stop.direct_target?,
+        trace.stop.fallthrough?,
+    )?;
     let mut index = instructions.len() - 1;
     let cmp_index = loop {
         index = index.checked_sub(1)?;
@@ -1832,10 +1868,10 @@ fn recognize_postlude_dispatch(
         branch: shape.branch,
         head: shape.head,
     });
-    candidate.evidence.push(
-        "handler ends in the shared stack-check postlude; ja targets the proven dispatch head"
-            .to_owned(),
-    );
+    candidate.evidence.push(format!(
+        "handler ends in the shared stack-check postlude; its guard branch at {} selects the proven dispatch head at {}",
+        shape.branch, shape.head
+    ));
     match anchor {
         Some((base, _)) => candidate.evidence.push(format!(
             "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base {base} falls into the head"
@@ -2071,6 +2107,57 @@ mod tests {
         let shape = match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
             .expect("stack-check shape recovered despite the junk cmp");
         assert_eq!(shape.head, Rva(0x2000));
+    }
+
+    #[test]
+    fn stack_check_accepts_the_inverted_guard_polarity() {
+        // `jbe` jumps to the OVERFLOW path, so the dispatch head is the
+        // fall-through. 91 of 122 handler-spec stalls were refused on this.
+        for (sense, target_is_head) in [("ja", true), ("jae", true), ("jb", false), ("jbe", false)]
+        {
+            let mut a = CodeAssembler::new(64).expect("x64 assembler");
+            a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+            a.cmp(rbp, rax).expect("vsp vs guard compare");
+            match sense {
+                "ja" => a.ja(0x1_4000_2000_u64),
+                "jae" => a.jae(0x1_4000_2000_u64),
+                "jb" => a.jb(0x1_4000_2000_u64),
+                _ => a.jbe(0x1_4000_2000_u64),
+            }
+            .expect("stack-check branch");
+            let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+            let trace = conditional_trace(&bytes);
+            let expected_head = if target_is_head {
+                trace.stop.direct_target.expect("target")
+            } else {
+                trace.stop.fallthrough.expect("fall-through")
+            };
+            let shape = match_stack_check(&trace, STACK_CHECK_ROLES, STACK_CHECK)
+                .unwrap_or_else(|| panic!("{sense} guard must match"));
+            assert_eq!(shape.head, expected_head, "{sense}");
+            assert_ne!(shape.fallthrough, shape.head, "{sense}");
+        }
+    }
+
+    /// A branch that is not an unsigned limit compare is still refused, so the
+    /// polarity widening did not become "any conditional branch".
+    #[test]
+    fn stack_check_still_rejects_an_unrelated_condition() {
+        for build in [0_u8, 1] {
+            let mut a = CodeAssembler::new(64).expect("x64 assembler");
+            a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+            a.cmp(rbp, rax).expect("vsp vs guard compare");
+            if build == 0 {
+                a.jne(0x1_4000_2000_u64).expect("branch");
+            } else {
+                a.jg(0x1_4000_2000_u64).expect("branch");
+            }
+            let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+            assert!(
+                match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

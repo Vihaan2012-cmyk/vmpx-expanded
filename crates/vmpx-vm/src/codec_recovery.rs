@@ -294,7 +294,77 @@ pub fn recover_handler_codecs(
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,
 ) -> Result<HandlerCodecRecoveryReport, DisasmError> {
-    recover_handler_codecs_once(pe, entry, config)
+    let base = recover_handler_codecs_once(pe, entry, config)?;
+    // Only a handler the clean trace could not finish is worth re-walking, and
+    // only when it stopped AT a conditional -- that branch is the thing in the
+    // way. A caller that already asked to follow conditionals gets what it asked
+    // for, untouched.
+    if base.decode_spec.is_some()
+        || config.trace_limits.follow_conditional_fallthrough
+        || base.trace_stop.kind != DirectJumpTraceStopKind::ConditionalBranch
+    {
+        return Ok(base);
+    }
+    let walk = |take_target: bool| {
+        let mut config = config.clone();
+        config.trace_limits.follow_conditional_fallthrough = true;
+        config.trace_limits.follow_conditional_target = take_target;
+        // Exactly one: past that the two arm-choices stop covering every path,
+        // so agreement would prove nothing.
+        config.trace_limits.max_conditional_continuations = 1;
+        recover_handler_codecs_once(pe, entry, &config)
+    };
+    let fallthrough = walk(false)?;
+    let taken = walk(true)?;
+    let agree = fallthrough.decode_spec.is_some()
+        && fallthrough.decode_spec == taken.decode_spec
+        && fallthrough.boundary_spec == taken.boundary_spec
+        && fallthrough.handler_analysis.as_ref().map(|a| a.semantic)
+            == taken.handler_analysis.as_ref().map(|a| a.semantic);
+    if agree {
+        let mut proven = fallthrough;
+        // Both paths through the branch give this specification, so no arm was
+        // chosen and nothing is assumed. The label must NOT be carried.
+        proven.conditional_arms.clear();
+        proven.diagnostics.push(
+            "recovered identically along both arms of the handler's single conditional, so the              specification holds on every path through it"
+                .to_owned(),
+        );
+        return Ok(proven);
+    }
+    // Past one conditional nothing can be proven this way, so everything below
+    // is LABELED. One arm of one conditional first, then deeper chains: the
+    // protector joins handler fragments with several junk predicates, and both
+    // single-conditional arms stop at the second one.
+    for arm in [fallthrough, taken] {
+        if arm.decode_spec.is_some() {
+            let mut labeled = arm;
+            labeled.diagnostics.push(
+                "recovered along one arm of the handler's conditional; the other arm did not"
+                    .to_owned(),
+            );
+            return Ok(labeled);
+        }
+    }
+    for depth in [2_usize, 4, 8, 16] {
+        for take_target in [false, true] {
+            let mut config = config.clone();
+            config.trace_limits.follow_conditional_fallthrough = true;
+            config.trace_limits.follow_conditional_target = take_target;
+            config.trace_limits.max_conditional_continuations = depth;
+            let deep = recover_handler_codecs_once(pe, entry, &config)?;
+            if deep.decode_spec.is_some() {
+                let mut labeled = deep;
+                labeled.diagnostics.push(format!(
+                    "recovered by walking {} conditional arm(s) of the handler, all {};                      the other combinations were not walked, so this is labeled, not proven",
+                    labeled.conditional_arms.len(),
+                    if take_target { "taken" } else { "fall-through" },
+                ));
+                return Ok(labeled);
+            }
+        }
+    }
+    Ok(base)
 }
 
 fn recover_handler_codecs_once(
@@ -1127,6 +1197,7 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
         max_instructions,
         global_table,
         &mut LinearDecodeCache::default(),
+        None,
     )
 }
 
@@ -1155,6 +1226,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
     max_instructions: usize,
     global_table: Option<GlobalTableBase>,
     cache: &mut LinearDecodeCache,
+    deadline: Option<std::time::Instant>,
 ) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
     let mut instructions = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1184,6 +1256,16 @@ pub fn recover_and_decode_linear_vm_stream_cached(
         });
 
     for _ in 0..max_instructions {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return Ok(linear_report(
+                instructions,
+                state,
+                cumulative_vsp_delta,
+                LinearDecodeStop::Deadline,
+                None,
+                handler_recoveries,
+            ));
+        }
         if !seen.insert(state) {
             return Ok(linear_report(
                 instructions,
@@ -1259,6 +1341,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                     partial: Box::new(partial),
                 });
             };
+            let recovery_at = std::time::Instant::now();
             let mut recovery = match recover_handler_codecs(pe, handler_rva, config) {
                 Ok(recovery) => recovery,
                 Err(source) => {
@@ -1335,6 +1418,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                     .handler_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.semantic.ends_linear_block());
+            crate::cfg::note_decode_slow("recover_handler_codecs", recovery_at);
             cache.recoveries.insert(state.handler, recovery.clone());
             handler_recoveries.insert(state.handler, recovery);
             let Some(spec) = spec else {

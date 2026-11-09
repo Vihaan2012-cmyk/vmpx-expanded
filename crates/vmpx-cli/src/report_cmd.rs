@@ -90,6 +90,7 @@ pub fn tier_of<'a>(assumptions: impl IntoIterator<Item = &'a VmCfgAssumption>) -
             | VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations
             | VmCfgAssumption::AssumesStalledBlockExits
             | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
+            | VmCfgAssumption::AssumesHandlerConditionalArm
             | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable
             | VmCfgAssumption::AssumesCrossVmSectionContinuation => Tier::UnprovenAssumption,
@@ -165,6 +166,18 @@ enum Outcome {
 fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) -> VmCfgLimits {
     VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
+            // The postlude proof's state budget. Measured on the handlers that
+            // refuse with "has no recovered specification": the top one exhausts
+            // it (`resource_limited`, 50_000 states) rather than failing on a
+            // shape. A larger budget only lets the proof finish -- it still has
+            // to come out `all_paths_dispatch` -- so this cannot make an unsound
+            // recovery, only a slower one.
+            dispatch_proof: vmpx_disasm::RegisterDispatchProofLimits {
+                max_states: vmpx_disasm::RegisterDispatchProofLimits::default()
+                    .max_states
+                    .saturating_mul(env_scale("VMPX_DISPATCH_PROOF_STATES")),
+                ..vmpx_disasm::RegisterDispatchProofLimits::default()
+            },
             instruction_limit,
             symbolic: vmpx_vm::SymbolicExecutionLimits {
                 serve_read_only_when_suppressed: serve_ro,

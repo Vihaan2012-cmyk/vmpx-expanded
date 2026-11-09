@@ -139,6 +139,11 @@ pub enum LinearDecodeStop {
     BytecodeError,
     RepeatedState,
     InstructionLimit,
+    /// The caller's wall-clock budget ran out mid-stream. The decoded prefix is
+    /// sound; the suffix is simply unknown, so the block is incomplete. Only the
+    /// cached, walker-driven decode can report this -- the plain entry points
+    /// pass no deadline and can never produce it.
+    Deadline,
     /// The virtual instruction pointer left the section that held the initial
     /// bytecode. Protector bytecode is confined to one section per profile, so
     /// escaping it proves the decoder state has drifted and the decoded suffix

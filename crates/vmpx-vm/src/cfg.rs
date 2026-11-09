@@ -359,6 +359,16 @@ pub enum VmCfgAssumption {
     /// address 0 always raises -- and so is the SEH coverage, which comes from
     /// the image's own exception directory.
     AssumesNullReadFaultExitsViaSeh,
+    /// A handler's specification was recovered by walking ONE arm of a
+    /// conditional branch inside the handler (an opcode sub-dispatch), because
+    /// the two arms did not agree.
+    ///
+    /// Where both arms recover the same specification the walk carries NO
+    /// assumption: the two paths are the only paths through a single
+    /// conditional, so agreement is a proof. This label marks the other case --
+    /// the specification holds on the arm that was taken, and the walk assumes
+    /// that arm is the one the protector actually runs.
+    AssumesHandlerConditionalArm,
     /// A block that STALLED was closed as a VM exit anyway, because
     /// `VMPX_ASSUME_STALLED_BLOCKS_EXIT` was set.
     ///
@@ -2722,6 +2732,21 @@ const DEFAULT_MAX_FLAGS: usize = 2;
 /// expression nodes). See the refusal in [`resolve_over_inputs_capped`].
 const MAX_ENUMERATION_WORK: usize = 4_000_000;
 
+/// `MAX_ENUMERATION_WORK` scaled by `VMPX_ENUMERATION_WORK` (integer multiplier,
+/// default 1). Still a deterministic work budget, so the same input gives the
+/// same answer on every run; a larger one only lets a cross-product finish.
+fn max_enumeration_work() -> usize {
+    static WORK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORK.get_or_init(|| {
+        let scale = std::env::var("VMPX_ENUMERATION_WORK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        MAX_ENUMERATION_WORK.saturating_mul(scale)
+    })
+}
+
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
 /// Diagnostic: with `VMPX_MEM_TRACE=1`, names any single call that ran longer
@@ -2741,6 +2766,11 @@ fn phase(label: &str) {
         return;
     }
     eprintln!("[enter] {label}");
+}
+
+/// `note_slow` for the decode, which lives in another module.
+pub(crate) fn note_decode_slow(label: &str, start: std::time::Instant) {
+    note_slow(label, start);
 }
 
 fn note_slow(label: &str, start: std::time::Instant) {
@@ -2847,7 +2877,7 @@ pub(crate) fn resolve_over_inputs_capped(
     let nodes = simplified.node_count_bounded(domain.max_expression_nodes);
     let work = combinations.saturating_mul(nodes);
     phase("rt/enumerate");
-    let enumerated = if work > MAX_ENUMERATION_WORK {
+    let enumerated = if work > max_enumeration_work() {
         Err(format!(
             "enumeration would cost {combinations} combinations x {nodes} nodes"
         ))
@@ -3690,6 +3720,7 @@ impl Walker<'_, '_> {
             self.limits.entry.instruction_limit.min(remaining),
             global_table,
             &mut self.cache,
+            self.deadline,
         ) {
             Ok(report) => {
                 let decode = report.decode;
@@ -3717,6 +3748,20 @@ impl Walker<'_, '_> {
                 }
             }
         };
+        // A handler recovered on one arm of its own conditional makes every
+        // block decoded through it conditional on that arm. Cached recoveries
+        // count too, so this reads the cache rather than the new recoveries.
+        let arm_recovered = block.instructions.iter().any(|instruction| {
+            self.cache
+                .recoveries
+                .get(&instruction.state_before.handler)
+                .is_some_and(|recovery| !recovery.conditional_arms.is_empty())
+        });
+        if arm_recovered {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesHandlerConditionalArm);
+        }
         self.total_instructions += block.instructions.len();
         // Decoded buffers live in `decoded` and in `cfg.blocks`. `visit` used to
         // hold a third, transient copy; it now shares the one in `decoded`.
