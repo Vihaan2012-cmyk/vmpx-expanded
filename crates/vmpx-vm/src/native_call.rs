@@ -530,13 +530,27 @@ pub fn analyze_native_call_handler(
             .then_some(*rva)
         })
         .collect::<Vec<_>>();
-    let [alias_copy] = alias_copies.as_slice() else {
-        return Ok(failed_report(
-            entry,
-            cfg.blocks.len(),
-            instruction_count,
-            vec!["call-frame base is not a uniquely proven VSP alias".to_owned()],
-        ));
+    // A register is an alias of itself: when the call target is loaded straight
+    // from `[vsp]` there is no copy to find, and the alias is live from the
+    // handler's entry. Everything downstream that uses this site then checks the
+    // whole prefix instead of a suffix, which is stricter.
+    let alias_copy = if vsp_alias == canonical(vsp) {
+        entry
+    } else {
+        let [alias_copy] = alias_copies.as_slice() else {
+            return Ok(failed_report(
+                entry,
+                cfg.blocks.len(),
+                instruction_count,
+                vec![format!(
+                    "call-frame base is not a uniquely proven VSP alias (alias {:?}, vsp {:?}, copies {})",
+                    vsp_alias,
+                    canonical(vsp),
+                    alias_copies.len()
+                )],
+            ));
+        };
+        *alias_copy
     };
     if !is_win64_nonvolatile(vsp_alias) {
         return Ok(failed_report(
@@ -548,13 +562,13 @@ pub fn analyze_native_call_handler(
             )],
         ));
     }
-    let between_alias_and_call = reachable(&graph, *alias_copy)
+    let between_alias_and_call = reachable(&graph, alias_copy)
         .intersection(&reverse_reachable(&graph, call_site))
         .copied()
         .collect::<BTreeSet<_>>();
     let mut factory = iced_x86::InstructionInfoFactory::new();
     if between_alias_and_call.iter().any(|rva| {
-        *rva != *alias_copy
+        *rva != alias_copy
             && writes_register(&mut factory, &instructions[rva].instruction, vsp_alias)
     }) {
         return Ok(failed_report(
@@ -583,7 +597,7 @@ pub fn analyze_native_call_handler(
             vec!["native RSP is not saved exactly once through the VSP alias".to_owned()],
         ));
     };
-    if !dominates(&graph, entry, *alias_copy, *rsp_save) {
+    if !dominates(&graph, entry, alias_copy, *rsp_save) {
         return Ok(failed_report(
             entry,
             cfg.blocks.len(),
@@ -660,14 +674,23 @@ pub fn analyze_native_call_handler(
             .then_some(*rva)
         })
         .collect::<Vec<_>>();
+    // Only the register-move restore is modelled. The probe that motivated a
+    // frame-slot restore measured `frame saves 0` on the handler in question --
+    // its post-call VSP is a value the handler COMPUTES, not the pre-call one
+    // saved and reloaded -- so the pair-matching version was removed rather than
+    // kept on a shape nothing exhibits.
     let [vsp_restore] = vsp_restores.as_slice() else {
         return Ok(failed_report(
             entry,
             cfg.blocks.len(),
             instruction_count,
-            vec!["post-call VM stack pointer is not restored on every path".to_owned()],
+            vec![format!(
+                "post-call VM stack pointer is not restored on every path ({} alias move(s))",
+                vsp_restores.len()
+            )],
         ));
     };
+    let vsp_restore = *vsp_restore;
 
     let mut saved = BTreeSet::new();
     let mut restored = BTreeSet::new();
@@ -772,7 +795,7 @@ pub fn analyze_native_call_handler(
         native_rsp_save: Some(*rsp_save),
         native_rsp_restore: Some(*rsp_restore),
         return_store: Some(*return_store),
-        vsp_restore: Some(*vsp_restore),
+        vsp_restore: Some(vsp_restore),
         selector_register: Some(format!("{:?}", canonical(selector_register))),
         selector_completion: Some(selector_completion),
         dispatch_source: Some(*dispatch_source),
