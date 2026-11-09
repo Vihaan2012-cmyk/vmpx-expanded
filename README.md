@@ -222,4 +222,24 @@ Stage designs live in [`docs/superpowers/specs/`](docs/superpowers/specs/) —
 native reintegration, generalized OEP recovery, the mutation engine, and the
 dynamic engine.
 
+## Legal and ethical use
+
+This software is intended exclusively for:
+
+- Defensive malware analysis in isolated laboratory VMs
+- Academic and classroom instruction in reverse engineering
+- Incident-response work where the analyst has lawful possession of the sample
+- Security research published openly
+
+You must not use this tool:
+
+- Against software you do not own or do not have written permission to analyse
+- To defeat licensing or DRM on commercial software
+- To distribute unpacked malware binaries to parties who would not otherwise
+  have lawful access
+
+Nothing here is a grant of permission to analyse a particular binary. Lawful
+possession and, where it applies, written authorisation are the user's
+responsibility.
+
 MIT licensed, as the upstream project.
