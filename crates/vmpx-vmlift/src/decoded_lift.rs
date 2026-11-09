@@ -327,8 +327,24 @@ pub fn recover_exit(
     // through `final_vsp` itself and so does not care what it is rooted at.
     let placed_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial");
     let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
+        let address = add_offset(&symbolic.final_vsp, offset)?;
+        if restore_untracked_slots()
+            && symbolic
+                .read_tracked_memory(address.clone(), BitWidth::W64)
+                .is_err()
+        {
+            // The VM reads this address at exit and the value is unknown. The
+            // decompiler lowers a `memory_load_epoch_N` intrinsic to a real
+            // load, so this prints what actually happens instead of discarding
+            // the function.
+            return Ok(Expr::intrinsic(
+                BitWidth::W64,
+                format!("memory_load_epoch_{}", symbolic.memory_epoch),
+                vec![address],
+            ));
+        }
         symbolic
-            .read_tracked_memory(add_offset(&symbolic.final_vsp, offset)?, BitWidth::W64)
+            .read_tracked_memory(address, BitWidth::W64)
             .map_err(|error| {
                 // A restore slot is written by the entry stub, so a MISSING one
                 // means something discarded it rather than that it was never
@@ -407,11 +423,21 @@ pub fn recover_exit(
                     Expr::constant(BitWidth::W64, (slot - final_offset).cast_unsigned()),
                 )
                 .map_err(|error| fail(error.to_string()))?;
-                staged.push(
-                    symbolic
-                        .read_tracked_memory(address, BitWidth::W64)
-                        .map_err(|error| fail(error.to_string()))?,
-                );
+                // A staged continuation word the havoc discarded is still a
+                // word the VM reads; lower it as the load it is.
+                let word = match symbolic.read_tracked_memory(address.clone(), BitWidth::W64) {
+                    Ok(word) => word,
+                    Err(error) if restore_untracked_slots() => {
+                        let _ = error;
+                        Expr::intrinsic(
+                            BitWidth::W64,
+                            format!("memory_load_epoch_{}", symbolic.memory_epoch),
+                            vec![address],
+                        )
+                    }
+                    Err(error) => return Err(fail(error.to_string())),
+                };
+                staged.push(word);
             }
             return Ok(RecoveredExit::Region(RegionExit {
                 registers,
@@ -574,6 +600,12 @@ fn is_register(expression: &Expr, name: &str) -> bool {
 /// structural identity proves a VM-written return slot equals the standard
 /// callee return; a reconstructed address (e.g. relocation base plus a constant)
 /// is not accepted, so the lift fails closed on it.
+/// Whether an untracked register-restore slot is lowered as a load.
+fn restore_untracked_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+}
+
 fn is_caller_return_address(expression: &Expr) -> bool {
     is_register(expression, "native_return_address_initial")
 }

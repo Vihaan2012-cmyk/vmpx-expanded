@@ -580,7 +580,7 @@ impl<'a> SymbolicMachine<'a> {
         if initial.flags.width != BitWidth::W64 {
             return Err("initial flags value is not 64 bits".to_owned());
         }
-        if initial.memory_tainted {
+        if initial.memory_tainted && !resume_tainted() {
             return Err(
                 "initial memory is tainted by an unbounded alias and cannot be resumed soundly"
                     .to_owned(),
@@ -647,7 +647,11 @@ impl<'a> SymbolicMachine<'a> {
             byte_versions: BTreeMap::new(),
             last_zero_image_read: None,
             memory_tainted: initial.memory_tainted,
-            image_reads_suppressed: initial.image_reads_suppressed,
+            // A tainted state must never serve a file constant: the store that
+            // tainted it could have written that very address. The broad havoc
+            // sets the taint without setting this, so it is forced here rather
+            // than relied on.
+            image_reads_suppressed: initial.image_reads_suppressed || initial.memory_tainted,
             assumed_external_disjoint_from_vm_stack: false,
             assumed_external_disjoint_from_fresh_allocations: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
@@ -1615,6 +1619,12 @@ pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
 /// remaining blocker on 5 store-class entries, whose broad havoc sets
 /// `memory_tainted` and so stops their constant image reads being served.
 /// `VMPX_NO_SERVE_RO_TAINTED=1` restores the stricter gate.
+/// Whether a machine may be built from an already-tainted state.
+fn resume_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+}
+
 fn serve_read_only_when_tainted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VMPX_NO_SERVE_RO_TAINTED").is_none())

@@ -161,6 +161,17 @@ pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Resul
     })
 }
 
+/// Whether a block whose memory was havoced is lowered rather than refused.
+///
+/// The havoc empties tracked memory, so reads after it return fresh opaque
+/// intrinsics rather than stale values, and a lowering that needs a discarded
+/// cell fails at the read with the address in hand. Refusing up front only
+/// loses the blocks that did not need one.
+fn lower_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_LOWER_TAINTED").is_ok_and(|v| v == "1"))
+}
+
 pub(crate) fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
     let cfg = input.cfg;
     let mut preds: BTreeMap<Va, Vec<Va>> = cfg.blocks.keys().map(|k| (*k, vec![])).collect();
@@ -451,7 +462,7 @@ impl Walker<'_, '_> {
         // those are where the VIP and operands live.
         if !report.native_calls.is_empty()
             || !report.fresh_allocations.is_empty()
-            || report.memory_tainted
+            || (report.memory_tainted && !lower_tainted())
         {
             let mut causes = Vec::new();
             if !report.native_calls.is_empty() {
