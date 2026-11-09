@@ -1,3 +1,4 @@
+pub mod directory_relocate;
 mod import_reconstruct;
 mod import_table;
 mod layout;

@@ -2837,6 +2837,7 @@ dependencies = [
 name = "vmpx-rebuild"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "thiserror 2.0.20",
  "vmpx-disasm",
  "vmpx-pe",

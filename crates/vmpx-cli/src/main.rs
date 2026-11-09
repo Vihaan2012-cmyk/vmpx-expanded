@@ -298,6 +298,32 @@ enum Command {
         /// wholly inside a removed section may be dropped.
         #[arg(long = "drop-directory", value_name = "INDEX")]
         drop_directory: Vec<usize>,
+        /// Rebuild the export directory into an appended standard section first,
+        /// so removing the protector section it currently lives in is possible
+        /// without dropping the exports.
+        #[arg(long)]
+        rebuild_exports: bool,
+        /// Rebuild the exception directory into an appended standard section
+        /// first, dropping the RUNTIME_FUNCTION entries that describe code in
+        /// the sections being removed (those would dangle).
+        #[arg(long)]
+        rebuild_exceptions: bool,
+        /// Rebuild the import directory, its lookup tables and its IAT into an
+        /// appended writable section first. Only sound where nothing outside
+        /// the removed sections reaches the old IAT by address.
+        #[arg(long)]
+        rebuild_imports: bool,
+        /// Rebuild the TLS directory, its raw-data template and its callback
+        /// array into an appended section, then rebuild the base-relocation
+        /// table for the result. Callbacks inside a removed section are dropped
+        /// and named, since they would otherwise dangle.
+        #[arg(long)]
+        rebuild_tls: bool,
+        /// Move the IAT even though the reference scan could not decode every
+        /// surviving executable byte. Without this, an incomplete scan refuses:
+        /// finding no references in 95% of the code is a sample, not a proof.
+        #[arg(long)]
+        accept_unverified_iat: bool,
     },
 }
 
@@ -1657,8 +1683,23 @@ fn main() -> Result<()> {
             output,
             remove,
             drop_directory,
+            rebuild_exports,
+            rebuild_exceptions,
+            rebuild_imports,
+            rebuild_tls,
+            accept_unverified_iat,
         } => {
-            strip_wiring::run_strip(&input, &output, &remove, &drop_directory)?;
+            strip_wiring::run_strip(
+                &input,
+                &output,
+                &remove,
+                &drop_directory,
+                rebuild_exports,
+                rebuild_exceptions,
+                rebuild_imports,
+                rebuild_tls,
+                accept_unverified_iat,
+            )?;
         }
     }
     Ok(())
