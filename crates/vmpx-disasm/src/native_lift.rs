@@ -582,6 +582,14 @@ struct Lifter<'a, A: Algebra> {
     tainted: [bool; 16],
     /// The instruction being executed reads `rsp` or a tainted register.
     inst_derived: bool,
+    /// IP of the instruction being executed, so an opaque term can be keyed to
+    /// its site: distinct between sites, equal to itself across a
+    /// recovered/recompiled pair.
+    current_ip: u64,
+    /// While set, reading a CLOBBERED flag yields a free term instead of
+    /// refusing. Enabled only for `cmovcc`/`setcc`, which merely SELECT on the
+    /// flag -- a branch still refuses, so control-flow recovery is unchanged.
+    free_clobbered_flags: bool,
     info: InstructionInfoFactory,
     xmm: Vec<(A::Expr, A::Expr)>,
     xmm_written: BTreeSet<u8>,
@@ -606,6 +614,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             deferred: Vec::new(),
             tainted: [false; 16],
             inst_derived: false,
+            current_ip: 0,
+            free_clobbered_flags: false,
             info: InstructionInfoFactory::new(),
             xmm: (0..16)
                 .map(|n| {
@@ -1124,6 +1134,16 @@ impl<'a, A: Algebra> Lifter<'a, A> {
     fn flag_value(&self, flag: Flag) -> R<A::Expr> {
         match self.flags.get(&flag) {
             Some(FlagState::Value(value)) => Ok(value.clone()),
+            Some(FlagState::Clobbered) if self.free_clobbered_flags => {
+                // The flag's computation was not modeled, so its value is
+                // unknown -- a free term over-approximates it, which is sound
+                // for a selection and strictly better than refusing the block.
+                Ok(self.alg.intrinsic(
+                    Width::W8,
+                    &format!("unmodeled_flag_{}", flag.name()),
+                    vec![self.k(Width::W64, self.current_ip)],
+                ))
+            }
             Some(FlagState::Clobbered) => {
                 unsupported(format!("{flag:?} is not modeled at this point"))
             }
@@ -1242,8 +1262,22 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         if self.options.assume_stack_disjoint {
             self.inst_derived = self.reads_derived(inst, mnemonic);
         }
+        self.current_ip = inst.ip();
+        {
+        }
         match mnemonic {
             Mnemonic::Nop => Ok(()),
+            // AH becomes the low FLAGS byte, which holds bits this lifter does
+            // not model, so the result is a free term keyed to the site -- the
+            // same treatment as `pushfq`.
+            Mnemonic::Lahf => {
+                let value = self.alg.intrinsic(
+                    Width::W8,
+                    "unmodeled_lahf",
+                    vec![self.k(Width::W64, inst.ip())],
+                );
+                self.write_reg(Register::AH, value)
+            }
             // DF is not modeled, and neither is any instruction that reads it:
             // no string operation (`movs`/`stos`/`lods`/`scas`/`cmps`) has an
             // arm here, so none can observe the direction flag. Setting or
@@ -1411,7 +1445,12 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             m if Self::is_cmov(m) => {
                 Self::expect_ops(inst, 2)?;
                 let width = Self::operand_width(inst, 0)?;
-                let cond = self.condition(inst.condition_code())?;
+                // Only the condition read may use a free term for a clobbered
+                // flag; everything after it is back to the strict rule.
+                self.free_clobbered_flags = true;
+                let cond = self.condition(inst.condition_code());
+                self.free_clobbered_flags = false;
+                let cond = cond?;
                 let src = self.read_operand(inst, 1, width)?;
                 let dst = self.read_operand(inst, 0, width)?;
                 let result = if let Some(taken) = self.alg.as_const(&cond) {
@@ -1427,8 +1466,10 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             }
             m if Self::is_setcc(m) => {
                 Self::expect_ops(inst, 1)?;
-                let cond = self.condition(inst.condition_code())?;
-                self.write_operand(inst, 0, cond)
+                self.free_clobbered_flags = true;
+                let cond = self.condition(inst.condition_code());
+                self.free_clobbered_flags = false;
+                self.write_operand(inst, 0, cond?)
             }
             Mnemonic::Mul | Mnemonic::Div | Mnemonic::Idiv => self.exec_wide(inst, mnemonic),
             Mnemonic::Imul => {
@@ -1979,12 +2020,39 @@ impl<'a, A: Algebra> Lifter<'a, A> {
     /// a 64-bit operand has no wider native width for the carry bit and fails closed, as
     /// does a variable count. OF is defined only for a 1-bit rotate, so it is clobbered;
     /// SF/ZF/AF/PF are architecturally unaffected.
+    /// `rcl`/`rcr` in the shapes the exact path cannot express: a variable
+    /// count (the modulus is width+1, so the count cannot be masked) and a
+    /// 64-bit operand (the rotated value needs 65 bits). The operation IS
+    /// defined, so this is an over-approximation rather than undefined
+    /// behaviour: an unknown function of the three inputs, which is sound in the
+    /// UNSAT direction and lets the block lift instead of refusing.
+    fn rotate_carry_opaque(
+        &mut self,
+        inst: &Instruction,
+        left: bool,
+        width: Width,
+        count: A::Expr,
+    ) -> R<()> {
+        let cin = self.flag_value(Flag::Cf)?;
+        let value = self.read_operand(inst, 0, width)?;
+        let name = if left { "unmodeled_rcl" } else { "unmodeled_rcr" };
+        let result = self.alg.intrinsic(width, name, vec![value, cin.clone(), count.clone()]);
+        let carry = self.alg.intrinsic(
+            Width::W8,
+            if left { "unmodeled_rcl_cf" } else { "unmodeled_rcr_cf" },
+            vec![result.clone(), cin, count],
+        );
+        self.set_flag(Flag::Cf, carry);
+        self.clobber(&[Flag::Of]);
+        self.write_operand(inst, 0, result)
+    }
+
     fn exec_rotate_carry(&mut self, inst: &Instruction, left: bool) -> R<()> {
         Self::expect_ops(inst, 2)?;
         let width = Self::operand_width(inst, 0)?;
         let count = self.read_operand(inst, 1, Width::W8)?;
         let Some(raw) = self.alg.as_const(&count) else {
-            return unsupported("rcl/rcr by a variable count");
+            return self.rotate_carry_opaque(inst, left, width, count);
         };
         let bits = width.bits();
         let mask = if bits == 64 { 63 } else { 31 };
@@ -1998,7 +2066,8 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             Width::W16 => Width::W32,
             Width::W32 => Width::W64,
             Width::W64 => {
-                return unsupported("rcl/rcr on a 64-bit operand (carry bit exceeds 64 bits)");
+                let count = self.k(Width::W8, raw);
+                return self.rotate_carry_opaque(inst, left, width, count);
             }
         };
         let cin = self.flag_value(Flag::Cf)?;
