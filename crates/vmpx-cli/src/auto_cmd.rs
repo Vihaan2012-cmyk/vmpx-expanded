@@ -166,11 +166,16 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
     for rva in targets {
         let candidate = analyze_vm_entry_at(pe, Rva(rva), VmDiscoveryLimits::default());
         if candidate.as_ref().is_some_and(|c| c.confidence >= 80) {
+            log.trace(&format!("{rva:#x}"), &format!("guard (VM entry, confidence {})", candidate.as_ref().map_or(0, |c| c.confidence)));
             guards.push(rva);
         } else if recover_native_cfg_pe_with(pe, Rva(rva), options).is_ok() {
+            log.trace(&format!("{rva:#x}"), "mutated native");
             natives.push(rva);
         } else if candidate.is_some() {
+            log.trace(&format!("{rva:#x}"), "guard (VM entry, low confidence)");
             guards.push(rva); // a VM entry the scorer was unsure of
+        } else {
+            log.trace(&format!("{rva:#x}"), "unclassified protector target (left as-is)");
         }
     }
     log.info(&format!(
