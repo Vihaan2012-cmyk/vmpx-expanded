@@ -62,14 +62,48 @@ fn main() {
             .map(u64::from_le_bytes)
     };
 
-    // Every RIP-relative operand in a `.pdata`-described function that reads a
-    // slot the strip removed, resolved through the intact image.
+    // Code ranges to decode: every `.pdata`-described function, PLUS the
+    // executable bytes `.pdata` does not cover. The thunk table at 0x1740ab8 is
+    // a direct-jump table in such a gap, so scanning only `.pdata` would miss
+    // it -- which is why two thunk slots survived the first repoint pass.
+    let mut ranges: Vec<(u32, u32)> = stripped
+        .report()
+        .exception_functions
+        .iter()
+        .map(|f| (f.begin.0, f.end.0))
+        .filter(|(b, e)| e > b && e - b <= 0x10_0000 && mapped(*b))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (b, e) in ranges.clone() {
+        match merged.last_mut() {
+            Some(last) if b <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((b, e)),
+        }
+    }
+    for section in stripped.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
+        let start = section.virtual_address.0;
+        let size = section.virtual_size.max(section.size_of_raw_data);
+        let mut cursor = start;
+        for (b, e) in &merged {
+            if *e <= start || *b >= start + size {
+                continue;
+            }
+            if *b > cursor {
+                ranges.push((cursor, (*b).min(start + size)));
+            }
+            cursor = cursor.max(*e);
+        }
+        if cursor < start + size {
+            ranges.push((cursor, start + size));
+        }
+    }
+
     let mut sites: Vec<(u32, u32)> = Vec::new(); // (instruction rva, wanted target)
     let mut unmapped: BTreeMap<u32, usize> = BTreeMap::new();
     let mut direct: Vec<(u32, u32)> = Vec::new();
-    for function in &stripped.report().exception_functions {
-        let (begin, end) = (function.begin.0, function.end.0);
-        if end <= begin || end - begin > 0x10_0000 || !mapped(begin) {
+    for (begin, end) in ranges {
+        if !mapped(begin) {
             continue;
         }
         let Ok(offset) = stripped.rva_to_file_offset(Rva(begin)) else {
