@@ -318,10 +318,15 @@ pub fn run(o: Options) -> Result<(), String> {
 
     // --- auto settings ---
     log.start("Choosing settings");
+    // Start at the smallest budget proven to decode a branch-complete guard
+    // CFG, and escalate PER GUARD only where that falls short (the retry ladder
+    // in `devirt_guards`). A larger blanket budget only slows the easy guards;
+    // adapting where needed is both faster and "best" in the sense asked for.
     let instruction_limit = 2048_usize;
-    log.step("instruction limit", &format!("{instruction_limit} (branch-complete default)"));
+    log.step("instruction limit", &format!("{instruction_limit}, escalating per guard as needed"));
     log.step("image reads", "serve read-only under suppression (labeled)");
     log.step("checksum", "fold against the intact image");
+    log.step("cross-section", "follow continuations across .vmp sections");
 
     // --- discover ---
     log.start("Analysing the application's protector references");
@@ -756,9 +761,28 @@ fn devirt_guards(
         }
         let new_rva = section_rva + u32::try_from(payload.len()).unwrap_or(0);
         let va = base + u64::from(new_rva);
-        match crate::devirt_cmd::build_one(intact, rva, instruction_limit, va) {
+        // Try the chosen budget, then escalate ONLY this guard if it fell short
+        // of a complete CFG -- an incomplete-CFG or limit-hit error is the only
+        // kind more budget can fix, so a nested-entry or checksum-pointer
+        // refusal is not retried.
+        let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
+        let mut used = instruction_limit;
+        while let Err(reason) = &result {
+            let budget_bound = reason.contains("incomplete") || reason.contains("limit");
+            if !budget_bound || used >= 65536 {
+                break;
+            }
+            used *= 2;
+            result = crate::devirt_cmd::build_one(intact, rva, used, va);
+        }
+        match result {
             Ok(bytes) => {
-                log.step(&format!("{rva:#x} devirtualized"), &format!("{} byte(s)", bytes.len()));
+                let detail = if used == instruction_limit {
+                    format!("{} byte(s)", bytes.len())
+                } else {
+                    format!("{} byte(s), budget {used}", bytes.len())
+                };
+                log.step(&format!("{rva:#x} devirtualized"), &detail);
                 payload.extend_from_slice(&bytes);
                 mapping.insert(rva, new_rva);
                 ok += 1;
