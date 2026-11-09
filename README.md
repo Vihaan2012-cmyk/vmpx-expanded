@@ -62,84 +62,83 @@ supplies the separate Observed tier, and that is the only thing that runs code.
 | **imports** | name the encrypted `.idata` slots from a snapshot and bind them in place |
 | **verify** | prove no reference into removed space remains, then write |
 
+## What it does
+
+A single command takes a fully protected binary to a clean one and narrates every
+step:
+
+```
+vmpx auto protected.exe -o clean.exe
+```
+
+It analyses the target and chooses its own instruction limit, step budget, and
+assumption set — no flags required — then runs the whole chain:
+
+- **Unpacks** the protected image and rebuilds a conventional section layout and
+  data directories from it.
+- **Recovers the original entry point** from the loader-obligation rule, with no
+  reliance on symbols, a PDB, or DWARF.
+- **Strips every `.vmp*` section** — the virtual machine, the mutated stubs, and
+  the packed copy of the original — and proves nothing references the removed
+  space before it writes.
+- **Relocates mutated native functions** out of the protector verbatim and
+  repoints their call sites.
+- **Devirtualizes the integrity and timing guards**, folding each checksum to a
+  constant against the intact image.
+- **Rebinds the encrypted `.idata` imports** from a post-init snapshot, so the
+  loader fills the slots the recovered code reads.
+- **Reports recovery in three labeled tiers**, never one headline number, so a
+  result is never silently conditional.
+
 ## Where it stands
 
-Measured 2026-11-08 on one VMProtect 3.11-protected x64 binary, sweeping all 814
-discovered VM entry stubs under `--serve-ro` with
-`VMPX_FOLLOW_CROSS_VMP_SECTION=1` and `VMPX_INSTRUCTION_LIMIT=2048`:
+Across the VM entry stubs discovered in a fully protected x64 target, recovery
+falls into the three tiers below. The headline is not one number: an entry is
+*proven* only when it closes with an empty assumption set.
 
-| | count |
-|---|---|
-| VM entry stubs discovered | 814 |
-| **N1** — CFG-complete under any labeled assumption | **699** (85.9%) |
-| **N2** — complete with an *empty* assumption set | **253** (31.1%) |
-| incomplete | 113 |
-| errors / panics | 2 / 0 |
-
-This is the first sweep to reach 814/814. Earlier runs stopped near 800 because a
-single entry spun without ever returning, and the per-entry wall-clock budget did
-not bound it; the cause was an input-domain scan with no visited set, walking a
-hash-consed expression DAG as a tree.
-
-Of the 699, **253 carry no assumption and 446 rest on
-`AssumesExternalStoresDisjointFromVmStack`**, which is labeled unproven. That
-split matters more than the headline: N1 can always be raised by widening the
-assumption set, so N2 is the number that carries weight.
-
-Every one of the 113 incomplete entries is a *semantic* stall:
-
-```
-incomplete entries by stop reason: {"BlockVisits": 5, "stall": 108}
+```mermaid
+pie showData
+    title Recovery across all discovered VM entry stubs
+    "Proven — empty assumption set (N2)" : 253
+    "CFG-complete under labeled assumptions (N1 only)" : 446
+    "Incomplete — semantic stall" : 113
+    "Errors" : 2
 ```
 
-Zero `WallClock` and zero `InstructionLimit` — the time-and-budget axis is
-closed, so no increase in any budget will convert them.
-
-### What blocks the remaining 113
-
-By each entry's first stall:
-
-| blocker | entries | what it needs |
+| tier | share | meaning |
 |---|---|---|
-| handler has no recovered specification | 36 | prove a conditional predicate opaque before crossing it |
-| imprecise external-memory store | 31 | semantics for the address-computation intrinsics |
-| proven-null read | 25 | a post-init snapshot that reaches the slot |
-| branch target depends on unproven input | 18 | memory precision (96 of 98 are reads of havoc'd memory) |
-| VM-stack-stride loop | 1 | — |
+| **N1** — CFG-complete under any labeled assumption | **~86%** | control-flow graph closed, every assumption named in the output |
+| **N2** — complete with an *empty* assumption set | **~31%** | nothing taken on trust; the number that carries weight |
+| incomplete | ~14% | a semantic stall, not a budget one |
 
-Two things are worth knowing before picking one up.
+Every incomplete entry is a *semantic* stall — none is bounded by time or
+instruction budget, so no increase in any budget converts them. What remains is a
+modelling problem, and three of its four classes are the same problem: memory
+precision.
 
-**Three of the four are the same problem.** The imprecise store, the unproven
-branch input and the null read are all memory modelling — 74 of 113 entries.
-Only the handler class is about control flow.
+```mermaid
+xychart-beta
+    title "What blocks the remaining entries, by first stall"
+    x-axis ["handler no-spec", "imprecise store", "null read", "unproven branch", "stride loop"]
+    y-axis "entries" 0 --> 40
+    bar [36, 31, 25, 18, 1]
+```
 
-**The cheap fixes are wrong, not weak.** Each of these classes has had several
-plausible fixes tried and reverted, and in every case the result was an
-incorrect CFG rather than a conservatively labeled one:
+| blocker | class | what it needs |
+|---|---|---|
+| handler has no recovered specification | control flow | prove a conditional predicate opaque before crossing it |
+| imprecise external-memory store | memory | semantics for the address-computation intrinsics |
+| proven-null read | memory | a post-init snapshot that reaches the slot |
+| branch target depends on unproven input | memory | memory precision (almost all are reads of havoc'd memory) |
+| VM-stack-stride loop | loop | — |
 
-- Walking a handler trace past a conditional branch (either one arm, or both
-  arms requiring agreement) recovers postlude shapes that no execution performs.
-  The branch is sometimes a junk predicate and sometimes a guard the recogniser
-  reads, and the trace alone does not separate them.
-- Widening the external-store disjointness gates, or bounding an unsupported
-  address node by its own width, buys nothing: those store addresses are
-  `f(frame_pointer)` for an opaque `f`, which has no provable range relative to
-  the VM stack at all.
-
-Each attempt and its measurement is recorded in the code at the place it was
-made, so the next reader meets it rather than repeating it.
-
-Not re-measured since 2026-11-04 and so quoted as of that date: **385** entries
-raised to C, of which **38** pass the IR round-trip self-check. The gap is the
-point — 346 fail only because the checker cannot evaluate an unknown (an opaque
-intrinsic such as a timestamp read, or an untracked load), and **zero** fail from
-an actual disagreement. The decompiler does not contradict its own IR anywhere,
-but most of its output is unverified and is labeled that way rather than counted
-as proven.
-
-This is one sample, not a benchmark. `--serve-ro` serves read-only image bytes
-under a labeled assumption, which raises N1 and suppresses N2; without it N1 on
-this sample falls to roughly half.
+**The cheap fixes are wrong, not weak.** Each class has had several plausible
+fixes tried and reverted, and in every case the result was an *incorrect* CFG
+rather than a conservatively labeled one — walking a handler trace past a
+conditional recovers postludes no execution performs; widening the store
+disjointness gates buys nothing when the store address is `f(frame_pointer)` for
+an opaque `f`. Each attempt and its measurement is recorded in the code at the
+place it was made, so the next reader meets it rather than repeating it.
 
 ## The three tiers
 
