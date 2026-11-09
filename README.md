@@ -194,28 +194,19 @@ its JSON reports — pick a binary, tick the flags, set the environment, run:
 cargo run --release -p vmpx-ui
 ```
 
-### Settings whose absence costs results silently
+### Settings that silently change the result
 
-Several knobs are not implied by anything, and leaving one out does not produce
-an error — just a worse number:
+Some knobs widen what completes rather than erroring when left out — omit one and
+the number just gets worse, never an error:
 
-- **`report` needs `--serve-ro`.** Without it N1 on the sample above falls from
-  658 to 359. `VMPX_DECOMPILE_SERVE_RO` does *not* apply to `report`.
-- **`decompile` needs `VMPX_DECOMPILE_SERVE_RO=1`.** Without it the CFG reads as
-  incomplete and you get one line saying so instead of code. There is no
-  `--serve-ro` flag on `decompile`.
-- **`--dynamic` needs `--volatility-snapshot`.** Without the snapshot it takes
-  the bare-detonation branch, which never finishes the multi-billion-step init
-  and so observes nothing — reporting a silent zero rather than failing.
-- **No snapshot exists by default, and no subcommand writes one.** Build it with
-  the `xpl_init_steps` example and `XPL_SNAPSHOT_OUT`; it takes a few minutes.
-  Raise `XPL_STACK_KB` while doing so — at the 8 MiB default the init overflows
-  the guest stack and the snapshot captures a truncated state.
-- **The accelerators are on by default and the init needs them.** The protector
-  spends its init decompressing with LZMA, and `XPL_NOACCEL=1` / `XPL_NOLZMA=1`
-  turn off the folds that make that finish.
-- **`VMPX_INSTRUCTION_LIMIT` is a multiplier, not an absolute**, and `report`'s
-  base is 512 while `decompile`'s is 100000.
+| for | pass | otherwise |
+|---|---|---|
+| `report` | `--serve-ro` | N1 falls to roughly half |
+| `decompile` | `VMPX_DECOMPILE_SERVE_RO=1` (no `--serve-ro` flag here) | CFG reads incomplete; one line instead of code |
+| `--dynamic` | `--volatility-snapshot <snap>` | silent zero — bare detonation never finishes init |
+| building that snapshot | `xpl_init_steps` example + `XPL_SNAPSHOT_OUT`, and raise `XPL_STACK_KB` | 8 MiB default overflows the guest stack → truncated snapshot |
+| the init folds | leave `XPL_NOACCEL` / `XPL_NOLZMA` **unset** | the LZMA init never finishes |
+| `VMPX_INSTRUCTION_LIMIT` | a multiplier, not an absolute | base is 512 on `report`, 100000 on `decompile` |
 
 ### Emulator throughput, and why a step is not the unit
 
