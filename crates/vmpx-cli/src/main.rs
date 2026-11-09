@@ -23,6 +23,7 @@ mod clean_wiring;
 mod coverage_gate;
 mod decoded_splice;
 mod decompile_cmd;
+mod devirt_cmd;
 mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
@@ -221,6 +222,22 @@ enum Command {
         probe: bool,
         /// VM instruction budget for entry-stream recovery.
         #[arg(long, default_value_t = 100_000)]
+        instruction_limit: usize,
+    },
+    /// Devirtualize guard functions to native code and reintegrate them into a
+    /// stripped image, folding the integrity checksum to a constant.
+    Devirt {
+        /// Intact image (the `.vmp2` checksum regions must still be present).
+        intact: PathBuf,
+        /// Stripped image to emit into and retarget.
+        stripped: PathBuf,
+        /// Output image; omit to only report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// VM entry RVAs to devirtualize (hex); repeatable.
+        #[arg(long = "rva", value_parser = parse_rva)]
+        rva: Vec<u32>,
+        #[arg(long, default_value_t = 2048)]
         instruction_limit: usize,
     },
     /// Perform structural validation without executing the input.
@@ -1316,6 +1333,20 @@ fn main() -> Result<()> {
             probe,
             instruction_limit,
         })?,
+        Command::Devirt {
+            intact,
+            stripped,
+            output,
+            rva,
+            instruction_limit,
+        } => devirt_cmd::run(devirt_cmd::Options {
+            intact,
+            stripped,
+            output,
+            rvas: rva,
+            instruction_limit,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?,
         Command::Verify { input, json } => {
             let (data, report) = inspect(&input)?;
             let digest = sha256(&data);
