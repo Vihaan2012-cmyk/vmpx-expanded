@@ -585,6 +585,135 @@ pub fn recover_modulo_image_targets(
     })
 }
 
+/// The result of proving an expression timing-invariant.
+#[derive(Clone, Debug)]
+pub struct TimingLoadFoldReport {
+    pub expression: Expr,
+    /// 1 when the expression was proven counter-independent and rewritten with
+    /// its remainder-driven reads baked; 0 when it was left unchanged.
+    pub folded: usize,
+}
+
+/// Proves an expression independent of the timestamp counter and bakes its
+/// remainder-driven image reads to constants.
+///
+/// A guard reads `.vmp` at `base + k * (rdtsc mod divisor)` and weaves the read
+/// into a checksum pointer/length; the individual reads track the counter, but
+/// the construction is arranged so the FINAL value does not. This proves that
+/// the way [`recover_modulo_image_targets`] proves a transfer target -- it
+/// substitutes the complete remainder domain (every residue `0..divisor`),
+/// concretizes the whole expression against the intact image at each, and folds
+/// only when every residue yields the SAME expression. Unlike that routine it
+/// does not require the result be a bare constant, so an invariant value that
+/// still contains a genuine runtime load (`const + *(caller+off)`) is proven
+/// too. It rejects -- returning the expression untouched -- when the quotient or
+/// the raw counter escapes the remainder, or when any residue differs, so a
+/// folded expression is genuinely counter-independent, not assumed to be.
+///
+/// Only a single division driver is handled (one counter sample); an expression
+/// with none is returned unchanged with `folded == 0`.
+///
+/// # Errors
+/// Propagates an expression rebuild or concretization failure.
+pub fn fold_timing_invariant_loads(
+    pe: &PeImage<'_>,
+    expression: &Expr,
+    limits: ModuloImageTargetLimits,
+) -> Result<TimingLoadFoldReport, ModuloImageTargetError> {
+    let unchanged = || TimingLoadFoldReport {
+        expression: expression.clone(),
+        folded: 0,
+    };
+    let why = std::env::var("VMPX_TIMING_WHY").is_ok_and(|value| value == "1");
+
+    let drivers = expression
+        .intrinsic_dependencies()
+        .into_iter()
+        .filter(|name| name.starts_with("x86_unsigned_divide_w32_"))
+        .collect::<Vec<_>>();
+    let [driver] = drivers.as_slice() else {
+        return Ok(unchanged());
+    };
+    let mut occurrences = Vec::new();
+    collect_named_intrinsic_arguments(expression, driver, &mut occurrences);
+    let Some(first) = occurrences.first() else {
+        return Ok(unchanged());
+    };
+    if occurrences.iter().any(|candidate| candidate != first) {
+        if why {
+            eprintln!("[timing] {driver}: ambiguous driver arguments");
+        }
+        return Ok(unchanged());
+    }
+    let [high, _low, divisor] = first.as_slice() else {
+        return Ok(unchanged());
+    };
+    if first.iter().any(|argument| argument.width != BitWidth::W32) || constant(high) != Some(0) {
+        return Ok(unchanged());
+    }
+    let Some(divisor) = constant(divisor).filter(|value| *value != 0) else {
+        return Ok(unchanged());
+    };
+    if usize::try_from(divisor).ok().is_none_or(|count| count > limits.max_residues) {
+        if why {
+            eprintln!("[timing] {driver}: divisor {divisor} over residue limit");
+        }
+        return Ok(unchanged());
+    }
+
+    // The value must be selected by the remainder alone: reject if the quotient
+    // or the raw counter escapes the division.
+    let packed = Expr::concat(
+        Expr::register(BitWidth::W32, "__vmpx_div_remainder"),
+        Expr::register(BitWidth::W32, "__vmpx_div_quotient"),
+    )?;
+    let sensitivity = expression
+        .rewrite_intrinsics(&mut |_, candidate, _| (candidate == driver).then(|| packed.clone()))?;
+    if sensitivity.dependencies().contains("__vmpx_div_quotient") {
+        if why {
+            eprintln!("[timing] {driver}: value depends on the DIV quotient");
+        }
+        return Ok(unchanged());
+    }
+    if sensitivity
+        .intrinsic_dependencies()
+        .iter()
+        .any(|name| name.starts_with("read_timestamp_counter_"))
+    {
+        if why {
+            eprintln!("[timing] {driver}: raw counter escapes the remainder");
+        }
+        return Ok(unchanged());
+    }
+
+    // Substitute the complete remainder domain; fold only if every residue
+    // yields the same expression.
+    let mut canonical: Option<Expr> = None;
+    for remainder in 0..divisor {
+        let assignment =
+            BTreeMap::from([(driver.clone(), Expr::constant(BitWidth::W64, remainder << 32))]);
+        let report =
+            concretize_with_immutable_image(pe, expression, &assignment, limits.concretization)?;
+        match &canonical {
+            None => canonical = Some(report.expression),
+            Some(previous) if *previous == report.expression => {}
+            Some(_) => {
+                if why {
+                    eprintln!("[timing] {driver}: residue {remainder} differs -- counter-dependent");
+                }
+                return Ok(unchanged());
+            }
+        }
+    }
+    match canonical {
+        Some(expression) => Ok(TimingLoadFoldReport {
+            expression,
+            folded: 1,
+        }),
+        None => Ok(unchanged()),
+    }
+}
+
 /// True when every one of `len` bytes starting at `address` lies in read-only
 /// image memory: the PE headers, or a section whose characteristics are
 /// readable, NOT writable, and file-backed (not uninitialized/`.bss`). Under the
@@ -1049,5 +1178,108 @@ mod table_tests {
             assert_eq!(reader.file_offset(rva), expected, "rva {raw:#x}");
             assert_eq!(reader.file_offset(Rva(raw / 2)), pe.rva_to_file_offset(Rva(raw / 2)).ok().and_then(|o| usize::try_from(o.get()).ok()));
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use crate::BinaryOp;
+    use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+    use vmpx_pe::PeImage;
+
+    // A W8 image read at `base + (divide(0, counter, divisor) >> 32)`: the
+    // division remainder, which a VMProtect timing guard derives from `rdtsc`,
+    // selects the read. `escape` picks the low dword (the quotient) instead, the
+    // one combination the proof must reject.
+    fn remainder_load(base: u64, divisor: u32, counter: Expr, escape: bool) -> Expr {
+        let divide = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_unsigned_divide_w32_9",
+            vec![
+                Expr::constant(BitWidth::W32, 0),
+                counter,
+                Expr::constant(BitWidth::W32, u64::from(divisor)),
+            ],
+        );
+        // The division packs the remainder in the high dword and the quotient
+        // in the low one (`17/5 -> (2<<32)|3`), so the guard extracts the
+        // remainder at lsb 32; `escape` instead reads the quotient at lsb 0 --
+        // the dependency the proof must reject.
+        let lane = Expr::extract(BitWidth::W32, if escape { 0 } else { 32 }, divide).expect("lane");
+        let selector = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, lane).expect("widen");
+        let address =
+            Expr::binary(BinaryOp::Add, Expr::constant(BitWidth::W64, base), selector).expect("addr");
+        Expr::intrinsic(BitWidth::W8, "memory_load_epoch_70", vec![address])
+    }
+
+    fn fold(pe: &PeImage<'_>, expr: &Expr) -> TimingLoadFoldReport {
+        fold_timing_invariant_loads(pe, expr, ModuloImageTargetLimits::default()).expect("fold")
+    }
+
+    #[test]
+    fn invariant_window_folds_to_the_constant() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        // `.rdata` is 0xDEAD_BEEF then zeroes, so the four bytes at RDATA_VA+4
+        // are all 0 -- identical at every residue.
+        let counter = Expr::register(BitWidth::W32, "counter");
+        let report = fold(&pe, &remainder_load(RDATA_VA + 4, 4, counter, false));
+        assert_eq!(report.folded, 1);
+        assert_eq!(report.expression, Expr::constant(BitWidth::W8, 0));
+    }
+
+    #[test]
+    fn counter_dependent_window_is_left_untouched() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        // The four bytes at RDATA_VA are EF BE AD DE -- they differ per residue,
+        // so the value genuinely tracks the counter and must not fold.
+        let counter = Expr::register(BitWidth::W32, "counter");
+        let expr = remainder_load(RDATA_VA, 4, counter, false);
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
+    }
+
+    #[test]
+    fn quotient_selected_read_is_rejected() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let counter = Expr::register(BitWidth::W32, "counter");
+        // Even an invariant window must not fold when the QUOTIENT (not the
+        // remainder) selects the read: the proof covers remainders only.
+        let expr = remainder_load(RDATA_VA + 4, 4, counter, true);
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
+    }
+
+    #[test]
+    fn escaping_raw_counter_is_rejected() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let counter = Expr::register(BitWidth::W32, "counter");
+        // The raw counter also appears OUTSIDE the division, so the value is not
+        // a pure function of the remainder.
+        let load = remainder_load(RDATA_VA + 4, 4, counter, false);
+        let rdtsc = Expr::intrinsic(BitWidth::W8, "read_timestamp_counter_3", Vec::new());
+        let expr = Expr::binary(BinaryOp::Xor, load, rdtsc).expect("xor");
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+    }
+
+    #[test]
+    fn expression_without_a_division_driver_is_unchanged() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let expr = Expr::intrinsic(
+            BitWidth::W8,
+            "memory_load_epoch_70",
+            vec![Expr::constant(BitWidth::W64, RDATA_VA)],
+        );
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
     }
 }

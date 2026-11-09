@@ -143,10 +143,16 @@ pub(crate) fn build_one(
         return Err("no exit path (all nested, dead, or loop)".to_owned());
     }
 
-    // Fold the checksum and resolve image reads against the intact image.
+    // Fold the checksum and resolve image reads against the intact image. The
+    // byte cap covers the largest checksummed region a guard weaves in (one is
+    // ~48 MiB); folding reads the region once and bakes the constant.
     let limits = ImageConcretizationLimits {
         max_expression_nodes: 400_000,
-        max_checksum_bytes: 4 * 1024 * 1024,
+        max_checksum_bytes: 64 * 1024 * 1024,
+    };
+    let modulo_limits = vmpx_vm::ModuloImageTargetLimits {
+        concretization: limits,
+        ..vmpx_vm::ModuloImageTargetLimits::default()
     };
     let mut folded = 0_usize;
     let mut unresolved = std::collections::BTreeSet::new();
@@ -154,7 +160,14 @@ pub(crate) fn build_one(
                 folded: &mut usize,
                 unresolved: &mut std::collections::BTreeSet<String>|
      -> Result<Expr, String> {
-        let report = concretize_with_immutable_image(intact, expr, &BTreeMap::new(), limits)
+        // A guard reads `.vmp` at an rdtsc-remainder-driven address and feeds it
+        // into a checksum pointer/length. Fold those loads to constants first --
+        // provably counter-independent when every residue reads the same image
+        // bytes -- so the checksum below can then pin its region and fold.
+        let timing = vmpx_vm::fold_timing_invariant_loads(intact, expr, modulo_limits)
+            .map_err(|error| format!("timing fold: {error}"))?;
+        *folded += timing.folded;
+        let report = concretize_with_immutable_image(intact, &timing.expression, &BTreeMap::new(), limits)
             .map_err(|error| format!("concretize: {error}"))?;
         *folded += report.resolved_intrinsics;
         // A `memory_load_epoch_N(addr)` concretize could not fold is a runtime

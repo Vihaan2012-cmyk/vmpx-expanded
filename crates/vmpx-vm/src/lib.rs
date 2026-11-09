@@ -130,8 +130,9 @@ pub use handler_slice::{
 pub use image_concretize::{
     ImageConcretizationError, ImageConcretizationLimits, ImageConcretizationReport,
     ImageTableBranchError, ImageTableBranchLimits, ImageTableBranchReport, ModuloImageTargetError,
-    ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
-    concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
+    ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget, TimingLoadFoldReport,
+    concretize_with_immutable_image, fold_timing_invariant_loads, recover_image_table_targets,
+    recover_modulo_image_targets,
 };
 pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage, set_volatile_image_pages, set_volatile_image_ranges};
 pub use input_closed::{
