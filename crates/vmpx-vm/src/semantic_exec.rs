@@ -1800,7 +1800,14 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
         )),
         ExprKind::Extract { .. } => "Extract",
         ExprKind::Concat { .. } => "Concat",
-        ExprKind::Register { .. } => "Register",
+        // Name it: a bare 64-bit register is the one shape nothing can bound, so
+        // WHICH register says whether that is a caller value (genuinely runtime)
+        // or VM state that something else should have resolved.
+        ExprKind::Register { name } => {
+            return Some(Box::leak(
+                format!("Register:{name}/w{}", expression.width.bits()).into_boxed_str(),
+            ));
+        }
         ExprKind::Const { .. } => "Const",
         _ => "other",
     })

@@ -674,23 +674,83 @@ pub fn analyze_native_call_handler(
             .then_some(*rva)
         })
         .collect::<Vec<_>>();
-    // Only the register-move restore is modelled. The probe that motivated a
-    // frame-slot restore measured `frame saves 0` on the handler in question --
-    // its post-call VSP is a value the handler COMPUTES, not the pre-call one
-    // saved and reloaded -- so the pair-matching version was removed rather than
-    // kept on a shape nothing exhibits.
-    let [vsp_restore] = vsp_restores.as_slice() else {
-        return Ok(failed_report(
-            entry,
-            cfg.blocks.len(),
-            instruction_count,
-            vec![format!(
-                "post-call VM stack pointer is not restored on every path ({} alias move(s))",
-                vsp_restores.len()
-            )],
-        ));
+    // Two shapes. The VSP was parked in `vsp_alias` and moved back, or -- the
+    // measured one -- the handler COMPUTED the post-call VSP into a frame slot
+    // before the call and loads it back after. The second is the exact mirror of
+    // the native-RSP save/restore accepted above, and rests on the same
+    // obligation that pair already does: the callee runs on the switched native
+    // stack and does not write the VM's frame.
+    let vsp_restore = match vsp_restores.as_slice() {
+        [vsp_restore] => *vsp_restore,
+        _ => {
+            let slot_stores = instructions
+                .iter()
+                .filter_map(|(rva, decoded)| {
+                    let (base, displacement, _) = exact_store(&decoded.instruction)?;
+                    (base == vsp_alias
+                        && displacement != *rsp_displacement
+                        && dominates(&graph, entry, *rva, call_site))
+                    .then_some((*rva, displacement))
+                })
+                .collect::<Vec<_>>();
+            let [(slot_store, slot_displacement)] = slot_stores.as_slice() else {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec![format!(
+                        "post-call VM stack pointer is not restored on every path ({} alias move(s), {} frame slot store(s))",
+                        vsp_restores.len(),
+                        slot_stores.len()
+                    )],
+                ));
+            };
+            // Nothing may rewrite the slot between the store and the call, or the
+            // value loaded back is not the one that was computed.
+            let between = reachable(&graph, *slot_store)
+                .intersection(&reverse_reachable(&graph, call_site))
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if between.iter().any(|rva| {
+                *rva != *slot_store
+                    && exact_store(&instructions[rva].instruction).is_some_and(
+                        |(base, displacement, _)| {
+                            base == vsp_alias && displacement == *slot_displacement
+                        },
+                    )
+            }) {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec!["the saved VM stack pointer slot is rewritten before the call".to_owned()],
+                ));
+            }
+            let slot_loads = instructions
+                .iter()
+                .filter_map(|(rva, decoded)| {
+                    let (destination, base, displacement) = exact_load(&decoded.instruction)?;
+                    (destination == canonical(vsp)
+                        && base == vsp_alias
+                        && displacement == *slot_displacement
+                        && dominates(&graph, resume_rva, *rva, dispatch))
+                    .then_some(*rva)
+                })
+                .collect::<Vec<_>>();
+            let [slot_load] = slot_loads.as_slice() else {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec![format!(
+                        "VM stack pointer slot is not loaded back on every dispatch path ({} load(s))",
+                        slot_loads.len()
+                    )],
+                ));
+            };
+            *slot_load
+        }
     };
-    let vsp_restore = *vsp_restore;
 
     let mut saved = BTreeSet::new();
     let mut restored = BTreeSet::new();
