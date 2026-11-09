@@ -38,7 +38,25 @@ fn main() {
     }
     println!("image declares {} imported symbol(s)", names.len());
 
-    let (_cpu, mem) = snapshot::load(std::path::Path::new(&args[2])).expect("snapshot");
+    let (cpu, mem) = snapshot::load(std::path::Path::new(&args[2])).expect("snapshot");
+    // Where had the protector's init reached when this was captured? If RIP is
+    // in application code, the snapshot has already passed the hand-off and the
+    // real module entry is observable rather than merely unresolved.
+    let where_is = |va: u64| -> String {
+        va.checked_sub(base)
+            .and_then(|v| u32::try_from(v).ok())
+            .and_then(|rva| {
+                pe.sections
+                    .iter()
+                    .find(|s| s.contains_mapped_rva(Rva(rva)))
+                    .map(|s| format!("{rva:#x} ({})", s.name.as_str()))
+            })
+            .unwrap_or_else(|| format!("{va:#x} (outside the image)"))
+    };
+    println!("snapshot rip: {}", where_is(cpu.rip));
+    for (name, value) in [("rsp", cpu.regs[4]), ("rcx", cpu.regs[1]), ("rdx", cpu.regs[2])] {
+        println!("  {name} = {}", where_is(value));
+    }
 
     // Which .idata slots does the application actually CALL through? Byte-scan
     // every executable section for `call/jmp [rip+disp32]`; the answer is what
