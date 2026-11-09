@@ -93,7 +93,8 @@ assumption set — no flags required — then runs the whole chain:
 ## Where it stands
 
 Across the VM entry stubs discovered in a fully protected x64 target, recovery
-falls into the three tiers below. The headline is not one number: an entry is
+falls into three labeled tiers. The report is deliberately three numbers rather
+than one, because "recovered" is not a single property — and an entry counts as
 *proven* only when it closes with an empty assumption set.
 
 ```mermaid
@@ -105,11 +106,20 @@ pie showData
     "Errors" : 2
 ```
 
-| tier | share | meaning |
-|---|---|---|
-| **N1** — CFG-complete under any labeled assumption | **~86%** | control-flow graph closed, every assumption named in the output |
-| **N2** — complete with an *empty* assumption set | **~31%** | nothing taken on trust; the number that carries weight |
-| incomplete | ~14% | a semantic stall, not a budget one |
+- **N1 — CFG-complete** (~86%). The VM control-flow graph closed with no stalls,
+  under an explicitly *labeled* set of assumptions. Every assumption is named in
+  the output (`AssumesImageProtectionStable`,
+  `AssumesExternalStoresDisjointFromVmStack`, `AssumesCrossVmSectionContinuation`,
+  and so on), so a result is never silently conditional. N1 can always be raised
+  by widening the assumption set, so it is not the number that carries weight.
+- **N2 — PROVEN** (~31%). The same, with an **empty** assumption set. Nothing was
+  taken on trust. N2 is a subset of N1 and is the figure that actually matters.
+- **N3 — proven-equivalent.** Recovered semantics checked against the recompiled
+  replacement. Not currently wired at the PE level.
+
+Assumptions are *conceded*, never assumed away. Closing a loop by shifting the VM
+stack base, for example, concedes frame privacy, so such an entry can reach N1
+and is barred from N2 by construction.
 
 Every incomplete entry is a *semantic* stall — none is bounded by time or
 instruction budget, so no increase in any budget converts them. What remains is a
@@ -139,25 +149,6 @@ conditional recovers postludes no execution performs; widening the store
 disjointness gates buys nothing when the store address is `f(frame_pointer)` for
 an opaque `f`. Each attempt and its measurement is recorded in the code at the
 place it was made, so the next reader meets it rather than repeating it.
-
-## The three tiers
-
-The report is deliberately three numbers rather than one, because "recovered" is
-not a single property:
-
-- **N1 — CFG-complete.** The VM control-flow graph closed with no stalls, under
-  an explicitly *labeled* set of assumptions. Every assumption is named in the
-  output (`AssumesImageProtectionStable`,
-  `AssumesExternalStoresDisjointFromVmStack`, `AssumesCrossVmSectionContinuation`,
-  and so on), so a result is never silently conditional.
-- **N2 — PROVEN.** The same, with an **empty** assumption set. Nothing was taken
-  on trust. N2 is a subset of N1 and is the number that actually carries weight.
-- **N3 — proven-equivalent.** Recovered semantics checked against the recompiled
-  replacement. Not currently wired at the PE level.
-
-Assumptions are *conceded*, never assumed away. Closing a loop by shifting the
-VM stack base, for example, concedes frame privacy, so such an entry can reach N1
-and is barred from N2 by construction.
 
 ## Soundness discipline
 
