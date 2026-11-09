@@ -393,7 +393,17 @@ pub(crate) fn with_entry_input<R>(
         exits: &exits,
         native_calls: &calls,
         memory: Some(&overlay),
-        limits: SymbolicExecutionLimits::default(),
+        // Serve read-only image bytes under suppression during the rolled/
+        // unrolled RE-EXECUTION too, not only during CFG recovery. Without it a
+        // checksum POINTER read from a non-writable `.vmp` address stays an
+        // opaque `memory_load_epoch`, so the checksum argument is not constant
+        // and cannot be folded -- which is exactly what blocked two of the
+        // guards. Matches the CFG-recovery setting above.
+        limits: SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
+            ..SymbolicExecutionLimits::default()
+        },
         target_limits: limits,
         max_expanded_blocks: 256,
     };
