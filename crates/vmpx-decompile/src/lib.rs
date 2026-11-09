@@ -378,7 +378,7 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     // on each return line.
     let exit_common = render::common_exit_components(&all_stmts);
     let mut ctx = Ctx {
-        r: Renderer { names: &names, temps: &temps.map, exit_common: &exit_common },
+        r: Renderer { names: &names, image_base: symbols.image_base(), temps: &temps.map, exit_common: &exit_common },
         out: String::new(),
         log: Vec::new(),
     };
@@ -432,7 +432,7 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     text.push_str(&ctx.out);
     text.push_str("}\n");
 
-    let text_check = check_text(&ctx.log, &names);
+    let text_check = check_text(&ctx.log, &names, symbols.image_base());
 
     // cross-check against the reference run
     let check = (|| -> Result<usize, String> {
@@ -534,7 +534,7 @@ fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {
 
 /// Re-evaluates every rendered expression/condition as C text (real C typing
 /// rules, UB detection) against the IR expression it came from.
-fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>) -> Result<(usize, usize), String> {
+fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>, image_base: u64) -> Result<(usize, usize), String> {
     let mut rng = Rng(0xC0DE_C0DE_1357_9BDF);
     let (mut checked, mut skipped) = (0, 0);
     for (item, text) in log {
@@ -551,6 +551,9 @@ fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>
         for k in 0..24 {
             let mut env_ir = Env::new();
             let mut env_c = std::collections::HashMap::new();
+            if image_base != 0 {
+                env_c.insert("IMAGE_BASE".to_owned(), (image_base, 64));
+            }
             for (n, w) in &regs {
                 let x = w.truncate(match k {
                     0 => 0,

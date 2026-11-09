@@ -78,6 +78,7 @@ What the pipeline can do today, end to end:
 | Strip every `.vmp*` section — VM, mutated stubs, packed original | ✅ |
 | Relocate mutated native functions out of the protector, verbatim | ✅ |
 | Recover and rebind the import table (IAT) from the encrypted `.idata` | ✅ |
+| Annotate recovered code (timing, integrity, memory, import semantics) | ✅ |
 | Prove no dangling reference into stripped space before writing | ✅ |
 | Report each entry with the assumptions it rests on — or none (*proven*) | ✅ |
 | Prove the rebuilt code equivalent to the original at the PE level | ☐ planned |

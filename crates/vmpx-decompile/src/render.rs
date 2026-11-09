@@ -33,6 +33,9 @@ const P_UN: u8 = 14;
 
 pub struct Renderer<'a> {
     pub names: &'a BTreeMap<String, String>,
+    /// Image base, so the recovered absolute addresses can print as `IMAGE_BASE`
+    /// instead of a bare constant. Zero when unknown.
+    pub image_base: u64,
     /// Subtrees that have been given a local name (see [`crate::cse`]). Any
     /// expression in here renders AS that name instead of being printed again,
     /// which is what keeps a shared value from appearing ten times in one line.
@@ -94,9 +97,32 @@ fn shift_mask(w: BitWidth) -> u64 {
     if w == BitWidth::W64 { 63 } else { 31 }
 }
 
+/// Display name for an intrinsic. Drops the trailing hash-cons `_<digits>`
+/// suffix that only distinguishes otherwise-identical reads
+/// (`read_timestamp_counter_110` -> `read_timestamp_counter`), keeping the
+/// meaningful width suffix (`_w32`). Printing only -- the IR keeps the full
+/// name, and the C re-evaluator rejects any such call either way, so this
+/// cannot change what evaluates.
+fn intrinsic_display(name: &str) -> &str {
+    match name.rsplit_once('_') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    }
+}
+
 impl Renderer<'_> {
     fn name(&self, n: &str) -> String {
         self.names.get(n).cloned().unwrap_or_else(|| n.to_owned())
+    }
+
+    /// A constant, as `IMAGE_BASE` when it is the image base and a hex literal
+    /// otherwise.
+    fn const_str(&self, w: BitWidth, v: u64) -> String {
+        if v != 0 && v == self.image_base {
+            "IMAGE_BASE".to_owned()
+        } else {
+            hex(w, v)
+        }
     }
 
     fn child(&self, c: &Expr, parent: Option<BinaryOp>, right: bool, ring: bool) -> String {
@@ -149,7 +175,7 @@ impl Renderer<'_> {
     fn rx_body(&self, e: &Expr, ring_ok: bool) -> (String, u8) {
         let narrow = e.width.bits() < 32;
         match &e.kind {
-            ExprKind::Const { value } => (hex(e.width, *value), P_ATOM),
+            ExprKind::Const { value } => (self.const_str(e.width, *value), P_ATOM),
             ExprKind::Register { name } => (self.name(name), P_ATOM),
             ExprKind::Unary { op, value } => {
                 let o = match op {
@@ -171,7 +197,7 @@ impl Renderer<'_> {
             }
             ExprKind::Intrinsic { name, arguments } => {
                 let args: Vec<String> = arguments.iter().map(|a| self.rx(a, false).0).collect();
-                (format!("{name}({})", args.join(", ")), P_ATOM)
+                (format!("{}({})", intrinsic_display(name), args.join(", ")), P_ATOM)
             }
             ExprKind::Extract { value, lsb } => {
                 let v = self.wrap_child(value, None, false);

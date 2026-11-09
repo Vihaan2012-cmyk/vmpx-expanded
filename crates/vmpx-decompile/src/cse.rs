@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use vmpx_vm::{Expr, ExprKind};
+use vmpx_vm::{BinaryOp, Expr, ExprKind};
 
 use crate::ir::{Cond, Store};
 use crate::opt::Stmt;
@@ -51,6 +51,47 @@ fn children(expr: &Expr) -> Vec<&Expr> {
         ExprKind::Binary { left, right, .. }
         | ExprKind::Concat { high: left, low: right } => vec![left, right],
         ExprKind::Intrinsic { arguments, .. } => arguments.iter().collect(),
+    }
+}
+
+/// Whether `e` is exactly the constant `v`.
+fn is_const(e: &Expr, v: u64) -> bool {
+    matches!(&e.kind, ExprKind::Const { value } if *value == v)
+}
+
+/// A name prefix for a temp, after the dominant protector operation in its
+/// definition: a timestamp read is `tsc`, a table checksum is `sum`, a value
+/// formed by adding the image base is a pointer `ptr`, everything else `t`.
+/// Derived only from terms the expression actually holds, so the name never
+/// claims more than the definition shows.
+fn role_prefix(expr: &Expr, image_base: u64) -> &'static str {
+    if image_base != 0
+        && let ExprKind::Binary { op: BinaryOp::Add, left, right } = &expr.kind
+        && (is_const(left, image_base) || is_const(right, image_base))
+    {
+        return "ptr";
+    }
+    fn scan(e: &Expr, tsc: &mut bool, sum: &mut bool) {
+        if let ExprKind::Intrinsic { name, .. } = &e.kind {
+            if name.contains("timestamp") {
+                *tsc = true;
+            }
+            if name.contains("checksum") {
+                *sum = true;
+            }
+        }
+        for c in children(e) {
+            scan(c, tsc, sum);
+        }
+    }
+    let (mut tsc, mut sum) = (false, false);
+    scan(expr, &mut tsc, &mut sum);
+    if sum {
+        "sum"
+    } else if tsc {
+        "tsc"
+    } else {
+        "t"
     }
 }
 
@@ -266,7 +307,6 @@ pub fn extract_with(
         prefix
     };
     let global_prefix = free("g", globals.len());
-    let temp_prefix = free("t", chosen.len());
 
     let mut temps = Temps::default();
     for (index, (address, expr)) in globals.into_iter().enumerate() {
@@ -277,8 +317,20 @@ pub fn extract_with(
         temps.map.insert(expr.clone(), name.clone());
         temps.order.push((name, expr));
     }
-    for (index, (_, expr)) in chosen.into_iter().enumerate() {
-        let name = format!("{temp_prefix}{index}");
+    let image_base = symbols.image_base();
+    let mut used: HashSet<String> = taken.clone();
+    used.extend(temps.order.iter().map(|(n, _)| n.clone()));
+    for (_, expr) in chosen.into_iter() {
+        let role = role_prefix(&expr, image_base);
+        let mut n = 0;
+        let name = loop {
+            let candidate = format!("{role}{n}");
+            if !used.contains(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        used.insert(name.clone());
         temps.map.insert(expr.clone(), name.clone());
         temps.order.push((name, expr));
     }

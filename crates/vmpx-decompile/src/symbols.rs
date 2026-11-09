@@ -62,6 +62,7 @@ const DYNAMIC_LOAD_FUNCTIONS: [&str; 4] =
 #[derive(Clone, Debug, Default)]
 pub struct Symbols {
     imports: BTreeMap<u64, String>,
+    image_base: u64,
 }
 
 impl Symbols {
@@ -80,7 +81,13 @@ impl Symbols {
                 imports.insert(image_base + u64::from(iat_rva), format!("{module}!{name}"));
             }
         }
-        Self { imports }
+        Self { imports, image_base }
+    }
+
+    /// The image base the IR's absolute addresses are relative to, 0 if unknown.
+    #[must_use]
+    pub fn image_base(&self) -> u64 {
+        self.image_base
     }
 
     #[must_use]
