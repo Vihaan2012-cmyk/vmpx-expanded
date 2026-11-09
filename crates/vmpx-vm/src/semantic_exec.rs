@@ -2047,6 +2047,31 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
             }
             scale_rootless(base.lo, base.hi, i64::try_from(scalar).ok()?)
         }
+        // `x | y` is at least either operand and never sets a bit above the
+        // highest bit either one can set, so a rootless non-negative pair lands
+        // in `[max(lo), 2^bits(max(hi)) - 1]`. A rooted operand is refused:
+        // OR-ing a root is not `root + constant`.
+        ExprKind::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let left = address_bounds(left)?;
+            let right = address_bounds(right)?;
+            if left.root.is_some() || right.root.is_some() || left.lo < 0 || right.lo < 0 {
+                return None;
+            }
+            let span = u64::try_from(left.hi.max(right.hi)).ok()?;
+            let bits = 64 - span.leading_zeros();
+            if bits >= 63 {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: left.lo.max(right.lo),
+                hi: (1i64 << bits) - 1,
+            })
+        }
         // `index & mask` with a small positive mask bounds the value to [0, mask].
         ExprKind::Binary {
             op: BinaryOp::And,
@@ -3961,6 +3986,39 @@ mod tests {
             Expr::register(BitWidth::W32, "vsp_initial"),
         )
         .expect("concat");
+        assert!(address_bounds(&address).is_none());
+    }
+
+    // `x | y` never sets a bit above the highest bit either side can set.
+    #[test]
+    fn an_or_of_two_bounded_values_rounds_up_to_the_next_power_of_two() {
+        let masked = |mask| {
+            Expr::binary(
+                BinaryOp::And,
+                Expr::register(BitWidth::W32, "native_rax_initial"),
+                Expr::constant(BitWidth::W32, mask),
+            )
+            .expect("mask")
+        };
+        let address =
+            Expr::binary(BinaryOp::Or, masked(0x5), masked(0x12)).expect("or");
+        let bounds = address_bounds(&address).expect("bounded");
+        // 0x12 is five significant bits, so nothing above 0x1f can be set.
+        assert_eq!((bounds.lo, bounds.hi), (0, 0x1f));
+        assert!(bounds.root.is_none());
+    }
+
+    // A rooted operand must still refuse: OR-ing a root is not an offset.
+    #[test]
+    fn an_or_over_a_rooted_operand_is_refused() {
+        let rooted = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("rooted");
+        let address = Expr::binary(BinaryOp::Or, rooted, Expr::constant(BitWidth::W32, 3))
+            .expect("or");
         assert!(address_bounds(&address).is_none());
     }
 
