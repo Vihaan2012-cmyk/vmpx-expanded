@@ -90,11 +90,14 @@ fn collect_legit_paths<'a>(
     out: &mut Vec<LegitPath<'a>>,
 ) {
     match node {
-        RNode::Exit(exit) if !exit.region => out.push(LegitPath {
+        // Both callee returns and region exits (a computed continuation) are
+        // kept: the region case emits a `Computed` continuation. Only dead and
+        // back-edge nodes drop.
+        RNode::Exit(exit) => out.push(LegitPath {
             stores: stores.clone(),
             exit,
         }),
-        RNode::Exit(_) | RNode::BackEdge { .. } | RNode::Dead(_) => {}
+        RNode::BackEdge { .. } | RNode::Dead(_) => {}
         RNode::Stores { stores: here, next } => {
             let added = here.len();
             stores.extend(here.iter());
@@ -130,7 +133,7 @@ fn build_one(
         return Err("has a loop; flat-exit emission does not cover it".to_owned());
     }
     if paths.is_empty() {
-        return Err("no legit callee-return path (all exits are region/nested)".to_owned());
+        return Err("no exit path (all nested, dead, or loop)".to_owned());
     }
 
     // Fold the checksum and resolve image reads against the intact image.
@@ -169,7 +172,13 @@ fn build_one(
     // same value, so the paths collapse to one. If after folding the paths are
     // NOT identical, the branch is genuinely input-dependent and this flat
     // emission cannot represent it -- reported, not guessed.
-    let mut folded_paths: Vec<(BTreeMap<X64NativeRegister, Expr>, Vec<EffectStore>)> = Vec::new();
+    struct FoldedPath {
+        registers: BTreeMap<X64NativeRegister, Expr>,
+        effects: Vec<EffectStore>,
+        continuation: Option<Expr>,
+        region: bool,
+    }
+    let mut folded_paths: Vec<FoldedPath> = Vec::new();
     // Win64 callee-saved registers. A function returning to a normal caller
     // must preserve them, so their exit value is their entry value regardless of
     // what the VM's internal bookkeeping tracked (the decompiler's
@@ -204,24 +213,56 @@ fn build_one(
                 width: store.width,
             });
         }
-        folded_paths.push((registers, effects));
+        // A region exit transfers to a computed continuation rather than
+        // returning; fold its target too.
+        let continuation = match (exit.region, &exit.continuation) {
+            (true, Some(target)) => Some(fold(target, &mut folded, &mut unresolved)?),
+            (true, None) => return Err("region exit with no recovered continuation".to_owned()),
+            (false, _) => None,
+        };
+        folded_paths.push(FoldedPath {
+            registers,
+            effects,
+            continuation,
+            region: exit.region,
+        });
     }
     let _ = (&unresolved, folded);
-    let (registers, effects) = &folded_paths[0];
-    if folded_paths.iter().any(|(r, e)| r != registers || e != effects) {
+    // When a guard has both callee-return and region-exit arms, the region arms
+    // are the tamper responses the decompiler drops; the callee returns are the
+    // legit behaviour. Only when EVERY arm is a region exit is the function a
+    // genuine trampoline, emitted with a computed continuation.
+    let region_only = folded_paths.iter().all(|path| path.region);
+    let chosen: Vec<&FoldedPath> = folded_paths
+        .iter()
+        .filter(|path| path.region == region_only)
+        .collect();
+    let first = chosen[0];
+    if chosen.iter().any(|path| {
+        path.registers != first.registers
+            || path.effects != first.effects
+            || path.continuation != first.continuation
+    }) {
         return Err(format!(
-            "{} legit path(s) differ after folding the checksum -- genuinely input-dependent branch",
-            folded_paths.len()
+            "{} {} path(s) differ after folding the checksum -- genuinely input-dependent branch",
+            chosen.len(),
+            if region_only { "region" } else { "callee" }
         ));
     }
-    let (registers, effects) = (registers.clone(), effects.clone());
+    let (registers, effects) = (first.registers.clone(), first.effects.clone());
+    // A region exit emits a `Computed` continuation: the replacement stages the
+    // target and transfers through it, so the destination need not be known.
+    let continuation = first
+        .continuation
+        .clone()
+        .map(vmpx_vmlift::ReplacementContinuation::Computed);
 
     let config = ReplacementConfig {
         inputs: replacement_inputs(),
         max_expression_nodes: 400_000,
         max_spill_slots: 128,
         import_calls: BTreeMap::new(),
-        continuation: None,
+        continuation,
         effects,
         effect_calls: Vec::new(),
         rflags: None,
