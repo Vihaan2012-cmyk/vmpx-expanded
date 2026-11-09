@@ -167,7 +167,11 @@ enum Outcome {
     Panic,
 }
 
-fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) -> VmCfgLimits {
+pub(crate) fn cfg_limits(
+    instruction_limit: usize,
+    serve_ro: bool,
+    serve_observed: bool,
+) -> VmCfgLimits {
     VmCfgLimits {
         entry: EntryProfileRecoveryLimits {
             // The postlude proof's state budget. Measured on the handlers that

@@ -225,13 +225,17 @@ pub(crate) fn lift_entry(
         None => "stream does not end at a recovered VM-exit handler".to_owned(),
     };
 
+    // Parity with `report`, taken from its own definition rather than a copy:
+    // the cross-section follow was already shared this way, but every other
+    // env-scaled cap was not, so raising one moved N1 and left this building a
+    // different graph.
     let limits = VmCfgLimits {
         entry: entry_limits,
-        // Parity with `report`: without this the two tools build DIFFERENT
-        // graphs, and an entry `report --all` counts CFG-complete is refused
-        // here as "the CFG is incomplete". Measured: 131 of 462.
-        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
-        ..VmCfgLimits::default()
+        ..crate::report_cmd::cfg_limits(
+            entry_limits.instruction_limit,
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            false,
+        )
     };
     let cfg = recover_vm_cfg_with_observed(pe, &candidate, limits, &observed)
         .map_err(|error| format!("linear: {linear_error}; cfg recovery failed: {error}"))?;
@@ -357,13 +361,17 @@ pub(crate) fn with_entry_input<R>(
         entry_limits.trace,
     )
     .map_err(|error| format!("entry frame not recovered: {error}"))?;
+    // Parity with `report`, taken from its own definition rather than a copy:
+    // the cross-section follow was already shared this way, but every other
+    // env-scaled cap was not, so raising one moved N1 and left this building a
+    // different graph.
     let limits = VmCfgLimits {
         entry: entry_limits,
-        // Parity with `report`: without this the two tools build DIFFERENT
-        // graphs, and an entry `report --all` counts CFG-complete is refused
-        // here as "the CFG is incomplete". Measured: 131 of 462.
-        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
-        ..VmCfgLimits::default()
+        ..crate::report_cmd::cfg_limits(
+            entry_limits.instruction_limit,
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            false,
+        )
     };
     let observed = ObservedRun::default();
     let seeded = Cell::new(false);

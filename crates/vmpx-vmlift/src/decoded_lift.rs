@@ -329,7 +329,24 @@ pub fn recover_exit(
     let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
         symbolic
             .read_tracked_memory(add_offset(&symbolic.final_vsp, offset)?, BitWidth::W64)
-            .map_err(|error| fail(error.to_string()))
+            .map_err(|error| {
+                // A restore slot is written by the entry stub, so a MISSING one
+                // means something discarded it rather than that it was never
+                // there. Say which havoc, or the message reads like a lift bug.
+                let havoc = symbolic
+                    .memory_havocs
+                    .iter()
+                    .rev()
+                    .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                    .map_or_else(
+                        || "no aliasing havoc recorded".to_owned(),
+                        |havoc| havoc.cause.clone(),
+                    );
+                fail(format!(
+                    "{error} [slot {offset:#x}, tainted={}, {havoc}]",
+                    symbolic.memory_tainted
+                ))
+            })
     };
     let mut registers = BTreeMap::new();
     for slot in &exit.restore_slots {
@@ -408,11 +425,21 @@ pub fn recover_exit(
         // stack. Popping it is byte-identical to popping the untouched caller
         // slot, so this is a clean callee return.
         Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
-        // Above the entry stack pointer with a VM-written value: the VM computed
-        // where to go and will transfer there. Fully recovered — the target, the
-        // registers and the flags are all in hand — so it is handed back rather
-        // than refused, and each consumer decides whether it can use it.
-        Ok(value) if return_slot > entry_sp && return_slot % 8 == 0 => {
+        // At or above the entry stack pointer with a VM-written value: the VM
+        // computed where to go and will transfer there. Fully recovered -- the
+        // target, the registers and the flags are all in hand -- so it is handed
+        // back rather than refused, and each consumer decides whether it can use
+        // it.
+        //
+        // `==` belongs here as much as `>`. The arm above already took the case
+        // where the slot holds the caller's own return address; reaching this one
+        // AT the entry stack pointer means the VM overwrote that slot with a
+        // value it computed, and the `ret` will go there. Probed on
+        // vm_c446e48: slot 0x98 == entry_sp, value an arithmetic expression over
+        // `memory_load_epoch_1583`, which is a computed target and not a return
+        // address however it is read. Refusing it threw away a fully recovered
+        // exit on 12 entries.
+        Ok(value) if return_slot >= entry_sp && return_slot % 8 == 0 => {
             return Ok(RecoveredExit::Trampoline(TrampolineExit {
                 registers,
                 rflags,
@@ -422,9 +449,11 @@ pub fn recover_exit(
         }
         Ok(value) => {
             if std::env::var_os("VMPX_SEG_TRACE").is_some() {
+                let rendered = format!("{value:?}");
                 eprintln!(
-                    "[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} deps {:?}",
-                    value.dependencies()
+                    "[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} deps {:?} value {}",
+                    value.dependencies(),
+                    &rendered[..rendered.len().min(400)]
                 );
             }
             return Err(DecodedLiftError::NotCalleeReturn(
@@ -787,16 +816,26 @@ mod tests {
         }
     }
 
-    // The same position, but the VM computed some other target: not provably the
-    // caller return, so it is refused (fail closed) rather than lifted as `ret`.
+    // The same position, but the VM computed some other target. This used to
+    // refuse, and the reason given was "rather than lifted as `ret`" -- the
+    // worry being that a computed target would be passed off as a clean return.
+    // A TRAMPOLINE does not do that: it carries the computed target explicitly,
+    // so the distinction the refusal was defending is kept while the exit stops
+    // being thrown away. The arm above still takes a provable caller return
+    // first, so a clean return can never arrive here.
     #[test]
-    fn a_written_slot_with_a_computed_non_return_target_is_refused() {
+    fn a_written_slot_with_a_computed_non_return_target_is_a_trampoline() {
         let computed = Expr::constant(BitWidth::W64, 0x1_8002_A700);
         let (symbolic, exit) = report(&computed);
-        assert!(matches!(
-            recover_exit(&symbolic, &exit, 16, 0),
-            Err(DecodedLiftError::NotCalleeReturn(_))
-        ));
+        match recover_exit(&symbolic, &exit, 16, 0) {
+            Ok(RecoveredExit::Trampoline(trampoline)) => {
+                assert_eq!(trampoline.target, computed);
+                // Exactly at the entry stack pointer, which is the case the
+                // `>` bound used to exclude.
+                assert_eq!(trampoline.slot_offset, Some(128));
+            }
+            other => panic!("expected a trampoline to the computed target, got {other:?}"),
+        }
     }
 
     // The VM built its exit frame below the captured VSP (`final_vsp` is negative

@@ -458,7 +458,20 @@ impl Walker<'_, '_> {
                 causes.push(format!("{} native call(s)", report.native_calls.len()));
             }
             if report.memory_tainted {
-                causes.push("memory tainted".to_owned());
+                // Name the havoc that set it. The lift-side relaxation measured
+                // +0 here and the message alone could not say why: for a
+                // vsp-ROOTED store address the executor refuses the narrowing
+                // whatever the walker assumed, so the retry can never clear it.
+                let havoc = report
+                    .memory_havocs
+                    .iter()
+                    .rev()
+                    .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                    .map_or_else(
+                        || "no aliasing havoc recorded".to_owned(),
+                        |havoc| havoc.cause.clone(),
+                    );
+                causes.push(format!("memory tainted [{havoc}]"));
             }
             if !report.fresh_allocations.is_empty() {
                 causes.push(format!("{} allocation(s)", report.fresh_allocations.len()));
