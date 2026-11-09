@@ -181,7 +181,18 @@ impl Walker<'_, '_> {
         let mut out: Vec<(u64, Va)> = Vec::new();
         for edge in &cfg.edges {
             if edge.from != key
-                || !matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch)
+                || !matches!(
+                    edge.kind,
+                    // A profile transition IS this block's successor: the
+                    // unconditional-branch handler pops a target and the VM
+                    // continues there under a different register profile. The
+                    // rolled frontend has counted it as one all along; leaving
+                    // it out here made the transition block's own target "not a
+                    // recovered successor".
+                    CfgEdgeKind::Branch
+                        | CfgEdgeKind::GuardedBranch
+                        | CfgEdgeKind::ProfileTransition
+                )
             {
                 continue;
             }
@@ -222,7 +233,20 @@ impl Walker<'_, '_> {
             if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
                 return Err(format!("block {key} instruction {index} ({semantic:?}): {reason}"));
             }
-            let boundary = match block.exit {
+            // Same case `rolled.rs` handles: `BlockExit` has no variant for a
+            // cross-profile transition, so the block records as `Stalled` while
+            // the CFG carries its outgoing `ProfileTransition` edge and the
+            // graph is complete through it. The edge's own documentation says
+            // what it is -- an unconditional-branch handler pops a target off
+            // the VM stack and the VM continues under a proven-different
+            // register profile -- so it is executed as exactly that.
+            let transition = block.exit == BlockExit::Stalled
+                && input
+                    .cfg
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from == key && edge.kind == CfgEdgeKind::ProfileTransition);
+            let boundary = match if transition { BlockExit::Branch } else { block.exit } {
                 BlockExit::VmExit => VmHandlerSemantic::VmExit,
                 BlockExit::Branch => VmHandlerSemantic::UnconditionalBranch,
                 BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
@@ -254,7 +278,10 @@ impl Walker<'_, '_> {
                     write.epoch,
                 ));
             }
-            match block.exit {
+            // The transition classification decided the boundary above, so the
+            // walk has to see the SAME exit -- matching on `block.exit` here
+            // sent a transition block into the `unreachable!` arm.
+            match if transition { BlockExit::Branch } else { block.exit } {
                 BlockExit::VmExit => {
                     let handler = block
                         .instructions
