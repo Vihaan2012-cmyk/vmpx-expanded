@@ -1116,6 +1116,12 @@ impl<'a, A: Algebra> Lifter<'a, A> {
         }
         match mnemonic {
             Mnemonic::Nop => Ok(()),
+            // DF is not modeled, and neither is any instruction that reads it:
+            // no string operation (`movs`/`stos`/`lods`/`scas`/`cmps`) has an
+            // arm here, so none can observe the direction flag. Setting or
+            // clearing it is therefore a no-op on the modeled state. Modeling
+            // any string operation later must add DF to `Flag` first.
+            Mnemonic::Cld | Mnemonic::Std => Ok(()),
             Mnemonic::Mov => {
                 Self::expect_ops(inst, 2)?;
                 let width = Self::operand_width(inst, 0)?;
@@ -1394,11 +1400,20 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                     return unsupported("bswap non-register operand");
                 }
                 let width = Self::operand_width(inst, 0)?;
-                if !matches!(width, Width::W32 | Width::W64) {
-                    return unsupported("bswap operand size (16-bit result is undefined)");
-                }
                 let value = self.read_operand(inst, 0, width)?;
-                let result = self.byte_reverse(width, value)?;
+                // 16-bit `bswap` has an architecturally UNDEFINED result. An
+                // unknown function of the operand is the exact model: the
+                // hardware's result is some deterministic function of it, and a
+                // free intrinsic over-approximates every such function. The
+                // protector's mutation engine emits these as junk, where
+                // nothing reads the destination -- but a reader is served a
+                // free value rather than a wrong one, so this is sound either
+                // way, and strictly more permissive than refusing the block.
+                let result = if matches!(width, Width::W32 | Width::W64) {
+                    self.byte_reverse(width, value)?
+                } else {
+                    self.alg.intrinsic(width, "undefined_bswap16", vec![value])
+                };
                 self.write_operand(inst, 0, result)
             }
             Mnemonic::Xadd => {
@@ -1749,16 +1764,36 @@ impl<'a, A: Algebra> Lifter<'a, A> {
                 return Ok(());
             }
             if n >= bits {
-                return unsupported("shld/shrd count at or beyond operand size (undefined)");
+                // Undefined per the ISA, as for 16-bit `bswap` above: model it
+                // as an unknown function of the three operands instead of
+                // refusing. Mutation junk, with a sound reading if used.
+                let name = if left {
+                    "undefined_shld_overshift"
+                } else {
+                    "undefined_shrd_overshift"
+                };
+                let result = self.alg.intrinsic(width, name, vec![dst, src, self.k(width, n)]);
+                self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+                return self.write_operand(inst, 0, result);
             }
             let main = self.bin(main_op, dst, self.k(width, n))?;
             let fill = self.bin(fill_op, src, self.k(width, bits - n))?;
             self.bin(BinOp::Or, main, fill)?
         } else {
             if width == Width::W16 {
-                // The 5-bit mask admits counts 16..=31, which are undefined on a 16-bit
-                // operand; a symbolic count cannot be proven to avoid them.
-                return unsupported("shld/shrd by a variable count on a 16-bit operand");
+                // The 5-bit mask admits counts 16..=31, which are undefined on a
+                // 16-bit operand, and a symbolic count cannot be proven to avoid
+                // them. The whole result is therefore an unknown function of the
+                // operands -- including the defined counts, which it
+                // over-approximates.
+                let name = if left {
+                    "undefined_shld_w16"
+                } else {
+                    "undefined_shrd_w16"
+                };
+                let result = self.alg.intrinsic(width, name, vec![dst, src, count]);
+                self.clobber(&[Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of]);
+                return self.write_operand(inst, 0, result);
             }
             // For 32/64-bit the masked count is strictly below the width, so the fill
             // shift `bits - n` lands in `1..=bits`; a shift equal to the width yields 0,
