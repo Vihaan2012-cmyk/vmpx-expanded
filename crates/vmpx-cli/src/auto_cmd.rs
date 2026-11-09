@@ -193,6 +193,94 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
 /// `xor eax,eax; inc eax; ret` for a `jmp rel32` tail into removed space.
 const RETURN_TRUE: [u8; 5] = [0x31, 0xC0, 0xFF, 0xC0, 0xC3];
 
+/// One residual guard thunk neutralized to its pass path.
+pub(crate) struct GuardNeutralized {
+    pub guard_rva: u32,
+    pub thunk_begin: u32,
+    pub thunk_bytes: u32,
+}
+
+/// Neutralize residual guard functions devirtualization could not lift. Each is
+/// a `.text` thunk whose body tail-transfers into the removed protector to run
+/// an anti-tamper / integrity / timing guard, leaving a dangling reference. The
+/// thunk's own function body is overwritten with `mov eax,1; ret` (then `int3`
+/// filler), so it returns the guard's pass value to its caller with a pristine
+/// stack -- no prologue has executed yet, so no teardown is needed. This both
+/// removes the dangling transfer and forces the guard's clean path.
+///
+/// It is deliberately NON-equivalent (it changes behavior under tampering), so
+/// every neutralized site is returned for the caller to log. A guard reached
+/// only through a transfer `.pdata` does not describe (e.g. the thunk table) is
+/// not found here and is left untouched.
+pub(crate) fn neutralize_residual_guards(
+    image: &mut [u8],
+    guard_rvas: &[u32],
+) -> Result<Vec<GuardNeutralized>, String> {
+    // (guard_rva, function begin rva, begin file offset, END file offset through
+    // the tail transfer). Only the bytes from the function entry through the
+    // transfer are overwritten -- the entry runs before any prologue, so a
+    // `ret` there needs no teardown, and the transfer is the last byte that must
+    // be erased. Bytes after it (which `.pdata` may fold into this function but
+    // the tail transfer never reaches) are left intact.
+    let mut hits: Vec<(u32, u32, usize, usize)> = Vec::new();
+    {
+        let pe = PeImage::parse(image).map_err(|e| e.to_string())?;
+        let base = pe.optional.image_base.0;
+        let targets: BTreeSet<u64> = guard_rvas.iter().map(|r| base + u64::from(*r)).collect();
+        for function in &pe.report().exception_functions {
+            let (b, e) = (function.begin.0, function.end.0);
+            if e <= b || e - b > 0x10_0000 {
+                continue;
+            }
+            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+            let from = off.0 as usize;
+            let to = (from + (e - b) as usize).min(image.len());
+            let Some(code) = image.get(from..to) else { continue };
+            let mut decoder = Decoder::with_ip(64, code, base + u64::from(b), DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    break;
+                }
+                if matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call | FlowControl::UnconditionalBranch
+                ) && instruction.near_branch64() != 0
+                    && targets.contains(&instruction.near_branch64())
+                {
+                    let guard_rva =
+                        u32::try_from(instruction.near_branch64() - base).unwrap_or(0);
+                    let transfer_end = from
+                        + usize::try_from(instruction.next_ip() - (base + u64::from(b)))
+                            .unwrap_or(to - from);
+                    hits.push((guard_rva, b, from, transfer_end.min(to)));
+                    break;
+                }
+            }
+        }
+    }
+    let mut done: Vec<GuardNeutralized> = Vec::new();
+    let mut overwritten: BTreeSet<u32> = BTreeSet::new();
+    for (guard_rva, begin, from, end) in hits {
+        if !overwritten.insert(begin) {
+            continue; // already overwrote this thunk for another target
+        }
+        if from + RETURN_TRUE.len() > end || end > image.len() {
+            continue;
+        }
+        image[from..from + RETURN_TRUE.len()].copy_from_slice(&RETURN_TRUE);
+        for byte in &mut image[from + RETURN_TRUE.len()..end] {
+            *byte = 0xCC;
+        }
+        done.push(GuardNeutralized {
+            guard_rva,
+            thunk_begin: begin,
+            thunk_bytes: u32::try_from(end - from).unwrap_or(0),
+        });
+    }
+    Ok(done)
+}
+
 /// The CRT-obligation OEP rule (loader-only root, takes the Win64 triple,
 /// branches on the reason, forwards all three, not in a protector section);
 /// link order breaks ties. Returns the recovered entry RVA.
@@ -524,9 +612,55 @@ pub fn run(o: Options) -> Result<(), String> {
     }
 
     // --- devirtualize guards ---
+    let mut residual_guards: Vec<u32> = Vec::new();
     if !targets.guards.is_empty() {
         log.start("Devirtualizing guard functions");
-        image = devirt_guards(&log, &pe, image, instruction_limit, &targets.guards)?;
+        let (new_image, residual) =
+            devirt_guards(&log, &pe, image, instruction_limit, &targets.guards)?;
+        image = new_image;
+        residual_guards = residual;
+    }
+
+    // --- neutralize residual guards ---
+    // A guard whose virtualized body could not be lifted (e.g. a non-terminating
+    // VM-dispatch loop) still leaves a dangling transfer into the removed
+    // protector, which would fault if reached. Neutralize each to its clean path:
+    // force the integrity/timing check to pass. This CHANGES behaviour under
+    // tampering, so it is a named stage and every site is logged.
+    if !residual_guards.is_empty() {
+        log.start("Neutralizing residual guards");
+        log.info("forces the anti-tamper pass path -- behaviour-changing, not a faithful lift");
+        match neutralize_residual_guards(&mut image, &residual_guards) {
+            Ok(done) => {
+                for action in &done {
+                    log.step(
+                        &format!("{:#x} neutralized", action.guard_rva),
+                        &format!(
+                            "thunk {:#x}, {} byte(s) -> return 1 (pass)",
+                            action.thunk_begin, action.thunk_bytes
+                        ),
+                    );
+                }
+                let reached: BTreeSet<u32> = done.iter().map(|a| a.guard_rva).collect();
+                let missed: Vec<String> = residual_guards
+                    .iter()
+                    .filter(|rva| !reached.contains(rva))
+                    .map(|rva| format!("{rva:#x}"))
+                    .collect();
+                log.step(
+                    "neutralized",
+                    &format!("{} of {} residual guard(s)", done.len(), residual_guards.len()),
+                );
+                if !missed.is_empty() {
+                    log.warn(&format!(
+                        "{} residual guard(s) not reached by a .pdata thunk, left as-is: {}",
+                        missed.len(),
+                        missed.join(", ")
+                    ));
+                }
+            }
+            Err(reason) => log.warn(&format!("neutralization failed: {reason}")),
+        }
     }
 
     // --- imports ---
@@ -1020,18 +1154,21 @@ fn repoint(
 }
 
 /// Devirtualize each guard and retarget its `.text` transfer.
+/// Returns the devirtualized image and the RVAs of guards that could not be
+/// lifted (the residuals a later neutralization stage handles).
 fn devirt_guards(
     log: &Log,
     intact: &PeImage<'_>,
     image: Vec<u8>,
     instruction_limit: usize,
     guards: &[u32],
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Vec<u32>), String> {
     let base = intact.optional.image_base.0;
     let section_rva = next_section_rva(&image).map_err(|e| e.to_string())?.0;
     let mut payload: Vec<u8> = Vec::new();
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
-    let (mut ok, mut skipped) = (0_usize, 0_usize);
+    let mut ok = 0_usize;
+    let mut residual: Vec<u32> = Vec::new();
     for &rva in guards {
         while payload.len() % 16 != 0 {
             payload.push(0xCC);
@@ -1065,15 +1202,14 @@ fn devirt_guards(
                 ok += 1;
             }
             Err(reason) => {
-                skipped += 1;
+                residual.push(rva);
                 log.warn(&format!("{rva:#x}: {}", reason.lines().next().unwrap_or(&reason)));
             }
         }
     }
     log.step("devirtualized", &format!("{ok} of {} guard(s), {} byte(s)", guards.len(), payload.len()));
     if mapping.is_empty() {
-        let _ = skipped;
-        return Ok(image);
+        return Ok((image, residual));
     }
     let rebuilt = append_section(
         &image,
@@ -1087,5 +1223,5 @@ fn devirt_guards(
     let mut out = rebuilt.bytes;
     let retargeted = crate::devirt_cmd::retarget_sites(&mut out, &mapping)?;
     log.step("retargeted", &format!("{retargeted} transfer(s)"));
-    Ok(out)
+    Ok((out, residual))
 }
