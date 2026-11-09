@@ -346,7 +346,11 @@ pub fn recover_handler_codecs(
             return Ok(labeled);
         }
     }
-    for depth in [2_usize, 4, 8, 16] {
+    // Depth 2 only. Each extra depth costs a FULL re-recovery (trace, slice,
+    // dispatch proof) of a handler that is already on the failing path, and the
+    // first sweep measured the labeled walks at +0 -- so the ladder of 2/4/8/16
+    // bought nothing and multiplied the cost of every refusal by eight.
+    for depth in [2_usize] {
         for take_target in [false, true] {
             let mut config = config.clone();
             config.trace_limits.follow_conditional_fallthrough = true;

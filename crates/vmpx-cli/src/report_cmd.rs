@@ -36,6 +36,10 @@ pub struct ReportOptions {
 /// Why incomplete entries stopped (limit hit, or `stall`), diagnostic only.
 static LIMIT_HITS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
 
+/// Recovery errors by message. `classify` used to drop the `CfgError`, so the
+/// headline's "errors N" named neither the entries nor the reason.
+static ERRORS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
 /// Snapshot bytes of the volatile, non-writable image ranges (observed seed).
 static SNAPSHOT_SEED: std::sync::OnceLock<vmpx_vm::ObservedMemory> = std::sync::OnceLock::new();
 
@@ -398,7 +402,14 @@ fn dump_discharge(entry: &VmEntryCandidate, cfg: &VmCfg) {
 fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Outcome {
     match result {
         Err(_) => Outcome::Panic,
-        Ok(Err(_)) => Outcome::Error,
+        Ok(Err(error)) => {
+            *ERRORS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(error.to_string().chars().take(160).collect())
+                .or_default() += 1;
+            Outcome::Error
+        }
         Ok(Ok(cfg)) if cfg.all_paths_reach_vm_exit() => {
             Outcome::Complete(cfg.assumptions.iter().copied().collect())
         }
@@ -788,6 +799,11 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
         "[report] incomplete entries by stop reason: {:?}",
         LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     );
+    let errors = ERRORS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !errors.is_empty() {
+        eprintln!("[report] recovery errors by message: {errors:?}");
+    }
+    drop(errors);
     if let Ok(spec) = std::env::var("VMPX_BUDGET_PASSES") {
         // Sweep of the exploration caps. Each pass re-runs the entries the base pass
         // left incomplete with larger caps (`tb,visits,total,instr` multipliers,
