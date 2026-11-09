@@ -897,6 +897,18 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             match rel {
                 Rel::Disjoint => {}
                 Rel::Unknown => {
+                    // A load that CONTAINS an earlier store has no `Rel`
+                    // variant: its bytes come from several writes. That is
+                    // VMProtect's `push r; xor [rsp],e32; pop r` idiom, where an
+                    // 8-byte load sits over a 4-byte store, and it is fully
+                    // determined -- so compose it byte-range by byte-range
+                    // instead of refusing. Only same-base overlaps are
+                    // computable; a different base stays a genuine refusal.
+                    if key.sym == store.key.sym
+                        && let Some(value) = self.compose_overlapping_load(&address, key, width)?
+                    {
+                        return Ok(value);
+                    }
                     return Err(Reason::Aliasing(
                         "load may alias or partially overlap an earlier store".into(),
                     ));
@@ -931,6 +943,122 @@ impl<'a, A: Algebra> Lifter<'a, A> {
             self.reads.push(read);
         }
         Ok(self.alg.load(width, address))
+    }
+
+    /// Resolves a load whose bytes come from more than one earlier store at the
+    /// same base, newest store first. Returns `None` when any piece is not a
+    /// whole power-of-two-sized field (so it has no `Width`), or when a store
+    /// with an unrelatable base could reach the load -- both stay refusals.
+    fn compose_overlapping_load(
+        &mut self,
+        address: &A::Expr,
+        key: &MemKey<A::Expr>,
+        width: Width,
+    ) -> R<Option<A::Expr>> {
+        let span = i64::from(width.bytes());
+        // Byte ranges of the load, relative to its own start, still unaccounted.
+        let mut open: Vec<(i64, i64)> = vec![(0, span)];
+        // (offset in the load, length, source expression already shifted down)
+        let mut pieces: Vec<(i64, i64, A::Expr)> = Vec::new();
+        let mut derived = false;
+        // Snapshot what the walk needs, so the composer can call `&mut self`
+        // helpers (shift, resize) while iterating.
+        let snapshot: Vec<(bool, i64, Width, A::Expr, bool)> = self
+            .stores
+            .iter()
+            .map(|store| {
+                (
+                    key.sym == store.key.sym,
+                    store.key.disp,
+                    store.write.width,
+                    store.write.value.clone(),
+                    store.derived,
+                )
+            })
+            .collect();
+        for (same_base, disp, store_width, store_value, store_derived) in snapshot.iter().rev() {
+            if open.is_empty() {
+                break;
+            }
+            if !*same_base {
+                // Cannot place it, so it might overlap anything still open.
+                return Ok(None);
+            }
+            let (store_width, store_value) = (*store_width, store_value.clone());
+            let lo = disp - key.disp;
+            let hi = lo + i64::from(store_width.bytes());
+            let mut next_open = Vec::new();
+            for (begin, end) in open.drain(..) {
+                let (cut_lo, cut_hi) = (begin.max(lo), end.min(hi));
+                if cut_lo >= cut_hi {
+                    next_open.push((begin, end));
+                    continue;
+                }
+                // The covered slice must be a whole field to have a Width.
+                let len = cut_hi - cut_lo;
+                let Ok(bytes) = usize::try_from(len) else {
+                    return Ok(None);
+                };
+                let Some(piece_width) = Width::from_bytes(bytes) else {
+                    return Ok(None);
+                };
+                let shift = (cut_lo - lo).cast_unsigned() * 8;
+                let value = if shift == 0 {
+                    store_value.clone()
+                } else {
+                    self.bin(BinOp::Shr, store_value.clone(), self.k(store_width, shift))?
+                };
+                let value = self.resize(Resize::Truncate, piece_width, value)?;
+                pieces.push((cut_lo, len, value));
+                derived |= *store_derived;
+                if begin < cut_lo {
+                    next_open.push((begin, cut_lo));
+                }
+                if cut_hi < end {
+                    next_open.push((cut_hi, end));
+                }
+            }
+            open = next_open;
+        }
+        // Anything no store touched is block-entry memory: read it.
+        for (begin, end) in std::mem::take(&mut open) {
+            let len = end - begin;
+            let Ok(bytes) = usize::try_from(len) else {
+                return Ok(None);
+            };
+            let Some(piece_width) = Width::from_bytes(bytes) else {
+                return Ok(None);
+            };
+            let at = if begin == 0 {
+                address.clone()
+            } else {
+                self.bin(BinOp::Add, address.clone(), self.k(Width::W64, begin.cast_unsigned()))?
+            };
+            let read = MemoryRead {
+                address: at.clone(),
+                width: piece_width,
+            };
+            if !self.reads.contains(&read) {
+                self.reads.push(read);
+            }
+            pieces.push((begin, len, self.alg.load(piece_width, at)));
+        }
+        // Place each piece at its bit offset and OR them together.
+        let mut result: Option<A::Expr> = None;
+        for (offset, _, value) in pieces {
+            let wide = self.resize(Resize::ZeroExtend, width, value)?;
+            let placed = if offset == 0 {
+                wide
+            } else {
+                self.bin(BinOp::Shl, wide, self.k(width, offset.cast_unsigned() * 8))?
+            };
+            result = Some(match result {
+                Some(acc) => self.bin(BinOp::Or, acc, placed)?,
+                None => placed,
+            });
+        }
+        self.inst_derived |= derived;
+        Ok(result)
     }
 
     fn store_mem(&mut self, inst: &Instruction, value: A::Expr) -> R<()> {

@@ -30,12 +30,19 @@ fn main() {
         match recover_native_cfg_pe_with(&pe, Rva(rva), options) {
             Err(error) => println!("  REFUSED: {error}"),
             Ok(cfg) => {
+                // Both kinds of gap: a terminator we could not recover, and a
+                // body the lifter refused. They are tracked separately now.
                 let unsupported: Vec<_> = cfg
                     .blocks
                     .values()
                     .filter_map(|block| match &block.terminator {
-                        Terminator::Unsupported(why) => Some((block.start, why.clone())),
-                        _ => None,
+                        Terminator::Unsupported(why) => {
+                            Some((block.start, format!("TERMINATOR: {why}")))
+                        }
+                        _ => block
+                            .body_refusal
+                            .as_ref()
+                            .map(|why| (block.start, format!("BODY: {why}"))),
                     })
                     .collect();
                 let lifted = cfg
