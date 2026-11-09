@@ -326,6 +326,27 @@ fn confirm(log: &Log, question: &str, default: bool, no_prompt: bool) -> bool {
     }
 }
 
+/// Whether two paths denote the same file, tolerating one that does not exist
+/// yet (the log path): it is resolved through its parent directory. Fails closed
+/// to "not the same" only when neither resolution is possible.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let resolve = |path: &std::path::Path| -> Option<PathBuf> {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return Some(canonical);
+        }
+        let name = path.file_name()?;
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        std::fs::canonicalize(parent).ok().map(|dir| dir.join(name))
+    };
+    match (resolve(a), resolve(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 pub fn run(o: Options) -> Result<(), String> {
     // `auto` IS the experimental path, so it enables the recovery settings
     // itself instead of making the caller remember env vars.
@@ -348,6 +369,15 @@ pub fn run(o: Options) -> Result<(), String> {
         .log_file
         .clone()
         .unwrap_or_else(|| output.with_extension("log"));
+    // Creating the transcript truncates its path, and that happens before the
+    // input is read -- so a `--log-file` aimed at the input would destroy it.
+    // Refuse any collision with the input or the output image.
+    if same_file(&log_path, &o.input) {
+        return Err("--log-file resolves to the input image; it would be truncated before being read".to_owned());
+    }
+    if same_file(&log_path, &output) {
+        return Err("--log-file resolves to the output image; choose a different log path".to_owned());
+    }
     let log = Log::new("vmpx", o.verbose).with_file(&log_path);
     log.start(&format!("Devirtualizing {}", o.input.display()));
 
@@ -508,11 +538,18 @@ pub fn run(o: Options) -> Result<(), String> {
         let beside = o.input.with_extension("snap");
         beside.exists().then_some(beside)
     });
+    // Whether the application's imports were actually rebound. A written image
+    // whose imports are still the protector's encrypted `.idata` will not run,
+    // so the final line must not claim a clean result when this stays false.
+    let mut imports_bound = false;
     if let Some(snapshot) = &snapshot {
         log.start("Rebuilding the application import table");
         log.trace("snapshot", &snapshot.display().to_string());
         match crate::auto_imports::bind(&log, &pe, &bytes, &image, snapshot) {
-            Ok(bound) => image = bound,
+            Ok(bound) => {
+                image = bound;
+                imports_bound = true;
+            }
             Err(reason) => log.warn(&format!("import binding skipped: {reason}")),
         }
     } else {
@@ -534,7 +571,10 @@ pub fn run(o: Options) -> Result<(), String> {
             match detonate_imports(&log, &o.input, &pe, steps) {
                 Ok(slots) if !slots.is_empty() => {
                     match crate::auto_imports::bind_slots(&log, &pe, &bytes, &image, slots) {
-                        Ok(bound) => image = bound,
+                        Ok(bound) => {
+                            image = bound;
+                            imports_bound = true;
+                        }
                         Err(reason) => log.warn(&format!("import binding failed: {reason}")),
                     }
                 }
@@ -571,10 +611,25 @@ pub fn run(o: Options) -> Result<(), String> {
     }
     std::fs::write(&output, &image).map_err(|e| e.to_string())?;
     log.file(&output.display().to_string(), &format!("{} bytes", image.len()));
-    log.success_detail(
-        &format!("clean PE written, {dangling} residual reference(s)"),
-        &log.total_elapsed(),
-    );
+    // Only a result with no residual references AND rebound imports is clean and
+    // runnable. Otherwise name the gaps instead of claiming success: the image
+    // is written (it is still useful for inspection) but will likely not run.
+    if imports_bound && dangling == 0 {
+        log.success_detail("clean PE written", &log.total_elapsed());
+    } else {
+        let mut gaps = Vec::new();
+        if !imports_bound {
+            gaps.push("imports not bound".to_owned());
+        }
+        if dangling > 0 {
+            gaps.push(format!("{dangling} reference(s) into removed space"));
+        }
+        log.warn(&format!(
+            "PE written in {} with unresolved gaps ({}) -- it may not load or run",
+            log.total_elapsed(),
+            gaps.join("; "),
+        ));
+    }
     let _ = base;
     Ok(())
 }
@@ -762,9 +817,35 @@ fn relocate_natives(
             } else {
                 None
             };
-            if let Some(t) = target
-                && let Some(nt) = moved(t)
-            {
+            // The absolute address the reference must still reach after the
+            // move. A target that moved with the component follows it. A target
+            // in a RETAINED section stays put -- but a rel32/RIP displacement is
+            // measured from the instruction, which DID move, so it must be
+            // recomputed to the same address or it would shift by the move
+            // delta. Only a reference into removed `.vmp` space is unrecoverable.
+            let destination = match target {
+                Some(t) if moved(t).is_some() => moved(t),
+                Some(t) => {
+                    let section = t
+                        .checked_sub(base)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .and_then(|r| intact.sections.iter().find(|s| s.contains_mapped_rva(Rva(r))));
+                    match section {
+                        // Not covered (moved was None), so a `.vmp` target is
+                        // genuinely in removed space.
+                        Some(s) if s.name.as_str().starts_with(".vmp") => {
+                            return Err(format!("component references removed space at {start:#x}"));
+                        }
+                        // Retained section: rebase the displacement to the same
+                        // address from the instruction's new location.
+                        Some(_) => Some(t),
+                        // Unmapped immediate/scratch: nothing to rebase.
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some(nt) = destination {
                 let new_ip = new_start + cursor as u64;
                 let next = new_ip + size as u64;
                 let value = i32::try_from(nt.cast_signed() - next.cast_signed())
@@ -791,13 +872,6 @@ fn relocate_natives(
                     slot.copy_from_slice(&saved);
                     return Err(format!("cannot rebase {start:#x}+{cursor}"));
                 }
-            } else if let Some(t) = target
-                && !covered(t)
-                && t.checked_sub(base).and_then(|v| u32::try_from(v).ok()).is_some_and(|r| {
-                    intact.sections.iter().find(|s| s.contains_mapped_rva(Rva(r))).is_some_and(|s| s.name.as_str().starts_with(".vmp"))
-                })
-            {
-                return Err(format!("component references removed space at {start:#x}"));
             }
             cursor += size;
         }
