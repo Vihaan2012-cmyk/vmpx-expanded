@@ -903,6 +903,7 @@ pub fn analyze_keyless_native_call_handler(
     selector_register: Register,
     operand_load: Rva,
     operand_bytes: i64,
+    direction: crate::BytecodeDirection,
     limits: CfgLimits,
     resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Register), String>,
 ) -> Result<NativeCallAnalysis, DisasmError> {
@@ -924,7 +925,11 @@ pub fn analyze_keyless_native_call_handler(
     if cfg.status != CfgStatus::Complete {
         return fail(format!("native-call CFG is incomplete: {:?}", cfg.status));
     }
-    if operand_load != entry {
+    let descending = direction == crate::BytecodeDirection::Descending;
+    // An ascending handler reads then advances, so its load IS the entry. A
+    // descending one advances first, so the load sits behind the advance and
+    // whatever junk the protector put between them.
+    if !descending && operand_load != entry {
         return fail("keyless operand is not the first handler instruction".to_owned());
     }
     let mut instructions = BTreeMap::new();
@@ -965,7 +970,11 @@ pub fn analyze_keyless_native_call_handler(
     let mut advance_factory = iced_x86::InstructionInfoFactory::new();
     let mut segment = Vec::new();
     let mut completion = None;
-    let mut cursor = Some(operand_load);
+    let mut reached_load = false;
+    // Descending walks `entry -> load`, ascending `load -> advance`. Either way
+    // this is a straight-line span and the first VIP write in it must be the
+    // exact advance for the operand's width.
+    let mut cursor = Some(if descending { entry } else { operand_load });
     while let Some(rva) = cursor
         && segment.len() < 64
         && let Some(decoded) = instructions.get(&rva)
@@ -973,18 +982,35 @@ pub fn analyze_keyless_native_call_handler(
     {
         let instruction = &decoded.instruction;
         segment.push(rva);
+        if descending && rva == operand_load {
+            reached_load = true;
+            break;
+        }
         if rva != operand_load && writes_register(&mut advance_factory, instruction, vip) {
-            let exact = instruction.mnemonic() == Mnemonic::Add
+            let advance = if descending { Mnemonic::Sub } else { Mnemonic::Add };
+            let exact = instruction.mnemonic() == advance
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op0_register() == vip
                 && signed_immediate(instruction, 1) == Some(operand_bytes);
-            completion = exact.then_some(rva);
-            break;
+            if !exact {
+                return fail(format!(
+                    "VIP is written at {rva} by something other than the operand advance"
+                ));
+            }
+            completion = Some(rva);
+            if !descending {
+                break;
+            }
         }
         cursor = decoded.next_rva();
     }
+    if descending && !reached_load {
+        return fail(
+            "the keyless operand load is not on the handler's straight-line prefix".to_owned(),
+        );
+    }
     let Some(completion) = completion else {
-        return fail("operand load is not followed by the exact VIP advance".to_owned());
+        return fail("the operand load is not paired with the exact VIP advance".to_owned());
     };
     let (dispatch_source, terminal_dispatch, table_register) = match resolve_dispatch(resume_rva) {
         Ok(resolved) => resolved,

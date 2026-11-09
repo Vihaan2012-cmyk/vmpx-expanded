@@ -218,9 +218,6 @@ fn attempt_keyless_operand(
     direction: BytecodeDirection,
     mut vip_delta: i64,
 ) -> Result<KeyedOperandCodecCandidate, String> {
-    if direction != BytecodeDirection::Ascending {
-        return Err("keyless operands require an ascending bytecode stream".to_owned());
-    }
     let source = active
         .first()
         .copied()
@@ -284,9 +281,18 @@ fn attempt_keyless_operand(
     if first_consumer.is_none() {
         return Err("raw operand has no live consumer".to_owned());
     }
-    if vip_delta != i64::from(width.bytes()) {
+    // The only thing the direction changes is which way the VIP then moves;
+    // the keyed extractor below computes exactly this and always has.
+    let expected_vip_delta = match direction {
+        BytecodeDirection::Ascending => i64::from(width.bytes()),
+        BytecodeDirection::Descending => -i64::from(width.bytes()),
+        BytecodeDirection::StateDependent | BytecodeDirection::Unknown => {
+            return Err("bytecode direction is not concrete".to_owned());
+        }
+    };
+    if vip_delta != expected_vip_delta {
         return Err(format!(
-            "VIP delta {vip_delta} does not match raw width {}",
+            "VIP delta {vip_delta} does not match raw width {} for a {direction:?} stream",
             width.bytes()
         ));
     }

@@ -541,6 +541,7 @@ fn recover_handler_codecs_once(
                 selector.decoded_register_id,
                 selector.encoded_load,
                 i64::from(selector.codec.width.bytes()),
+                config.bytecode_direction,
                 CfgLimits {
                     max_blocks: config.trace_limits.max_fragments,
                     max_instructions: config.trace_limits.max_instructions,
@@ -588,8 +589,11 @@ fn recover_handler_codecs_once(
                     };
                     let Some(resolved) = resolved else {
                         return Err(format!(
-                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch",
-                            report.candidates.len()
+                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch{}",
+                            report.candidates.len(),
+                            report.rejected_sources.first().map_or(String::new(), |rejection| {
+                                format!(" (first rejection at {}: {})", rejection.encoded_load, rejection.reason)
+                            })
                         ));
                     };
                     resumed = Some(report);
@@ -611,6 +615,23 @@ fn recover_handler_codecs_once(
                     native_call = Some(analysis.report);
                 }
             }
+        } else {
+            // The keyless fallback exists so a native-call handler whose body
+            // spans the call -- and whose rolling key is therefore restored by a
+            // `pop` the operand model cannot pair -- can still be recovered. When
+            // even that finds no selector, say so: silence here reads exactly
+            // like "this is not a native-call handler".
+            native_call_resume_diagnostic = Some(format!(
+                "keyless native-call selector not recovered: {} candidate(s){}",
+                raw_operand.candidates.len(),
+                raw_operand
+                    .rejected_sources
+                    .first()
+                    .map_or(String::new(), |rejection| format!(
+                        ", first rejection: {}",
+                        rejection.reason
+                    )),
+            ));
         }
     }
 
