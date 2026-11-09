@@ -289,12 +289,22 @@ pub struct NativeCfg {
 }
 
 impl NativeCfg {
-    /// True when no block ended in [`Terminator::Unsupported`].
+    /// True when no block ended in [`Terminator::Unsupported`], i.e. control
+    /// flow is fully recovered. A block whose BODY the lifter refused still
+    /// counts as complete here, with [`NativeBlock::semantics`] `None`; use
+    /// [`Self::all_bodies_lifted`] when the consumer needs the semantics.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.blocks
             .values()
             .all(|b| !matches!(b.terminator, Terminator::Unsupported(_)))
+    }
+
+    /// True when every block's straight-line body was lifted, so the whole
+    /// function has semantics and not just a shape.
+    #[must_use]
+    pub fn all_bodies_lifted(&self) -> bool {
+        self.blocks.values().all(|b| b.semantics.is_some())
     }
 }
 
@@ -640,13 +650,20 @@ pub fn recover_native_cfg_opts(
         let mut lift_options: LiftOptions = options.into();
         lift_options.entry_args_disjoint_from_frame =
             options.entry_args_disjoint && start == entry && !entry_is_branch_target;
-        let semantics = match lift_block_with(&VmAlgebra, &body, lift_options) {
-            Ok(sem) => Some(sem),
-            Err(e) => {
-                terminator = Terminator::Unsupported(e.to_string());
-                None
-            }
+        // A body the lifter cannot model and a terminator we cannot find are
+        // DIFFERENT facts. Overwriting the terminator here conflated them and
+        // suppressed the block's outgoing edges, so one unmodelable instruction
+        // truncated the control-flow graph. `semantics: None` already records
+        // "the body was refused"; the recovered terminator is kept.
+        let (semantics, body_refusal) = match lift_block_with(&VmAlgebra, &body, lift_options) {
+            Ok(sem) => (Some(sem), None),
+            Err(e) => (None, Some(e.to_string())),
         };
+        if body_refusal.is_some() && matches!(terminator, Terminator::Unsupported(_)) {
+            // Nothing was recovered either way; keep the lift's reason, which is
+            // the more specific of the two.
+            terminator = Terminator::Unsupported(body_refusal.clone().unwrap_or_default());
+        }
         match &terminator {
             Terminator::FallThrough(t) => edges.push((start, *t, EdgeKind::FallThrough)),
             Terminator::Jump(t) => edges.push((start, *t, EdgeKind::Jump)),
@@ -901,7 +918,10 @@ mod tests {
         let cfg = recover_native_cfg_proven(FRAME, 0x1000, 0x1000).expect("cfg");
         let b = &cfg.blocks[&0x1000];
         assert!(b.semantics.is_none() && !b.assumes_stack_disjoint);
-        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+        // The BODY is refused; control flow is still recovered, and those are
+        // tracked separately now.
+        assert!(!cfg.assumes_stack_disjoint && !cfg.all_bodies_lifted());
+        assert!(cfg.is_complete());
 
         assert!(
             lift_native_block(&FRAME[..FRAME.len() - 1], 0x1000)
@@ -916,7 +936,7 @@ mod tests {
     fn genuine_alias_fails_closed_even_with_assumption() {
         let cfg = recover_native_cfg(ALIAS, 0x1000, 0x1000).expect("cfg");
         assert!(cfg.blocks[&0x1000].semantics.is_none());
-        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+        assert!(!cfg.assumes_stack_disjoint && !cfg.all_bodies_lifted());
     }
 
     #[test]
