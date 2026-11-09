@@ -233,7 +233,7 @@ pub(crate) fn lift_entry(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
             false,
         )
     };
@@ -347,7 +347,7 @@ pub(crate) fn with_entry_input<R>(
         // carries `AssumesImageProtectionStable` — so this widens what can be
         // decompiled, never what is claimed proven.
         symbolic: vmpx_vm::SymbolicExecutionLimits {
-            serve_read_only_when_suppressed: std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            serve_read_only_when_suppressed: (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
             ..vmpx_vm::SymbolicExecutionLimits::default()
         },
         ..EntryProfileRecoveryLimits::default()
@@ -369,7 +369,7 @@ pub(crate) fn with_entry_input<R>(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some(),
+            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
             false,
         )
     };

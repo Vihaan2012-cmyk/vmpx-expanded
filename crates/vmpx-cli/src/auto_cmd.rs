@@ -272,8 +272,25 @@ fn recover_oep(pe: &PeImage<'_>, bytes: &[u8]) -> Option<u32> {
     found.into_iter().min()
 }
 
+/// The recovery settings `auto` turns on for itself: serve read-only image
+/// bytes under suppression, and follow cross-`.vmp`-section continuations.
+/// The caller no longer sets `VMPX_DECOMPILE_SERVE_RO` /
+/// `VMPX_FOLLOW_CROSS_VMP_SECTION` by hand -- those env vars still work, and
+/// this flag is ORed with them at every read site. A safe atomic, because
+/// `std::env::set_var` is forbidden under edition 2024's `unsafe_code = forbid`.
+pub(crate) static AUTO_SETTINGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `auto` mode turned the recovery settings on.
+pub(crate) fn auto_settings() -> bool {
+    AUTO_SETTINGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn run(o: Options) -> Result<(), String> {
     let log = Log::new("vmpx", o.verbose);
+    // `auto` IS the experimental path, so it enables the recovery settings
+    // itself instead of making the caller remember env vars.
+    AUTO_SETTINGS.store(true, std::sync::atomic::Ordering::Relaxed);
     // Resolve the output path under --dir, creating the directory if needed.
     let output = match &o.dir {
         Some(dir) => {

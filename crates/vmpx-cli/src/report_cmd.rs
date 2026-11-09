@@ -237,7 +237,7 @@ pub(crate) fn cfg_limits(
                 .saturating_mul(env_scale("VMPX_DOMAIN_COMBINATIONS")),
             ..vmpx_vm::SymbolicDomainLimits::default()
         },
-        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
+        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some() || crate::auto_cmd::auto_settings(),
         // VMPX_WALL_SECS sets the per-entry budget, and a budget-pass sweep bounds
         // each rerun entry by VMPX_PASS_WALL_SECS instead. A lower cap only stops
         // an entry sooner, as WallClock, i.e. incomplete — so this knob is
