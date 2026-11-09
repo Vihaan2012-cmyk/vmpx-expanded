@@ -12,11 +12,10 @@
 
 ---
 
-A fork of [vmpx](https://github.com/skyboundfs/vmpx) that takes the pipeline all
-the way to a behaviour-preserving, devirtualized PE. The original recovers a
-great deal but deliberately stops short of emitting a clean binary; this fork
-implements the remaining stages — entry-point recovery, import reconstruction,
-native relocation, guard devirtualization — and wires them into a single command.
+A fork of [vmpx](https://github.com/skyboundfs/vmpx) that carries the pipeline all
+the way to a clean, behaviour-preserving PE. The original stops short of emitting a
+binary; this fork adds the final stages — entry-point recovery, import
+reconstruction, native relocation, guard devirtualization — behind one command.
 
 ## Quick start
 
@@ -51,28 +50,20 @@ supplies a separate observed-only result, and that is the only thing that runs c
 
 ## What it does
 
-A single command takes a fully protected binary to a clean one and narrates every
-step:
-
-```
-vmpx auto protected.exe -o clean.exe
-```
-
-It analyses the target and chooses its own instruction limit, step budget, and
-assumption set — no flags required — then runs the whole chain:
+One command runs the whole chain, from a protected PE to a clean one:
 
 ```mermaid
 flowchart TD
-    A["Protected PE<br/>.exe · .dll · .xpl · .sys"] --> B["unpack<br/>decompress to a mapped image"]
-    B --> C["analyse<br/>find every protector reference the app makes"]
-    C --> D["rebuild layout<br/>conventional sections + data directories"]
-    D --> E["recover OEP<br/>CRT loader-obligation rule, no symbols/PDB/DWARF"]
-    E --> F["strip every .vmp*<br/>VM · mutated stubs · packed original"]
-    F --> G["relocate mutated natives<br/>move out verbatim + repoint call sites"]
-    G --> H["devirtualize guards<br/>fold each checksum to a constant"]
-    H --> I["rebind IAT<br/>name encrypted .idata slots, bind in place"]
-    I --> J["verify<br/>no reference into removed space remains"]
-    J --> K["Clean PE"]
+    A[Protected PE] --> B[unpack]
+    B --> C[analyse protector references]
+    C --> D[rebuild layout + directories]
+    D --> E[recover OEP]
+    E --> F[strip every .vmp*]
+    F --> G[relocate mutated natives]
+    G --> H[devirtualize guards]
+    H --> I[rebind IAT]
+    I --> J[verify no dangling refs]
+    J --> K[Clean PE]
 ```
 
 ## Where it stands
