@@ -92,6 +92,12 @@ pub struct RolledFunction {
     pub loops: usize,
     pub forks: usize,
     pub straight_blocks: usize,
+    /// Concessions THIS LIFT made that the entry's CFG did not already carry.
+    ///
+    /// The recovery side owns the labels for what it assumed; this is the lift's
+    /// own set, so a function lowered under a relaxation the CFG never needed
+    /// still names it instead of reading as unconditional.
+    pub assumptions: BTreeSet<vmpx_vm::VmCfgAssumption>,
 }
 
 struct LoopCtx {
@@ -122,6 +128,7 @@ struct Walker<'a, 'b> {
     loops: usize,
     phi_id: usize,
     loop_stack: Vec<LoopCtx>,
+    assumed: BTreeSet<vmpx_vm::VmCfgAssumption>,
 }
 
 /// Rolled walk of `input`'s CFG.
@@ -142,9 +149,16 @@ pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Resul
         loops: 0,
         phi_id: 0,
         loop_stack: Vec::new(),
+        assumed: BTreeSet::new(),
     };
     let root = w.walk(input.cfg.entry, state, Vec::new(), false)?;
-    Ok(RolledFunction { root, loops: w.loops, forks: w.forks, straight_blocks: w.blocks })
+    Ok(RolledFunction {
+        root,
+        loops: w.loops,
+        forks: w.forks,
+        straight_blocks: w.blocks,
+        assumptions: w.assumed,
+    })
 }
 
 pub(crate) fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
@@ -392,19 +406,18 @@ impl Walker<'_, '_> {
         // narrows it to the cells that could genuinely alias. Without this the
         // rolled frontend refused 51 entries the CFG walk had already got past.
         //
-        // Gated on the entry's CFG ALREADY carrying the assumption, which is what
-        // makes this parity rather than a second, quieter relaxation. The walk
-        // records `AssumesExternalStoresDisjointFromVmStack` whenever its own
-        // retry takes effect, and it is the recovery side that owns the label; a
-        // lift has no assumption set to add to. Were this ungated, an entry whose
-        // CFG never needed the relaxation — and which therefore still reads as
-        // PROVEN — could emit C that quietly rests on it.
-        let may_relax = self
+        // Where the CFG already carries the label this is parity with the walk's
+        // own retry. Where it does not, the relaxation is THIS LIFT's, and the
+        // honest move is to record it rather than refuse: an entry whose CFG
+        // never needed the narrowing still reads as PROVEN at the CFG tier, so
+        // the emitted C must name the concession itself. It does — the label
+        // lands in `RolledFunction::assumptions` and the decompiler prints it.
+        let already = self
             .input
             .cfg
             .assumptions
             .contains(&vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
-        if report.memory_tainted && may_relax {
+        if report.memory_tainted {
             let relaxed = SymbolicExecutionLimits {
                 assume_loaded_store_addresses_disjoint: true,
                 ..SymbolicExecutionLimits::default()
@@ -417,6 +430,11 @@ impl Walker<'_, '_> {
                 self.input.memory,
             ) && !retry.memory_tainted
             {
+                if !already {
+                    self.assumed.insert(
+                        vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack,
+                    );
+                }
                 report = retry;
             }
         }

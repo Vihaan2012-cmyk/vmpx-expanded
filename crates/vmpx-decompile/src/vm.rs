@@ -966,6 +966,12 @@ fn rewrite_exprs_only(n: &RNode, f: &dyn Fn(&Expr) -> Expr) -> RNode {
 /// Gate arms that differ, multi-way branches, or any shape listed above.
 pub fn lower(rolled: &RolledFunction, name: &str) -> Result<VmLowered, String> {
     let mut notes = Vec::new();
+    // The lift's own concessions come first: they qualify everything below them.
+    for assumption in &rolled.assumptions {
+        notes.push(format!(
+            "this function rests on a LIFT assumption its CFG did not need: {assumption:?}"
+        ));
+    }
     let tree = collapse(&rolled.root, &mut notes)?;
     let mut lw = Lower { blocks: BTreeMap::new(), next: 0, notes: &mut notes, loops: Vec::new(), uid: 0 };
     let entry = lw.lower(&tree, None)?;
@@ -975,4 +981,67 @@ pub fn lower(rolled: &RolledFunction, name: &str) -> Result<VmLowered, String> {
         func: Func { name: name.to_owned(), entry, blocks, params: vec![], notes: vec![] },
         notes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A concession the lift made itself must reach the output. Without this the
+    /// relaxation that unblocked the `memory tainted` refusals would be silent,
+    /// and emitted C would read as unconditional while resting on it.
+    #[test]
+    fn a_lift_assumption_is_reported_as_a_note() {
+        let rolled = RolledFunction {
+            root: RNode::Exit(RExit {
+                registers: std::iter::once((
+                    vmpx_vm::X64NativeRegister::Rax,
+                    Expr::constant(vmpx_vm::BitWidth::W64, 0),
+                ))
+                .collect(),
+                region: false,
+                continuation: None,
+            }),
+            loops: 0,
+            forks: 0,
+            straight_blocks: 1,
+            assumptions: std::iter::once(
+                vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack,
+            )
+            .collect(),
+        };
+        let low = lower(&rolled, "f").expect("lowers");
+        assert!(
+            low.notes.iter().any(|n| n.contains("LIFT assumption")
+                && n.contains("AssumesExternalStoresDisjointFromVmStack")),
+            "notes: {:?}",
+            low.notes
+        );
+    }
+
+    /// And the ordinary case stays quiet, so the note means something.
+    #[test]
+    fn no_lift_assumption_adds_no_note() {
+        let rolled = RolledFunction {
+            root: RNode::Exit(RExit {
+                registers: std::iter::once((
+                    vmpx_vm::X64NativeRegister::Rax,
+                    Expr::constant(vmpx_vm::BitWidth::W64, 0),
+                ))
+                .collect(),
+                region: false,
+                continuation: None,
+            }),
+            loops: 0,
+            forks: 0,
+            straight_blocks: 1,
+            assumptions: std::collections::BTreeSet::new(),
+        };
+        let low = lower(&rolled, "f").expect("lowers");
+        assert!(
+            !low.notes.iter().any(|n| n.contains("LIFT assumption")),
+            "notes: {:?}",
+            low.notes
+        );
+    }
 }
