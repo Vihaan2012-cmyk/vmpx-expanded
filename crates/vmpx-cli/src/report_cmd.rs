@@ -1016,6 +1016,29 @@ pub fn render(r: &Report) -> String {
         format!("all {} discovered entries", s.discovered)
     };
     let _ = writeln!(o, "\nHEADLINE (static, sound path; scope: {scope})");
+    // The caps the run was measured at. Raising one is soundness-neutral --
+    // it only lets the walk explore further -- but it moves N1 a long way, so a
+    // headline without them cannot be compared to another headline.
+    let caps = [
+        ("instruction-limit", "VMPX_INSTRUCTION_LIMIT"),
+        ("visits", "VMPX_VISITS"),
+        ("total-instructions", "VMPX_TOTAL_INSTRUCTIONS"),
+        ("transition-budget", "VMPX_TRANSITION_BUDGET"),
+        ("profile-transitions", "VMPX_PROFILE_TRANSITIONS"),
+        ("nested-entries", "VMPX_NESTED_ENTRIES"),
+        ("dispatch-proof-states", "VMPX_DISPATCH_PROOF_STATES"),
+    ]
+    .into_iter()
+    .filter_map(|(name, var)| {
+        let scale = env_scale(var);
+        (scale != 1).then(|| format!("{name} x{scale}"))
+    })
+    .collect::<Vec<_>>();
+    let _ = writeln!(
+        o,
+        "  caps: {}",
+        if caps.is_empty() { "all default".to_owned() } else { caps.join(", ") }
+    );
     let _ = writeln!(
         o,
         "  N1 CFG-complete (any labeled assumption) : {} / {}",

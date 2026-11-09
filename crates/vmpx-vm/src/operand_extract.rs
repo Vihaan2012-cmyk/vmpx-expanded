@@ -441,7 +441,20 @@ fn attempt_operand(
             canonical(roles.rolling_key),
         ) && !allowed_key_writes.contains(&decoded.rva)
     }) {
-        return Err("rolling-key register has an unmodelled write".to_owned());
+        // Name the write. "unmodelled" is the biggest single handler-spec
+        // diagnostic and says nothing about WHICH instruction to model.
+        let offender = active.iter().find(|decoded| {
+            writes_register(
+                &mut factory,
+                &decoded.instruction,
+                canonical(roles.rolling_key),
+            ) && !allowed_key_writes.contains(&decoded.rva)
+        });
+        return Err(format!(
+            "rolling-key register has an unmodelled write ({:?} at {:?})",
+            offender.map(|decoded| decoded.instruction.mnemonic()),
+            offender.map(|decoded| decoded.rva),
+        ));
     }
     let input_key_operation =
         input_key_operation.ok_or_else(|| "input-key operation was not recovered".to_owned())?;

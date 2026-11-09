@@ -63,6 +63,16 @@ fn main() {
                 vmpx_vm::BytecodeDirection::Ascending
             };
         }
+        // Follow conditional arms, so a handler whose trace stops at a
+        // sub-dispatch can be inspected past it. HDIAG_FOLLOW=f|t, HDIAG_DEPTH=n.
+        if let Ok(which) = std::env::var("HDIAG_FOLLOW") {
+            config.trace_limits.follow_conditional_fallthrough = true;
+            config.trace_limits.follow_conditional_target = which == "t";
+            config.trace_limits.max_conditional_continuations = std::env::var("HDIAG_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+        }
         if std::env::var("HDIAG_TRACE").is_ok() {
             use iced_x86::Formatter;
             let trace =

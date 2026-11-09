@@ -346,28 +346,12 @@ pub fn recover_handler_codecs(
             return Ok(labeled);
         }
     }
-    // Depth 2 only. Each extra depth costs a FULL re-recovery (trace, slice,
-    // dispatch proof) of a handler that is already on the failing path, and the
-    // first sweep measured the labeled walks at +0 -- so the ladder of 2/4/8/16
-    // bought nothing and multiplied the cost of every refusal by eight.
-    for depth in [2_usize] {
-        for take_target in [false, true] {
-            let mut config = config.clone();
-            config.trace_limits.follow_conditional_fallthrough = true;
-            config.trace_limits.follow_conditional_target = take_target;
-            config.trace_limits.max_conditional_continuations = depth;
-            let deep = recover_handler_codecs_once(pe, entry, &config)?;
-            if deep.decode_spec.is_some() {
-                let mut labeled = deep;
-                labeled.diagnostics.push(format!(
-                    "recovered by walking {} conditional arm(s) of the handler, all {};                      the other combinations were not walked, so this is labeled, not proven",
-                    labeled.conditional_arms.len(),
-                    if take_target { "taken" } else { "fall-through" },
-                ));
-                return Ok(labeled);
-            }
-        }
-    }
+    // No deeper than one conditional. Measured on the handler this was built
+    // for: at depth 4 the trace runs PAST the handler's own dispatch into the
+    // next handler, and the recovery then refuses with "handler register has an
+    // unmodelled write" / "descending VIP has an unmodelled pre-source write" --
+    // garbage from over-running, not progress. Depth 1 is also the only depth
+    // where both arms are every path, i.e. the only one that can prove anything.
     Ok(base)
 }
 
