@@ -189,12 +189,19 @@ fn main() {
                 let Some(target) = dangles(&instruction) else {
                     continue;
                 };
-                // Padding before it, or a clean run after it, is the only
-                // structural evidence available outside .pdata.
-                let padded = at >= 4
-                    && window[at - 4..at]
-                        .iter()
-                        .all(|b| matches!(b, 0x90 | 0xCC | 0x00));
+                // Outside .pdata the only structural evidence is padding. A
+                // thunk slot is `jmp rel32` + padding, so the FIRST slot of a
+                // table is padding-preceded but the rest are not -- they are
+                // padding-FOLLOWED, each sitting right after the previous
+                // slot's filler. Testing only the preceding bytes counted 1 of
+                // the 4 slots at 0x1740ab8 and silently dropped 3.
+                let pad = |b: &u8| matches!(b, 0x90 | 0xCC | 0x00);
+                let before = at >= 4 && window[at - 4..at].iter().all(pad);
+                let len = usize::from(instruction.len() as u8);
+                let after = window
+                    .get(at + len..at + len + 3)
+                    .is_some_and(|tail| tail.iter().all(pad));
+                let padded = before || after;
                 let mut clean = true;
                 for _ in 0..4 {
                     if !probe.can_decode() {
@@ -207,7 +214,7 @@ fn main() {
                 }
                 if padded && clean {
                     on_boundary.push(format!(
-                        "{rva:#x} -> {target:#x}  {instruction}   [no .pdata, padding-preceded]"
+                        "{rva:#x} -> {target:#x}  {instruction}   [no .pdata, padding-adjacent]"
                     ));
                 } else {
                     off_boundary += 1;
