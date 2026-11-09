@@ -1169,6 +1169,30 @@ fn main() -> Result<()> {
                         } else {
                             std::borrow::Cow::Borrowed(bytes.as_slice())
                         };
+                        // Neutralization stage (experimental image only, after any
+                        // strip): force each residual guard thunk -- a `.text`
+                        // tail-transfer into removed space whose virtualized body
+                        // could not be lifted -- to its pass path, so the written
+                        // image has no reference into removed space. Only matters
+                        // once `.vmp` is gone (so a transfer into it dangles).
+                        // Behaviour-changing; the sound `output` path is untouched.
+                        let mut to_write = to_write.into_owned();
+                        match auto_cmd::neutralize_dangling_guard_thunks(&mut to_write) {
+                            Ok(done) if !done.is_empty() => {
+                                for action in &done {
+                                    println!(
+                                        "[neutralize] guard {:#x}: thunk {:#x} forced to return 1 (pass), {} byte(s)",
+                                        action.guard_rva, action.thunk_begin, action.thunk_bytes
+                                    );
+                                }
+                                println!(
+                                    "[neutralize] {} residual guard thunk(s) neutralized (behaviour-changing)",
+                                    done.len()
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => eprintln!("[neutralize] skipped: {error}"),
+                        }
                         fs::write(path, &to_write)
                             .with_context(|| format!("failed to write {}", path.display()))?;
                         // A stripped image is validated before being offered; the

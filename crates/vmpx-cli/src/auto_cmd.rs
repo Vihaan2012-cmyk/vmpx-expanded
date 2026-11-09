@@ -259,11 +259,73 @@ pub(crate) fn neutralize_residual_guards(
             }
         }
     }
+    Ok(apply_guard_neutralizations(image, hits))
+}
+
+/// Self-contained neutralization for a reintegrated image: find every `.text`
+/// thunk that tail-transfers into removed/unmapped space (a residual guard whose
+/// body could not be lifted) and force its pass path, exactly as
+/// [`neutralize_residual_guards`] does, but without needing the guard RVA list.
+/// Used by the `clean --experimental` output, which does not carry that list.
+pub(crate) fn neutralize_dangling_guard_thunks(
+    image: &mut [u8],
+) -> Result<Vec<GuardNeutralized>, String> {
+    let mut hits: Vec<(u32, u32, usize, usize)> = Vec::new();
+    {
+        let pe = PeImage::parse(image).map_err(|e| e.to_string())?;
+        let base = pe.optional.image_base.0;
+        let soi = pe.optional.size_of_image;
+        let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+        for function in &pe.report().exception_functions {
+            let (b, e) = (function.begin.0, function.end.0);
+            if e <= b || e - b > 0x10_0000 {
+                continue;
+            }
+            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+            let from = off.0 as usize;
+            let to = (from + (e - b) as usize).min(image.len());
+            let Some(code) = image.get(from..to) else { continue };
+            let mut decoder = Decoder::with_ip(64, code, base + u64::from(b), DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    break;
+                }
+                if matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call | FlowControl::UnconditionalBranch
+                ) && instruction.near_branch64() != 0
+                    && let Some(rva) = instruction
+                        .near_branch64()
+                        .checked_sub(base)
+                        .and_then(|v| u32::try_from(v).ok())
+                    && rva < soi
+                    && !mapped(rva)
+                {
+                    let transfer_end = from
+                        + usize::try_from(instruction.next_ip() - (base + u64::from(b)))
+                            .unwrap_or(to - from);
+                    hits.push((rva, b, from, transfer_end.min(to)));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(apply_guard_neutralizations(image, hits))
+}
+
+/// Overwrite each hit's `[entry .. transfer_end)` with `mov eax,1; ret` plus
+/// `int3` filler, so the thunk returns "pass" with a pristine stack and its
+/// dangling transfer is erased. Shared by both neutralization scanners.
+fn apply_guard_neutralizations(
+    image: &mut [u8],
+    hits: Vec<(u32, u32, usize, usize)>,
+) -> Vec<GuardNeutralized> {
     let mut done: Vec<GuardNeutralized> = Vec::new();
     let mut overwritten: BTreeSet<u32> = BTreeSet::new();
     for (guard_rva, begin, from, end) in hits {
         if !overwritten.insert(begin) {
-            continue; // already overwrote this thunk for another target
+            continue;
         }
         if from + RETURN_TRUE.len() > end || end > image.len() {
             continue;
@@ -278,7 +340,7 @@ pub(crate) fn neutralize_residual_guards(
             thunk_bytes: u32::try_from(end - from).unwrap_or(0),
         });
     }
-    Ok(done)
+    done
 }
 
 /// The CRT-obligation OEP rule (loader-only root, takes the Win64 triple,
