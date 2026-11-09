@@ -393,6 +393,32 @@ impl Walker<'_, '_> {
                         continue;
                     }
                     if successors.len() < 2 {
+                        // Exactly one edge and one usable successor: the CFG
+                        // already PROVED that target -- a `Branch` edge is a
+                        // target proven constant, a `GuardedBranch` one proven
+                        // over an exhaustive input domain. Trust the same proof
+                        // the rolled walk trusts rather than refusing a target
+                        // the graph already settled.
+                        let raw = self
+                            .input
+                            .cfg
+                            .edges
+                            .iter()
+                            .filter(|e| {
+                                e.from == key
+                                    && matches!(
+                                        e.kind,
+                                        CfgEdgeKind::Branch
+                                            | CfgEdgeKind::GuardedBranch
+                                            | CfgEdgeKind::ProfileTransition
+                                    )
+                            })
+                            .count();
+                        if raw == 1 && successors.len() == 1 {
+                            self.decided += 1;
+                            key = successors[0].1;
+                            continue;
+                        }
                         return Err(format!(
                             "block {key} branch target depends on inputs but has {} recovered successor(s)",
                             successors.len()

@@ -90,7 +90,16 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
             }
         })?;
         let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-            vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+            {
+            let resolver = vmpx_vmlift::PeNestedEntries {
+                pe,
+                limits: vmpx_vm::EntryProfileRecoveryLimits {
+                    instruction_limit: o.instruction_limit,
+                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                },
+            };
+            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+        }
         })??;
         println!("// rolled: loops={} forks={} blocks_walked={}", rolled.loops, rolled.forks, rolled.straight_blocks);
         print_tree(&rolled.root, 0);
@@ -102,7 +111,16 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         // entry at all, so the size of an unrolled fallback is measurable before
         // anyone builds the lowering it would need.
         let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-            vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+            {
+            let resolver = vmpx_vmlift::PeNestedEntries {
+                pe,
+                limits: vmpx_vm::EntryProfileRecoveryLimits {
+                    instruction_limit: o.instruction_limit,
+                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                },
+            };
+            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+        }
         })
         .map_err(|e| e.to_string())
         .and_then(|r| r.map_err(|e| e.to_string()));
@@ -122,7 +140,16 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         return Ok(());
     }
     let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-        vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+        {
+            let resolver = vmpx_vmlift::PeNestedEntries {
+                pe,
+                limits: vmpx_vm::EntryProfileRecoveryLimits {
+                    instruction_limit: o.instruction_limit,
+                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                },
+            };
+            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+        }
     })??;
     let low = vmpx_decompile::vm::lower(&rolled, name)?;
     let d = vmpx_decompile::decompile_with(&low.func, &image_symbols(pe))?;
