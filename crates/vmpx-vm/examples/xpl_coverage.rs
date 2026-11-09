@@ -951,7 +951,9 @@ fn main() {
             | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
                     | VmCfgAssumption::AssumesVmStackFramePrivate
                     | VmCfgAssumption::AssumesImageProtectionStable
-                    | VmCfgAssumption::AssumesCrossVmSectionContinuation => "UNPROVEN-ASSUMPTION",
+                    | VmCfgAssumption::AssumesCrossVmSectionContinuation
+                    | VmCfgAssumption::AssumesHandlerConditionalArm
+                    | VmCfgAssumption::AssumesTaintedBranchStateSufficient => "UNPROVEN-ASSUMPTION",
                     VmCfgAssumption::PreferredImageBase
                     | VmCfgAssumption::OverApproximatedEnvironmentGate => "BENIGN-LABELED",
                 };

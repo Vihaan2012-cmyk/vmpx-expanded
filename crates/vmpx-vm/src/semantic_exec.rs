@@ -1002,7 +1002,20 @@ impl<'a> SymbolicMachine<'a> {
                     self.vm_stack_address_escapes,
                     self.vm_stack_pointer_lost,
                 ) + &format!(
-                    " offset={:?} unbounded_at={}",
+                    " lower_bound={:?} cells={:?} offset={:?} unbounded_at={}",
+                    address_lower_bound(address).map(|bounds| (
+                        bounds.root.is_some(),
+                        format!("{:#x}", bounds.lo)
+                    )),
+                    {
+                        let offsets: Vec<i64> =
+                            self.memory.iter().filter_map(|(cell, _)| pointer_offset(cell)).collect();
+                        offsets
+                            .iter()
+                            .copied()
+                            .min()
+                            .map(|lo| (format!("{lo:#x}"), format!("{:#x}", offsets.iter().copied().max().unwrap_or(lo)), offsets.len()))
+                    },
                     pointer_offset(address).map(|offset| format!("{offset:#x}")),
                     // Which node kind `address_bounds` has no arm for. The
                     // address renders to more than 400 bytes, so the text is
@@ -2137,6 +2150,110 @@ fn scale_rootless(lo: i64, hi: i64, scale: i64) -> Option<AddressBounds> {
 /// proven-region `root`) that a `width`-wide store provably stays within.
 /// Returns `None` unless the address reduces to `root + [lo, hi]` over a
 /// `vsp_initial` / fresh-allocation root with representable signed bounds.
+/// A LOWER bound on an address, when no two-sided bound exists.
+///
+/// `store_range_disjoint_from_cell` keeps a cell when `offset < slo` OR
+/// `offset >= shi`, so the two halves are independent: proving only `slo`
+/// already saves every tracked cell below the store. That matters because the
+/// addresses that defeat `address_bounds` are indexed stores --
+/// `vsp_initial + k + <64-bit index>` -- where the index has no upper bound but
+/// is trivially non-negative.
+///
+/// Every value is treated as UNSIGNED, which is what makes a lower bound
+/// available at all: a 64-bit register has no `i64` upper bound but its
+/// unsigned minimum is 0. Subtraction and anything unmodelled refuse, since
+/// they can move the address down.
+///
+/// This rests on the sum not wrapping the address space. That is the same thing
+/// the existing `vsp_initial + const` handling assumes, but it is a real
+/// assumption once an unbounded index is involved, so a caller that uses this
+/// must label it.
+fn address_lower_bound(expression: &Expr) -> Option<AddressBounds> {
+    // A two-sided bound is strictly better; only fall back when there is none.
+    if let Some(bounds) = address_bounds(expression) {
+        return Some(bounds);
+    }
+    match &expression.kind {
+        ExprKind::Register { name } if name == "vsp_initial" => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Intrinsic { .. } if is_fresh_allocation_root(expression) => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        // An unsigned value of any width is at least zero. This is the whole
+        // point of the fallback: a 64-bit register lands here.
+        ExprKind::Register { .. }
+        | ExprKind::Intrinsic { .. }
+        | ExprKind::Load { .. }
+        | ExprKind::Extract { .. }
+        | ExprKind::Unary { .. }
+        | ExprKind::Resize { .. } => Some(AddressBounds {
+            root: None,
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Concat { high, low } => {
+            let high = address_lower_bound(high)?;
+            let low = address_lower_bound(low)?;
+            (high.root.is_none()).then_some(AddressBounds {
+                root: low.root,
+                // The high half contributes at least `high.lo << width(low)`,
+                // but that product is what overflowed in the two-sided arm, so
+                // the sound floor to keep is the low half's own.
+                lo: low.lo,
+                hi: 0,
+            })
+        }
+        ExprKind::Binary { op, left, right } => match op {
+            // `a + b >= lo(a) + lo(b)` for unsigned halves that do not wrap.
+            BinaryOp::Add => {
+                let left = address_lower_bound(left)?;
+                let right = address_lower_bound(right)?;
+                let ((None, root) | (root, None)) = (left.root, right.root) else {
+                    return None;
+                };
+                Some(AddressBounds {
+                    root,
+                    lo: left.lo.checked_add(right.lo)?,
+                    hi: 0,
+                })
+            }
+            // `a | b >= max(a, b)`, and `a * c`, `a << c` scale a floor up.
+            BinaryOp::Or => {
+                let left = address_lower_bound(left)?;
+                let right = address_lower_bound(right)?;
+                (left.root.is_none() && right.root.is_none()).then_some(AddressBounds {
+                    root: None,
+                    lo: left.lo.max(right.lo),
+                    hi: 0,
+                })
+            }
+            BinaryOp::Shl | BinaryOp::Mul => {
+                let left = address_lower_bound(left)?;
+                (left.root.is_none()).then_some(AddressBounds {
+                    root: None,
+                    lo: 0,
+                    hi: 0,
+                })
+            }
+            // `a & m` and a shift right can only move a value DOWN, to zero.
+            BinaryOp::And | BinaryOp::Shr => Some(AddressBounds {
+                root: None,
+                lo: 0,
+                hi: 0,
+            }),
+            // Subtraction moves the address down by an unbounded amount.
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+
 fn proven_store_byte_range(address: &Expr, width: BitWidth) -> Option<(Expr, i64, i64)> {
     let bounds = address_bounds(address)?;
     let root = bounds.root?;

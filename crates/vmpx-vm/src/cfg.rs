@@ -369,6 +369,13 @@ pub enum VmCfgAssumption {
     /// the specification holds on the arm that was taken, and the walk assumes
     /// that arm is the one the protector actually runs.
     AssumesHandlerConditionalArm,
+    /// The walk resolved a branch whose block had HAVOCED memory, because the
+    /// target resolved anyway. Nothing about this target rests on the discarded
+    /// cells -- a load the havoc touched returns an opaque intrinsic and the
+    /// target would not have resolved -- but the successor state carries the
+    /// loss, so every block after it is reached with less memory than it would
+    /// otherwise have had.
+    AssumesTaintedBranchStateSufficient,
     /// A block that STALLED was closed as a VM exit anyway, because
     /// `VMPX_ASSUME_STALLED_BLOCKS_EXIT` was set.
     ///
@@ -1453,8 +1460,18 @@ fn widen_state(
     a: &SymbolicVmInitialState,
     r: &SymbolicVmInitialState,
 ) -> Result<Option<SymbolicVmInitialState>, String> {
-    if a.memory_tainted || r.memory_tainted {
-        return Err("loop follows an imprecise external-memory store".to_owned());
+    // Precision has to be loop-invariant, and that is a statement about the two
+    // states AGREEING, not about either being precise. Two states that both
+    // havoced have both discarded their tracked cells, so widening them is the
+    // ordinary case: differing cells become fresh unknowns, which is what the
+    // widening does anyway. Only a MIXED pair is refused, where the widened
+    // state would claim a precision one side does not have.
+    let mixed = a.memory_tainted != r.memory_tainted;
+    if (a.memory_tainted || r.memory_tainted) && (mixed || !taint_try_resolve()) {
+        return Err(format!(
+            "loop follows an imprecise external-memory store (tainted {} / {})",
+            a.memory_tainted, r.memory_tainted
+        ));
     }
     if a.vsp != r.vsp {
         return Err("loop changes the VM stack pointer".to_owned());
@@ -2793,6 +2810,13 @@ fn note_slow(label: &str, start: std::time::Instant) {
         // stderr is unbuffered, so these appear as they happen.
         eprintln!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
     }
+}
+
+/// Whether a branch in a block with havoced memory is attempted rather than
+/// vetoed on the flag alone.
+fn taint_try_resolve() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_TAINT_TRY_RESOLVE").is_ok_and(|v| v == "1"))
 }
 
 fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
@@ -4476,7 +4500,7 @@ impl Walker<'_, '_> {
             self.stall(key, vip, "branch has no symbolic target");
             return;
         };
-        if symbolic.memory_tainted {
+        if symbolic.memory_tainted && !taint_try_resolve() {
             // Carry BOTH halves of the refusal into the stall text, because they
             // are independent and each can block alone: the walker's gate on the
             // labeled disjointness retry, and the executor's own per-block check
@@ -4507,6 +4531,11 @@ impl Walker<'_, '_> {
                 ),
             );
             return;
+        }
+        if symbolic.memory_tainted {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesTaintedBranchStateSufficient);
         }
         let (dispatch, anchor) = match self.branch_dispatch(final_state.handler) {
             Ok(found) => found,

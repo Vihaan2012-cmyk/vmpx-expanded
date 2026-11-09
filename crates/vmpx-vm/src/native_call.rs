@@ -905,7 +905,7 @@ pub fn analyze_keyless_native_call_handler(
     operand_bytes: i64,
     direction: crate::BytecodeDirection,
     limits: CfgLimits,
-    resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Register), String>,
+    resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Option<Register>), String>,
 ) -> Result<NativeCallAnalysis, DisasmError> {
     let cfg = recover_cfg(pe, entry, limits)?;
     let instruction_count = cfg
@@ -1021,18 +1021,26 @@ pub fn analyze_keyless_native_call_handler(
     {
         return fail("post-call dispatch source is not on the recovered return path".to_owned());
     }
-    let table_register = canonical(table_register);
-    if [vip, vsp_canonical, canonical(selector_register)].contains(&table_register) {
-        return fail("table register overlaps a VM role".to_owned());
-    }
-    if segment.iter().any(|rva| {
-        writes_register(
-            &mut advance_factory,
-            &instructions[rva].instruction,
-            table_register,
-        )
-    }) {
-        return fail("table register is written before the operand advance completes".to_owned());
+    // Only a TABLE dispatch has a base to keep alive; a relative one resumes by
+    // adding the decoded delta to the handler register and has nothing here to
+    // protect, so both obligations are vacuous and are skipped rather than
+    // faked.
+    let table_register = table_register.map(canonical);
+    if let Some(table_register) = table_register {
+        if [vip, vsp_canonical, canonical(selector_register)].contains(&table_register) {
+            return fail("table register overlaps a VM role".to_owned());
+        }
+        if segment.iter().any(|rva| {
+            writes_register(
+                &mut advance_factory,
+                &instructions[rva].instruction,
+                table_register,
+            )
+        }) {
+            return fail(
+                "table register is written before the operand advance completes".to_owned(),
+            );
+        }
     }
     let dispatch_region = reachable(&graph, dispatch_source);
     if instructions.iter().any(|(rva, decoded)| {
@@ -1124,10 +1132,19 @@ pub fn analyze_keyless_native_call_handler(
         call_site,
         dispatch_source,
         terminal_dispatch,
-        completion,
+        // Where the selector register provably holds the decoded byte. In an
+        // ASCENDING stream the advance follows the load, so the advance is that
+        // point. In a DESCENDING one the advance comes FIRST -- `sub vip,n`
+        // before `movzx r,[vip]` -- so seeding at the advance is overwritten by
+        // the load an instruction later, and every branch on the selector then
+        // reads an unknown. Seed at the load there.
+        if descending { operand_load } else { completion },
         selector_register,
         vsp,
-        &[roles.vip, table_register],
+        // The registers the outcome check must see preserved: the VIP always,
+        // and a table base only when there is one.
+        &table_register
+            .map_or_else(|| vec![roles.vip], |table| vec![roles.vip, table]),
         limits.max_instructions.max(1),
     ) {
         Ok(outcomes) => outcomes,

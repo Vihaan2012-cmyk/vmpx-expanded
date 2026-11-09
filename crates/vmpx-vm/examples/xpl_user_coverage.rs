@@ -163,7 +163,9 @@ fn tier(a: &[VmCfgAssumption]) -> &'static str {
             | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
             | VmCfgAssumption::AssumesVmStackFramePrivate
             | VmCfgAssumption::AssumesImageProtectionStable
-            | VmCfgAssumption::AssumesCrossVmSectionContinuation => 2,
+            | VmCfgAssumption::AssumesCrossVmSectionContinuation
+            | VmCfgAssumption::AssumesHandlerConditionalArm
+            | VmCfgAssumption::AssumesTaintedBranchStateSufficient => 2,
             VmCfgAssumption::PreferredImageBase | VmCfgAssumption::OverApproximatedEnvironmentGate => 1,
         });
     }

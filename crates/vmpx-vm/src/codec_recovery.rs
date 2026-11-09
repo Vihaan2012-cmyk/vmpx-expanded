@@ -289,77 +289,76 @@ fn apply_keyless_reentry_facts(
 /// # Errors
 ///
 /// Propagates a decode failure at the handler entry.
+/// Where the dispatch actually starts on a native-call RESUME path.
+///
+/// After the call the VM restores its role registers with `pop`, and puts junk
+/// writes to those same registers in between:
+///
+/// ```text
+/// mov rsp,[rbp-10h] ; cmc ; dec r15w ; mov rbp,[rbp-8] ; mov [rbp],rax
+/// pop rbx ; pop r15 ; adc r10b,dil ; bt r10w,r13w ; pop r10 ; sub r10,4 ; jmp
+/// ```
+///
+/// An extractor reading from the raw resume point sees every role "modified
+/// before the encoded load" -- `pop r15` for the handler, `pop r10` for the VIP,
+/// `pop rbx` for the key -- which is true, and is exactly why a native-call
+/// handler was never recoverable on its return path. The codec lives AFTER the
+/// restore.
+///
+/// Returns the address just past the last leading `pop <role>`, and only when
+/// ALL THREE dispatch roles are restored there; otherwise `resume` unchanged, so
+/// no other shape changes behaviour. Trimming can only lose definitions the
+/// codec would then be missing, and the codec shapes are exact, so a wrong trim
+/// refuses rather than mis-recovers.
+fn resume_after_role_restore(
+    pe: &PeImage<'_>,
+    resume: Rva,
+    roles: HandlerRegisterRoles,
+    limits: DirectJumpTraceLimits,
+) -> Rva {
+    let Ok(trace) = trace_direct_jump_fragments(pe, resume, limits) else {
+        return resume;
+    };
+    let mut remaining: BTreeSet<iced_x86::Register> =
+        [roles.vip, roles.rolling_key, roles.handler]
+            .into_iter()
+            .map(crate::dispatch_extract::canonical)
+            .collect();
+    let mut after = None;
+    for decoded in trace.instructions() {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() == iced_x86::Mnemonic::Pop
+            && instruction.op0_kind() == iced_x86::OpKind::Register
+            && remaining.remove(&crate::dispatch_extract::canonical(instruction.op0_register()))
+        {
+            after = decoded.next_rva();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+    }
+    if remaining.is_empty() {
+        after.unwrap_or(resume)
+    } else {
+        resume
+    }
+}
+
+
 pub fn recover_handler_codecs(
     pe: &PeImage<'_>,
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,
 ) -> Result<HandlerCodecRecoveryReport, DisasmError> {
-    let base = recover_handler_codecs_once(pe, entry, config)?;
-    // Only a handler the clean trace could not finish is worth re-walking, and
-    // only when it stopped AT a conditional -- that branch is the thing in the
-    // way. A caller that already asked to follow conditionals gets what it asked
-    // for, untouched.
-    if base.decode_spec.is_some()
-        || config.trace_limits.follow_conditional_fallthrough
-        || base.trace_stop.kind != DirectJumpTraceStopKind::ConditionalBranch
-    {
-        return Ok(base);
-    }
-    let walk = |take_target: bool| {
-        let mut config = config.clone();
-        config.trace_limits.follow_conditional_fallthrough = true;
-        config.trace_limits.follow_conditional_target = take_target;
-        // Exactly one: past that the two arm-choices stop covering every path,
-        // so agreement would prove nothing.
-        config.trace_limits.max_conditional_continuations = 1;
-        recover_handler_codecs_once(pe, entry, &config)
-    };
-    // An arm walk that errors is NOT this handler's answer: it means the chosen
-    // arm ran into something that does not decode -- VMProtect joins fragments
-    // through predicates whose untaken side points at data. Propagating that
-    // turned six entries' ordinary "no recovered specification" into a hard
-    // "native handler recovery failed: invalid instruction", which is a worse
-    // report of the same fact. The base report is the answer in that case.
-    let (Ok(fallthrough), Ok(taken)) = (walk(false), walk(true)) else {
-        return Ok(base);
-    };
-    let agree = fallthrough.decode_spec.is_some()
-        && fallthrough.decode_spec == taken.decode_spec
-        && fallthrough.boundary_spec == taken.boundary_spec
-        && fallthrough.handler_analysis.as_ref().map(|a| a.semantic)
-            == taken.handler_analysis.as_ref().map(|a| a.semantic);
-    if agree {
-        let mut proven = fallthrough;
-        // Both paths through the branch give this specification, so no arm was
-        // chosen and nothing is assumed. The label must NOT be carried.
-        proven.conditional_arms.clear();
-        proven.diagnostics.push(
-            "recovered identically along both arms of the handler's single conditional, so the              specification holds on every path through it"
-                .to_owned(),
-        );
-        return Ok(proven);
-    }
-    // Past one conditional nothing can be proven this way, so everything below
-    // is LABELED. One arm of one conditional first, then deeper chains: the
-    // protector joins handler fragments with several junk predicates, and both
-    // single-conditional arms stop at the second one.
-    for arm in [fallthrough, taken] {
-        if arm.decode_spec.is_some() {
-            let mut labeled = arm;
-            labeled.diagnostics.push(
-                "recovered along one arm of the handler's conditional; the other arm did not"
-                    .to_owned(),
-            );
-            return Ok(labeled);
-        }
-    }
-    // No deeper than one conditional. Measured on the handler this was built
-    // for: at depth 4 the trace runs PAST the handler's own dispatch into the
-    // next handler, and the recovery then refuses with "handler register has an
-    // unmodelled write" / "descending VIP has an unmodelled pre-source write" --
-    // garbage from over-running, not progress. Depth 1 is also the only depth
-    // where both arms are every path, i.e. the only one that can prove anything.
-    Ok(base)
+    // No arm walk here any more. Following one arm of a handler's conditional
+    // was built, labeled and measured at +0 on N1 across all 814 entries -- and
+    // `postlude_dispatch::inexact_postlude_shapes_are_not_recognized` then
+    // caught what it cost: a handler whose stack-check guard compares the WRONG
+    // register used to refuse, and instead got recovered by walking past the
+    // guard to the dispatch head. A fail-closed shape check is worth more than a
+    // labeled path that buys nothing, so the retry is gone rather than special-
+    // cased.
+    recover_handler_codecs_once(pe, entry, config)
 }
 
 fn recover_handler_codecs_once(
@@ -476,8 +475,16 @@ fn recover_handler_codecs_once(
         )?;
         if let Some(recovered) = analysis.recovered {
             if let Some(dispatch_source) = recovered.report.dispatch_source {
-                let resume_trace =
-                    trace_direct_jump_fragments(pe, dispatch_source, config.trace_limits)?;
+                let resume_trace = trace_direct_jump_fragments(
+                    pe,
+                    resume_after_role_restore(
+                        pe,
+                        dispatch_source,
+                        config.roles,
+                        config.trace_limits,
+                    ),
+                    config.trace_limits,
+                )?;
                 let resume_slice = backward_slice_handler_trace(
                     &resume_trace,
                     &HandlerSliceConfig {
@@ -549,8 +556,11 @@ fn recover_handler_codecs_once(
                 },
                 |resume| {
                     let extracted = (|| {
-                        let resume_trace =
-                            trace_direct_jump_fragments(pe, resume, config.trace_limits)?;
+                        let resume_trace = trace_direct_jump_fragments(
+                            pe,
+                            resume_after_role_restore(pe, resume, config.roles, config.trace_limits),
+                            config.trace_limits,
+                        )?;
                         let resume_slice = backward_slice_handler_trace(
                             &resume_trace,
                             &HandlerSliceConfig {
@@ -576,20 +586,36 @@ fn recover_handler_codecs_once(
                         }
                     };
                     let resolved = match report.candidates.as_slice() {
+                        // A table dispatch keeps its base register; a relative
+                        // one has none, and this path only ever used the
+                        // register to protect a base. Both are accepted.
                         [candidate]
-                            if candidate.codec.table.is_some()
-                                && candidate.postlude.is_none()
+                            if candidate.postlude.is_none()
                                 && !candidate.vip_rebased_before_source =>
                         {
-                            candidate.table_register.map(|table| {
-                                (candidate.encoded_load, candidate.terminal_dispatch, table)
-                            })
+                            Some((
+                                candidate.encoded_load,
+                                candidate.terminal_dispatch,
+                                candidate.table_register,
+                            ))
                         }
                         _ => None,
                     };
                     let Some(resolved) = resolved else {
+                        let why = report.candidates.first().map_or_else(
+                            || "no candidate".to_owned(),
+                            |candidate| {
+                                format!(
+                                    "table={} postlude={} vip_rebased={} table_register={:?}",
+                                    candidate.codec.table.is_some(),
+                                    candidate.postlude.is_some(),
+                                    candidate.vip_rebased_before_source,
+                                    candidate.table_register,
+                                )
+                            },
+                        );
                         return Err(format!(
-                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch{}",
+                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch [{why}]{}",
                             report.candidates.len(),
                             report.rejected_sources.first().map_or(String::new(), |rejection| {
                                 format!(" (first rejection at {}: {})", rejection.encoded_load, rejection.reason)
