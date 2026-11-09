@@ -2821,6 +2821,7 @@ dependencies = [
  "iced-x86",
  "vmpx-disasm",
  "vmpx-pe",
+ "vmpx-rebuild",
  "vmpx-vm",
 ]
 
