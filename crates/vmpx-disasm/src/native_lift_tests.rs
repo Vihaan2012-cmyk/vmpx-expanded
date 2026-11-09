@@ -1483,16 +1483,20 @@ fn shld_shrd_shift_in_bits_from_the_source() {
         }
     }
 
-    // A variable count on a 16-bit operand is undefined (mask admits 16..=31).
-    assert!(matches!(
-        lift(|a| a.shld(bx, cx, cl).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
-    // A constant count at/over the operand size on a 16-bit operand is undefined.
-    assert!(matches!(
-        lift(|a| a.shld(bx, cx, 20u32).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
+    // Undefined per the ISA -- a variable count on a 16-bit operand (the mask
+    // admits 16..=31), and any constant count at or over the operand size.
+    // Both now LIFT, writing an opaque term: the hardware result is some
+    // function of the operands, and a free term over-approximates every such
+    // function. `eval_with` cannot evaluate it, which is the point -- the
+    // destination holds no claimed value.
+    for sem in [
+        ok(|a| a.shld(bx, cx, cl).unwrap()),
+        ok(|a| a.shld(bx, cx, 20u32).unwrap()),
+        ok(|a| a.bswap(bx).unwrap()),
+    ] {
+        let get = |name: &str| input_value(0, name);
+        assert_eq!(eval_with(&sem.regs[&Gpr::Rbx], &get), None);
+    }
 }
 
 fn rotate_carry_ref(left: bool, bits: u32, dst: u64, cin: u64, count: u64) -> (u64, u64) {

@@ -372,6 +372,34 @@ fn closed_exit(
     Ok((exit, effects))
 }
 
+/// Why each path that did not reach a VM exit stopped: its chain's stop reason
+/// and the last diagnostic the explorer left. Without this a whole bucket of
+/// refusals reads only "paths are not complete", which names no cause.
+fn incomplete_paths(family: &vmpx_vm::RecoveredEntryPathFamily) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for path in family.paths.iter().filter(|path| path.native_exit.is_none()) {
+        let last = path.chain.diagnostics.last().map_or("", String::as_str);
+        parts.push(format!(
+            "{:?} after {} instruction(s) in {} segment(s){}",
+            path.chain.stop_reason,
+            path.chain.total_instructions,
+            path.chain.segments.len(),
+            if last.is_empty() {
+                String::new()
+            } else {
+                format!(" [{last}]")
+            }
+        ));
+        if parts.len() == 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return "no path reported a stop".to_owned();
+    }
+    parts.join("; ")
+}
+
 /// Recovers `rva` as an input-closed function: an empty input domain, so the
 /// entry must be a single complete path that no input steers.
 pub(crate) fn recover_input_closed(
@@ -386,9 +414,10 @@ pub(crate) fn recover_input_closed(
         return Err(ClosedFailure::BranchesOnInput);
     }
     if !family.all_paths_reach_vm_exit {
-        return Err(ClosedFailure::Rejected(
-            "entry paths are not complete".to_owned(),
-        ));
+        return Err(ClosedFailure::Rejected(format!(
+            "entry paths are not complete: {}",
+            incomplete_paths(&family)
+        )));
     }
     let [path] = family.paths.as_slice() else {
         return Err(ClosedFailure::Rejected(format!(
@@ -430,7 +459,11 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
     .map_err(|error| error.to_string())?;
     let family = &guarded.family;
     if !family.domain_complete || !family.all_paths_reach_vm_exit {
-        return Err("branch paths are not complete".to_owned());
+        return Err(format!(
+            "branch paths are not complete (domain_complete={}): {}",
+            family.domain_complete,
+            incomplete_paths(family)
+        ));
     }
     let mut assumptions = ClosedAssumptions::default();
     // The replacement evaluates the branch target to pick a path, so the guard
