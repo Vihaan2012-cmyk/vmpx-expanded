@@ -64,9 +64,14 @@ fn main() {
             ) && instruction.near_branch64() != 0
             {
                 let target = instruction.near_branch64();
+                // "Unmapped" on a stripped image; on an intact one, a transfer
+                // from native code INTO a protector section is the same
+                // question asked before the strip: which VM entries does
+                // anything outside the VM actually reach?
                 if let Some(rva) = target.checked_sub(base).and_then(|v| u32::try_from(v).ok())
                     && rva < size_of_image
-                    && !mapped(rva)
+                    && (!mapped(rva)
+                        || (home(rva).starts_with(".vmp") && !from.starts_with(".vmp")))
                 {
                     *control.entry(from).or_default() += 1;
                     if samples.len() < 64 {
