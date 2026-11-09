@@ -1147,14 +1147,28 @@ fn loads_forward_from_a_wider_store_and_skip_disjoint_ranges() {
     }
     assert_eq!(sem.reads.len(), 1);
     assert!(!sem.assumes_stack_disjoint);
-    // straddles the end of the store: still unprovable
-    assert!(matches!(
-        lift(|a| {
-            a.mov(dword_ptr(rcx), edx).unwrap();
-            a.mov(rax, qword_ptr(rcx)).unwrap();
-        }),
-        Err(LiftError::MemoryAliasing { .. })
-    ));
+    // A load that CONTAINS a store is composed from several writes rather than
+    // refused. With the high half also stored, every byte is known, so the
+    // result is checkable -- this is VMProtect's `push r; xor [rsp],e32; pop r`
+    // idiom, where an 8-byte load sits over a 4-byte store.
+    let sem = ok(|a| {
+        a.mov(qword_ptr(rcx), rsi).unwrap();
+        a.mov(dword_ptr(rcx), edx).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+    });
+    assert!(sem.reads.is_empty());
+    for seed in SEEDS {
+        let (d, si) = (inp(seed, Gpr::Rdx), inp(seed, Gpr::Rsi));
+        assert_eq!(reg(&sem, seed, Gpr::Rax), (si & !0xFFFF_FFFF) | (d & 0xFFFF_FFFF));
+    }
+    // With the high half never written, the composition reads exactly the four
+    // bytes it is missing and nothing more.
+    let sem = ok(|a| {
+        a.mov(dword_ptr(rcx), edx).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+    });
+    assert_eq!(sem.reads.len(), 1);
+    assert_eq!(sem.reads[0].width, Width::W32);
 }
 
 #[test]

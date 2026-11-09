@@ -272,6 +272,10 @@ pub struct NativeBlock {
     pub end: u64,
     /// Lift of the straight-line body (terminator excluded); `None` if the lifter refused it.
     pub semantics: Option<BlockSemantics<Expr>>,
+    /// Why the body was refused, when `semantics` is `None`. Kept because the
+    /// terminator is recovered independently, so the refusal is no longer
+    /// visible as a `Terminator::Unsupported`.
+    pub body_refusal: Option<String>,
     pub terminator: Terminator,
     /// The lift relied on the stack-disjoint assumption (mirrors
     /// `semantics.assumes_stack_disjoint`; `false` when not lifted).
@@ -659,10 +663,12 @@ pub fn recover_native_cfg_opts(
             Ok(sem) => (Some(sem), None),
             Err(e) => (None, Some(e.to_string())),
         };
-        if body_refusal.is_some() && matches!(terminator, Terminator::Unsupported(_)) {
+        if let Some(why) = &body_refusal
+            && matches!(terminator, Terminator::Unsupported(_))
+        {
             // Nothing was recovered either way; keep the lift's reason, which is
             // the more specific of the two.
-            terminator = Terminator::Unsupported(body_refusal.clone().unwrap_or_default());
+            terminator = Terminator::Unsupported(why.clone());
         }
         match &terminator {
             Terminator::FallThrough(t) => edges.push((start, *t, EdgeKind::FallThrough)),
@@ -685,6 +691,7 @@ pub fn recover_native_cfg_opts(
                     .as_ref()
                     .is_some_and(|s| s.assumes_stack_disjoint),
                 semantics,
+                body_refusal,
                 terminator,
             },
         );
