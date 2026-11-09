@@ -49,19 +49,6 @@ application's imports (otherwise it asks before writing an image that will not
 run). It never executes the protected sample — a contained software emulator
 supplies the separate Observed tier, and that is the only thing that runs code.
 
-### What each stage does
-
-| stage | does |
-|---|---|
-| **unpack** | decompress a packed `.dll`/`.exe` to a mapped analysis image |
-| **analyse** | find every protector reference the application's own code makes |
-| **directories + strip** | rebuild the data directories out of `.vmp*`, remove the protector sections |
-| **entry point** | recover the original `DllEntryPoint` by its CRT obligation, not a signature |
-| **relocate** | move mutated-native functions out of the protector, verbatim, and repoint |
-| **devirtualize** | lift the integrity guards to native, folding the checksum to a constant |
-| **imports** | name the encrypted `.idata` slots from a snapshot and bind them in place |
-| **verify** | prove no reference into removed space remains, then write |
-
 ## What it does
 
 A single command takes a fully protected binary to a clean one and narrates every
@@ -74,28 +61,40 @@ vmpx auto protected.exe -o clean.exe
 It analyses the target and chooses its own instruction limit, step budget, and
 assumption set — no flags required — then runs the whole chain:
 
-- **Unpacks** the protected image and rebuilds a conventional section layout and
-  data directories from it.
-- **Recovers the original entry point** from the loader-obligation rule, with no
-  reliance on symbols, a PDB, or DWARF.
-- **Strips every `.vmp*` section** — the virtual machine, the mutated stubs, and
-  the packed copy of the original — and proves nothing references the removed
-  space before it writes.
-- **Relocates mutated native functions** out of the protector verbatim and
-  repoints their call sites.
-- **Devirtualizes the integrity and timing guards**, folding each checksum to a
-  constant against the intact image.
-- **Rebinds the encrypted `.idata` imports** from a post-init snapshot, so the
-  loader fills the slots the recovered code reads.
-- **Reports recovery in three labeled tiers**, never one headline number, so a
-  result is never silently conditional.
+```mermaid
+flowchart TD
+    A["Protected PE<br/>.exe · .dll · .xpl · .sys"] --> B["unpack<br/>decompress to a mapped image"]
+    B --> C["analyse<br/>find every protector reference the app makes"]
+    C --> D["rebuild layout<br/>conventional sections + data directories"]
+    D --> E["recover OEP<br/>CRT loader-obligation rule, no symbols/PDB/DWARF"]
+    E --> F["strip every .vmp*<br/>VM · mutated stubs · packed original"]
+    F --> G["relocate mutated natives<br/>move out verbatim + repoint call sites"]
+    G --> H["devirtualize guards<br/>fold each checksum to a constant"]
+    H --> I["rebind IAT<br/>name encrypted .idata slots, bind in place"]
+    I --> J["verify<br/>no reference into removed space remains"]
+    J --> K["Clean PE"]
+```
 
 ## Where it stands
 
-Across the VM entry stubs discovered in a fully protected x64 target, recovery
-falls into three labeled tiers. The report is deliberately three numbers rather
-than one, because "recovered" is not a single property — and an entry counts as
-*proven* only when it closes with an empty assumption set.
+What the pipeline can do today, end to end:
+
+| capability | status |
+|---|---|
+| Unpack a packed `.dll`/`.exe` to an analysis image | ✅ |
+| Recover the original entry point (OEP) with no symbols, PDB, or DWARF | ✅ |
+| Rebuild the section layout and data directories | ✅ |
+| Strip every `.vmp*` section — VM, mutated stubs, packed original | ✅ |
+| Relocate mutated native functions out of the protector, verbatim | ✅ |
+| Recover and rebind the import table (IAT) from the encrypted `.idata` | ✅ |
+| Devirtualize the integrity / timing guards | ◐ 10 / 14 |
+| Prove no dangling reference into stripped space before writing | ✅ |
+| Report recovery in three labeled tiers (N1 / N2 / N3) | ✅ |
+| N3 proven-equivalence wired at the PE level | ☐ planned |
+
+Recovery of the VM entry stubs is reported in three labeled tiers, never one
+headline number — an entry counts as *proven* only when it closes with an **empty**
+assumption set:
 
 ```mermaid
 pie showData
