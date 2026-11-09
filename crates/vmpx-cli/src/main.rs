@@ -324,6 +324,11 @@ enum Command {
         /// finding no references in 95% of the code is a sample, not a proof.
         #[arg(long)]
         accept_unverified_iat: bool,
+        /// Rebuild EVERY directory that lives in a removed section into one
+        /// appended section. The header has room for a single extra section, so
+        /// the per-directory flags can only ever move one of them.
+        #[arg(long)]
+        rebuild_directories: bool,
     },
 }
 
@@ -1688,6 +1693,7 @@ fn main() -> Result<()> {
             rebuild_imports,
             rebuild_tls,
             accept_unverified_iat,
+            rebuild_directories,
         } => {
             strip_wiring::run_strip(
                 &input,
@@ -1699,6 +1705,7 @@ fn main() -> Result<()> {
                 rebuild_imports,
                 rebuild_tls,
                 accept_unverified_iat,
+                rebuild_directories,
             )?;
         }
     }

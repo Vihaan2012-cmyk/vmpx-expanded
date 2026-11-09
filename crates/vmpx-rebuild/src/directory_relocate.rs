@@ -1112,6 +1112,378 @@ pub fn scan_iat_references(
     })
 }
 
+
+/// Everything a combined rebuild produced.
+#[derive(Clone, Debug)]
+pub struct AllDirectories {
+    pub bytes: Vec<u8>,
+    pub section: AppendedSection,
+    pub moved: Vec<RelocatedDirectory>,
+    pub exception_entries: (usize, usize),
+    pub import_modules: usize,
+    pub import_symbols: usize,
+    pub tls_callbacks: (usize, Vec<Rva>),
+    pub relocations: RelocationRebuild,
+}
+
+/// The TLS directory read out of the image, with its pointers resolved.
+struct TlsState {
+    raw: Vec<u8>,
+    index_va: u64,
+    kept: Vec<u64>,
+    dropped: Vec<Rva>,
+    zero_fill: u32,
+    characteristics: u32,
+}
+
+fn align8(payload: &mut Vec<u8>) {
+    while payload.len() % 8 != 0 {
+        payload.push(0);
+    }
+}
+
+/// Rebuilds EVERY directory that lives in a removed section into ONE appended
+/// section.
+///
+/// One section, not five, because the header has room for exactly one more.
+/// Measured on the sample: the section table ends at 0x5c0 and `SizeOfHeaders`
+/// is 0x600, so 64 free bytes -- a single 40-byte slot. Appending the export
+/// directory succeeds and the next append fails with "new section header ending
+/// at 0x610 exceeds header capacity 0x600". Growing the headers would mean
+/// moving every section's raw data; packing the directories together does not.
+///
+/// Read-write, because the IAT and the TLS index must be writable and the
+/// read-only tables beside them do not mind.
+///
+/// # Errors
+///
+/// A malformed directory, or any failure of the append.
+#[allow(clippy::too_many_lines)]
+pub fn rebuild_all_directories(
+    input: &[u8],
+    name: [u8; 8],
+    removed: &[&str],
+) -> Result<AllDirectories, DirectoryRelocateError> {
+    let at = At::new(input)?;
+    let image_base = at.pe.optional.image_base.get();
+    let present = |index: usize| {
+        at.pe
+            .directory(index)
+            .filter(|directory| directory.address != 0 && directory.size != 0)
+            .map(|directory| (Rva(directory.address), directory.size))
+    };
+    let in_removed = |rva: Rva| {
+        at.pe.sections.iter().any(|section| {
+            removed.contains(&section.name.as_str()) && section.contains_mapped_rva(rva)
+        })
+    };
+    let moves = |index: usize| present(index).filter(|(rva, _)| in_removed(*rva));
+
+    // ---- read every table that has to move -------------------------------
+    let exports = match moves(EXPORT_DIRECTORY) {
+        Some(from) => Some((from.0, read_exports(&at)?.2)),
+        None => None,
+    };
+    let imports = match moves(IMPORT_DIRECTORY) {
+        Some(from) => Some((from.0, read_imports(&at)?)),
+        None => None,
+    };
+    let exceptions = match moves(EXCEPTION_DIRECTORY) {
+        Some((from, size)) => {
+            let count = size as usize / RUNTIME_FUNCTION_BYTES;
+            let table = at.slice(from, count * RUNTIME_FUNCTION_BYTES)?;
+            let mut kept = Vec::with_capacity(table.len());
+            let mut dropped = 0_usize;
+            for index in 0..count {
+                let entry =
+                    &table[index * RUNTIME_FUNCTION_BYTES..(index + 1) * RUNTIME_FUNCTION_BYTES];
+                let word = |at: usize| {
+                    u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]])
+                };
+                let (begin, end, unwind) = (word(0), word(4), word(8));
+                if in_removed(Rva(begin)) || in_removed(Rva(end.saturating_sub(1))) {
+                    dropped += 1;
+                    continue;
+                }
+                if in_removed(Rva(unwind)) {
+                    return Err(DirectoryRelocateError::Malformed(format!(
+                        "runtime function {begin:#x} keeps unwind info at {unwind:#x}, inside a removed section"
+                    )));
+                }
+                kept.extend_from_slice(entry);
+            }
+            Some((from, kept, dropped))
+        }
+        None => None,
+    };
+    let tls = match moves(TLS_DIRECTORY) {
+        Some((from, _)) => {
+            let header = at.slice(from, TLS_DIRECTORY_BYTES)?;
+            let quad = |offset: usize| {
+                u64::from_le_bytes(header[offset..offset + 8].try_into().expect("8 bytes"))
+            };
+            let word = |offset: usize| {
+                u32::from_le_bytes(header[offset..offset + 4].try_into().expect("4 bytes"))
+            };
+            let to_rva = |va: u64| -> Result<Rva, DirectoryRelocateError> {
+                va.checked_sub(image_base)
+                    .and_then(|rva| u32::try_from(rva).ok())
+                    .map(Rva)
+                    .ok_or_else(|| {
+                        DirectoryRelocateError::Malformed(format!(
+                            "TLS pointer {va:#x} is below the base"
+                        ))
+                    })
+            };
+            let (raw_start, raw_end) = (to_rva(quad(0))?, to_rva(quad(8))?);
+            if raw_end.0 < raw_start.0 {
+                return Err(DirectoryRelocateError::Malformed(
+                    "TLS raw data ends before it starts".to_owned(),
+                ));
+            }
+            let raw = at
+                .slice(raw_start, (raw_end.0 - raw_start.0) as usize)?
+                .to_vec();
+            let callbacks = to_rva(quad(24))?;
+            let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+            for slot in 0_u32.. {
+                let entry = Rva(callbacks.0.saturating_add(slot.saturating_mul(8)));
+                let value =
+                    u64::from_le_bytes(at.slice(entry, 8)?.try_into().expect("8 bytes"));
+                if value == 0 {
+                    break;
+                }
+                let target = to_rva(value)?;
+                if in_removed(target) {
+                    dropped.push(target);
+                } else {
+                    kept.push(value);
+                }
+                if slot > 1024 {
+                    return Err(DirectoryRelocateError::Malformed(
+                        "TLS callback array is unterminated".to_owned(),
+                    ));
+                }
+            }
+            Some((
+                from,
+                TlsState {
+                    raw,
+                    index_va: quad(16),
+                    kept,
+                    dropped,
+                    zero_fill: word(32),
+                    characteristics: word(36),
+                },
+            ))
+        }
+        None => None,
+    };
+    // Surviving fixups, as (target, kind). The rebuilt pointers are added when
+    // the layout knows where they landed.
+    let mut surviving: Vec<(Rva, u8)> = Vec::new();
+    let mut dropped_fixups = 0_usize;
+    for block in &at
+        .pe
+        .parse_relocations()
+        .map_err(|error| DirectoryRelocateError::Malformed(error.to_string()))?
+    {
+        for entry in &block.entries {
+            if entry.kind == 0 {
+                continue;
+            }
+            let target = Rva(block.page_rva.0.saturating_add(u32::from(entry.offset)));
+            if in_removed(target) {
+                dropped_fixups += 1;
+            } else {
+                surviving.push((target, entry.kind));
+            }
+        }
+    }
+    let relocation_from = present(BASE_RELOCATION_DIRECTORY).map_or(Rva(0), |(rva, _)| rva);
+    let iat_was = present(IAT_DIRECTORY).map_or(Rva(0), |(rva, _)| rva);
+
+    // ---- lay everything out at `base` ------------------------------------
+    let build = |base: Rva| -> (Vec<u8>, Vec<RelocatedDirectory>) {
+        let mut payload: Vec<u8> = Vec::new();
+        let mut placed: Vec<RelocatedDirectory> = Vec::new();
+        let here = |payload: &Vec<u8>| Rva(base.0 + u32::try_from(payload.len()).unwrap_or(0));
+        let mut fixups: Vec<Rva> = Vec::new();
+
+        if let Some((from, exports)) = &exports {
+            let start = here(&payload);
+            let bytes = serialize_exports(exports, start);
+            let size = u32::try_from(bytes.len()).unwrap_or(0);
+            payload.extend_from_slice(&bytes);
+            align8(&mut payload);
+            placed.push(RelocatedDirectory { index: EXPORT_DIRECTORY, from: *from, to: start, size });
+        }
+        if let Some((from, table, _)) = &exceptions {
+            let start = here(&payload);
+            let size = u32::try_from(table.len()).unwrap_or(0);
+            payload.extend_from_slice(table);
+            align8(&mut payload);
+            placed.push(RelocatedDirectory { index: EXCEPTION_DIRECTORY, from: *from, to: start, size });
+        }
+        if let Some((from, modules)) = &imports {
+            let start = here(&payload);
+            let (bytes, iat_rva, iat_size) = serialize_imports(modules, start);
+            let descriptors = u32::try_from((modules.len() + 1) * DESCRIPTOR_BYTES).unwrap_or(0);
+            payload.extend_from_slice(&bytes);
+            align8(&mut payload);
+            placed.push(RelocatedDirectory { index: IMPORT_DIRECTORY, from: *from, to: start, size: descriptors });
+            placed.push(RelocatedDirectory {
+                index: IAT_DIRECTORY,
+                from: iat_was,
+                to: iat_rva,
+                size: iat_size,
+            });
+        }
+        if let Some((from, tls)) = &tls {
+            let start = here(&payload);
+            let raw_rva = start.0 + u32::try_from(TLS_DIRECTORY_BYTES).unwrap_or(0);
+            let callbacks = raw_rva + u32::try_from(tls.raw.len()).unwrap_or(0);
+            payload.extend_from_slice(&(image_base + u64::from(raw_rva)).to_le_bytes());
+            payload.extend_from_slice(
+                &(image_base + u64::from(raw_rva) + tls.raw.len() as u64).to_le_bytes(),
+            );
+            payload.extend_from_slice(&tls.index_va.to_le_bytes());
+            payload.extend_from_slice(&(image_base + u64::from(callbacks)).to_le_bytes());
+            payload.extend_from_slice(&tls.zero_fill.to_le_bytes());
+            payload.extend_from_slice(&tls.characteristics.to_le_bytes());
+            payload.extend_from_slice(&tls.raw);
+            for callback in &tls.kept {
+                payload.extend_from_slice(&callback.to_le_bytes());
+            }
+            payload.extend_from_slice(&0_u64.to_le_bytes());
+            align8(&mut payload);
+            placed.push(RelocatedDirectory {
+                index: TLS_DIRECTORY,
+                from: *from,
+                to: start,
+                size: u32::try_from(TLS_DIRECTORY_BYTES).unwrap_or(0),
+            });
+            // The four VA fields, then one slot per surviving callback.
+            fixups.extend([start, Rva(start.0 + 8), Rva(start.0 + 16), Rva(start.0 + 24)]);
+            for slot in 0..tls.kept.len() {
+                fixups.push(Rva(callbacks + u32::try_from(slot * 8).unwrap_or(0)));
+            }
+        }
+        // Relocations last: they describe the pointers written above.
+        let mut pages: std::collections::BTreeMap<u32, Vec<u16>> =
+            std::collections::BTreeMap::new();
+        for (target, kind) in &surviving {
+            pages
+                .entry(target.0 & !0xfff)
+                .or_default()
+                .push((u16::from(*kind) << 12) | u16::try_from(target.0 & 0xfff).unwrap_or(0));
+        }
+        for target in &fixups {
+            pages
+                .entry(target.0 & !0xfff)
+                .or_default()
+                .push((DIR64 << 12) | u16::try_from(target.0 & 0xfff).unwrap_or(0));
+        }
+        if !pages.is_empty() {
+            let start = here(&payload);
+            let mut table: Vec<u8> = Vec::new();
+            for (page, mut entries) in pages {
+                entries.sort_unstable();
+                if entries.len() % 2 != 0 {
+                    entries.push(0);
+                }
+                let size = u32::try_from(8 + entries.len() * 2).unwrap_or(0);
+                table.extend_from_slice(&page.to_le_bytes());
+                table.extend_from_slice(&size.to_le_bytes());
+                for entry in entries {
+                    table.extend_from_slice(&entry.to_le_bytes());
+                }
+            }
+            let size = u32::try_from(table.len()).unwrap_or(0);
+            payload.extend_from_slice(&table);
+            align8(&mut payload);
+            placed.push(RelocatedDirectory {
+                index: BASE_RELOCATION_DIRECTORY,
+                from: relocation_from,
+                to: start,
+                size,
+            });
+        }
+        (payload, placed)
+    };
+
+    let (probe, _) = build(Rva(0));
+    if probe.is_empty() {
+        return Err(DirectoryRelocateError::Absent("relocatable directory"));
+    }
+    let first = append_section(
+        input,
+        AppendSection { name, data: &probe, characteristics: READ_WRITE_DATA },
+    )?;
+    let placed_at = first.section.rva;
+    let (payload, placements) = build(placed_at);
+    if payload.len() != probe.len() {
+        return Err(DirectoryRelocateError::Malformed(
+            "combined directory payload changed length between passes".to_owned(),
+        ));
+    }
+    let second = append_section(
+        input,
+        AppendSection { name, data: &payload, characteristics: READ_WRITE_DATA },
+    )?;
+    if second.section.rva != placed_at {
+        return Err(DirectoryRelocateError::Unstable {
+            first: placed_at,
+            second: second.section.rva,
+        });
+    }
+    let mut bytes = second.bytes;
+    for directory in &placements {
+        write_directory(&mut bytes, directory.index, directory.to, directory.size)?;
+    }
+    // Read the moved tables back out of the rewritten image before offering it.
+    let rebuilt = At::new(&bytes)?;
+    if exports.is_some() {
+        read_exports(&rebuilt)?;
+    }
+    if imports.is_some() {
+        read_imports(&rebuilt)?;
+    }
+    // Count what the rebuilt table actually holds beyond the survivors, rather
+    // than guessing from the directory list: the TLS rebuild emits one fixup per
+    // pointer it wrote, which is four header fields PLUS one per callback.
+    let added = rebuilt
+        .pe
+        .parse_relocations()
+        .map_err(|error| DirectoryRelocateError::Malformed(error.to_string()))?
+        .iter()
+        .map(|block| block.entries.iter().filter(|entry| entry.kind != 0).count())
+        .sum::<usize>()
+        .saturating_sub(surviving.len());
+    Ok(AllDirectories {
+        bytes,
+        section: second.section,
+        moved: placements,
+        exception_entries: exceptions
+            .as_ref()
+            .map_or((0, 0), |(_, table, dropped)| {
+                (table.len() / RUNTIME_FUNCTION_BYTES, *dropped)
+            }),
+        import_modules: imports.as_ref().map_or(0, |(_, modules)| modules.len()),
+        import_symbols: imports.as_ref().map_or(0, |(_, modules)| {
+            modules.iter().map(|module| module.symbols.len()).sum()
+        }),
+        tls_callbacks: tls
+            .as_ref()
+            .map_or((0, Vec::new()), |(_, tls)| (tls.kept.len(), tls.dropped.clone())),
+        relocations: RelocationRebuild {
+            kept: surviving.len(),
+            dropped: dropped_fixups,
+            added,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests;
 
