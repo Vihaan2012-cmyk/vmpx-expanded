@@ -124,7 +124,14 @@ pub(crate) fn build_one(
     va: u64,
 ) -> Result<Vec<u8>, String> {
     let rolled = crate::decoded_splice::with_entry_input(intact, Rva(rva), instruction_limit, |input| {
-        vmpx_vmlift::roll_decoded_cfg(input, 200_000)
+        let resolver = vmpx_vmlift::PeNestedEntries {
+            pe: intact,
+            limits: vmpx_vm::EntryProfileRecoveryLimits {
+                instruction_limit,
+                ..vmpx_vm::EntryProfileRecoveryLimits::default()
+            },
+        };
+        vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
     })??;
     let mut has_loop = false;
     let mut paths = Vec::new();

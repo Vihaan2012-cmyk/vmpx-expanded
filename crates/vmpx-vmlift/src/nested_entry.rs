@@ -37,11 +37,27 @@ pub struct PeNestedEntries<'a, 'b> {
 
 impl NestedEntryResolver for PeNestedEntries<'_, '_> {
     fn resolve(&self, return_address: &vmpx_vm::Expr) -> Option<NestedEntry> {
-        let ExprKind::Const { value } = return_address.simplify().kind else {
-            return None;
-        };
         let base = self.pe.optional.image_base;
-        let (frame_entry, candidate) = nested_entry_stub(self.pe, base.checked_rva_of(Va(value))?)?;
+        // A nested entry's return address is the entry stub's VA, which the
+        // protector may emit as modulo-image arithmetic rather than a constant.
+        // Resolve the single proven image target exactly as the CFG's own
+        // nested-entry follow does, so a non-constant does not refuse the entry.
+        let simplified = return_address.simplify();
+        let rva = if let ExprKind::Const { value } = simplified.kind {
+            base.checked_rva_of(Va(value))?
+        } else {
+            let report = vmpx_vm::recover_modulo_image_targets(
+                self.pe,
+                return_address,
+                vmpx_vm::ModuloImageTargetLimits::default(),
+            )
+            .ok()?;
+            if !report.complete || report.targets.len() != 1 {
+                return None;
+            }
+            report.targets[0].rva?
+        };
+        let (frame_entry, candidate) = nested_entry_stub(self.pe, rva)?;
         let stream = recover_entry_stream(self.pe, &candidate, self.limits).ok()?;
         let (frame, top_offset) = recover_entry_frame(
             self.pe,
