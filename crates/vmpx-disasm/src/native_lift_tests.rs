@@ -836,16 +836,22 @@ fn cmov_setcc_read_entry_flags_fold_constants_and_fail_closed() {
         sem.regs[&Gpr::Rdx],
         zext64(trunc(Width::W32, input("rcx_in")))
     );
-    let cmov = lift(|a| {
+    // `shl` clobbers CF, so `cmovb` SELECTS on a flag whose computation was not
+    // modeled. That is a selection, not a branch: the condition becomes a free
+    // term and the block lifts, with a destination no evaluation can pin down.
+    // Control flow is untouched -- a conditional jump on a clobbered flag still
+    // fails closed.
+    let get = |name: &str| input_value(0, name);
+    let cmov = ok(|a| {
         a.shl(eax, 1).unwrap();
         a.cmovb(ebx, ecx).unwrap();
     });
-    assert!(matches!(cmov, Err(LiftError::Unsupported { .. })));
-    let set = lift(|a| {
+    assert_eq!(eval_with(&cmov.regs[&Gpr::Rbx], &get), None);
+    let set = ok(|a| {
         a.shl(eax, 1).unwrap();
         a.sete(dl).unwrap();
     });
-    assert!(matches!(set, Err(LiftError::Unsupported { .. })));
+    assert_eq!(eval_with(&set.regs[&Gpr::Rdx], &get), None);
 }
 
 fn wide_mul_ref(bits: u32, signed: bool, a: u64, b: u64) -> (u64, u64) {
@@ -1602,15 +1608,17 @@ fn rcl_rcr_rotate_the_operand_through_carry() {
     let noop = ok(|a| a.rcl(ebx, 0u32).unwrap());
     assert!(noop.written.is_empty());
 
-    // Fail closed: 64-bit (carry bit has no wider native width) and variable counts.
-    assert!(matches!(
-        lift(|a| a.rcl(rbx, 3u32).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
-    assert!(matches!(
-        lift(|a| a.rcr(ebx, cl).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
+    // The two shapes the exact path cannot express -- a 64-bit operand (the
+    // rotated value needs 65 bits) and a variable count (the modulus is
+    // width+1, so the count cannot be masked) -- are over-approximated as an
+    // unknown function of the operands rather than refused. Defined behaviour
+    // modelled loosely, so the destination is opaque but the block lifts.
+    for sem in [
+        ok(|a| a.rcl(rbx, 3u32).unwrap()),
+        ok(|a| a.rcr(ebx, cl).unwrap()),
+    ] {
+        assert_eq!(eval_with(&sem.regs[&Gpr::Rbx], &|name| input_value(0, name)), None);
+    }
     // Fail closed when the carry-in is not modeled (imul clobbers CF).
     assert!(matches!(
         lift(|a| {
