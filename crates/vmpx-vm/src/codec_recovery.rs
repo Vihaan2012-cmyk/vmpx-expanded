@@ -314,8 +314,15 @@ pub fn recover_handler_codecs(
         config.trace_limits.max_conditional_continuations = 1;
         recover_handler_codecs_once(pe, entry, &config)
     };
-    let fallthrough = walk(false)?;
-    let taken = walk(true)?;
+    // An arm walk that errors is NOT this handler's answer: it means the chosen
+    // arm ran into something that does not decode -- VMProtect joins fragments
+    // through predicates whose untaken side points at data. Propagating that
+    // turned six entries' ordinary "no recovered specification" into a hard
+    // "native handler recovery failed: invalid instruction", which is a worse
+    // report of the same fact. The base report is the answer in that case.
+    let (Ok(fallthrough), Ok(taken)) = (walk(false), walk(true)) else {
+        return Ok(base);
+    };
     let agree = fallthrough.decode_spec.is_some()
         && fallthrough.decode_spec == taken.decode_spec
         && fallthrough.boundary_spec == taken.boundary_spec

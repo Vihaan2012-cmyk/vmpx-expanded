@@ -1745,7 +1745,9 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
     }
     Some(match &expression.kind {
         ExprKind::Binary { op, .. } => match op {
-            BinaryOp::Add => "Add",
+            // An `Add` only refuses when BOTH sides carry a root, which is a
+            // non-unit coefficient, not a missing arm.
+            BinaryOp::Add => "Add/two-roots",
             BinaryOp::Sub => "Sub",
             BinaryOp::Mul => "Mul",
             BinaryOp::Shl => "Shl",
@@ -1799,7 +1801,18 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
             format!("Intrinsic:{name}").into_boxed_str(),
         )),
         ExprKind::Extract { .. } => "Extract",
-        ExprKind::Concat { .. } => "Concat",
+        // Both halves bound (the recursion above would have reported a child
+        // otherwise), so say which of the arm's own conditions refused.
+        ExprKind::Concat { high, low } => {
+            let reason = if u32::from(low.width.bits()) >= 64 {
+                "wide-low"
+            } else if address_bounds(high).is_some_and(|bounds| bounds.root.is_some()) {
+                "rooted-high"
+            } else {
+                "overflow"
+            };
+            return Some(Box::leak(format!("Concat/{reason}").into_boxed_str()));
+        }
         // Name it: a bare 64-bit register is the one shape nothing can bound, so
         // WHICH register says whether that is a caller value (genuinely runtime)
         // or VM state that something else should have resolved.
@@ -1911,6 +1924,42 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 root: low.root,
                 lo: shift(high.lo)?.checked_add(low.lo)?,
                 hi: shift(high.hi)?.checked_add(low.hi)?,
+            })
+        }
+        // `!x` over w bits is exactly `(2^w - 1) - x`, so a rootless bounded
+        // operand stays bounded with its ends swapped. A rooted operand is
+        // refused: complementing a root is not `root + constant`.
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            value,
+        } => {
+            let (_, mask) = unsigned_width_range(expression.width)?;
+            let inner = address_bounds(value)?;
+            if inner.root.is_some() || inner.lo < 0 || inner.hi > mask {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: mask - inner.hi,
+                hi: mask - inner.lo,
+            })
+        }
+        // `-x` wraps as soon as `x` can be zero, so its image is not a
+        // contiguous range and the operand's own bounds do not carry over. The
+        // width bound is the sound answer, and it still bounds a sub-64-bit
+        // value. Rooted operands are refused as above.
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            value,
+        } => {
+            let (lo, hi) = unsigned_width_range(expression.width)?;
+            if address_bounds(value)?.root.is_some() {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo,
+                hi,
             })
         }
         // `x >> c` on a rootless non-negative range. A rooted operand is
@@ -3912,6 +3961,64 @@ mod tests {
             Expr::register(BitWidth::W32, "vsp_initial"),
         )
         .expect("concat");
+        assert!(address_bounds(&address).is_none());
+    }
+
+    // `!x` over w bits is `(2^w - 1) - x`, so a rootless bounded operand stays
+    // bounded with its ends swapped.
+    #[test]
+    fn a_complement_of_a_narrow_value_is_bounded_by_its_width() {
+        let masked = Expr::binary(
+            BinaryOp::And,
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::constant(BitWidth::W32, 0xff),
+        )
+        .expect("mask");
+        let bounds = address_bounds(&Expr::unary(UnaryOp::Not, masked))
+            .expect("bounded");
+        assert_eq!((bounds.lo, bounds.hi), (0xffff_ff00, 0xffff_ffff));
+        assert!(bounds.root.is_none());
+    }
+
+    // `-x` wraps once x can be zero, so the operand's range must NOT carry over;
+    // the width bound is what is sound.
+    #[test]
+    fn a_negation_falls_back_to_the_width_bound() {
+        let masked = Expr::binary(
+            BinaryOp::And,
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::constant(BitWidth::W32, 0xff),
+        )
+        .expect("mask");
+        let bounds = address_bounds(&Expr::unary(UnaryOp::Neg, masked))
+            .expect("bounded");
+        assert_eq!((bounds.lo, bounds.hi), (0, 0xffff_ffff));
+    }
+
+    // Both arms must refuse a ROOTED operand: complementing or negating a root
+    // is not `root + constant`, and trading the root away for a value bound is
+    // the mistake this file already measured at +0.
+    #[test]
+    fn a_unary_over_a_rooted_operand_is_refused() {
+        let rooted = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("rooted");
+        for op in [UnaryOp::Not, UnaryOp::Neg] {
+            let address = Expr::unary(op, rooted.clone());
+            assert!(address_bounds(&address).is_none(), "{op:?} must refuse a root");
+        }
+    }
+
+    // A 64-bit complement has no width bound to fall back on.
+    #[test]
+    fn a_full_width_complement_is_not_bounded() {
+        let address = Expr::unary(
+            UnaryOp::Not,
+            Expr::register(BitWidth::W64, "native_rax_initial"),
+        );
         assert!(address_bounds(&address).is_none());
     }
 

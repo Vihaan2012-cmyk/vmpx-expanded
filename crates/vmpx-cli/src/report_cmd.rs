@@ -218,6 +218,15 @@ fn cfg_limits(instruction_limit: usize, serve_ro: bool, serve_observed: bool) ->
         max_transition_instructions: VmCfgLimits::default()
             .max_transition_instructions
             .saturating_mul(transition_scale()),
+        // Branch-target enumeration's own domain cap, separate from the work
+        // budget: with `VMPX_ENUMERATION_WORK` raised, the four
+        // enumeration-cost entries moved on to refusing here instead.
+        domain: vmpx_vm::SymbolicDomainLimits {
+            max_combinations: vmpx_vm::SymbolicDomainLimits::default()
+                .max_combinations
+                .saturating_mul(env_scale("VMPX_DOMAIN_COMBINATIONS")),
+            ..vmpx_vm::SymbolicDomainLimits::default()
+        },
         follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some(),
         // VMPX_WALL_SECS sets the per-entry budget, and a budget-pass sweep bounds
         // each rerun entry by VMPX_PASS_WALL_SECS instead. A lower cap only stops
@@ -1027,6 +1036,8 @@ pub fn render(r: &Report) -> String {
         ("profile-transitions", "VMPX_PROFILE_TRANSITIONS"),
         ("nested-entries", "VMPX_NESTED_ENTRIES"),
         ("dispatch-proof-states", "VMPX_DISPATCH_PROOF_STATES"),
+        ("enumeration-work", "VMPX_ENUMERATION_WORK"),
+        ("domain-combinations", "VMPX_DOMAIN_COMBINATIONS"),
     ]
     .into_iter()
     .filter_map(|(name, var)| {
