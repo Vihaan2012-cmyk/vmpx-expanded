@@ -70,6 +70,8 @@ pub struct Log {
     run_at: Instant,
     stage_at: std::cell::Cell<Instant>,
     started: std::cell::Cell<bool>,
+    /// A plain (no-colour) transcript of every line, when a log file is set.
+    file: Option<std::sync::Mutex<std::fs::File>>,
 }
 
 impl Log {
@@ -82,7 +84,18 @@ impl Log {
             run_at: now,
             stage_at: std::cell::Cell::new(now),
             started: std::cell::Cell::new(false),
+            file: None,
         }
+    }
+
+    /// Mirror every line (colour-stripped) into `path`, truncating it. A failure
+    /// to open is reported and logging continues to the terminal only.
+    pub fn with_file(mut self, path: &std::path::Path) -> Self {
+        match std::fs::File::create(path) {
+            Ok(file) => self.file = Some(std::sync::Mutex::new(file)),
+            Err(error) => self.warn(&format!("cannot write log file {}: {error}", path.display())),
+        }
+        self
     }
 
     /// Elapsed since the previous `stage` call (or run start), reset for the next.
@@ -104,7 +117,10 @@ impl Log {
         }
     }
 
-    fn emit(&self, kind: Kind, message: &str, detail: Option<&str>) {
+    /// `to_terminal` false writes the line only to the file transcript -- used
+    /// for the per-step detail lines a concise terminal hides. The file always
+    /// gets the full, plain trace.
+    fn emit_where(&self, kind: Kind, message: &str, detail: Option<&str>, to_terminal: bool) {
         let tag = self.paint("90", &format!("[{}]", self.tag));
         let arrow = self.paint("90", "»");
         let glyph = self.paint(kind.colour(), kind.glyph());
@@ -112,16 +128,31 @@ impl Log {
         let left = format!("{tag} {arrow} {glyph} {label} {message}");
         let line = match detail {
             Some(detail) => {
-                // Pad so the detail sits at a fixed column; measure the VISIBLE
-                // length (strip SGR) so colour does not skew the alignment.
                 let visible = visible_len(&left);
                 let pad = DETAIL_COLUMN.saturating_sub(visible).max(2);
                 format!("{left}{}{}", " ".repeat(pad), self.paint("90", detail))
             }
             None => left,
         };
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
+        if to_terminal {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = writeln!(file, "{}", strip_sgr(&line));
+        }
+    }
+
+    fn emit(&self, kind: Kind, message: &str, detail: Option<&str>) {
+        self.emit_where(kind, message, detail, true);
+    }
+
+    /// A fine-grained detail line: always in the file, on the terminal only when
+    /// verbose. Use it liberally for the step-by-step trace.
+    pub fn trace(&self, message: &str, detail: &str) {
+        self.emit_where(Kind::Step, message, Some(detail), self.verbose);
     }
 
     /// Begin a stage. The right-aligned detail shows how long the PREVIOUS
@@ -138,14 +169,10 @@ impl Log {
         self.emit(Kind::Info, message, None);
     }
     pub fn step(&self, message: &str, detail: &str) {
-        if self.verbose {
-            self.emit(Kind::Step, message, Some(detail));
-        }
+        self.emit_where(Kind::Step, message, Some(detail), self.verbose);
     }
     pub fn layer(&self, message: &str, detail: &str) {
-        if self.verbose {
-            self.emit(Kind::Layer, message, Some(detail));
-        }
+        self.emit_where(Kind::Layer, message, Some(detail), self.verbose);
     }
     pub fn success(&self, message: &str) {
         self.emit(Kind::Success, message, None);
@@ -191,6 +218,24 @@ fn format_elapsed(duration: std::time::Duration) -> String {
     } else {
         format!("in {:.1} s", duration.as_secs_f64())
     }
+}
+
+/// `text` with every SGR escape sequence removed, for the file transcript.
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for e in chars.by_ref() {
+                if e == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Length of `text` ignoring SGR escape sequences, for alignment.

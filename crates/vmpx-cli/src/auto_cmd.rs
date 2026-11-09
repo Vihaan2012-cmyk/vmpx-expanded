@@ -15,6 +15,7 @@ use vmpx_rebuild::{
     AppendSection, append_section, directory_relocate::rebuild_all_directories, next_section_rva,
     retarget_direct_branch, retarget_rip_relative, set_entry_point, validate_for_loader,
 };
+use vmpx_unpack::{UnpackLimits, locate_packer_table, unpack_to_mapped_image};
 use vmpx_vm::{VmDiscoveryLimits, analyze_vm_entry_at};
 
 use crate::logkit::Log;
@@ -29,8 +30,17 @@ pub struct Options {
     /// Post-init snapshot (VMPXSNP1) for import recovery; without it, imports
     /// stay as they are and that stage is skipped.
     pub snapshot: Option<PathBuf>,
-    /// Print the full per-step trace (`--log`).
+    /// Print the full per-step trace on the terminal (`--log`). The file
+    /// transcript is always full regardless.
     pub verbose: bool,
+    /// Where to write the full transcript; defaults to the output with a `.log`
+    /// extension.
+    pub log_file: Option<PathBuf>,
+    /// Treat the input as a packed on-disk `.dll`/`.exe`: unpack it to a mapped
+    /// analysis image first.
+    pub unpack: bool,
+    /// Never prompt; assume "no" for every optional step (for scripts).
+    pub yes_to_all_defaults: bool,
 }
 
 const EXEC: u32 = 0x2000_0000;
@@ -286,8 +296,29 @@ pub(crate) fn auto_settings() -> bool {
     AUTO_SETTINGS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Ask a yes/no question. Returns `default` without prompting when
+/// `no_prompt` is set or stdin is not a terminal (so scripts are deterministic).
+fn confirm(log: &Log, question: &str, default: bool, no_prompt: bool) -> bool {
+    use std::io::{IsTerminal, Write};
+    if no_prompt || !std::io::stdin().is_terminal() {
+        log.info(&format!("{question} [{}] (assumed)", if default { "Y/n" } else { "y/N" }));
+        return default;
+    }
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    print!("    ? {question} {hint} ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return default;
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default,
+    }
+}
+
 pub fn run(o: Options) -> Result<(), String> {
-    let log = Log::new("vmpx", o.verbose);
     // `auto` IS the experimental path, so it enables the recovery settings
     // itself instead of making the caller remember env vars.
     AUTO_SETTINGS.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -303,9 +334,54 @@ pub fn run(o: Options) -> Result<(), String> {
         }
         None => o.output.clone(),
     };
+    // The file transcript always gets the FULL step-by-step trace, even when the
+    // terminal is concise; `--log` additionally shows every step on screen.
+    let log_path = o
+        .log_file
+        .clone()
+        .unwrap_or_else(|| output.with_extension("log"));
+    let log = Log::new("vmpx", o.verbose).with_file(&log_path);
     log.start(&format!("Devirtualizing {}", o.input.display()));
 
-    let bytes = std::fs::read(&o.input).map_err(|e| e.to_string())?;
+    let raw = std::fs::read(&o.input).map_err(|e| e.to_string())?;
+    // A packed on-disk `.dll`/`.exe` must be unpacked to a mapped analysis image
+    // first. `--unpack` forces it; otherwise a packer table is detected and the
+    // user is asked.
+    let bytes = {
+        let packed = PeImage::parse(&raw)
+            .ok()
+            .and_then(|pe| locate_packer_table(&pe, UnpackLimits::default()).ok())
+            .is_some();
+        let do_unpack = o.unpack
+            || (packed
+                && confirm(
+                    &log,
+                    "input looks packed; unpack it to a mapped image first?",
+                    true,
+                    o.yes_to_all_defaults,
+                ));
+        if do_unpack {
+            log.start("Unpacking to a mapped analysis image");
+            let result = unpack_to_mapped_image(&raw, UnpackLimits::default())
+                .map_err(|e| format!("unpack: {e}"))?;
+            log.step(
+                "unpacked",
+                &format!(
+                    "{:?}, {} byte(s) mapped",
+                    result.report.packer_table.kind,
+                    result.image.len()
+                ),
+            );
+            if let Some(dir) = &o.dir {
+                let mapped_path = dir.join("mapped.bin");
+                std::fs::write(&mapped_path, &result.image).map_err(|e| e.to_string())?;
+                log.file(&mapped_path.display().to_string(), &format!("{} bytes", result.image.len()));
+            }
+            result.image
+        } else {
+            raw
+        }
+    };
     let pe = PeImage::parse(&bytes).map_err(|e| e.to_string())?;
     let base = pe.optional.image_base.0;
     let report = vmpx_detect::detect_vmprotect(&pe);
@@ -401,14 +477,33 @@ pub fn run(o: Options) -> Result<(), String> {
     }
 
     // --- imports ---
-    if let Some(snapshot) = &o.snapshot {
+    // A given snapshot is used directly. With none, look for one beside the
+    // input (`<input>.snap`), and if that is absent the application's imports
+    // cannot be recovered statically (`.idata` is encrypted); ask whether to
+    // proceed without them.
+    let snapshot = o.snapshot.clone().or_else(|| {
+        let beside = o.input.with_extension("snap");
+        beside.exists().then_some(beside)
+    });
+    if let Some(snapshot) = &snapshot {
         log.start("Rebuilding the application import table");
+        log.trace("snapshot", &snapshot.display().to_string());
         match crate::auto_imports::bind(&log, &pe, &bytes, &image, snapshot) {
             Ok(bound) => image = bound,
             Err(reason) => log.warn(&format!("import binding skipped: {reason}")),
         }
     } else {
-        log.info("no snapshot given; import table left as-is (pass --snapshot to recover it)");
+        log.start("Application import table");
+        log.warn("no snapshot: the application's imports are in encrypted .idata");
+        log.info("produce one with `clean --dynamic`, or pass --snapshot <VMPXSNP1>");
+        if !confirm(
+            &log,
+            "write the image WITHOUT recovering imports (it will not run)?",
+            true,
+            o.yes_to_all_defaults,
+        ) {
+            return Err("aborted: run again with --snapshot to bind imports".to_owned());
+        }
     }
 
     // --- verify + write ---

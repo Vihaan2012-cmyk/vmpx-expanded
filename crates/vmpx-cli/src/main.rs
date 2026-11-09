@@ -231,7 +231,7 @@ enum Command {
     /// strip, directory rebuild, OEP, native relocation, guard devirtualization,
     /// and (with a snapshot) import binding.
     Auto {
-        /// Mapped analysis image (protector sections present).
+        /// Mapped analysis image, or a packed `.dll`/`.exe` with --unpack.
         input: PathBuf,
         /// Output image name (placed under --dir when relative).
         output: PathBuf,
@@ -241,9 +241,19 @@ enum Command {
         /// Post-init snapshot (VMPXSNP1) for import recovery.
         #[arg(long)]
         snapshot: Option<PathBuf>,
-        /// Print the full per-step trace.
+        /// Print the full per-step trace on the terminal (the file transcript is
+        /// always full).
         #[arg(long)]
         log: bool,
+        /// Where to write the full transcript (default: output with `.log`).
+        #[arg(long = "log-file")]
+        log_file: Option<PathBuf>,
+        /// Treat the input as a packed on-disk image and unpack it first.
+        #[arg(long)]
+        unpack: bool,
+        /// Never prompt; take the default for every optional step.
+        #[arg(long = "no-prompt")]
+        no_prompt: bool,
     },
     /// Devirtualize guard functions to native code and reintegrate them into a
     /// stripped image, folding the integrity checksum to a constant.
@@ -1360,12 +1370,18 @@ fn main() -> Result<()> {
             dir,
             snapshot,
             log,
+            log_file,
+            unpack,
+            no_prompt,
         } => auto_cmd::run(auto_cmd::Options {
             input,
             output,
             dir,
             snapshot,
             verbose: log,
+            log_file,
+            unpack,
+            yes_to_all_defaults: no_prompt,
         })
         .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {
