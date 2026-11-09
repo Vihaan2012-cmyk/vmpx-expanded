@@ -119,6 +119,39 @@ fn main() {
     for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
         let start = section.virtual_address.0;
         let size = section.virtual_size.max(section.size_of_raw_data);
+        // An executable section with NO exception-directory coverage at all is
+        // either ours (an emitted replacement section) or a thunk table; either
+        // way a linear decode from its start is the intended reading, and the
+        // padding heuristic below would MISS references in it -- which it did,
+        // under-reporting three in `.vmpx0`.
+        let described = merged
+            .iter()
+            .any(|(begin, end)| *end > start && *begin < start + size);
+        if !described {
+            if let Ok(offset) = pe.rva_to_file_offset(Rva(start)) {
+                let from = offset.0 as usize;
+                let to = from.saturating_add(size as usize).min(bytes.len());
+                if let Some(code) = bytes.get(from..to) {
+                    let mut decoder =
+                        Decoder::with_ip(64, code, base + u64::from(start), DecoderOptions::NONE);
+                    while decoder.can_decode() {
+                        let at = decoder.position();
+                        let instruction = decoder.decode();
+                        if instruction.is_invalid() {
+                            break;
+                        }
+                        if let Some(target) = dangles(&instruction) {
+                            let rva = start + u32::try_from(at).unwrap_or(0);
+                            on_boundary.push(format!(
+                                "{rva:#x} -> {target:#x}  {instruction}   [{}, linear from section start]",
+                                section.name.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let mut cursor = start;
         let mut gaps: Vec<(u32, u32)> = Vec::new();
         for (begin, end) in &merged {
