@@ -47,7 +47,7 @@ full per-step trace; a complete transcript is always written to `out/clean.log`.
 With a packed input it unpacks first; `--snapshot <VMPXSNP1>` recovers the
 application's imports (otherwise it asks before writing an image that will not
 run). It never executes the protected sample — a contained software emulator
-supplies the separate Observed tier, and that is the only thing that runs code.
+supplies a separate observed-only result, and that is the only thing that runs code.
 
 ## What it does
 
@@ -89,65 +89,12 @@ What the pipeline can do today, end to end:
 | Recover and rebind the import table (IAT) from the encrypted `.idata` | ✅ |
 | Devirtualize the integrity / timing guards | ◐ 10 / 14 |
 | Prove no dangling reference into stripped space before writing | ✅ |
-| Report recovery in three labeled tiers (N1 / N2 / N3) | ✅ |
-| N3 proven-equivalence wired at the PE level | ☐ planned |
+| Report each entry with the assumptions it rests on — or none (*proven*) | ✅ |
+| Prove the rebuilt code equivalent to the original at the PE level | ☐ planned |
 
-Recovery of the VM entry stubs is reported in three labeled tiers, never one
-headline number — an entry counts as *proven* only when it closes with an **empty**
-assumption set:
-
-```mermaid
-pie showData
-    title Recovery across all discovered VM entry stubs
-    "Proven — empty assumption set (N2)" : 253
-    "CFG-complete under labeled assumptions (N1 only)" : 446
-    "Incomplete — semantic stall" : 113
-    "Errors" : 2
-```
-
-- **N1 — CFG-complete** (~86%). The VM control-flow graph closed with no stalls,
-  under an explicitly *labeled* set of assumptions. Every assumption is named in
-  the output (`AssumesImageProtectionStable`,
-  `AssumesExternalStoresDisjointFromVmStack`, `AssumesCrossVmSectionContinuation`,
-  and so on), so a result is never silently conditional. N1 can always be raised
-  by widening the assumption set, so it is not the number that carries weight.
-- **N2 — PROVEN** (~31%). The same, with an **empty** assumption set. Nothing was
-  taken on trust. N2 is a subset of N1 and is the figure that actually matters.
-- **N3 — proven-equivalent.** Recovered semantics checked against the recompiled
-  replacement. Not currently wired at the PE level.
-
-Assumptions are *conceded*, never assumed away. Closing a loop by shifting the VM
-stack base, for example, concedes frame privacy, so such an entry can reach N1
-and is barred from N2 by construction.
-
-Every incomplete entry is a *semantic* stall — none is bounded by time or
-instruction budget, so no increase in any budget converts them. What remains is a
-modelling problem, and three of its four classes are the same problem: memory
-precision.
-
-```mermaid
-xychart-beta
-    title "What blocks the remaining entries, by first stall"
-    x-axis ["handler no-spec", "imprecise store", "null read", "unproven branch", "stride loop"]
-    y-axis "entries" 0 --> 40
-    bar [36, 31, 25, 18, 1]
-```
-
-| blocker | class | what it needs |
-|---|---|---|
-| handler has no recovered specification | control flow | prove a conditional predicate opaque before crossing it |
-| imprecise external-memory store | memory | semantics for the address-computation intrinsics |
-| proven-null read | memory | a post-init snapshot that reaches the slot |
-| branch target depends on unproven input | memory | memory precision (almost all are reads of havoc'd memory) |
-| VM-stack-stride loop | loop | — |
-
-**The cheap fixes are wrong, not weak.** Each class has had several plausible
-fixes tried and reverted, and in every case the result was an *incorrect* CFG
-rather than a conservatively labeled one — walking a handler trace past a
-conditional recovers postludes no execution performs; widening the store
-disjointness gates buys nothing when the store address is `f(frame_pointer)` for
-an opaque `f`. Each attempt and its measurement is recorded in the code at the
-place it was made, so the next reader meets it rather than repeating it.
+Each recovered VM entry is reported with the assumptions it rests on, never as a
+single headline number — an entry counts as *proven* only when it closes with an
+**empty** assumption set (nothing taken on trust).
 
 ## Soundness discipline
 
@@ -201,7 +148,7 @@ the number just gets worse, never an error:
 
 | for | pass | otherwise |
 |---|---|---|
-| `report` | `--serve-ro` | N1 falls to roughly half |
+| `report` | `--serve-ro` | read-only image bytes go unresolved, so fewer than half the entries reach a complete control-flow graph |
 | `decompile` | `VMPX_DECOMPILE_SERVE_RO=1` (no `--serve-ro` flag here) | CFG reads incomplete; one line instead of code |
 | `--dynamic` | `--volatility-snapshot <snap>` | silent zero — bare detonation never finishes init |
 | building that snapshot | `xpl_init_steps` example + `XPL_SNAPSHOT_OUT`, and raise `XPL_STACK_KB` | 8 MiB default overflows the guest stack → truncated snapshot |
