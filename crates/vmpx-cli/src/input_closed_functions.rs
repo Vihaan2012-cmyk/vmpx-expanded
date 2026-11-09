@@ -14,7 +14,7 @@ use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{
     BranchingRecoveryLimits, DomainCertificate, EntryPathRecoveryLimits, Expr, NativeExitState,
     RecoveredEntryPath, RecoveredEntryPathFamily, VmDiscoveryLimits, VmEntryCandidate,
-    X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
+    VmProfileExplorerLimits, X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
     exit_closure_violation, input_closure_violation, recover_branching_entry_paths,
     recover_entry_paths,
 };
@@ -106,6 +106,32 @@ fn memory_is_exact(family: &RecoveredEntryPathFamily, path: &RecoveredEntryPath)
         .all(|report| report.memory_havocs.is_empty() && !report.memory_tainted)
 }
 
+/// The two labeled relaxations the CFG sweep uses, as input-closure never did.
+///
+/// `report --serve-ro` takes N1 from 402 to 733 on systems.xpl, and 481 of
+/// those 733 carry `AssumesExternalStoresDisjointFromVmStack`. Input-closure
+/// re-derives each entry with `SymbolicExecutionLimits::default()`, where BOTH
+/// of those are off -- so it was refusing, as "no provably finite domain" and
+/// "exit depends on a symbol outside the replacement inputs", reads the CFG
+/// path resolves. The configurations are now the same, and an entry that used
+/// either relaxation says so in its assumption set.
+///
+/// MEASURED +0 on all 814, so it stays OPT-IN (`VMPX_CLOSURE_RELAXATIONS=1`):
+/// enabling an unproven assumption that buys nothing is a cost, not a default.
+/// The reason it buys nothing is in the diagnostics -- of the 289 entries
+/// refused as "no provably finite domain", 224 name a read whose ADDRESS is
+/// symbolic (114 Register, 110 Unary, 24 Binary) and only 22 a constant. A
+/// read-only image serve needs an address to look up; these have none.
+fn closure_symbolic_limits() -> vmpx_vm::SymbolicExecutionLimits {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VMPX_CLOSURE_RELAXATIONS").is_some());
+    vmpx_vm::SymbolicExecutionLimits {
+        serve_read_only_when_suppressed: on,
+        assume_loaded_store_addresses_disjoint: on,
+        ..vmpx_vm::SymbolicExecutionLimits::default()
+    }
+}
+
 fn recovery_limits() -> EntryPathRecoveryLimits {
     // The same scaled caps `clean.rs` uses. This site drives input-closure and
     // was the one hardcoded copy left unscaled when the knob was added, which
@@ -114,9 +140,17 @@ fn recovery_limits() -> EntryPathRecoveryLimits {
     // Note these are TIGHTER than `VmProfileExplorerLimits::default()` (64 /
     // 4096 / 65536), so input-closure explores less than the explorer's own
     // default before refusing "entry paths are not complete".
+    let default = EntryPathRecoveryLimits::default();
     EntryPathRecoveryLimits {
-        chain: crate::clean::chain_limits(),
-        ..EntryPathRecoveryLimits::default()
+        chain: VmProfileExplorerLimits {
+            symbolic: closure_symbolic_limits(),
+            ..crate::clean::chain_limits()
+        },
+        entry: vmpx_vm::EntryProfileRecoveryLimits {
+            symbolic: closure_symbolic_limits(),
+            ..default.entry
+        },
+        ..default
     }
 }
 
@@ -557,10 +591,19 @@ pub(crate) fn recover_input_closed_functions(
     skip: Option<Rva>,
 ) -> RecoveredFunctions {
     let mut recovered = RecoveredFunctions::default();
-    for entry in inventory
-        .iter()
-        .filter(|entry| entry.confidence >= MIN_CONFIDENCE && Some(entry.rva) != skip)
-    {
+    // Diagnostic, mirroring `report`'s knob of the same name: restrict the
+    // sweep to these entry RVAs (comma-separated hex) so one hypothesis costs
+    // seconds instead of re-deriving all 814.
+    let only: Option<Vec<u32>> = std::env::var("VMPX_ONLY_ENTRIES").ok().map(|list| {
+        list.split(',')
+            .filter_map(|rva| u32::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    for entry in inventory.iter().filter(|entry| {
+        entry.confidence >= MIN_CONFIDENCE
+            && Some(entry.rva) != skip
+            && only.as_ref().is_none_or(|keep| keep.contains(&entry.rva.0))
+    }) {
         match recover_input_closed(pe, entry.rva) {
             Ok(function) => recovered.closed.push(function),
             Err(ClosedFailure::BranchesOnInput) => match recover_branching(pe, entry.rva) {
