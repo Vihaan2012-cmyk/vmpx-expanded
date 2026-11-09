@@ -38,6 +38,7 @@ fn main() {
     let mut data: BTreeMap<&str, usize> = BTreeMap::new();
     let mut decoded = 0_usize;
     let mut samples = Vec::new();
+    let mut data_samples: Vec<String> = Vec::new();
 
     for function in &functions {
         let (begin, end) = (function.begin.0, function.end.0);
@@ -92,6 +93,13 @@ fn main() {
                     && !mapped(rva)
                 {
                     *data.entry(from).or_default() += 1;
+                    if data_samples.len() < 48 {
+                        data_samples.push(format!(
+                            "fn {begin:#x} at {:#x} -> {rva:#x} ({})",
+                            instruction.ip() - base,
+                            home(rva)
+                        ));
+                    }
                 }
             }
         }
@@ -114,5 +122,8 @@ fn main() {
     }
     for sample in &samples {
         println!("  sample {sample}");
+    }
+    for sample in &data_samples {
+        println!("  data {sample}");
     }
 }
