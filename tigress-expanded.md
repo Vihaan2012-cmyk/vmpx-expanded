@@ -27,7 +27,7 @@ so we can generate unlimited `(clean source → obfuscated binary → known outp
 triples and **measure correctness as a number, then hill-climb** — something we
 cannot do on VMProtect at all. That single fact makes most of Tigress a
 *lower-risk, higher-confidence* target than the work already shipped in
-[vmpx-expanded](vmpx-expanded.md).
+[vmpx-expanded](README.md).
 
 ## Difficulty, calibrated against the VMProtect work
 

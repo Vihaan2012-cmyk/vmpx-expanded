@@ -57,7 +57,7 @@ A PR that trades soundness for a bigger headline number will not be merged.
 | front ends | `vmpx-cli`, `vmpx-ui` |
 
 Stage designs live under [`docs/`](docs/). Tool overviews:
-[vmpx-expanded](vmpx-expanded.md), [tigress-expanded](tigress-expanded.md).
+[vmpx-expanded](README.md), [tigress-expanded](tigress-expanded.md).
 
 ## Scope and conduct
 
