@@ -10,6 +10,14 @@
   <code>Rust</code> · <code>static-first</code> · the sample is never executed natively
 </p>
 
+<p align="center">
+  <b>vmpx-expanded</b> &nbsp;·&nbsp;
+  <a href="tigress-expanded.md">tigress-expanded</a> &nbsp;·&nbsp;
+  <a href="CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="SECURITY.md">Security</a> &nbsp;·&nbsp;
+  <a href="LICENSE">MIT license</a>
+</p>
+
 ---
 
 A fork of [vmpx](https://github.com/skyboundfs/vmpx) that carries the pipeline all

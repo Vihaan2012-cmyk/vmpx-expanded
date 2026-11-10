@@ -10,6 +10,14 @@
   <code>status: planned / design</code>
 </p>
 
+<p align="center">
+  <a href="README.md">vmpx-expanded</a> &nbsp;·&nbsp;
+  <b>tigress-expanded</b> &nbsp;·&nbsp;
+  <a href="CONTRIBUTING.md">Contributing</a> &nbsp;·&nbsp;
+  <a href="SECURITY.md">Security</a> &nbsp;·&nbsp;
+  <a href="LICENSE">MIT license</a>
+</p>
+
 ---
 
 Tigress (Collberg et al.) is a **source-to-source** C obfuscator/diversifier. It
