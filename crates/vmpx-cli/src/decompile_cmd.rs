@@ -6,6 +6,68 @@ use anyhow::{Context, Result};
 use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
 
+/// `--fold proven`: collapse a subtree to a constant when it is PROVEN constant
+/// against the image -- the rdtsc-invariant reads (timing fold) and the `.vmp2`
+/// checksum (image concretization). Anything unproven is left symbolic.
+fn fold_proven_expr(e: &vmpx_vm::Expr, pe: &PeImage<'_>) -> vmpx_vm::Expr {
+    let limits = vmpx_vm::ImageConcretizationLimits {
+        max_expression_nodes: 400_000,
+        max_checksum_bytes: 64 * 1024 * 1024,
+    };
+    let modulo = vmpx_vm::ModuloImageTargetLimits {
+        concretization: limits,
+        ..vmpx_vm::ModuloImageTargetLimits::default()
+    };
+    let timing = vmpx_vm::fold_timing_invariant_loads(pe, e, modulo)
+        .map(|r| r.expression)
+        .unwrap_or_else(|_| e.clone());
+    vmpx_vm::concretize_with_immutable_image(pe, &timing, &std::collections::BTreeMap::new(), limits)
+        .map(|r| r.expression)
+        .unwrap_or(timing)
+}
+
+/// Fold the rolled tree's exprs BEFORE lowering: lowering rewrites the image
+/// reads from `memory_load_epoch_*` intrinsics (which the fold recognises) into
+/// `Load` nodes (which it does not), so folding must happen here.
+fn fold_rolled(n: &mut vmpx_vmlift::RNode, pe: &PeImage<'_>) {
+    use vmpx_vmlift::RNode;
+    match n {
+        RNode::Stores { stores, next } => {
+            for s in stores.iter_mut() {
+                s.address = fold_proven_expr(&s.address, pe);
+                s.value = fold_proven_expr(&s.value, pe);
+            }
+            fold_rolled(next, pe);
+        }
+        RNode::Exit(e) => {
+            for v in e.registers.values_mut() {
+                *v = fold_proven_expr(v, pe);
+            }
+            if let Some(c) = &mut e.continuation {
+                *c = fold_proven_expr(c, pe);
+            }
+        }
+        RNode::Fork { selector, arms, .. } => {
+            *selector = fold_proven_expr(selector, pe);
+            for (_, a) in arms.iter_mut() {
+                fold_rolled(a, pe);
+            }
+        }
+        RNode::Loop { phis, body, .. } => {
+            for p in phis.iter_mut() {
+                p.init = fold_proven_expr(&p.init, pe);
+            }
+            fold_rolled(body, pe);
+        }
+        RNode::BackEdge { next } => {
+            for e in next.iter_mut() {
+                *e = fold_proven_expr(e, pe);
+            }
+        }
+        RNode::Dead(_) => {}
+    }
+}
+
 pub(crate) struct Options {
     pub input: PathBuf,
     pub only: Vec<String>,
@@ -151,6 +213,10 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
             vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
         }
     })??;
+    let mut rolled = rolled;
+    if std::env::var_os("VMPX_DECOMPILE_FOLD").is_some_and(|v| v == "proven") {
+        fold_rolled(&mut rolled.root, pe);
+    }
     let low = vmpx_decompile::vm::lower(&rolled, name)?;
     let d = vmpx_decompile::decompile_with(&low.func, &image_symbols(pe))?;
     // The lifter records a note per path it lowered, so the same caveat arrives
