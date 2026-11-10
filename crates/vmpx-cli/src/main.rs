@@ -1010,6 +1010,14 @@ fn default_sweep_threads() -> usize {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Provenance assertion: the caller states the input is a faithful post-init
+    // mapped snapshot (e.g. a swept `*_mapped.bin`), so non-writable section
+    // bytes are the runtime bytes and may be served SOUNDLY -- upgrading them
+    // from the `--serve-ro` labelled assumption to proven-under-asserted-
+    // provenance. Runtime mutation stays guarded per path (see immutable_image).
+    if std::env::var_os("VMPX_TRUST_MAPPED_IMAGE").is_some() {
+        vmpx_vm::set_trusted_mapped_image(true);
+    }
     match cli.command {
         Command::Clean {
             input,

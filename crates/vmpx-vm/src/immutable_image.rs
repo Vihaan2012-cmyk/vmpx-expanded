@@ -188,6 +188,28 @@ impl SymbolicMemorySource for ObservedImage<'_, '_> {
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+/// PROVENANCE ASSERTION: the analysed image is a faithful post-init MAPPED
+/// snapshot, so a non-writable section's file bytes ARE its runtime bytes. The
+/// caller asserts this about how the image was produced (e.g. a swept
+/// `*_mapped.bin`); it is NOT inferred, so it never silently upgrades an
+/// on-disk packed file. With it set, `image_cannot_reprotect` stops being
+/// pessimistic about the imported reprotect APIs the protector used *during
+/// init* (already reflected in the snapshot) -- the remaining runtime-mutation
+/// risk is still carried per path by `protection_may_have_changed`, tracked
+/// stores overriding image reads, and the volatile-range vetoes.
+static TRUSTED_MAPPED_IMAGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Assert (or clear) that the image under analysis is a faithful post-init
+/// mapped snapshot. See [`TRUSTED_MAPPED_IMAGE`].
+pub fn set_trusted_mapped_image(trusted: bool) {
+    TRUSTED_MAPPED_IMAGE.store(trusted, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn trusted_mapped_image() -> bool {
+    TRUSTED_MAPPED_IMAGE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static VOLATILE_PAGES: std::sync::RwLock<BTreeSet<u64>> =
     std::sync::RwLock::new(BTreeSet::new());
 /// Disjoint inclusive byte ranges keyed by start.
@@ -297,6 +319,14 @@ static REPROTECT_CACHE: std::sync::Mutex<Vec<(usize, usize, bool)>> =
 /// approximate (false positives only withhold the proof). Says nothing about
 /// code outside this image.
 pub(crate) fn image_cannot_reprotect(pe: &PeImage<'_>) -> bool {
+    // A faithful post-init mapped snapshot already reflects every init-time
+    // reprotection, so the imported reprotect APIs are no longer a reason to
+    // withhold its non-writable bytes. Runtime mutation during the analysed
+    // execution is still caught per path (protection_may_have_changed, tracked
+    // stores, volatile vetoes), so this only removes the init-time pessimism.
+    if trusted_mapped_image() {
+        return true;
+    }
     let data = pe.data();
     let key = (data.as_ptr() as usize, data.len());
     if let Some(&(_, _, cached)) = REPROTECT_CACHE
