@@ -282,9 +282,10 @@ impl Renderer<'_> {
                 UnaryOp::Neg => (format!("-{}", self.child(value, 90)), 90),
             },
             ExprKind::Binary { op, left, right } => self.binary(e.width, *op, left, right),
-            ExprKind::Load { address } => {
-                (format!("read_u{}({})", e.width.bits(), self.child(address, 0)), ATOM)
-            }
+            ExprKind::Load { address } => match self.field_sugar(address) {
+                Some(f) => (f, ATOM),
+                None => (format!("read_u{}({})", e.width.bits(), self.child(address, 0)), ATOM),
+            },
             ExprKind::Intrinsic { name, arguments } => {
                 let args: Vec<String> = arguments.iter().map(|a| self.child(a, 0)).collect();
                 (format!("{}({})", intrinsic(name), args.join(", ")), ATOM)
@@ -401,6 +402,20 @@ impl Renderer<'_> {
         }
     }
 
+    /// Pseudo-code struct-field access for `ctx + off` when `ctx` is the inferred
+    /// context pointer: `read_u64(ctx + 0x98)` -> `ctx.f98`. Compilable dialects
+    /// keep `read_u*`/`write_*` so the output stays real code.
+    fn field_sugar(&self, address: &Expr) -> Option<String> {
+        if self.dialect != Dialect::Pseudo {
+            return None;
+        }
+        let (r, off) = base_offset(address)?;
+        if self.name(r) != "ctx" {
+            return None;
+        }
+        Some(format!("ctx.f{off:x}"))
+    }
+
     /// A loop/branch condition, parenthesised for the C-style `if (...)`/`while
     /// (...)` of every dialect but Rust.
     fn guard(&self, c: &Cond) -> String {
@@ -432,12 +447,16 @@ impl Renderer<'_> {
                 out.push_str(&format!("{pad}{} = {}{semi}\n", self.name(n), self.body(e).0));
             }
             Stmt::Store(st) => {
-                out.push_str(&format!(
-                    "{pad}write_u{}({}, {}){semi}\n",
-                    st.value.width.bits(),
-                    self.child(&st.address, 0),
-                    self.body(&st.value).0
-                ));
+                let val = self.body(&st.value).0;
+                if let Some(f) = self.field_sugar(&st.address) {
+                    out.push_str(&format!("{pad}{f} = {val}{semi}\n"));
+                } else {
+                    out.push_str(&format!(
+                        "{pad}write_u{}({}, {val}){semi}\n",
+                        st.value.width.bits(),
+                        self.child(&st.address, 0),
+                    ));
+                }
             }
             Stmt::If { cond, then, els } => {
                 out.push_str(&format!("{pad}if {} {{\n", self.guard(cond)));
@@ -520,6 +539,53 @@ fn classify_constants(
         out.insert(v, if i == 0 { "DECODE_KEY".to_owned() } else { format!("DECODE_KEY{}", i + 1) });
     }
     out
+}
+
+/// `reg + const` as `(reg, const)` -- a struct-field address shape.
+fn base_offset(e: &Expr) -> Option<(&str, u64)> {
+    if let ExprKind::Binary { op: BinaryOp::Add, left, right } = &e.kind
+        && let (ExprKind::Register { name }, ExprKind::Const { value }) = (&left.kind, &right.kind)
+    {
+        return Some((name, *value));
+    }
+    None
+}
+
+/// A bare argument display name (`a12`): an SSA value safe to re-role as `ctx`.
+fn is_bare_arg(n: &str) -> bool {
+    n.len() >= 2 && n.starts_with('a') && n[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The argument register that behaves like a struct/context pointer: the base of
+/// the most *distinct* `reg + const` field accesses (at least two). Returns its
+/// internal name. Faithful to rename -- a structural fact, not a guess about the
+/// field's meaning; only a register whose current display is a bare argument is
+/// promoted, so nothing already carrying a role is clobbered.
+fn infer_struct_base(
+    names: &BTreeMap<String, String>,
+    temps: &[(String, Expr)],
+    prologue: &[Stmt],
+    body: &[Stmt],
+) -> Option<String> {
+    let mut offs: BTreeMap<String, std::collections::BTreeSet<u64>> = BTreeMap::new();
+    let mut visit = |e: &Expr| {
+        if let Some((r, off)) = base_offset(e) {
+            let display = names.get(r).map_or(r, String::as_str);
+            if is_bare_arg(display) {
+                offs.entry(r.to_owned()).or_default().insert(off);
+            }
+        }
+    };
+    for (_, def) in temps {
+        each_subexpr(def, &mut visit);
+    }
+    for s in prologue.iter().chain(body) {
+        stmt_exprs(s, &mut visit);
+    }
+    offs.into_iter()
+        .filter(|(_, set)| set.len() >= 2)
+        .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(&a.0)))
+        .map(|(r, _)| r)
 }
 
 fn xor_masks(e: &Expr, counts: &mut BTreeMap<u64, usize>) {
@@ -753,17 +819,36 @@ pub fn render_function(
     let d = Dialect::parse(dialect().as_deref().unwrap_or("")).unwrap_or(Dialect::Rust);
     let consts = classify_constants(temps_order, prologue, body);
     let image_base = symbols.image_base();
+
+    // Stage B: the argument that is a struct/context pointer becomes `ctx`. Only
+    // in the readable path -- the C cross-check already ran on the original names.
+    let mut names_owned = names.clone();
+    // Display name the signature shows for the context arg, if any (`a14` -> `ctx`).
+    let mut ctx_sig: Option<(String, String)> = None;
+    if let Some(b) = infer_struct_base(names, temps_order, prologue, body) {
+        let old = names.get(&b).cloned().unwrap_or_else(|| b.clone());
+        names_owned.insert(b, "ctx".to_owned());
+        ctx_sig = Some((old, "ctx".to_owned()));
+    }
+    let names = &names_owned;
     let r = Renderer { dialect: d, names, image_base, temps: temps_map, consts: &consts };
 
-    // Signature: `u64 a1` -> `a1: u64` (Rust) / `uint64_t a1` (C) / `a1` (pseudo).
+    // Signature: `u64 a1` -> `a1: u64` (Rust) / `uint64_t a1` (C) / `a1` (pseudo),
+    // with the context pointer shown under its inferred name.
     let args: Vec<String> = c_sig
         .iter()
         .map(|a| match a.rsplit_once(' ') {
-            Some((ty, nm)) => match d {
-                Dialect::Rust => format!("{nm}: {ty}"),
-                Dialect::Pseudo => nm.to_owned(),
-                _ => format!("{} {nm}", sig_ty(d, ty)),
-            },
+            Some((ty, raw)) => {
+                let nm = match &ctx_sig {
+                    Some((old, new)) if old == raw => new.as_str(),
+                    _ => raw,
+                };
+                match d {
+                    Dialect::Rust => format!("{nm}: {ty}"),
+                    Dialect::Pseudo => nm.to_owned(),
+                    _ => format!("{} {nm}", sig_ty(d, ty)),
+                }
+            }
             None => a.clone(),
         })
         .collect();
@@ -915,5 +1000,26 @@ mod tests {
         assert_eq!(render_as(Dialect::Rust, &trunc, 0), "x as u32");
         assert_eq!(render_as(Dialect::C99, &trunc, 0), "(uint32_t)x");
         assert_eq!(render_as(Dialect::Pseudo, &trunc, 0), "x");
+    }
+
+    #[test]
+    fn struct_base_is_the_argument_with_the_most_fields() {
+        let field = |base: &str, off: u64, w: BitWidth| {
+            Expr::load(
+                w,
+                Expr::binary(BinaryOp::Add, reg(base), Expr::constant(BitWidth::W64, off)).unwrap(),
+            )
+        };
+        // a14 is the base of two distinct offsets; a2 of only one.
+        let temps = vec![
+            ("t0".to_owned(), field("a14", 0x98, BitWidth::W64)),
+            ("t1".to_owned(), field("a14", 0xa0, BitWidth::W8)),
+            ("t2".to_owned(), field("a2", 0x8, BitWidth::W64)),
+        ];
+        let names = BTreeMap::new();
+        assert_eq!(infer_struct_base(&names, &temps, &[], &[]).as_deref(), Some("a14"));
+        // A single field access is not enough to call something a struct pointer.
+        let one = vec![("t0".to_owned(), field("a2", 0x8, BitWidth::W64))];
+        assert_eq!(infer_struct_base(&names, &one, &[], &[]), None);
     }
 }
