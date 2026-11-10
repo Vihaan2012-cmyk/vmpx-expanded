@@ -15,6 +15,7 @@ pub mod ir;
 pub mod mba;
 pub mod native;
 pub mod opt;
+pub mod readable;
 pub mod render;
 pub mod structure;
 pub mod symbols;
@@ -484,6 +485,25 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
         }
         Ok(n)
     })();
+
+    // Opt-in readable Rust dialect: re-render the same recovered tree. The C
+    // output above is unchanged, and the cross-check ran against it.
+    if std::env::var_os("VMPX_DECOMPILE_DIALECT").is_some_and(|v| v == "rust") {
+        text = readable::prelude().to_owned()
+            + "\n"
+            + &readable::render_function(
+                &func.name,
+                &sig,
+                ret_ty,
+                &decl,
+                &temps.order,
+                &prologue,
+                &body,
+                &names,
+                &temps.map,
+                symbols,
+            );
+    }
 
     Ok(Decompiled { text, structured, fallback_reason, check, text_check, loops, ifs, gotos })
 }
