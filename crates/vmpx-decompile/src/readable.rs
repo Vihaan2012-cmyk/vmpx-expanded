@@ -51,6 +51,8 @@ pub struct RustRenderer<'a> {
     pub names: &'a BTreeMap<String, String>,
     pub image_base: u64,
     pub temps: &'a HashMap<Expr, String>,
+    /// Role-named constants (a recurring XOR mask -> `DECODE_KEY`, etc.).
+    pub consts: &'a BTreeMap<u64, String>,
 }
 
 impl RustRenderer<'_> {
@@ -61,6 +63,9 @@ impl RustRenderer<'_> {
     fn lit(&self, w: BitWidth, v: u64) -> String {
         if let Some(n) = const_name(w, v, self.image_base) {
             return n.to_owned();
+        }
+        if let Some(n) = self.consts.get(&v) {
+            return n.clone();
         }
         if v <= 9 { v.to_string() } else { format!("0x{v:x}") }
     }
@@ -294,6 +299,80 @@ impl RustRenderer<'_> {
     }
 }
 
+/// Role-name recurring XOR-mask constants: a value used as an `^` operand more
+/// than once (and wider than a byte, so trivial toggles stay literal) is a
+/// decode key. The most-used is `DECODE_KEY`, the next `DECODE_KEY2`, ...
+fn classify_constants(
+    temps: &[(String, Expr)],
+    prologue: &[Stmt],
+    body: &[Stmt],
+) -> BTreeMap<u64, String> {
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut visit = |e: &Expr| xor_masks(e, &mut counts);
+    for (_, def) in temps {
+        each_subexpr(def, &mut visit);
+    }
+    for s in prologue.iter().chain(body) {
+        stmt_exprs(s, &mut visit);
+    }
+    let mut ranked: Vec<(u64, usize)> =
+        counts.into_iter().filter(|(v, c)| *v > 0xff && *c >= 2).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = BTreeMap::new();
+    for (i, (v, _)) in ranked.into_iter().enumerate() {
+        out.insert(v, if i == 0 { "DECODE_KEY".to_owned() } else { format!("DECODE_KEY{}", i + 1) });
+    }
+    out
+}
+
+fn xor_masks(e: &Expr, counts: &mut BTreeMap<u64, usize>) {
+    if let ExprKind::Binary { op: BinaryOp::Xor, left, right } = &e.kind {
+        for side in [left, right] {
+            if let ExprKind::Const { value } = side.kind {
+                *counts.entry(value).or_default() += 1;
+            }
+        }
+    }
+}
+
+fn each_subexpr(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { value, .. }
+        | ExprKind::Load { address: value }
+        | ExprKind::Extract { value, .. }
+        | ExprKind::Resize { value, .. } => each_subexpr(value, f),
+        ExprKind::Binary { left, right, .. } | ExprKind::Concat { high: left, low: right } => {
+            each_subexpr(left, f);
+            each_subexpr(right, f);
+        }
+        ExprKind::Intrinsic { arguments, .. } => arguments.iter().for_each(|a| each_subexpr(a, f)),
+        ExprKind::Const { .. } | ExprKind::Register { .. } => {}
+    }
+}
+
+fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
+    match s {
+        Stmt::Assign(_, e) => each_subexpr(e, f),
+        Stmt::Store(st) => {
+            each_subexpr(&st.address, f);
+            each_subexpr(&st.value, f);
+        }
+        Stmt::If { cond, then, els } => {
+            cond.exprs().into_iter().for_each(|e| each_subexpr(e, f));
+            then.iter().chain(els).for_each(|s| stmt_exprs(s, f));
+        }
+        Stmt::Loop(b) => b.iter().for_each(|s| stmt_exprs(s, f)),
+        Stmt::While { cond, body: b } | Stmt::DoWhile { body: b, cond } => {
+            cond.exprs().into_iter().for_each(|e| each_subexpr(e, f));
+            b.iter().for_each(|s| stmt_exprs(s, f));
+        }
+        Stmt::Return(vals) => vals.iter().for_each(|(_, e)| each_subexpr(e, f)),
+        Stmt::IfGoto { cond, .. } => cond.exprs().into_iter().for_each(|e| each_subexpr(e, f)),
+        _ => {}
+    }
+}
+
 fn collect_vm_flags<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     if let ExprKind::Intrinsic { name, .. } = &e.kind
         && name.starts_with("vm_flags_")
@@ -395,7 +474,6 @@ fn intrinsic(name: &str) -> String {
 /// The shared prelude: typedef-free Rust helpers the body uses. Emitted once.
 pub fn prelude() -> &'static str {
     "// ---- prelude (generated) ----\n\
-     const IMAGE_BASE: u64 = 0;  // set per image\n\
      const INT3: u8 = 0xCC;\n\
      #[inline] unsafe fn read_u8(a: u64)  -> u8  { *(a as *const u8) }\n\
      #[inline] unsafe fn read_u16(a: u64) -> u16 { *(a as *const u16) }\n\
@@ -420,7 +498,8 @@ pub fn render_function(
     temps_map: &HashMap<Expr, String>,
     symbols: &Symbols,
 ) -> String {
-    let r = RustRenderer { names, image_base: symbols.image_base(), temps: temps_map };
+    let consts = classify_constants(temps_order, prologue, body);
+    let r = RustRenderer { names, image_base: symbols.image_base(), temps: temps_map, consts: &consts };
     // `u64 a1` -> `a1: u64`.
     let args: Vec<String> = c_sig
         .iter()
@@ -432,6 +511,16 @@ pub fn render_function(
     let ret = if ret_ty == "void" { String::new() } else { format!(" -> {ret_ty}") };
 
     let mut out = String::new();
+    // Per-function constant legend, with real values.
+    if symbols.image_base() != 0 {
+        out.push_str(&format!("const IMAGE_BASE: u64 = 0x{:x};\n", symbols.image_base()));
+    }
+    for (v, nm) in &consts {
+        out.push_str(&format!("const {nm}: u64 = 0x{v:x};\n"));
+    }
+    if symbols.image_base() != 0 || !consts.is_empty() {
+        out.push('\n');
+    }
     out.push_str(&format!("unsafe fn {name}({}){ret} {{\n", args.join(", ")));
     // Mutable locals the body assigns across branches.
     for (v, w) in decl {
@@ -461,7 +550,8 @@ mod tests {
     fn render(e: &Expr, image_base: u64) -> String {
         let names = BTreeMap::new();
         let temps = HashMap::new();
-        RustRenderer { names: &names, image_base, temps: &temps }.body(e).0
+        let consts = BTreeMap::new();
+        RustRenderer { names: &names, image_base, temps: &temps, consts: &consts }.body(e).0
     }
     fn reg(n: &str) -> Expr {
         Expr::register(BitWidth::W64, n)
