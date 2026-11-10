@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use vmpx_emulate::snapshot;
-use vmpx_pe::{PeImage, Rva};
+use vmpx_pe::PeImage;
 use vmpx_rebuild::{AppendSection, append_section, serialize_import_table};
 use vmpx_rebuild::{ImportModuleSpec, ImportTarget};
 
@@ -155,7 +155,7 @@ pub fn bind_slots(
     // Install directory 1 and point the IAT directory at the .idata span.
     let pe_off = u32::from_le_bytes(image[0x3c..0x40].try_into().expect("4")) as usize;
     let dirs = pe_off + 24 + 112;
-    let mut put = |image: &mut Vec<u8>, index: usize, rva: u32, sz: u32| {
+    let put = |image: &mut Vec<u8>, index: usize, rva: u32, sz: u32| {
         let at = dirs + index * 8;
         image[at..at + 4].copy_from_slice(&rva.to_le_bytes());
         image[at + 4..at + 8].copy_from_slice(&sz.to_le_bytes());

@@ -153,7 +153,7 @@ fn roots(stmts: &[Stmt], out: &mut Vec<Expr>) {
 /// hold all of it to see what the branch tests. On vm_c447739 the four longest
 /// lines in the function were all `if` conditions of 367-376 characters.
 fn roots_and_conditions(stmts: &[Stmt], out: &mut Vec<Expr>, conditions: &mut Vec<Expr>) {
-    let mut cond = |c: &Cond, out: &mut Vec<Expr>, conditions: &mut Vec<Expr>| match c {
+    let cond = |c: &Cond, out: &mut Vec<Expr>, conditions: &mut Vec<Expr>| match c {
         Cond::Cmp { a, b, .. } => {
             out.push(a.clone());
             out.push(b.clone());

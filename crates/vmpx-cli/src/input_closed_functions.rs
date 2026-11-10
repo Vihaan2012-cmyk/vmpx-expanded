@@ -42,6 +42,8 @@ pub(crate) struct InputClosedFunction {
     /// True when closing this function required folding an image-backed read to
     /// a constant, which holds only while the image's protection does. Such a
     /// recovery rests on `AssumesImageProtectionStable` and is never PROVEN.
+    /// Recorded assumption state; not yet consumed by a reader.
+    #[allow(dead_code)]
     pub assumes_image_protection: bool,
 }
 

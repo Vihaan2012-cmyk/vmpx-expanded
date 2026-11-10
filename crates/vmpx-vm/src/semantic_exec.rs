@@ -1880,7 +1880,6 @@ fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
             ));
         }
         ExprKind::Const { .. } => "Const",
-        _ => "other",
     })
 }
 

@@ -364,7 +364,6 @@ pub fn diff_against_original_paths(
     }
     let zero = c(BitWidth::W8, 0);
     let mut obligations = Vec::new();
-    let mut vacuous = 0_usize;
     for (oi, (orig, ocond)) in originals.iter().enumerate() {
         let before = obligations.len();
         for (ri, (rec, rcond)) in recs.iter().enumerate() {
@@ -385,7 +384,7 @@ pub fn diff_against_original_paths(
             });
             match step {
                 Ok(Some(o)) => obligations.push(o),
-                Ok(None) => vacuous += 1,
+                Ok(None) => {}
                 Err(e) => return fail(out, format!("pair (original {oi}, recovered {ri}): {e}")),
             }
         }

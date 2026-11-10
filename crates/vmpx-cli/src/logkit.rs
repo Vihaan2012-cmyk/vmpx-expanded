@@ -10,6 +10,8 @@ use std::time::Instant;
 const DETAIL_COLUMN: usize = 72;
 
 #[derive(Clone, Copy)]
+// Layer/Error are part of the logger's kind set; not every kind has a wired call site yet.
+#[allow(dead_code)]
 enum Kind {
     Start,
     Step,
@@ -74,6 +76,8 @@ pub struct Log {
     file: Option<std::sync::Mutex<std::fs::File>>,
 }
 
+// error/layer/verbose/timed are intended helpers of this logging API, not yet wired to a call site.
+#[allow(dead_code)]
 impl Log {
     pub fn new(tag: impl Into<String>, verbose: bool) -> Self {
         let now = Instant::now();

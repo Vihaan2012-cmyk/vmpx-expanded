@@ -236,8 +236,8 @@ pub(crate) fn lift_entry(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
-                || crate::auto_cmd::auto_settings()),
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
             false,
         )
     };
@@ -381,8 +381,8 @@ pub(crate) fn with_entry_input<R>(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
-                || crate::auto_cmd::auto_settings()),
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
             false,
         )
     };

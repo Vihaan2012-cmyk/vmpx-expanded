@@ -240,12 +240,15 @@ pub enum RecoveredExit {
 #[derive(Debug)]
 pub struct TrampolineExit {
     pub registers: BTreeMap<X64NativeRegister, Expr>,
+    /// Computed exit flags; part of the trampoline-exit description, not yet read by a consumer.
+    #[allow(dead_code)]
     pub rflags: Expr,
     /// The computed address control transfers to.
     pub target: Expr,
     /// Signed byte offset of the `ret` slot from the initial VM stack pointer,
     /// or `None` when the final VSP is not rooted at the entry frame at all and
     /// the slot therefore has no position in those coordinates.
+    #[allow(dead_code)]
     pub slot_offset: Option<i64>,
 }
 

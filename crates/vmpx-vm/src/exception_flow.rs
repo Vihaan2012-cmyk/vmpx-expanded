@@ -626,6 +626,7 @@ fn resolve_stack_sled_continuation_with_context(
     resolution
 }
 
+#[cfg(test)]
 fn resolve_stack_sled_continuation(
     sled: &ExceptionStackSledReport,
 ) -> ExceptionContinuationResolution {

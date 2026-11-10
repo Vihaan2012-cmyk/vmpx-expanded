@@ -1062,12 +1062,6 @@ fn relocate_natives(
             }
         }
     }
-    let covered = |va: u64| {
-        blocks
-            .range(..=va)
-            .next_back()
-            .is_some_and(|(_, end)| va < *end)
-    };
     let section_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
     let mut payload: Vec<u8> = Vec::new();
     let mut placement: BTreeMap<u64, u64> = BTreeMap::new();

@@ -2077,10 +2077,6 @@ fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
 /// identity.
 type ShiftMemo = std::collections::HashMap<Expr, Expr>;
 
-fn shift_stack_relative(expr: &Expr, base_terms: &HashMap<Expr, i64>, delta: u64) -> Expr {
-    shift_stack_relative_memo(expr, base_terms, delta, &mut ShiftMemo::new(), &std::cell::Cell::new(SHIFT_NODE_BUDGET))
-}
-
 /// Memoized on node identity. Expressions here are a hash-consed DAG, and the
 /// unmemoized walk descended into every *edge*, so a subterm shared k ways was
 /// rebuilt k times — the DAG expanded into its tree. Measured on one entry's

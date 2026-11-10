@@ -665,7 +665,7 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
     let mut remaining: Vec<usize> = (0..rhs.len()).collect();
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     let mut tail_map: HashMap<String, Expr> = HashMap::new();
-    let mut assign_maps: HashMap<usize, HashMap<String, Expr>> = HashMap::new();
+    let assign_maps: HashMap<usize, HashMap<String, Expr>> = HashMap::new();
     while !remaining.is_empty() {
         // candidates whose hard deps (new-refs) are all emitted
         let ready: Vec<usize> = remaining

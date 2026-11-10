@@ -175,7 +175,6 @@ fn region(
     if depth > MAX_DEPTH {
         return Err("VM/native chain is too deep".to_owned());
     }
-    let (instruction_limit, max_blocks, max_paths) = limits;
     region_seeded(pe, rva, None, depth, limits, tally)
 }
 

@@ -104,8 +104,6 @@ pub struct RolledFunction {
 
 struct LoopCtx {
     header: Va,
-    /// Live phi names, in `RNode::Loop::phis` order.
-    names: Vec<String>,
     cells: Vec<Cell>,
     /// The state the body is walked from (carried cells hold their phi).
     base: SymbolicVmInitialState,
@@ -819,7 +817,6 @@ impl Walker<'_, '_> {
             self.loops += 1;
             self.loop_stack.push(LoopCtx {
                 header,
-                names: names.clone(),
                 cells: cells.clone(),
                 base: phi_state.clone(),
                 pending: Vec::new(),

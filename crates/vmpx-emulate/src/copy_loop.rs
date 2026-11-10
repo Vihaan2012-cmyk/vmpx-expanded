@@ -81,7 +81,7 @@ impl Shape {
         let mut address = head;
         let mut stage = 0u8;
         let mut steps = 0u32;
-        let mut record = |shape: &mut Self, from: u64, to: u64| -> bool {
+        let record = |shape: &mut Self, from: u64, to: u64| -> bool {
             let slot = usize::from(shape.flow_site_count);
             if slot >= shape.flow_sites.len() {
                 return false;
