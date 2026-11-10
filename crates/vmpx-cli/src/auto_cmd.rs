@@ -1185,20 +1185,28 @@ fn relocate_natives(
     let mut queue: VecDeque<u32> = seeds.iter().copied().collect();
     let mut seen: BTreeSet<u32> = seeds.iter().copied().collect();
     let mut blocks: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut skipped = 0usize;
     while let Some(rva) = queue.pop_front() {
         let cfg = recover_native_cfg_pe_with(intact, Rva(rva), options)
             .map_err(|e| format!("native cfg {rva:#x}: {e}"))?;
+        // An incomplete CFG has unresolved edges and can carry spurious blocks
+        // spawned off a bad edge (e.g. a short branch that decoded into data --
+        // observed as a `jge` into a "popo" address). Relocating such a function
+        // verbatim is unsound, so skip it: its blocks are not placed and its
+        // edges are not followed. The `.text` reference that named it then
+        // dangles and is caught, fail-closed, by the dangling-ref check before
+        // any image is written -- never silently relocated as garbage.
+        if !cfg.is_complete() {
+            log.trace(
+                &format!("  skip {rva:#x}"),
+                &format!("{} block(s), incomplete CFG -- not relocated", cfg.blocks.len()),
+            );
+            skipped += 1;
+            continue;
+        }
         log.trace(
             &format!("  recover {rva:#x}"),
-            &format!(
-                "{} block(s){}",
-                cfg.blocks.len(),
-                if cfg.is_complete() {
-                    ""
-                } else {
-                    " (incomplete)"
-                }
-            ),
+            &format!("{} block(s)", cfg.blocks.len()),
         );
         for block in cfg.blocks.values() {
             blocks.insert(block.start, block.end);
@@ -1332,6 +1340,12 @@ fn relocate_natives(
             cursor += size;
         }
     }
+    if payload.is_empty() {
+        // Every candidate native was skipped (all incomplete): nothing to
+        // relocate, so append no section. Their `.text` references then dangle
+        // and the dangling-ref check refuses the write, fail-closed.
+        return Ok((stripped.to_vec(), BTreeMap::new()));
+    }
     let rebuilt = append_section(
         stripped,
         AppendSection {
@@ -1350,9 +1364,14 @@ fn relocate_natives(
     log.step(
         "relocated",
         &format!(
-            "{} function block(s), {} byte(s)",
+            "{} function block(s), {} byte(s){}",
             blocks.len(),
-            payload.len()
+            payload.len(),
+            if skipped == 0 {
+                String::new()
+            } else {
+                format!(" ({skipped} incomplete native(s) skipped)")
+            }
         ),
     );
     Ok((rebuilt.bytes, mapping))
@@ -1705,5 +1724,48 @@ mod tests {
         // not turn a legitimate in-image branch into a false positive.
         let image = pe_with_text(&branch_at_text(0xE9, 0x1010));
         assert_eq!(count_dangling(&image), 0);
+    }
+
+    #[test]
+    fn complete_native_is_relocated() {
+        // A lone `ret` is a complete one-block function: it must be relocated,
+        // so the completeness gate never drops a valid native.
+        let image = pe_with_text(&[0xC3]);
+        let pe = PeImage::parse(&image).unwrap();
+        let log = Log::new("t", false);
+        let (_out, mapping) = relocate_natives(&log, &pe, &image, &image, &[0x1000]).unwrap();
+        assert!(
+            mapping.contains_key(&0x1000),
+            "a complete native must be relocated"
+        );
+    }
+
+    #[test]
+    fn incomplete_native_is_skipped_complete_one_kept() {
+        // Two seeds: a complete `ret` at 0x1000, and at 0x1010 a `jmp rel32` to a
+        // target outside the image -- a `Terminator::Unsupported`, so that CFG is
+        // incomplete. The incomplete one is skipped (fail-closed on the
+        // component) rather than relocated as garbage -- the fix for
+        // `cannot rebase 0x706f706f` on the CL650 -- while the complete one is
+        // still relocated.
+        let mut code = vec![0xCCu8; 0x20];
+        code[0] = 0xC3; // 0x1000: a complete `ret`
+        let site = BASE + 0x1010;
+        let rel = (BASE + u64::from(GUARD_RVA)) as i64 - (site as i64 + 5);
+        code[0x10] = 0xE9; // 0x1010: jmp rel32 to an out-of-image target
+        code[0x11..0x15].copy_from_slice(&(rel as i32).to_le_bytes());
+        let image = pe_with_text(&code);
+        let pe = PeImage::parse(&image).unwrap();
+        let log = Log::new("t", false);
+        let (_out, mapping) =
+            relocate_natives(&log, &pe, &image, &image, &[0x1000, 0x1010]).unwrap();
+        assert!(
+            mapping.contains_key(&0x1000),
+            "the complete native must still be relocated"
+        );
+        assert!(
+            !mapping.contains_key(&0x1010),
+            "the incomplete native must be skipped, not relocated"
+        );
     }
 }
