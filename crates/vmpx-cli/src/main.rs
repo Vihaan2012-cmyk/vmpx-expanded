@@ -229,7 +229,7 @@ enum Command {
         /// Readable output (sugar for `--dialect rust`).
         #[arg(long)]
         readable: bool,
-        /// Output dialect: c (default) | rust. (c23/cpp/c99/pseudo: wip.)
+        /// Output dialect: c (default) | rust | c99 | c23 | cpp | pseudo.
         #[arg(long, default_value = "c")]
         dialect: String,
         /// Fold level: named (default) | proven. `proven` bakes every subtree

@@ -34,6 +34,45 @@ pub fn dialect() -> Option<String> {
     std::env::var("VMPX_DECOMPILE_DIALECT").ok()
 }
 
+/// The readable output dialects. All render the *same* recovered tree -- idioms,
+/// names and proven folds are dialect-independent; only syntax differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// Faithful Rust: explicit `.wrapping_*`, `!` bitwise-not, no body types.
+    Rust,
+    /// Compilable C with `<stdint.h>` types; unsigned overflow is defined, so the
+    /// body needs no wrapping verbs.
+    C99,
+    /// C23: like C99 but `auto`-typed temporaries and `constexpr` constants.
+    C23,
+    /// C++: like C99 but `auto`-typed temporaries and `constexpr` constants.
+    Cpp,
+    /// Maximally readable, not compilable: types and widening casts elided.
+    Pseudo,
+}
+
+impl Dialect {
+    /// Parse a `--dialect` value; `None` for the default C emitter (not readable).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rust" => Some(Self::Rust),
+            "c99" => Some(Self::C99),
+            "c23" => Some(Self::C23),
+            "cpp" | "c++" => Some(Self::Cpp),
+            "pseudo" => Some(Self::Pseudo),
+            _ => None,
+        }
+    }
+    fn is_c_family(self) -> bool {
+        matches!(self, Self::C99 | Self::C23 | Self::Cpp)
+    }
+    /// C23/C++ infer temp types with `auto`.
+    fn auto_temps(self) -> bool {
+        matches!(self, Self::C23 | Self::Cpp)
+    }
+}
+
 fn uty(w: BitWidth) -> &'static str {
     match w {
         BitWidth::W8 => "u8",
@@ -52,6 +91,39 @@ fn ity(w: BitWidth) -> &'static str {
     }
 }
 
+fn cty(w: BitWidth) -> &'static str {
+    match w {
+        BitWidth::W8 => "uint8_t",
+        BitWidth::W16 => "uint16_t",
+        BitWidth::W32 => "uint32_t",
+        BitWidth::W64 => "uint64_t",
+    }
+}
+
+fn cty_signed(w: BitWidth) -> &'static str {
+    match w {
+        BitWidth::W8 => "int8_t",
+        BitWidth::W16 => "int16_t",
+        BitWidth::W32 => "int32_t",
+        BitWidth::W64 => "int64_t",
+    }
+}
+
+fn psty(w: BitWidth) -> &'static str {
+    match w {
+        BitWidth::W8 => "s8",
+        BitWidth::W16 => "s16",
+        BitWidth::W32 => "s32",
+        BitWidth::W64 => "s64",
+    }
+}
+
+/// Parenthesise `s` (rendered at precedence `have`) when embedded where `need`
+/// binding is required.
+fn paren(s: String, have: u8, need: u8) -> String {
+    if have < need { format!("({s})") } else { s }
+}
+
 /// A constant's readable name, or `None` for a plain literal. Role-based, so the
 /// same value in a different role is free to print as a literal.
 fn const_name(w: BitWidth, v: u64, image_base: u64) -> Option<&'static str> {
@@ -64,7 +136,8 @@ fn const_name(w: BitWidth, v: u64, image_base: u64) -> Option<&'static str> {
     None
 }
 
-pub struct RustRenderer<'a> {
+pub struct Renderer<'a> {
+    pub dialect: Dialect,
     pub names: &'a BTreeMap<String, String>,
     pub image_base: u64,
     pub temps: &'a HashMap<Expr, String>,
@@ -72,9 +145,33 @@ pub struct RustRenderer<'a> {
     pub consts: &'a BTreeMap<u64, String>,
 }
 
-impl RustRenderer<'_> {
+impl Renderer<'_> {
     fn name(&self, n: &str) -> String {
         self.names.get(n).cloned().unwrap_or_else(|| n.to_owned())
+    }
+
+    /// Unsigned type name for this dialect (`u32` / `uint32_t`).
+    fn ty(&self, w: BitWidth) -> &'static str {
+        if self.dialect.is_c_family() { cty(w) } else { uty(w) }
+    }
+    /// Signed type name (`i32` / `int32_t` / `s32`).
+    fn sty(&self, w: BitWidth) -> &'static str {
+        match self.dialect {
+            Dialect::Rust => ity(w),
+            Dialect::Pseudo => psty(w),
+            _ => cty_signed(w),
+        }
+    }
+
+    /// Cast `inner` (precedence `p`) to width `w` as a plain widen/truncate.
+    /// Rust: `x as u32`. C: `(uint32_t)x`. Pseudo: elided -- the width is carried
+    /// by context, so the cast is noise.
+    fn widen(&self, inner: String, p: u8, w: BitWidth) -> (String, u8) {
+        match self.dialect {
+            Dialect::Pseudo => (inner, p),
+            Dialect::Rust => (format!("{} as {}", paren(inner, p, 80), self.ty(w)), 80),
+            _ => (format!("({}){}", self.ty(w), paren(inner, p, 85)), 85),
+        }
     }
 
     fn lit(&self, w: BitWidth, v: u64) -> String {
@@ -146,11 +243,23 @@ impl RustRenderer<'_> {
         let (op, c) = recognize_cmp(&hits, n)?;
         let xr = self.child(x, 10);
         let cname = self.lit(xw, c);
-        let mut s = format!("({xr} {op} {cname}) as {}", uty(out_w));
+        // `x CMP C` is a two-valued indicator; widen it to the result type, then
+        // scale. The comparison binds looser than a cast, so it parenthesises.
+        let (mut s, mut p) = self.widen(format!("{xr} {op} {cname}"), 10, out_w);
         if scale != 1 {
-            s = format!("(({s}).wrapping_mul({scale}))");
+            (s, p) = self.mul_const(s, p, scale);
         }
+        let _ = p;
         Some(s)
+    }
+
+    /// `value * k` with the dialect's multiply (wrapping in Rust, plain in C).
+    fn mul_const(&self, value: String, p: u8, k: u64) -> (String, u8) {
+        if self.dialect == Dialect::Rust {
+            (format!("({}.wrapping_mul({k}))", paren(value, p, ATOM)), ATOM)
+        } else {
+            (format!("{} * {k}", paren(value, p, 61)), 60)
+        }
     }
 
     fn body(&self, e: &Expr) -> (String, u8) {
@@ -161,8 +270,16 @@ impl RustRenderer<'_> {
             ExprKind::Const { value } => (self.lit(e.width, *value), ATOM),
             ExprKind::Register { name } => (self.name(name), ATOM),
             ExprKind::Unary { op, value } => match op {
-                UnaryOp::Not => (format!("!{}", self.child(value, 90)), 90),
-                UnaryOp::Neg => (format!("{}.wrapping_neg()", self.child(value, ATOM)), ATOM),
+                // Rust `!` is bitwise-not on integers; C/pseudo spell it `~`.
+                UnaryOp::Not => {
+                    let tilde = if self.dialect == Dialect::Rust { "!" } else { "~" };
+                    (format!("{tilde}{}", self.child(value, 90)), 90)
+                }
+                // Unsigned negation is defined mod 2^n in both Rust (wrapping) and C.
+                UnaryOp::Neg if self.dialect == Dialect::Rust => {
+                    (format!("{}.wrapping_neg()", self.child(value, ATOM)), ATOM)
+                }
+                UnaryOp::Neg => (format!("-{}", self.child(value, 90)), 90),
             },
             ExprKind::Binary { op, left, right } => self.binary(e.width, *op, left, right),
             ExprKind::Load { address } => {
@@ -173,38 +290,82 @@ impl RustRenderer<'_> {
                 (format!("{}({})", intrinsic(name), args.join(", ")), ATOM)
             }
             ExprKind::Extract { value, lsb } => {
-                let v = self.child(value, 70);
-                let shifted = if *lsb == 0 { v } else { format!("({v} >> {lsb})") };
-                (format!("{shifted} as {}", uty(e.width)), 80)
+                let (vs, vp) = self.rx(value);
+                let (inner, ip) = if *lsb == 0 {
+                    (vs, vp)
+                } else {
+                    (format!("{} >> {lsb}", paren(vs, vp, 71)), 70)
+                };
+                self.widen(inner, ip, e.width)
             }
-            ExprKind::Resize { op, value } => {
-                let v = self.child(value, 80);
-                match op {
-                    ResizeOp::Truncate | ResizeOp::ZeroExtend => {
-                        (format!("{v} as {}", uty(e.width)), 80)
-                    }
-                    ResizeOp::SignExtend => (
-                        format!("{v} as {} as {} as {}", ity(value.width), ity(e.width), uty(e.width)),
-                        80,
-                    ),
+            ExprKind::Resize { op, value } => match op {
+                ResizeOp::Truncate | ResizeOp::ZeroExtend => {
+                    let (vs, vp) = self.rx(value);
+                    self.widen(vs, vp, e.width)
                 }
-            }
+                ResizeOp::SignExtend => (self.sign_extend(value, e.width), 85),
+            },
             ExprKind::Concat { high, low } => {
-                let n = uty(e.width);
-                let h = self.child(high, ATOM);
-                let l = self.child(low, 80);
-                (
-                    format!("(({h} as {n}) << {}) | ({l} as {n})", low.width.bits()),
-                    40,
-                )
+                let (hs, hp) = self.rx(high);
+                let (ls, lp) = self.rx(low);
+                let (h, _) = self.widen(hs, hp, e.width);
+                let (l, _) = self.widen(ls, lp, e.width);
+                (format!("({h} << {}) | ({l})", low.width.bits()), 40)
             }
         }
     }
 
+    /// Sign-extend `value` to `w`: Rust casts through both signed widths, C stacks
+    /// signed casts, pseudo keeps the signed markers.
+    fn sign_extend(&self, value: &Expr, w: BitWidth) -> String {
+        let v = self.child(value, 85);
+        let (from, to) = (value.width, w);
+        match self.dialect {
+            Dialect::Rust => {
+                format!("{v} as {} as {} as {}", self.sty(from), self.sty(to), self.ty(w))
+            }
+            Dialect::Pseudo => format!("({})({}){v}", self.sty(to), self.sty(from)),
+            _ => format!("({})({})({}){v}", self.ty(w), self.sty(to), self.sty(from)),
+        }
+    }
+
     fn binary(&self, w: BitWidth, op: BinaryOp, l: &Expr, r: &Expr) -> (String, u8) {
+        if self.dialect == Dialect::Rust {
+            return self.binary_rust(w, op, l, r);
+        }
+        // C-family and pseudo: unsigned arithmetic wraps by definition, so plain
+        // infix is already faithful -- no wrapping verbs needed.
+        let infix = |sym: &str, prec: u8| -> (String, u8) {
+            (format!("{} {sym} {}", self.child(l, prec), self.child(r, prec + 1)), prec)
+        };
+        match op {
+            BinaryOp::Mul => infix("*", 75),
+            BinaryOp::Add => infix("+", 72),
+            BinaryOp::Sub => infix("-", 72),
+            BinaryOp::Shl => infix("<<", 70),
+            BinaryOp::Shr => infix(">>", 70),
+            BinaryOp::And => infix("&", 60),
+            BinaryOp::Xor => infix("^", 50),
+            BinaryOp::Or => infix("|", 40),
+            BinaryOp::Sar => {
+                // Arithmetic shift: shift the signed view; context reads it back.
+                let a = self.child(l, 85);
+                let b = self.child(r, 71);
+                (format!("(({}){a}) >> {b}", self.sty(w)), 70)
+            }
+            BinaryOp::Rol | BinaryOp::Ror => {
+                let f = if op == BinaryOp::Rol { "rotl" } else { "rotr" };
+                let a = self.child(l, 0);
+                let b = self.child(r, 0);
+                (format!("{f}{}({a}, {b})", w.bits()), ATOM)
+            }
+        }
+    }
+
+    /// Faithful Rust: every op the VM relies on to wrap gets an explicit
+    /// `.wrapping_*`, so debug and release agree.
+    fn binary_rust(&self, w: BitWidth, op: BinaryOp, l: &Expr, r: &Expr) -> (String, u8) {
         let as_w = |s: String, need_as: bool| if need_as { format!("{s} as {}", uty(w)) } else { s };
-        // Arithmetic the VM relies on to wrap -> explicit wrapping methods, so
-        // the output is faithful in both debug and release builds.
         let method = |name: &str| -> (String, u8) {
             let a = self.child(l, ATOM);
             let b = self.child(r, 0);
@@ -219,7 +380,6 @@ impl RustRenderer<'_> {
                 let b = self.child(r, 0);
                 (format!("{a}.wrapping_shl({b} as u32)"), ATOM)
             }
-            // Bitwise ops and logical shift never overflow -> infix.
             BinaryOp::Xor => (format!("{} ^ {}", self.child(l, 50), self.child(r, 51)), 50),
             BinaryOp::And => (format!("{} & {}", self.child(l, 60), self.child(r, 61)), 60),
             BinaryOp::Or => (format!("{} | {}", self.child(l, 40), self.child(r, 41)), 40),
@@ -241,6 +401,16 @@ impl RustRenderer<'_> {
         }
     }
 
+    /// A loop/branch condition, parenthesised for the C-style `if (...)`/`while
+    /// (...)` of every dialect but Rust.
+    fn guard(&self, c: &Cond) -> String {
+        if self.dialect == Dialect::Rust {
+            self.cond(c)
+        } else {
+            format!("({})", self.cond(c))
+        }
+    }
+
     fn cond(&self, c: &Cond) -> String {
         match c {
             Cond::Cmp { op, a, b } => {
@@ -255,20 +425,22 @@ impl RustRenderer<'_> {
 
     fn stmt(&self, s: &Stmt, out: &mut String, depth: usize) {
         let pad = "    ".repeat(depth);
+        // Pseudo-code drops statement terminators; every real dialect keeps them.
+        let semi = if self.dialect == Dialect::Pseudo { "" } else { ";" };
         match s {
             Stmt::Assign(n, e) => {
-                out.push_str(&format!("{pad}{} = {};\n", self.name(n), self.body(e).0));
+                out.push_str(&format!("{pad}{} = {}{semi}\n", self.name(n), self.body(e).0));
             }
             Stmt::Store(st) => {
                 out.push_str(&format!(
-                    "{pad}write_u{}({}, {});\n",
+                    "{pad}write_u{}({}, {}){semi}\n",
                     st.value.width.bits(),
                     self.child(&st.address, 0),
                     self.body(&st.value).0
                 ));
             }
             Stmt::If { cond, then, els } => {
-                out.push_str(&format!("{pad}if {} {{\n", self.cond(cond)));
+                out.push_str(&format!("{pad}if {} {{\n", self.guard(cond)));
                 self.stmts(then, out, depth + 1);
                 if els.is_empty() {
                     out.push_str(&format!("{pad}}}\n"));
@@ -279,32 +451,40 @@ impl RustRenderer<'_> {
                 }
             }
             Stmt::Loop(body) => {
-                out.push_str(&format!("{pad}loop {{\n"));
+                let head = if self.dialect == Dialect::Rust { "loop {" } else { "for (;;) {" };
+                out.push_str(&format!("{pad}{head}\n"));
                 self.stmts(body, out, depth + 1);
                 out.push_str(&format!("{pad}}}\n"));
             }
             Stmt::While { cond, body } => {
-                out.push_str(&format!("{pad}while {} {{\n", self.cond(cond)));
+                out.push_str(&format!("{pad}while {} {{\n", self.guard(cond)));
                 self.stmts(body, out, depth + 1);
                 out.push_str(&format!("{pad}}}\n"));
             }
+            Stmt::DoWhile { body, cond } if self.dialect.is_c_family() => {
+                out.push_str(&format!("{pad}do {{\n"));
+                self.stmts(body, out, depth + 1);
+                out.push_str(&format!("{pad}}} while ({});\n", self.cond(cond)));
+            }
             Stmt::DoWhile { body, cond } => {
-                out.push_str(&format!("{pad}loop {{\n"));
+                // Rust/pseudo: no do-while, so a loop with a trailing break.
+                let head = if self.dialect == Dialect::Rust { "loop {" } else { "for (;;) {" };
+                out.push_str(&format!("{pad}{head}\n"));
                 self.stmts(body, out, depth + 1);
                 out.push_str(&format!("{pad}    if !({}) {{ break; }}\n", self.cond(cond)));
                 out.push_str(&format!("{pad}}}\n"));
             }
             Stmt::Return(vals) => {
                 let v = vals.first().map_or_else(|| "0".to_owned(), |(_, e)| self.body(e).0);
-                out.push_str(&format!("{pad}return {v};\n"));
+                out.push_str(&format!("{pad}return {v}{semi}\n"));
             }
-            Stmt::Break => out.push_str(&format!("{pad}break;\n")),
-            Stmt::Continue => out.push_str(&format!("{pad}continue;\n")),
+            Stmt::Break => out.push_str(&format!("{pad}break{semi}\n")),
+            Stmt::Continue => out.push_str(&format!("{pad}continue{semi}\n")),
             Stmt::Comment(c) => out.push_str(&format!("{pad}// {c}\n")),
             Stmt::Label(n) => out.push_str(&format!("{pad}// label {n:?}\n")),
             Stmt::Goto(n) => out.push_str(&format!("{pad}// goto {n:?}\n")),
             Stmt::IfGoto { cond, target } => {
-                out.push_str(&format!("{pad}if {} {{ /* goto {target:?} */ }}\n", self.cond(cond)));
+                out.push_str(&format!("{pad}if {} {{ /* goto {target:?} */ }}\n", self.guard(cond)));
             }
         }
     }
@@ -488,7 +668,8 @@ fn intrinsic(name: &str) -> String {
     }
 }
 
-/// The shared prelude: typedef-free Rust helpers the body uses. Emitted once.
+/// The shared Rust prelude: typedef-free helpers the body uses. Emitted once.
+/// Kept as the Rust default; [`preamble`] selects it per dialect.
 pub fn prelude() -> &'static str {
     "// ---- prelude (generated) ----\n\
      const INT3: u8 = 0xCC;\n\
@@ -501,7 +682,61 @@ pub fn prelude() -> &'static str {
      #[inline] unsafe fn write_u64(a: u64, v: u64) { *(a as *mut u64) = v; }\n"
 }
 
-/// Render one function as Rust, reusing the structures the C path already built.
+/// The generated helper prelude for `d`: `read_*`/`write_*`, `INT3`, rotates.
+#[must_use]
+pub fn preamble(d: Dialect) -> String {
+    match d {
+        Dialect::Rust => prelude().to_owned(),
+        Dialect::Pseudo => "// pseudo-code: widths and widening casts elided.\n\
+             // read_uN(a) = load N bits at a; rotlN/rotrN = rotate; INT3 = 0xCC.\n"
+            .to_owned(),
+        _ => {
+            let header = if d == Dialect::Cpp { "#include <cstdint>" } else { "#include <stdint.h>" };
+            let mut s = format!("// ---- prelude (generated) ----\n{header}\n#define INT3 0xCC\n");
+            for b in [8u32, 16, 32, 64] {
+                s += &format!(
+                    "static inline uint{b}_t read_u{b}(uint64_t a){{ return *(uint{b}_t *)(uintptr_t)a; }}\n"
+                );
+            }
+            for b in [8u32, 16, 32, 64] {
+                s += &format!(
+                    "static inline void write_u{b}(uint64_t a, uint{b}_t v){{ *(uint{b}_t *)(uintptr_t)a = v; }}\n"
+                );
+            }
+            for b in [8u32, 16, 32, 64] {
+                let m = b - 1;
+                s += &format!(
+                    "static inline uint{b}_t rotl{b}(uint{b}_t x, uint{b}_t n){{ return (uint{b}_t)((x << (n & {m})) | (x >> (({b} - n) & {m}))); }}\n"
+                );
+                s += &format!(
+                    "static inline uint{b}_t rotr{b}(uint{b}_t x, uint{b}_t n){{ return (uint{b}_t)((x >> (n & {m})) | (x << (({b} - n) & {m}))); }}\n"
+                );
+            }
+            s
+        }
+    }
+}
+
+/// Short width type (`u32`) to the dialect's spelling for a signature/return.
+fn sig_ty(d: Dialect, t: &str) -> String {
+    if d == Dialect::Pseudo {
+        return String::new();
+    }
+    if !d.is_c_family() {
+        return t.to_owned(); // Rust keeps u8/u64.
+    }
+    match t {
+        "u8" => "uint8_t",
+        "u16" => "uint16_t",
+        "u32" => "uint32_t",
+        "u64" => "uint64_t",
+        other => other, // void, etc.
+    }
+    .to_owned()
+}
+
+/// Render one recovered function in the dialect selected by [`dialect`] (Rust
+/// when unset), reusing the structures the C path already built.
 #[allow(clippy::too_many_arguments)]
 pub fn render_function(
     name: &str,
@@ -515,47 +750,87 @@ pub fn render_function(
     temps_map: &HashMap<Expr, String>,
     symbols: &Symbols,
 ) -> String {
+    let d = Dialect::parse(dialect().as_deref().unwrap_or("")).unwrap_or(Dialect::Rust);
     let consts = classify_constants(temps_order, prologue, body);
-    let r = RustRenderer { names, image_base: symbols.image_base(), temps: temps_map, consts: &consts };
-    // `u64 a1` -> `a1: u64`.
+    let image_base = symbols.image_base();
+    let r = Renderer { dialect: d, names, image_base, temps: temps_map, consts: &consts };
+
+    // Signature: `u64 a1` -> `a1: u64` (Rust) / `uint64_t a1` (C) / `a1` (pseudo).
     let args: Vec<String> = c_sig
         .iter()
         .map(|a| match a.rsplit_once(' ') {
-            Some((ty, nm)) => format!("{nm}: {ty}"),
+            Some((ty, nm)) => match d {
+                Dialect::Rust => format!("{nm}: {ty}"),
+                Dialect::Pseudo => nm.to_owned(),
+                _ => format!("{} {nm}", sig_ty(d, ty)),
+            },
             None => a.clone(),
         })
         .collect();
-    let ret = if ret_ty == "void" { String::new() } else { format!(" -> {ret_ty}") };
 
     let mut out = String::new();
+
     // Per-function constant legend, with real values.
-    if symbols.image_base() != 0 {
-        out.push_str(&format!("const IMAGE_BASE: u64 = 0x{:x};\n", symbols.image_base()));
+    let decl_const = |nm: &str, v: u64| -> String {
+        match d {
+            Dialect::Rust => format!("const {nm}: u64 = 0x{v:x};\n"),
+            Dialect::C99 => format!("#define {nm} 0x{v:x}ULL\n"),
+            Dialect::C23 | Dialect::Cpp => format!("constexpr uint64_t {nm} = 0x{v:x};\n"),
+            Dialect::Pseudo => format!("// {nm} = 0x{v:x}\n"),
+        }
+    };
+    if image_base != 0 {
+        out.push_str(&decl_const("IMAGE_BASE", image_base));
     }
     for (v, nm) in &consts {
-        out.push_str(&format!("const {nm}: u64 = 0x{v:x};\n"));
+        out.push_str(&decl_const(nm, *v));
     }
-    if symbols.image_base() != 0 || !consts.is_empty() {
+    if image_base != 0 || !consts.is_empty() {
         out.push('\n');
     }
-    out.push_str(&format!("unsafe fn {name}({}){ret} {{\n", args.join(", ")));
+
+    // Header.
+    match d {
+        Dialect::Rust => {
+            let ret = if ret_ty == "void" { String::new() } else { format!(" -> {ret_ty}") };
+            out.push_str(&format!("unsafe fn {name}({}){ret} {{\n", args.join(", ")));
+        }
+        Dialect::Pseudo => out.push_str(&format!("{name}({}):\n", args.join(", "))),
+        _ => out.push_str(&format!("{} {name}({}) {{\n", sig_ty(d, ret_ty), args.join(", "))),
+    }
+
     // Mutable locals the body assigns across branches.
     for (v, w) in decl {
-        out.push_str(&format!("    let mut {}: {} = 0;\n", names.get(v).unwrap_or(v), uty(*w)));
+        let nm = names.get(v).unwrap_or(v);
+        let line = match d {
+            Dialect::Rust => format!("    let mut {nm}: {} = 0;\n", uty(*w)),
+            Dialect::Pseudo => format!("    {nm} = 0\n"),
+            _ => format!("    {} {nm} = 0;\n", cty(*w)),
+        };
+        out.push_str(&line);
     }
     if !decl.is_empty() {
         out.push('\n');
     }
+
     // Shared subtrees, smaller first (each references only names above it).
     for (nm, def) in temps_order {
-        out.push_str(&format!("    let {nm} = {};\n", r.define(def)));
+        let rhs = r.define(def);
+        let line = match d {
+            Dialect::Rust => format!("    let {nm} = {rhs};\n"),
+            Dialect::Pseudo => format!("    {nm} = {rhs}\n"),
+            _ if d.auto_temps() => format!("    auto {nm} = {rhs};\n"),
+            _ => format!("    {} {nm} = {rhs};\n", cty(def.width)),
+        };
+        out.push_str(&line);
     }
     if !temps_order.is_empty() {
         out.push('\n');
     }
+
     r.stmts(prologue, &mut out, 1);
     r.stmts(body, &mut out, 1);
-    out.push_str("}\n");
+    out.push_str(if d == Dialect::Pseudo { "" } else { "}\n" });
     out
 }
 
@@ -565,10 +840,13 @@ mod tests {
     use vmpx_vm::{BinaryOp, Expr, UnaryOp};
 
     fn render(e: &Expr, image_base: u64) -> String {
+        render_as(Dialect::Rust, e, image_base)
+    }
+    fn render_as(dialect: Dialect, e: &Expr, image_base: u64) -> String {
         let names = BTreeMap::new();
         let temps = HashMap::new();
         let consts = BTreeMap::new();
-        RustRenderer { names: &names, image_base, temps: &temps, consts: &consts }.body(e).0
+        Renderer { dialect, names: &names, image_base, temps: &temps, consts: &consts }.body(e).0
     }
     fn reg(n: &str) -> Expr {
         Expr::register(BitWidth::W64, n)
@@ -617,5 +895,25 @@ mod tests {
             render(&Expr::constant(BitWidth::W64, 0x1_4000_0000), 0x1_4000_0000),
             "IMAGE_BASE"
         );
+    }
+
+    #[test]
+    fn dialects_render_the_same_tree_differently() {
+        // Unsigned add: Rust needs a wrapping verb; C/pseudo wrap by definition.
+        let add = Expr::binary(BinaryOp::Add, reg("a"), reg("b")).unwrap();
+        assert_eq!(render_as(Dialect::Rust, &add, 0), "a.wrapping_add(b)");
+        assert_eq!(render_as(Dialect::C99, &add, 0), "a + b");
+        assert_eq!(render_as(Dialect::Pseudo, &add, 0), "a + b");
+
+        // Bitwise-not: Rust `!`, the C family and pseudo `~`.
+        let not = Expr::unary(UnaryOp::Not, reg("x"));
+        assert_eq!(render_as(Dialect::Rust, &not, 0), "!x");
+        assert_eq!(render_as(Dialect::Cpp, &not, 0), "~x");
+
+        // A widening truncate: explicit cast in Rust/C, elided in pseudo.
+        let trunc = Expr::resize(ResizeOp::Truncate, BitWidth::W32, reg("x")).unwrap();
+        assert_eq!(render_as(Dialect::Rust, &trunc, 0), "x as u32");
+        assert_eq!(render_as(Dialect::C99, &trunc, 0), "(uint32_t)x");
+        assert_eq!(render_as(Dialect::Pseudo, &trunc, 0), "x");
     }
 }

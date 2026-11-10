@@ -486,10 +486,10 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
         Ok(n)
     })();
 
-    // Opt-in readable Rust dialect: re-render the same recovered tree. The C
-    // output above is unchanged, and the cross-check ran against it.
-    if readable::dialect().as_deref() == Some("rust") {
-        text = readable::prelude().to_owned()
+    // Opt-in readable dialect (rust / c99 / c23 / cpp / pseudo): re-render the
+    // same recovered tree. The C cross-check above is unchanged and already ran.
+    if let Some(d) = readable::dialect().as_deref().and_then(readable::Dialect::parse) {
+        text = readable::preamble(d)
             + "\n"
             + &readable::render_function(
                 &func.name,
