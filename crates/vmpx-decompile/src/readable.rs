@@ -85,7 +85,56 @@ impl RustRenderer<'_> {
         self.body(e).0
     }
 
+    /// A VM flag-word predicate (`vm_flags_*(K, x) & bit >> shift`), collapsed
+    /// to the comparison it actually is -- but ONLY when exhaustively proven.
+    /// The predicate is a pure function of its one non-constant operand `x`, so
+    /// over `x`'s whole (<=16-bit) domain it either is a clean indicator of a
+    /// comparison or it is not; if it is, emit `(x CMP C) [as T] [* scale]`,
+    /// else fall through to the literal rendering. Never emits an unproven form.
+    fn flag_predicate(&self, e: &Expr) -> Option<String> {
+        // The one `vm_flags_*` intrinsic in `e` (bail on zero or several), and
+        // its single non-constant operand `x` -- the value the predicate tests.
+        let mut flags = Vec::new();
+        collect_vm_flags(e, &mut flags);
+        let [intrin] = flags[..] else { return None };
+        let ExprKind::Intrinsic { arguments, .. } = &intrin.kind else { return None };
+        let nonconst: Vec<&Expr> = arguments.iter().filter(|a| cst(a).is_none()).collect();
+        let [x] = nonconst[..] else { return None };
+        let xw = x.width;
+        if xw.bits() > 16 {
+            return None;
+        }
+        let out_w = e.width;
+        // Replace `x` everywhere with a probe register, then tabulate `e` over the
+        // probe's whole domain -- structure-agnostic and exact. If any other free
+        // value or an unfoldable intrinsic remains, eval errors and we bail.
+        let probe = Expr::register(xw, "__flagprobe");
+        let e2 = replace_subtree(e, x, &probe);
+        let n = 1u64 << xw.bits();
+        let mut table = Vec::with_capacity(n as usize);
+        for v in 0..n {
+            let env: crate::exec::Env = std::iter::once(("__flagprobe".to_owned(), v)).collect();
+            table.push(crate::exec::eval(&e2, &env).ok()?);
+        }
+        let scale = *table.iter().find(|&&v| v != 0)?;
+        if table.iter().any(|&v| v != 0 && v != scale) {
+            return None; // not a two-valued indicator
+        }
+        let hits: Vec<u64> = (0..n).filter(|&i| table[i as usize] == scale).collect();
+        let (op, c) = recognize_cmp(&hits, n)?;
+        let xr = self.child(x, 10);
+        let cname = self.lit(xw, c);
+        let mut s = format!("({xr} {op} {cname}) as {}", uty(out_w));
+        if scale != 1 {
+            s = format!("(({s}).wrapping_mul({scale}))");
+        }
+        Some(s)
+    }
+
     fn body(&self, e: &Expr) -> (String, u8) {
+        if let Some(pred) = self.flag_predicate(e) {
+            return (pred, ATOM);
+        }
         match &e.kind {
             ExprKind::Const { value } => (self.lit(e.width, *value), ATOM),
             ExprKind::Register { name } => (self.name(name), ATOM),
@@ -245,6 +294,91 @@ impl RustRenderer<'_> {
     }
 }
 
+fn collect_vm_flags<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Intrinsic { name, .. } = &e.kind
+        && name.starts_with("vm_flags_")
+    {
+        out.push(e);
+    }
+    match &e.kind {
+        ExprKind::Unary { value, .. }
+        | ExprKind::Load { address: value }
+        | ExprKind::Extract { value, .. }
+        | ExprKind::Resize { value, .. } => collect_vm_flags(value, out),
+        ExprKind::Binary { left, right, .. } | ExprKind::Concat { high: left, low: right } => {
+            collect_vm_flags(left, out);
+            collect_vm_flags(right, out);
+        }
+        ExprKind::Intrinsic { arguments, .. } => {
+            for a in arguments {
+                collect_vm_flags(a, out);
+            }
+        }
+        ExprKind::Const { .. } | ExprKind::Register { .. } => {}
+    }
+}
+
+/// Rebuild `e` with every occurrence of `target` replaced by `repl` (same width,
+/// so no constructor fails).
+fn replace_subtree(e: &Expr, target: &Expr, repl: &Expr) -> Expr {
+    if e == target {
+        return repl.clone();
+    }
+    let rc = |c: &Expr| replace_subtree(c, target, repl);
+    match &e.kind {
+        ExprKind::Const { .. } | ExprKind::Register { .. } => e.clone(),
+        ExprKind::Unary { op, value } => Expr::unary(*op, rc(value)),
+        ExprKind::Binary { op, left, right } => {
+            Expr::binary(*op, rc(left), rc(right)).unwrap_or_else(|_| e.clone())
+        }
+        ExprKind::Load { address } => Expr::load(e.width, rc(address)),
+        ExprKind::Intrinsic { name, arguments } => {
+            Expr::intrinsic(e.width, name.clone(), arguments.iter().map(rc).collect())
+        }
+        ExprKind::Extract { value, lsb } => {
+            Expr::extract(e.width, *lsb, rc(value)).unwrap_or_else(|_| e.clone())
+        }
+        ExprKind::Concat { high, low } => {
+            Expr::concat(rc(high), rc(low)).unwrap_or_else(|_| e.clone())
+        }
+        ExprKind::Resize { op, value } => {
+            Expr::resize(*op, e.width, rc(value)).unwrap_or_else(|_| e.clone())
+        }
+    }
+}
+
+fn cst(e: &Expr) -> Option<u64> {
+    match e.kind {
+        ExprKind::Const { value } => Some(value),
+        _ => None,
+    }
+}
+
+/// The comparison whose indicator set over `0..n` is exactly `hits` (sorted),
+/// or `None` when the set is not a single clean comparison.
+fn recognize_cmp(hits: &[u64], n: u64) -> Option<(&'static str, u64)> {
+    if hits.is_empty() || hits.len() as u64 == n {
+        return None;
+    }
+    if hits.len() == 1 {
+        return Some(("==", hits[0]));
+    }
+    if hits.len() as u64 == n - 1 {
+        let present: std::collections::HashSet<u64> = hits.iter().copied().collect();
+        return Some(("!=", (0..n).find(|v| !present.contains(v))?));
+    }
+    let (first, last) = (hits[0], *hits.last()?);
+    if hits.windows(2).all(|w| w[1] == w[0] + 1) {
+        if first == 0 {
+            return Some(("<=", last));
+        }
+        if last == n - 1 {
+            return Some((">=", first));
+        }
+    }
+    None
+}
+
 fn intrinsic(name: &str) -> String {
     let base = match name.rsplit_once('_') {
         Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
@@ -348,6 +482,23 @@ mod tests {
             render(&Expr::binary(BinaryOp::Xor, reg("x"), reg("y")).unwrap(), 0),
             "x ^ y"
         );
+    }
+
+
+    #[test]
+    fn recognize_cmp_characterises_indicator_sets() {
+        // The flag-idiom collapse only fires when the exhaustive table is a
+        // clean indicator; recognize_cmp names which comparison.
+        assert_eq!(recognize_cmp(&[0xCC], 256), Some(("==", 0xCC)));
+        let all_but_one: Vec<u64> = (0..256).filter(|&v| v != 7).collect();
+        assert_eq!(recognize_cmp(&all_but_one, 256), Some(("!=", 7)));
+        let low: Vec<u64> = (0..10).collect();
+        assert_eq!(recognize_cmp(&low, 256), Some(("<=", 9)));
+        let high: Vec<u64> = (0x80..256).collect();
+        assert_eq!(recognize_cmp(&high, 256), Some((">=", 0x80)));
+        // Not a single clean comparison -> no collapse.
+        assert_eq!(recognize_cmp(&[1, 3, 5], 256), None);
+        assert_eq!(recognize_cmp(&[], 256), None);
     }
 
     #[test]
