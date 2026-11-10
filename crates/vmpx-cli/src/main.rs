@@ -226,6 +226,16 @@ enum Command {
         /// VM instruction budget for entry-stream recovery.
         #[arg(long, default_value_t = 100_000)]
         instruction_limit: usize,
+        /// Readable output (sugar for `--dialect rust`).
+        #[arg(long)]
+        readable: bool,
+        /// Output dialect: c (default) | rust. (c23/cpp/c99/pseudo: wip.)
+        #[arg(long, default_value = "c")]
+        dialect: String,
+        /// Fold level: named (default) | proven. `proven` bakes every subtree
+        /// proven constant against the image (rdtsc reads, .vmp2 checksum).
+        #[arg(long, default_value = "named")]
+        fold: String,
     },
     /// One command: analyse a mapped VMProtect image and produce a clean PE --
     /// strip, directory rebuild, OEP, native relocation, guard devirtualization,
@@ -1391,6 +1401,9 @@ fn main() -> Result<()> {
             original,
             probe,
             instruction_limit,
+            readable,
+            dialect,
+            fold,
         } => decompile_cmd::run(decompile_cmd::Options {
             input,
             only: function,
@@ -1399,6 +1412,8 @@ fn main() -> Result<()> {
             original,
             probe,
             instruction_limit,
+            dialect: if readable && dialect == "c" { "rust".to_owned() } else { dialect },
+            fold,
         })?,
         Command::Auto {
             input,

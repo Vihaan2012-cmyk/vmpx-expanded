@@ -76,6 +76,10 @@ pub(crate) struct Options {
     pub original: Option<PathBuf>,
     pub probe: bool,
     pub instruction_limit: usize,
+    /// Output dialect: "c" (default) or "rust".
+    pub dialect: String,
+    /// Fold level: "named" (default) or "proven".
+    pub fold: String,
 }
 
 /// Import slots from the image's own import directory, so the decompiler can
@@ -108,6 +112,10 @@ pub(crate) fn run(o: Options) -> Result<()> {
 }
 
 fn go(o: &Options) -> Result<()> {
+    vmpx_decompile::readable::set_dialect(match o.dialect.as_str() {
+        "" | "c" => None,
+        d => Some(d.to_owned()),
+    });
     let bytes = std::fs::read(&o.input).context("read input")?;
     if o.native {
         return native(o, &bytes);
@@ -214,7 +222,7 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         }
     })??;
     let mut rolled = rolled;
-    if std::env::var_os("VMPX_DECOMPILE_FOLD").is_some_and(|v| v == "proven") {
+    if o.fold == "proven" {
         fold_rolled(&mut rolled.root, pe);
     }
     let low = vmpx_decompile::vm::lower(&rolled, name)?;

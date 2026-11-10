@@ -17,6 +17,23 @@ use crate::symbols::Symbols;
 
 const ATOM: u8 = 100;
 
+static DIALECT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Select the output dialect (`"rust"`, ...), or `None` for the default C. Set
+/// by the CLI `--dialect` flag; falls back to `VMPX_DECOMPILE_DIALECT`.
+pub fn set_dialect(d: Option<String>) {
+    *DIALECT.write().unwrap_or_else(std::sync::PoisonError::into_inner) = d;
+}
+
+/// The selected dialect: the CLI flag if set, else the env var.
+#[must_use]
+pub fn dialect() -> Option<String> {
+    if let Some(d) = DIALECT.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+        return Some(d);
+    }
+    std::env::var("VMPX_DECOMPILE_DIALECT").ok()
+}
+
 fn uty(w: BitWidth) -> &'static str {
     match w {
         BitWidth::W8 => "u8",

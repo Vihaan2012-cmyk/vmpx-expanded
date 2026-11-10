@@ -488,7 +488,7 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
 
     // Opt-in readable Rust dialect: re-render the same recovered tree. The C
     // output above is unchanged, and the cross-check ran against it.
-    if std::env::var_os("VMPX_DECOMPILE_DIALECT").is_some_and(|v| v == "rust") {
+    if readable::dialect().as_deref() == Some("rust") {
         text = readable::prelude().to_owned()
             + "\n"
             + &readable::render_function(
