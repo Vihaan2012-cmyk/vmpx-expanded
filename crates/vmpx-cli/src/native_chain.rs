@@ -16,7 +16,9 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKi
 use vmpx_disasm::{LiftOptions, lift_block_with};
 use vmpx_mutation::cfg_recovery::{CfgOptions, VmAlgebra};
 use vmpx_pe::{PeImage, Rva};
-use vmpx_verify::differential::{apply_native_segment, compose_into_next, prepare_recovered, same_exit};
+use vmpx_verify::differential::{
+    apply_native_segment, compose_into_next, prepare_recovered, same_exit,
+};
 use vmpx_vm::ExprKind;
 use vmpx_vmlift::{ExitSemantics, UnrolledFunction, UnrolledPath};
 
@@ -105,7 +107,8 @@ fn decode_segment(pe: &PeImage<'_>, target_va: u64) -> Result<(Vec<Instruction>,
                 return Ok((body, Tail::Return));
             }
             FlowControl::UnconditionalBranch
-                if ins.mnemonic() == Mnemonic::Jmp && matches!(ins.op0_kind(), OpKind::NearBranch64) =>
+                if ins.mnemonic() == Mnemonic::Jmp
+                    && matches!(ins.op0_kind(), OpKind::NearBranch64) =>
             {
                 va = ins.near_branch_target();
             }
@@ -134,11 +137,18 @@ fn decode_segment(pe: &PeImage<'_>, target_va: u64) -> Result<(Vec<Instruction>,
                 let rva = u32::try_from(push.ip().wrapping_sub(base))
                     .map_err(|_| "re-entry stub outside the image".to_owned())?;
                 if is_push_reg64(&push) {
-                    return Ok((body, Tail::ReenterReg(Rva(rva), push.op0_register().full_register())));
+                    return Ok((
+                        body,
+                        Tail::ReenterReg(Rva(rva), push.op0_register().full_register()),
+                    ));
                 }
                 return Ok((body, Tail::Reenter(Rva(rva))));
             }
-            other => return Err(format!("native segment ends in unmodeled control flow {other:?}")),
+            other => {
+                return Err(format!(
+                    "native segment ends in unmodeled control flow {other:?}"
+                ));
+            }
         }
     }
     Err("native segment is too long".to_owned())
@@ -197,16 +207,17 @@ fn region_of(
     let mut exits: Vec<ExitSemantics> = Vec::new();
     for (index, path) in base.paths.iter().enumerate() {
         tally.blocks += path.blocks_executed;
-        let (prepared, _) = match prepare_recovered(&path.semantics, &path.store_epochs, base.entry_sp_offset) {
-            Ok(p) => p,
-            Err(e) => {
-                if path.region_exit {
-                    tally.gate_arms += 1;
-                    continue;
+        let (prepared, _) =
+            match prepare_recovered(&path.semantics, &path.store_epochs, base.entry_sp_offset) {
+                Ok(p) => p,
+                Err(e) => {
+                    if path.region_exit {
+                        tally.gate_arms += 1;
+                        continue;
+                    }
+                    return Err(format!("path {index}: {e}"));
                 }
-                return Err(format!("path {index}: {e}"));
-            }
-        };
+            };
         if !path.region_exit {
             push_unique(&mut exits, prepared);
             continue;
@@ -215,7 +226,11 @@ fn region_of(
             if std::env::var_os("VMPX_DIFF_TRACE").is_some() {
                 eprintln!(
                     "[chain] region exit {index} not followable: region={:?} stores={}",
-                    path.region.as_ref().map(|r| (r.staged_words, r.target.dependencies(), r.target.intrinsic_dependencies())),
+                    path.region.as_ref().map(|r| (
+                        r.staged_words,
+                        r.target.dependencies(),
+                        r.target.intrinsic_dependencies()
+                    )),
                     path.semantics.effects.stores.len()
                 );
             }
@@ -230,7 +245,9 @@ fn region_of(
                 }
             }
             Err(e) => {
-                tally.notes.push(format!("region exit to {target:#x} not followed: {e}"));
+                tally
+                    .notes
+                    .push(format!("region exit to {target:#x} not followed: {e}"));
                 tally.gate_arms += 1;
             }
         }
@@ -263,7 +280,10 @@ fn follow(
         Tail::Return => Ok(vec![after]),
         Tail::Reenter(rva) => {
             let nested = region(pe, rva, depth + 1, limits, tally)?;
-            nested.iter().map(|next| compose_into_next(&after, next)).collect()
+            nested
+                .iter()
+                .map(|next| compose_into_next(&after, next))
+                .collect()
         }
         Tail::ReenterReg(rva, reg) => {
             // The seed is the pushed register's value under the state the exit left.
@@ -280,10 +300,17 @@ fn follow(
                 .ok_or("the pushed register has no value in the exit state")?
                 .simplify();
             let ExprKind::Const { value: seed } = value.kind else {
-                return Err(format!("the re-entry seed register is not a constant under the exit state (depends on {:?} / {:?})", value.dependencies(), value.intrinsic_dependencies()));
+                return Err(format!(
+                    "the re-entry seed register is not a constant under the exit state (depends on {:?} / {:?})",
+                    value.dependencies(),
+                    value.intrinsic_dependencies()
+                ));
             };
             let nested = region_seeded(pe, rva, Some(seed), depth + 1, limits, tally)?;
-            nested.iter().map(|next| compose_into_next(&after, next)).collect()
+            nested
+                .iter()
+                .map(|next| compose_into_next(&after, next))
+                .collect()
         }
     }
 }
@@ -299,8 +326,13 @@ pub(crate) fn unroll_chained(
 ) -> Result<UnrolledFunction, String> {
     let mut tally = Tally::default();
     let limits = (instruction_limit, max_blocks, max_paths);
-    let first = crate::decoded_splice::unroll_entry_cfg(pe, rva, instruction_limit, max_blocks, max_paths)?;
-    if first.paths.iter().all(|p| !p.region_exit || p.region.is_none()) {
+    let first =
+        crate::decoded_splice::unroll_entry_cfg(pe, rva, instruction_limit, max_blocks, max_paths)?;
+    if first
+        .paths
+        .iter()
+        .all(|p| !p.region_exit || p.region.is_none())
+    {
         return Ok(first);
     }
     let exits = region_of(pe, &first, 0, limits, &mut tally)?;

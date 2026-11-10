@@ -119,7 +119,9 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
         };
         let from = offset.0 as usize;
         let to = from.saturating_add((end - begin) as usize).min(bytes.len());
-        let Some(code) = bytes.get(from..to) else { continue };
+        let Some(code) = bytes.get(from..to) else {
+            continue;
+        };
         let mut decoder = Decoder::with_ip(64, code, base + u64::from(begin), DecoderOptions::NONE);
         while decoder.can_decode() {
             let instruction = decoder.decode();
@@ -169,7 +171,13 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
     for rva in targets {
         let candidate = analyze_vm_entry_at(pe, Rva(rva), VmDiscoveryLimits::default());
         if candidate.as_ref().is_some_and(|c| c.confidence >= 80) {
-            log.trace(&format!("{rva:#x}"), &format!("guard (VM entry, confidence {})", candidate.as_ref().map_or(0, |c| c.confidence)));
+            log.trace(
+                &format!("{rva:#x}"),
+                &format!(
+                    "guard (VM entry, confidence {})",
+                    candidate.as_ref().map_or(0, |c| c.confidence)
+                ),
+            );
             guards.push(rva);
         } else if recover_native_cfg_pe_with(pe, Rva(rva), options).is_ok() {
             log.trace(&format!("{rva:#x}"), "mutated native");
@@ -178,7 +186,10 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
             log.trace(&format!("{rva:#x}"), "guard (VM entry, low confidence)");
             guards.push(rva); // a VM entry the scorer was unsure of
         } else {
-            log.trace(&format!("{rva:#x}"), "unclassified protector target (left as-is)");
+            log.trace(
+                &format!("{rva:#x}"),
+                "unclassified protector target (left as-is)",
+            );
         }
     }
     log.info(&format!(
@@ -232,10 +243,14 @@ pub(crate) fn neutralize_residual_guards(
             if e <= b || e - b > 0x10_0000 {
                 continue;
             }
-            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else {
+                continue;
+            };
             let from = off.0 as usize;
             let to = (from + (e - b) as usize).min(image.len());
-            let Some(code) = image.get(from..to) else { continue };
+            let Some(code) = image.get(from..to) else {
+                continue;
+            };
             let mut decoder = Decoder::with_ip(64, code, base + u64::from(b), DecoderOptions::NONE);
             while decoder.can_decode() {
                 let instruction = decoder.decode();
@@ -248,8 +263,7 @@ pub(crate) fn neutralize_residual_guards(
                 ) && instruction.near_branch64() != 0
                     && targets.contains(&instruction.near_branch64())
                 {
-                    let guard_rva =
-                        u32::try_from(instruction.near_branch64() - base).unwrap_or(0);
+                    let guard_rva = u32::try_from(instruction.near_branch64() - base).unwrap_or(0);
                     let transfer_end = from
                         + usize::try_from(instruction.next_ip() - (base + u64::from(b)))
                             .unwrap_or(to - from);
@@ -281,10 +295,14 @@ pub(crate) fn neutralize_dangling_guard_thunks(
             if e <= b || e - b > 0x10_0000 {
                 continue;
             }
-            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+            let Ok(off) = pe.rva_to_file_offset(Rva(b)) else {
+                continue;
+            };
             let from = off.0 as usize;
             let to = (from + (e - b) as usize).min(image.len());
-            let Some(code) = image.get(from..to) else { continue };
+            let Some(code) = image.get(from..to) else {
+                continue;
+            };
             let mut decoder = Decoder::with_ip(64, code, base + u64::from(b), DecoderOptions::NONE);
             while decoder.can_decode() {
                 let instruction = decoder.decode();
@@ -358,7 +376,9 @@ fn recover_oep(pe: &PeImage<'_>, bytes: &[u8]) -> Option<u32> {
         let to = from
             .saturating_add(section.size_of_raw_data as usize)
             .min(bytes.len());
-        let Some(blob) = bytes.get(from..to) else { continue };
+        let Some(blob) = bytes.get(from..to) else {
+            continue;
+        };
         for at in 0..blob.len().saturating_sub(5) {
             if blob[at] != 0xE8 {
                 continue;
@@ -394,7 +414,9 @@ fn recover_oep(pe: &PeImage<'_>, bytes: &[u8]) -> Option<u32> {
                         set.insert(dst);
                     }
                 }
-                let from = |s: &BTreeSet<Register>| s.iter().any(|r| r.full_register() == src.full_register());
+                let from = |s: &BTreeSet<Register>| {
+                    s.iter().any(|r| r.full_register() == src.full_register())
+                };
                 match dst.full_register() {
                     Register::RCX if from(&a1) => staged.0 = true,
                     Register::RDX if from(&a2) => staged.1 = true,
@@ -403,7 +425,9 @@ fn recover_oep(pe: &PeImage<'_>, bytes: &[u8]) -> Option<u32> {
                 }
             }
             if matches!(ins.mnemonic(), Mnemonic::Test | Mnemonic::Cmp)
-                && a2.iter().any(|r| r.full_register() == ins.op0_register().full_register())
+                && a2
+                    .iter()
+                    .any(|r| r.full_register() == ins.op0_register().full_register())
             {
                 branched = true;
             }
@@ -425,10 +449,17 @@ fn recover_oep(pe: &PeImage<'_>, bytes: &[u8]) -> Option<u32> {
         if e <= b || e - b > 0x800 || incoming.get(&b).copied().unwrap_or(0) != 0 {
             continue;
         }
-        if pe.sections.iter().find(|s| s.contains_mapped_rva(Rva(b))).is_some_and(|s| s.name.as_str().starts_with(".vmp")) {
+        if pe
+            .sections
+            .iter()
+            .find(|s| s.contains_mapped_rva(Rva(b)))
+            .is_some_and(|s| s.name.as_str().starts_with(".vmp"))
+        {
             continue;
         }
-        let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+        let Ok(off) = pe.rva_to_file_offset(Rva(b)) else {
+            continue;
+        };
         let from = off.0 as usize;
         let Some(code) = bytes.get(from..(from + (e - b) as usize).min(bytes.len())) else {
             continue;
@@ -459,7 +490,10 @@ pub(crate) fn auto_settings() -> bool {
 fn confirm(log: &Log, question: &str, default: bool, no_prompt: bool) -> bool {
     use std::io::{IsTerminal, Write};
     if no_prompt || !std::io::stdin().is_terminal() {
-        log.info(&format!("{question} [{}] (assumed)", if default { "Y/n" } else { "y/N" }));
+        log.info(&format!(
+            "{question} [{}] (assumed)",
+            if default { "Y/n" } else { "y/N" }
+        ));
         return default;
     }
     let hint = if default { "[Y/n]" } else { "[y/N]" };
@@ -523,10 +557,15 @@ pub fn run(o: Options) -> Result<(), String> {
     // input is read -- so a `--log-file` aimed at the input would destroy it.
     // Refuse any collision with the input or the output image.
     if same_file(&log_path, &o.input) {
-        return Err("--log-file resolves to the input image; it would be truncated before being read".to_owned());
+        return Err(
+            "--log-file resolves to the input image; it would be truncated before being read"
+                .to_owned(),
+        );
     }
     if same_file(&log_path, &output) {
-        return Err("--log-file resolves to the output image; choose a different log path".to_owned());
+        return Err(
+            "--log-file resolves to the output image; choose a different log path".to_owned(),
+        );
     }
     let log = Log::new("vmpx", o.verbose).with_file(&log_path);
     log.start(&format!("Devirtualizing {}", o.input.display()));
@@ -563,7 +602,10 @@ pub fn run(o: Options) -> Result<(), String> {
             if let Some(dir) = &o.dir {
                 let mapped_path = dir.join("mapped.bin");
                 std::fs::write(&mapped_path, &result.image).map_err(|e| e.to_string())?;
-                log.file(&mapped_path.display().to_string(), &format!("{} bytes", result.image.len()));
+                log.file(
+                    &mapped_path.display().to_string(),
+                    &format!("{} bytes", result.image.len()),
+                );
             }
             result.image
         } else {
@@ -576,7 +618,11 @@ pub fn run(o: Options) -> Result<(), String> {
     log.info(&format!(
         "{} sections, image base {base:#x}, {} import symbol(s)",
         pe.sections.len(),
-        pe.report().imports.iter().map(|m| m.entries.len()).sum::<usize>()
+        pe.report()
+            .imports
+            .iter()
+            .map(|m| m.entries.len())
+            .sum::<usize>()
     ));
     log.info(&format!("protection: {:?}", report.verdict));
 
@@ -587,7 +633,10 @@ pub fn run(o: Options) -> Result<(), String> {
     // in `devirt_guards`). A larger blanket budget only slows the easy guards;
     // adapting where needed is both faster and "best" in the sense asked for.
     let instruction_limit = 2048_usize;
-    log.step("instruction limit", &format!("{instruction_limit}, escalating per guard as needed"));
+    log.step(
+        "instruction limit",
+        &format!("{instruction_limit}, escalating per guard as needed"),
+    );
     log.step("image reads", "serve read-only under suppression (labeled)");
     log.step("checksum", "fold against the intact image");
     log.step("cross-section", "follow continuations across .vmp sections");
@@ -615,18 +664,41 @@ pub fn run(o: Options) -> Result<(), String> {
     let dirs = rebuild_all_directories(&conventional, *b".vmpxdir", &removed)
         .map_err(|e| format!("directory rebuild: {e}"))?;
     const DIR_NAMES: [&str; 13] = [
-        "export", "import", "resource", "exception", "security", "basereloc",
-        "debug", "architecture", "globalptr", "tls", "load_config", "bound_import", "iat",
+        "export",
+        "import",
+        "resource",
+        "exception",
+        "security",
+        "basereloc",
+        "debug",
+        "architecture",
+        "globalptr",
+        "tls",
+        "load_config",
+        "bound_import",
+        "iat",
     ];
     for moved in &dirs.moved {
         let name = DIR_NAMES.get(moved.index).copied().unwrap_or("directory");
         log.trace(
             &format!("  relocate {name}"),
-            &format!("{:#x} -> {:#x} ({} bytes)", moved.from.0, moved.to.0, moved.size),
+            &format!(
+                "{:#x} -> {:#x} ({} bytes)",
+                moved.from.0, moved.to.0, moved.size
+            ),
         );
     }
-    log.trace("  exception table", &format!("{} entries", dirs.exception_entries.0));
-    log.trace("  import directory", &format!("{} symbols / {} modules", dirs.import_symbols, dirs.import_modules));
+    log.trace(
+        "  exception table",
+        &format!("{} entries", dirs.exception_entries.0),
+    );
+    log.trace(
+        "  import directory",
+        &format!(
+            "{} symbols / {} modules",
+            dirs.import_symbols, dirs.import_modules
+        ),
+    );
     log.trace("  tls callbacks", &format!("{}", dirs.tls_callbacks.0));
     log.step(
         "directories relocated",
@@ -711,7 +783,11 @@ pub fn run(o: Options) -> Result<(), String> {
                     .collect();
                 log.step(
                     "neutralized",
-                    &format!("{} of {} residual guard(s)", done.len(), residual_guards.len()),
+                    &format!(
+                        "{} of {} residual guard(s)",
+                        done.len(),
+                        residual_guards.len()
+                    ),
                 );
                 if !missed.is_empty() {
                     log.warn(&format!(
@@ -779,12 +855,7 @@ pub fn run(o: Options) -> Result<(), String> {
             }
         } else {
             log.info("skipping imports; the written image will not run until they are bound");
-            if !confirm(
-                &log,
-                "write the image anyway?",
-                true,
-                o.yes_to_all_defaults,
-            ) {
+            if !confirm(&log, "write the image anyway?", true, o.yes_to_all_defaults) {
                 return Err("aborted: run with --snapshot or allow detonation".to_owned());
             }
         }
@@ -796,7 +867,9 @@ pub fn run(o: Options) -> Result<(), String> {
     if dangling == 0 {
         log.success("no reference into removed space remains");
     } else {
-        log.warn(&format!("{dangling} reference(s) into removed space remain"));
+        log.warn(&format!(
+            "{dangling} reference(s) into removed space remain"
+        ));
     }
     match validate_for_loader(&image) {
         Ok(r) => log.step(
@@ -806,7 +879,10 @@ pub fn run(o: Options) -> Result<(), String> {
         Err(e) => return Err(format!("loader validation failed: {e}")),
     }
     std::fs::write(&output, &image).map_err(|e| e.to_string())?;
-    log.file(&output.display().to_string(), &format!("{} bytes", image.len()));
+    log.file(
+        &output.display().to_string(),
+        &format!("{} bytes", image.len()),
+    );
     // Only a result with no residual references AND rebound imports is clean and
     // runnable. Otherwise name the gaps instead of claiming success: the image
     // is written (it is still useful for inspection) but will likely not run.
@@ -841,14 +917,10 @@ fn detonate_imports(
     max_steps: u64,
 ) -> Result<Vec<(u32, String, String)>, String> {
     let base = pe.optional.image_base.0;
-    let xplm = pe
-        .report()
-        .imports
-        .iter()
-        .any(|m| {
-            let n = m.name.to_ascii_uppercase();
-            n.starts_with("XPLM") || n.starts_with("XPWIDGETS")
-        });
+    let xplm = pe.report().imports.iter().any(|m| {
+        let n = m.name.to_ascii_uppercase();
+        n.starts_with("XPLM") || n.starts_with("XPWIDGETS")
+    });
     let mut warnings = Vec::new();
     let export_reference =
         crate::clean::dynamic_export_reference(&input_path.to_string_lossy(), &mut warnings);
@@ -857,7 +929,10 @@ fn detonate_imports(
     }
     log.step(
         "detonating",
-        &format!("up to {max_steps} steps, xplm={xplm}, {} reference module(s)", export_reference.len()),
+        &format!(
+            "up to {max_steps} steps, xplm={xplm}, {} reference module(s)",
+            export_reference.len()
+        ),
     );
     let options = vmpx_emulate::DetonateOptions {
         export_reference,
@@ -868,7 +943,12 @@ fn detonate_imports(
     let result = vmpx_emulate::detonate(pe, &options).map_err(|e| format!("{e:?}"))?;
     log.step(
         "detonated",
-        &format!("{} step(s), stop {:?}, {} import(s) observed", result.steps, result.stop, result.observed.imports.len()),
+        &format!(
+            "{} step(s), stop {:?}, {} import(s) observed",
+            result.steps,
+            result.stop,
+            result.observed.imports.len()
+        ),
     );
     let slots = result
         .observed
@@ -888,7 +968,9 @@ fn detonate_imports(
 
 /// Count references from surviving code into removed (unmapped) space.
 fn count_dangling(image: &[u8]) -> usize {
-    let Ok(pe) = PeImage::parse(image) else { return 0 };
+    let Ok(pe) = PeImage::parse(image) else {
+        return 0;
+    };
     let base = pe.optional.image_base.0;
     let soi = pe.optional.size_of_image;
     let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
@@ -898,7 +980,9 @@ fn count_dangling(image: &[u8]) -> usize {
         if e <= b || e - b > 0x10_0000 || !mapped(b) {
             continue;
         }
-        let Ok(off) = pe.rva_to_file_offset(Rva(b)) else { continue };
+        let Ok(off) = pe.rva_to_file_offset(Rva(b)) else {
+            continue;
+        };
         let from = off.0 as usize;
         let Some(code) = image.get(from..(from + (e - b) as usize).min(image.len())) else {
             continue;
@@ -911,7 +995,9 @@ fn count_dangling(image: &[u8]) -> usize {
             }
             let t = if matches!(
                 ins.flow_control(),
-                FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch
+                FlowControl::Call
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::ConditionalBranch
             ) && ins.near_branch64() != 0
             {
                 Some(ins.near_branch64())
@@ -954,7 +1040,15 @@ fn relocate_natives(
             .map_err(|e| format!("native cfg {rva:#x}: {e}"))?;
         log.trace(
             &format!("  recover {rva:#x}"),
-            &format!("{} block(s){}", cfg.blocks.len(), if cfg.is_complete() { "" } else { " (incomplete)" }),
+            &format!(
+                "{} block(s){}",
+                cfg.blocks.len(),
+                if cfg.is_complete() {
+                    ""
+                } else {
+                    " (incomplete)"
+                }
+            ),
         );
         for block in cfg.blocks.values() {
             blocks.insert(block.start, block.end);
@@ -968,7 +1062,12 @@ fn relocate_natives(
             }
         }
     }
-    let covered = |va: u64| blocks.range(..=va).next_back().is_some_and(|(_, end)| va < *end);
+    let covered = |va: u64| {
+        blocks
+            .range(..=va)
+            .next_back()
+            .is_some_and(|(_, end)| va < *end)
+    };
     let section_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
     let mut payload: Vec<u8> = Vec::new();
     let mut placement: BTreeMap<u64, u64> = BTreeMap::new();
@@ -978,7 +1077,10 @@ fn relocate_natives(
         }
         placement.insert(*start, base + u64::from(section_rva) + payload.len() as u64);
         let rva = u32::try_from(start - base).unwrap_or(0);
-        let off = intact.rva_to_file_offset(Rva(rva)).map_err(|e| e.to_string())?.0 as usize;
+        let off = intact
+            .rva_to_file_offset(Rva(rva))
+            .map_err(|e| e.to_string())?
+            .0 as usize;
         payload.extend_from_slice(
             intact_bytes
                 .get(off..off + (end - start) as usize)
@@ -997,14 +1099,17 @@ fn relocate_natives(
         let mut cursor = 0;
         while cursor < len {
             let window = &payload[at + cursor..at + len];
-            let ins = Decoder::with_ip(64, window, start + cursor as u64, DecoderOptions::NONE).decode();
+            let ins =
+                Decoder::with_ip(64, window, start + cursor as u64, DecoderOptions::NONE).decode();
             if ins.is_invalid() {
                 break;
             }
             let size = ins.len();
             let target = if matches!(
                 ins.flow_control(),
-                FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch
+                FlowControl::Call
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::ConditionalBranch
             ) && ins.near_branch64() != 0
             {
                 Some(ins.near_branch64())
@@ -1025,12 +1130,19 @@ fn relocate_natives(
                     let section = t
                         .checked_sub(base)
                         .and_then(|v| u32::try_from(v).ok())
-                        .and_then(|r| intact.sections.iter().find(|s| s.contains_mapped_rva(Rva(r))));
+                        .and_then(|r| {
+                            intact
+                                .sections
+                                .iter()
+                                .find(|s| s.contains_mapped_rva(Rva(r)))
+                        });
                     match section {
                         // Not covered (moved was None), so a `.vmp` target is
                         // genuinely in removed space.
                         Some(s) if s.name.as_str().starts_with(".vmp") => {
-                            return Err(format!("component references removed space at {start:#x}"));
+                            return Err(format!(
+                                "component references removed space at {start:#x}"
+                            ));
                         }
                         // Retained section: rebase the displacement to the same
                         // address from the instruction's new location.
@@ -1059,7 +1171,11 @@ fn relocate_natives(
                     } else {
                         re.ip_rel_memory_address() == nt
                     };
-                    if !re.is_invalid() && re.len() == size && re.mnemonic() == ins.mnemonic() && reaches {
+                    if !re.is_invalid()
+                        && re.len() == size
+                        && re.mnemonic() == ins.mnemonic()
+                        && reaches
+                    {
                         ok = true;
                         break;
                     }
@@ -1089,7 +1205,11 @@ fn relocate_natives(
     }
     log.step(
         "relocated",
-        &format!("{} function block(s), {} byte(s)", blocks.len(), payload.len()),
+        &format!(
+            "{} function block(s), {} byte(s)",
+            blocks.len(),
+            payload.len()
+        ),
     );
     Ok((rebuilt.bytes, mapping))
 }
@@ -1118,7 +1238,10 @@ fn repoint(
     let mut payload = Vec::new();
     let mut slot_of = BTreeMap::new();
     for new in &order {
-        slot_of.insert(*new, section_rva + u32::try_from(payload.len()).unwrap_or(0));
+        slot_of.insert(
+            *new,
+            section_rva + u32::try_from(payload.len()).unwrap_or(0),
+        );
         payload.extend_from_slice(&(base + u64::from(*new)).to_le_bytes());
     }
     let mut out = append_section(
@@ -1150,7 +1273,11 @@ fn repoint(
             _ => merged.push((b, e)),
         }
     }
-    for s in pe2.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
+    for s in pe2
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & EXEC != 0)
+    {
         let (start, size) = (s.virtual_address.0, s.virtual_size.max(s.size_of_raw_data));
         let mut cur = start;
         for (b, e) in &merged {
@@ -1171,7 +1298,9 @@ fn repoint(
         if !mapped(begin) {
             continue;
         }
-        let Ok(off) = pe2.rva_to_file_offset(Rva(begin)) else { continue };
+        let Ok(off) = pe2.rva_to_file_offset(Rva(begin)) else {
+            continue;
+        };
         let from = off.0 as usize;
         let Some(code) = out.get(from..(from + (end - begin) as usize).min(out.len())) else {
             continue;
@@ -1184,18 +1313,28 @@ fn repoint(
                 break;
             }
             let site = begin + u32::try_from(at).unwrap_or(0);
-            if matches!(ins.flow_control(), FlowControl::Call | FlowControl::UnconditionalBranch)
-                && ins.near_branch64() != 0
-                && let Some(t) = ins.near_branch64().checked_sub(base).and_then(|v| u32::try_from(v).ok())
+            if matches!(
+                ins.flow_control(),
+                FlowControl::Call | FlowControl::UnconditionalBranch
+            ) && ins.near_branch64() != 0
+                && let Some(t) = ins
+                    .near_branch64()
+                    .checked_sub(base)
+                    .and_then(|v| u32::try_from(v).ok())
                 && let Some(new) = mapping.get(&t)
             {
                 edits.push((site, *new, true));
             }
             if ins.memory_base() == Register::RIP
-                && let Some(slot) = ins.ip_rel_memory_address().checked_sub(base).and_then(|v| u32::try_from(v).ok())
+                && let Some(slot) = ins
+                    .ip_rel_memory_address()
+                    .checked_sub(base)
+                    .and_then(|v| u32::try_from(v).ok())
                 && slot < pe2.optional.size_of_image
                 && !mapped(slot)
-                && let Some(t) = qword(slot).and_then(|q| q.checked_sub(base)).and_then(|v| u32::try_from(v).ok())
+                && let Some(t) = qword(slot)
+                    .and_then(|q| q.checked_sub(base))
+                    .and_then(|v| u32::try_from(v).ok())
                 && let Some(new) = mapping.get(&t)
             {
                 edits.push((site, slot_of[new], false));
@@ -1211,7 +1350,10 @@ fn repoint(
             retarget_rip_relative(&out, Rva(site), Rva(target)).map_err(|e| e.to_string())?
         };
     }
-    log.step("repointed", &format!("{slots} slot load(s), {direct} direct transfer(s)"));
+    log.step(
+        "repointed",
+        &format!("{slots} slot load(s), {direct} direct transfer(s)"),
+    );
     Ok(out)
 }
 
@@ -1265,11 +1407,21 @@ fn devirt_guards(
             }
             Err(reason) => {
                 residual.push(rva);
-                log.warn(&format!("{rva:#x}: {}", reason.lines().next().unwrap_or(&reason)));
+                log.warn(&format!(
+                    "{rva:#x}: {}",
+                    reason.lines().next().unwrap_or(&reason)
+                ));
             }
         }
     }
-    log.step("devirtualized", &format!("{ok} of {} guard(s), {} byte(s)", guards.len(), payload.len()));
+    log.step(
+        "devirtualized",
+        &format!(
+            "{ok} of {} guard(s), {} byte(s)",
+            guards.len(),
+            payload.len()
+        ),
+    );
     if mapping.is_empty() {
         return Ok((image, residual));
     }

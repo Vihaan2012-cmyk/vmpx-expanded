@@ -15,7 +15,11 @@ pub type Env = HashMap<String, u64>;
 
 fn sext(v: u64, from: BitWidth) -> u64 {
     let v = from.truncate(v);
-    if v >> (from.bits() - 1) & 1 == 1 { v | !from.mask() } else { v }
+    if v >> (from.bits() - 1) & 1 == 1 {
+        v | !from.mask()
+    } else {
+        v
+    }
 }
 
 pub fn mem_read(addr: u64, w: BitWidth) -> u64 {
@@ -42,10 +46,18 @@ fn binop(op: BinaryOp, w: BitWidth, l: u64, r: u64) -> u64 {
         BinaryOp::Shr => l.wrapping_shr(sc),
         BinaryOp::Sar => sext(l, w).cast_signed().wrapping_shr(sc).cast_unsigned(),
         BinaryOp::Rol => {
-            if rc == 0 { l } else { (l << rc) | (l >> (bits - rc)) }
+            if rc == 0 {
+                l
+            } else {
+                (l << rc) | (l >> (bits - rc))
+            }
         }
         BinaryOp::Ror => {
-            if rc == 0 { l } else { (l >> rc) | (l << (bits - rc)) }
+            if rc == 0 {
+                l
+            } else {
+                (l >> rc) | (l << (bits - rc))
+            }
         }
     };
     w.truncate(out)
@@ -58,9 +70,10 @@ pub fn eval(e: &Expr, env: &Env) -> Result<u64, String> {
         }
         let v = match &e.kind {
             ExprKind::Const { value } => *value,
-            ExprKind::Register { name } => e
-                .width
-                .truncate(*env.get(name).ok_or_else(|| format!("`{name}` is uninitialized"))?),
+            ExprKind::Register { name } => e.width.truncate(
+                *env.get(name)
+                    .ok_or_else(|| format!("`{name}` is uninitialized"))?,
+            ),
             ExprKind::Unary { op, value } => {
                 let v = go(value, env, memo)?;
                 e.width.truncate(match op {
@@ -72,9 +85,9 @@ pub fn eval(e: &Expr, env: &Env) -> Result<u64, String> {
                 binop(*op, e.width, go(left, env, memo)?, go(right, env, memo)?)
             }
             ExprKind::Extract { value, lsb } => e.width.truncate(go(value, env, memo)? >> lsb),
-            ExprKind::Concat { high, low } => {
-                e.width.truncate((go(high, env, memo)? << low.width.bits()) | go(low, env, memo)?)
-            }
+            ExprKind::Concat { high, low } => e
+                .width
+                .truncate((go(high, env, memo)? << low.width.bits()) | go(low, env, memo)?),
             ExprKind::Resize { op, value } => {
                 let v = go(value, env, memo)?;
                 e.width.truncate(match op {
@@ -230,7 +243,11 @@ pub fn run_reference(f: &Func, inputs: &Env) -> Result<Outcome, String> {
     for _ in 0..BUDGET {
         let b = f.blocks.get(&id).ok_or("missing block")?;
         for s in &b.stores {
-            stores.push((eval(&s.address, &env)?, s.value.width.bits(), eval(&s.value, &env)?));
+            stores.push((
+                eval(&s.address, &env)?,
+                s.value.width.bits(),
+                eval(&s.value, &env)?,
+            ));
         }
         let mut next: Vec<(String, u64)> = Vec::new();
         for (v, d) in &b.assigns {
@@ -248,10 +265,15 @@ pub fn run_reference(f: &Func, inputs: &Env) -> Result<Outcome, String> {
         }
         match &b.term {
             Term::Return(vals) => {
-                return Ok(Outcome { ret: eval(&vals[0].1, &env)?, stores });
+                return Ok(Outcome {
+                    ret: eval(&vals[0].1, &env)?,
+                    stores,
+                });
             }
             Term::Goto(t) => id = *t,
-            Term::Branch { cond, then, els } => id = if eval_cond(cond, &env)? { *then } else { *els },
+            Term::Branch { cond, then, els } => {
+                id = if eval_cond(cond, &env)? { *then } else { *els }
+            }
         }
         for (v, x) in next {
             env.insert(v, x);
@@ -287,7 +309,11 @@ impl Interp {
 
     fn tick(&mut self) -> Result<(), String> {
         self.steps += 1;
-        if self.steps > BUDGET { Err("structured run exceeded its step budget".into()) } else { Ok(()) }
+        if self.steps > BUDGET {
+            Err("structured run exceeded its step budget".into())
+        } else {
+            Ok(())
+        }
     }
 
     fn one(&mut self, s: &Stmt) -> Result<Flow, String> {
@@ -303,7 +329,11 @@ impl Interp {
                 self.stores.push((a, st.value.width.bits(), x));
             }
             Stmt::If { cond, then, els } => {
-                return if eval_cond(cond, &self.env)? { self.seq(then) } else { self.seq(els) };
+                return if eval_cond(cond, &self.env)? {
+                    self.seq(then)
+                } else {
+                    self.seq(els)
+                };
             }
             Stmt::Loop(body) => loop {
                 self.tick()?;
@@ -359,11 +389,20 @@ pub fn run_structured(
     for (k, v) in inputs {
         env.insert(k.clone(), widths.get(k).map_or(*v, |w| w.truncate(*v)));
     }
-    let mut it = Interp { env, stores: Vec::new(), steps: 0 };
+    let mut it = Interp {
+        env,
+        stores: Vec::new(),
+        steps: 0,
+    };
     let mut pc = 0;
     loop {
         match it.seq(&body[pc..])? {
-            Flow::Return(v) => return Ok(Outcome { ret: v, stores: it.stores }),
+            Flow::Return(v) => {
+                return Ok(Outcome {
+                    ret: v,
+                    stores: it.stores,
+                });
+            }
             Flow::Goto(l) => {
                 pc = body
                     .iter()

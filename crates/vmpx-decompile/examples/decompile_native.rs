@@ -41,7 +41,13 @@ fn main() {
                     print!("{}", d.text);
                     println!(
                         "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?} ctext={:?}\n",
-                        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
+                        d.structured,
+                        d.loops,
+                        d.ifs,
+                        d.gotos,
+                        d.fallback_reason,
+                        d.check,
+                        d.text_check
                     );
                 }
             },

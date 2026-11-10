@@ -13,8 +13,8 @@ use vmpx_vm::{
     VmEntrySource, VmMemoryExceptionCoverageReport, VmProfileChainStop, VmProfileExplorerLimits,
     analyze_native_continuation, analyze_vm_entry_at,
     analyze_vm_memory_exception_coverage_with_state, continue_through_native_vm_entry,
-    decide_oep_with_returns,
-    discover_vm_entries, recover_entry_paths, recover_modulo_image_targets,
+    decide_oep_with_returns, discover_vm_entries, recover_entry_paths,
+    recover_modulo_image_targets,
 };
 use vmpx_vmlift::audit_entry_effect_liveness;
 
@@ -358,13 +358,20 @@ fn dynamic_capture_requests(warnings: &mut Vec<String>) -> Vec<(u64, usize)> {
         return Vec::new();
     };
     let mut requests = Vec::new();
-    for item in spec.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let (address, length) = match item.split_once(':') {
             Some((address, length)) => (address, length),
             None => (item, "8"),
         };
         let address = address.trim().trim_start_matches("0x");
-        match (u64::from_str_radix(address, 16), length.trim().parse::<usize>()) {
+        match (
+            u64::from_str_radix(address, 16),
+            length.trim().parse::<usize>(),
+        ) {
             (Ok(address), Ok(length)) if length > 0 && length <= 4096 => {
                 requests.push((address, length));
             }
@@ -729,7 +736,10 @@ pub(crate) fn dynamic_export_reference(
     // export list). Offline, accurate (real local DLLs); missing => skipped.
     let db = vmpx_emulate::SysDllDb::new();
     let mut system_modules: std::collections::BTreeSet<String> =
-        vmpx_emulate::DEFAULT_SYSTEM_MODULES.iter().map(|m| (*m).to_owned()).collect();
+        vmpx_emulate::DEFAULT_SYSTEM_MODULES
+            .iter()
+            .map(|m| (*m).to_owned())
+            .collect();
     system_modules.extend(reference.keys().cloned());
     let mut auto_modules = 0usize;
     let mut auto_symbols = 0usize;
@@ -754,9 +764,11 @@ pub(crate) fn dynamic_export_reference(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            match std::fs::read(path).ok().and_then(|b| PeImage::parse(&b).ok().map(|pe| {
-                vmpx_emulate::export_reference_from_exports(&pe)
-            })) {
+            match std::fs::read(path).ok().and_then(|b| {
+                PeImage::parse(&b)
+                    .ok()
+                    .map(|pe| vmpx_emulate::export_reference_from_exports(&pe))
+            }) {
                 Some(names) => {
                     warnings.push(format!(
                         "[dynamic][experimental] export reference: {} export(s) for {key} from system-DLL reference {path}",
@@ -838,7 +850,12 @@ pub fn rebuild_dumped_pe(input_path: &str, input: &[u8]) -> Result<DumpPeOutcome
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(base.max_steps);
-    let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, dump: true, ..base };
+    let opts = vmpx_emulate::DetonateOptions {
+        export_reference,
+        max_steps,
+        dump: true,
+        ..base
+    };
     let result = vmpx_emulate::detonate(&pe, &opts)
         .map_err(|error| anyhow!("[dump-pe] detonation could not start: {error:?}"))?;
     let dump = result
@@ -1058,8 +1075,9 @@ pub fn analyze_clean_with_image(
                 result.observed.imports
             }
             Err(error) => {
-                warnings
-                    .push(format!("[dynamic][experimental] detonation could not start: {error:?}"));
+                warnings.push(format!(
+                    "[dynamic][experimental] detonation could not start: {error:?}"
+                ));
                 Vec::new()
             }
         }

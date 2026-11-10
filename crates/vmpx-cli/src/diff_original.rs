@@ -12,7 +12,9 @@ use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
 use vmpx_verify::branch_paths::diff_against_original_paths;
 use vmpx_verify::differential::native_loops::execute_native_loops;
-use vmpx_verify::differential::{AbiPolicy, DiffOutcome, ForkLimits, NativeEnv, execute_native_paths};
+use vmpx_verify::differential::{
+    AbiPolicy, DiffOutcome, ForkLimits, NativeEnv, execute_native_paths,
+};
 use vmpx_verify::equiv::{Budget, CellVerdict, EquivVerdict, Method, Verifier};
 use vmpx_verify::loops::{PairFamily, prove_loop_equivalence};
 
@@ -56,7 +58,11 @@ fn is_push_imm(i: &iced_x86::Instruction) -> bool {
 }
 
 /// Export -> (jmp ->)* `push seed; call wrapper` stub RVA.
-pub(crate) fn resolve_stub(pe: &PeImage<'_>, data: &[u8], export: u32) -> std::result::Result<u32, String> {
+pub(crate) fn resolve_stub(
+    pe: &PeImage<'_>,
+    data: &[u8],
+    export: u32,
+) -> std::result::Result<u32, String> {
     let mut rva = export;
     for _ in 0..3 {
         let off = pe
@@ -64,7 +70,11 @@ pub(crate) fn resolve_stub(pe: &PeImage<'_>, data: &[u8], export: u32) -> std::r
             .map_err(|e| format!("unmapped {rva:#x}: {e}"))?
             .0 as usize;
         let end = (off + 32).min(data.len());
-        let bits = if pe.optional.kind == vmpx_pe::PeKind::Pe32Plus { 64 } else { 32 };
+        let bits = if pe.optional.kind == vmpx_pe::PeKind::Pe32Plus {
+            64
+        } else {
+            32
+        };
         let mut dec = Decoder::with_ip(bits, &data[off..end], u64::from(rva), DecoderOptions::NONE);
         let first = dec.decode();
         if matches!(
@@ -108,7 +118,11 @@ fn methods(o: &DiffOutcome) -> String {
             }
         }
     }
-    counts.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(" ")
+    counts
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn diff(o: &DiffOptions) -> Result<()> {
@@ -151,10 +165,16 @@ fn diff(o: &DiffOptions) -> Result<()> {
     );
 
     let (mut proven, mut refuted, mut timeout, mut total) = (0, 0, 0, 0);
-    let symbols = protected.report().exports.map(|e| e.symbols).unwrap_or_default();
+    let symbols = protected
+        .report()
+        .exports
+        .map(|e| e.symbols)
+        .unwrap_or_default();
     let mut targets: Vec<(String, u32, u32)> = Vec::new();
     for sym in symbols {
-        let Some(name) = sym.name.clone() else { continue };
+        let Some(name) = sym.name.clone() else {
+            continue;
+        };
         let Ok(stub) = resolve_stub(&protected, &mapped, sym.rva.0) else {
             println!("{name}: not a virtualized user function (no push-seed;call stub)");
             continue;
@@ -176,7 +196,15 @@ fn diff(o: &DiffOptions) -> Result<()> {
             *own
         };
         total += 1;
-        let outcome = compare_one(o, &protected, &original, *stub, original_rva, &verifier, &policy);
+        let outcome = compare_one(
+            o,
+            &protected,
+            &original,
+            *stub,
+            original_rva,
+            &verifier,
+            &policy,
+        );
         match outcome.verdict {
             EquivVerdict::Proven => proven += 1,
             EquivVerdict::Refuted => refuted += 1,
@@ -184,7 +212,9 @@ fn diff(o: &DiffOptions) -> Result<()> {
         }
         print_outcome(name, *stub, &outcome);
     }
-    println!("\n==== GROUND-TRUTH DIFFERENTIAL: {total} functions | PROVEN {proven} | REFUTED {refuted} | TIMEOUT {timeout}");
+    println!(
+        "\n==== GROUND-TRUTH DIFFERENTIAL: {total} functions | PROVEN {proven} | REFUTED {refuted} | TIMEOUT {timeout}"
+    );
     Ok(())
 }
 
@@ -207,7 +237,11 @@ fn compare_one(
         frame_stores_dropped: 0,
         fidelity: None,
     };
-    let cfg = match recover_native_cfg_pe_with(original, Rva(original_rva), CfgOptions::DIFFERENTIAL_ENTRY_ARGS) {
+    let cfg = match recover_native_cfg_pe_with(
+        original,
+        Rva(original_rva),
+        CfgOptions::DIFFERENTIAL_ENTRY_ARGS,
+    ) {
         Ok(cfg) => cfg,
         Err(e) => return timeout(format!("original CFG: {e}")),
     };
@@ -225,13 +259,26 @@ fn compare_one(
             .collect(),
     };
     if std::env::var_os("VMPX_DIAG_RECOVERED").is_some() {
-        match crate::native_chain::unroll_chained(protected, Rva(stub), o.instruction_limit, o.max_blocks, o.max_paths) {
-            Ok(r) => eprintln!("[diag] recovered ok: {} paths, {} forks", r.paths.len(), r.forks),
+        match crate::native_chain::unroll_chained(
+            protected,
+            Rva(stub),
+            o.instruction_limit,
+            o.max_blocks,
+            o.max_paths,
+        ) {
+            Ok(r) => eprintln!(
+                "[diag] recovered ok: {} paths, {} forks",
+                r.paths.len(),
+                r.forks
+            ),
             Err(e) => eprintln!("[diag] recovered failed: {e}"),
         }
     }
     let env_limit = |name: &str, default: usize| -> usize {
-        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     };
     let limits = ForkLimits {
         max_forks_per_path: env_limit("VMPX_FORK_DEPTH", ForkLimits::DEFAULT.max_forks_per_path),
@@ -242,7 +289,9 @@ fn compare_one(
         Err(e) if e.starts_with("input-dependent loop") => {
             let l = match execute_native_loops(&cfg, o.max_blocks, &native_env, limits) {
                 Ok(l) => l,
-                Err(x) => return timeout(format!("{e}; not summarizable as cut-point segments: {x}")),
+                Err(x) => {
+                    return timeout(format!("{e}; not summarizable as cut-point segments: {x}"));
+                }
             };
             println!(
                 "  native loops: {} cut(s) {:x?}; entry segment {} path(s); {} loop segment(s) with {} path(s)",
@@ -255,8 +304,11 @@ fn compare_one(
             for assumption in &l.assumptions {
                 println!("  assumption: {assumption}");
             }
-            let segmented = match crate::decoded_splice::with_entry_input(protected, Rva(stub), o.instruction_limit, |input| {
-                {
+            let segmented = match crate::decoded_splice::with_entry_input(
+                protected,
+                Rva(stub),
+                o.instruction_limit,
+                |input| {
                     let resolver = vmpx_vmlift::PeNestedEntries {
                         pe: protected,
                         limits: vmpx_vm::EntryProfileRecoveryLimits {
@@ -264,9 +316,14 @@ fn compare_one(
                             ..vmpx_vm::EntryProfileRecoveryLimits::default()
                         },
                     };
-                    vmpx_vmlift::segment_decoded_cfg(input, Some(&resolver), o.max_blocks, o.max_paths.max(256))
-                }
-            }) {
+                    vmpx_vmlift::segment_decoded_cfg(
+                        input,
+                        Some(&resolver),
+                        o.max_blocks,
+                        o.max_paths.max(256),
+                    )
+                },
+            ) {
                 Ok(Ok(s)) => s,
                 Ok(Err(x)) => return timeout(format!("{e}; protected side not segmentable: {x}")),
                 Err(x) => return timeout(format!("{e}; protected recovery: {x}")),
@@ -276,19 +333,29 @@ fn compare_one(
                 segmented.loops.len(),
                 segmented.entry.len(),
                 segmented.loops.len(),
-                segmented.loops.values().map(|s| s.paths.len()).sum::<usize>(),
+                segmented
+                    .loops
+                    .values()
+                    .map(|s| s.paths.len())
+                    .sum::<usize>(),
                 segmented.forks,
                 segmented.blocks
             );
-            let pair = PairFamily::from_native(&l).and_then(|n| Ok((n, PairFamily::from_segmented(&segmented)?)));
+            let pair = PairFamily::from_native(&l)
+                .and_then(|n| Ok((n, PairFamily::from_segmented(&segmented)?)));
             let (native_family, vm_family) = match pair {
                 Ok(p) => p,
-                Err(x) => return timeout(format!("{e}; the cut-point families cannot be paired: {x}")),
+                Err(x) => {
+                    return timeout(format!("{e}; the cut-point families cannot be paired: {x}"));
+                }
             };
             let mut out = prove_loop_equivalence(&native_family, &vm_family, verifier, policy);
             if o.strict_gates && out.verdict == EquivVerdict::Proven && out.modulo_env_gates() {
                 out.verdict = EquivVerdict::Timeout;
-                out.reason = format!("{} environment-gate arm(s) excluded and --strict-gates is set", out.region_paths);
+                out.reason = format!(
+                    "{} environment-gate arm(s) excluded and --strict-gates is set",
+                    out.region_paths
+                );
             }
             return out;
         }
@@ -309,8 +376,10 @@ fn compare_one(
             "  assumption: an incoming argument pointer (rcx/rdx/r8/r9 at entry) does not address the function's own frame below the entry rsp (Win64 stack discipline)"
         );
     }
-    let assumptions: std::collections::BTreeSet<&String> =
-        natives.iter().flat_map(|n| &n.function.assumptions).collect();
+    let assumptions: std::collections::BTreeSet<&String> = natives
+        .iter()
+        .flat_map(|n| &n.function.assumptions)
+        .collect();
     for assumption in assumptions {
         println!("  assumption: {assumption}");
     }
@@ -320,9 +389,18 @@ fn compare_one(
     println!(
         "  [{stub:#x}] original: {} path(s), {} blocks executed ({} branches decided, {} dead-frame stores dropped); recovered: {} paths ({} forks, {} counted-loop branches decided)",
         natives.len(),
-        natives.iter().map(|n| n.function.blocks_executed).sum::<usize>(),
-        natives.iter().map(|n| n.function.branches_decided).sum::<usize>(),
-        natives.iter().map(|n| n.function.frame_stores_dropped).sum::<usize>(),
+        natives
+            .iter()
+            .map(|n| n.function.blocks_executed)
+            .sum::<usize>(),
+        natives
+            .iter()
+            .map(|n| n.function.branches_decided)
+            .sum::<usize>(),
+        natives
+            .iter()
+            .map(|n| n.function.frame_stores_dropped)
+            .sum::<usize>(),
         recovered.paths.len(),
         recovered.forks,
         recovered.branches_decided
@@ -357,10 +435,18 @@ fn print_outcome(name: &str, stub: u32, o: &DiffOutcome) {
             f.cells[0],
             f.cells[1],
             f.cells[2],
-            if f.truncated { " | diff budget exhausted (lower bound)" } else { "" }
+            if f.truncated {
+                " | diff budget exhausted (lower bound)"
+            } else {
+                ""
+            }
         );
         if !f.divergences.is_empty() {
-            let list: Vec<String> = f.divergences.iter().map(|(d, n)| format!("{}:{n}", d.label())).collect();
+            let list: Vec<String> = f
+                .divergences
+                .iter()
+                .map(|(d, n)| format!("{}:{n}", d.label()))
+                .collect();
             println!("    divergences: {}", list.join(" "));
             for (d, ex) in &f.examples {
                 println!("      e.g. {}: {ex}", d.label());

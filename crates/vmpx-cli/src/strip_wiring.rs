@@ -6,11 +6,7 @@
 //! rewritten image must reparse from its own bytes and pass
 //! `vmpx_rebuild::validate_for_loader`. Nothing is written unless all three hold.
 
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 use vmpx_pe::{PeImage, SectionSelector, StripError, StripRequest, strip_sections};
@@ -95,7 +91,10 @@ pub enum CleanStripStage {
     /// The image has no non-standard sections to remove.
     NoProtectorSections,
     /// The protector sections were removed and the result was validated.
-    Stripped { bytes: Vec<u8>, summary: StripSummary },
+    Stripped {
+        bytes: Vec<u8>,
+        summary: StripSummary,
+    },
     /// A live reference (or another guard) kept a protector section; the image
     /// is left exactly as it was. This is the normal case for a still-protected
     /// or only partially devirtualized binary.
@@ -202,12 +201,9 @@ pub fn run_strip(
                 scan.decoded_functions
             );
         }
-        let all = vmpx_rebuild::directory_relocate::rebuild_all_directories(
-            &data,
-            *b".vmpxdir",
-            &names,
-        )
-        .context("rebuilding the directories out of the removed sections")?;
+        let all =
+            vmpx_rebuild::directory_relocate::rebuild_all_directories(&data, *b".vmpxdir", &names)
+                .context("rebuilding the directories out of the removed sections")?;
         for directory in &all.moved {
             println!(
                 "[directories] {} rebuilt: {} -> {} ({} bytes)",
@@ -309,11 +305,9 @@ pub fn run_strip(
                 scan.decoded_functions
             );
         }
-        let (moved, summary) = vmpx_rebuild::directory_relocate::rebuild_import_directory(
-            &data,
-            *b".idata2 ",
-        )
-        .context("rebuilding the import directory")?;
+        let (moved, summary) =
+            vmpx_rebuild::directory_relocate::rebuild_import_directory(&data, *b".idata2 ")
+                .context("rebuilding the import directory")?;
         println!(
             "[imports] {} module(s), {} symbol(s) rebuilt; IAT now at {} ({} bytes)",
             summary.modules, summary.symbols, summary.iat_rva, summary.iat_size
@@ -385,10 +379,7 @@ pub fn run_strip(
         }
         Err(failure) => {
             eprintln!("[strip] refused: {failure}");
-            bail!(
-                "strip refused {}; no output was written",
-                input.display()
-            );
+            bail!("strip refused {}; no output was written", input.display());
         }
     }
 }

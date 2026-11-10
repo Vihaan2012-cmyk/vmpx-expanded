@@ -343,8 +343,7 @@ fn closed_exit(
                         .values_mut()
                         .chain([&mut candidate.rflags, &mut candidate.return_address])
                     {
-                        if let Ok(substituted) =
-                            vmpx_vm::substitute_opaque_intrinsics(value, fill)
+                        if let Ok(substituted) = vmpx_vm::substitute_opaque_intrinsics(value, fill)
                         {
                             *value = substituted;
                         }
@@ -411,7 +410,11 @@ fn closed_exit(
 /// refusals reads only "paths are not complete", which names no cause.
 fn incomplete_paths(family: &vmpx_vm::RecoveredEntryPathFamily) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for path in family.paths.iter().filter(|path| path.native_exit.is_none()) {
+    for path in family
+        .paths
+        .iter()
+        .filter(|path| path.native_exit.is_none())
+    {
         let last = path.chain.diagnostics.last().map_or("", String::as_str);
         parts.push(format!(
             "{:?} after {} instruction(s) in {} segment(s){}",

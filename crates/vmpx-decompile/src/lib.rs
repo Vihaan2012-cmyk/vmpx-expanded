@@ -1,4 +1,4 @@
-﻿//! Decompilation SPIKE: raises already-recovered IR (native CFG blocks, or the
+//! Decompilation SPIKE: raises already-recovered IR (native CFG blocks, or the
 //! recovered VM CFG) to C-like pseudocode. Fail-closed: a shape the structurer
 //! cannot prove falls back to labelled gotos, never to guessed structure.
 #![allow(clippy::pedantic, clippy::all, dead_code)]
@@ -106,7 +106,10 @@ fn flat(blocks: &BTreeMap<NodeId, LBlock>, entry: NodeId) -> Vec<Stmt> {
                 }
             }
             Term::Branch { cond, then, els } => {
-                out.push(Stmt::IfGoto { cond: cond.clone(), target: *then });
+                out.push(Stmt::IfGoto {
+                    cond: cond.clone(),
+                    target: *then,
+                });
                 if Some(*els) != next {
                     out.push(Stmt::Goto(*els));
                 }
@@ -153,7 +156,8 @@ fn collect_decls(stmts: &[Stmt], out: &mut BTreeMap<String, BitWidth>) {
 }
 
 const REG_NAMES: [&str; 16] = [
-    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
 ];
 
 fn input_env(rng: &mut Rng, k: usize) -> Env {
@@ -172,7 +176,11 @@ fn input_env(rng: &mut Rng, k: usize) -> Env {
 
 /// Runs `f` and each `targets` expression (over register names / loads) on the
 /// same random register inputs; the return value must equal every target.
-pub fn linkage_vs_exprs(f: &Func, targets: &[vmpx_vm::Expr], vectors: usize) -> Result<usize, String> {
+pub fn linkage_vs_exprs(
+    f: &Func,
+    targets: &[vmpx_vm::Expr],
+    vectors: usize,
+) -> Result<usize, String> {
     let mut rng = Rng(0x0BAD_5EED_1234_5678);
     let mut f = f.clone();
     opt::cleanup_all(&mut f);
@@ -182,7 +190,9 @@ pub fn linkage_vs_exprs(f: &Func, targets: &[vmpx_vm::Expr], vectors: usize) -> 
         for (i, t) in targets.iter().enumerate() {
             let got = exec::eval(t, &env).map_err(|e| format!("target {i}: {e}"))?;
             if got != want {
-                return Err(format!("vector {k}: decompiled function returns {want:#x}, target {i} evaluates to {got:#x}"));
+                return Err(format!(
+                    "vector {k}: decompiled function returns {want:#x}, target {i} evaluates to {got:#x}"
+                ));
             }
         }
     }
@@ -218,7 +228,10 @@ pub fn dump_func(f: &Func, depth: u32) -> String {
             Term::Goto(t) => s.push_str(&format!("  goto {t:#x}\n")),
             Term::Branch { cond, then, els } => {
                 let c: Vec<String> = cond.exprs().into_iter().map(|e| p(e)).collect();
-                s.push_str(&format!("  branch {cond:?} [{}] then {then:#x} else {els:#x}\n", c.join(" ; ")));
+                s.push_str(&format!(
+                    "  branch {cond:?} [{}] then {then:#x} else {els:#x}\n",
+                    c.join(" ; ")
+                ));
             }
             Term::Return(v) => s.push_str(&format!("  return {}\n", p(&v[0].1))),
         }
@@ -253,7 +266,10 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     let all_zext = f.blocks.values().all(|b| match &b.term {
         Term::Return(v) => matches!(
             v[0].1.kind,
-            vmpx_vm::ExprKind::Resize { op: vmpx_vm::ResizeOp::ZeroExtend, .. }
+            vmpx_vm::ExprKind::Resize {
+                op: vmpx_vm::ResizeOp::ZeroExtend,
+                ..
+            }
         ),
         _ => true,
     });
@@ -299,7 +315,12 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
 
     // names
     let mut names: BTreeMap<String, String> = BTreeMap::new();
-    let var_w = |v: &str| -> BitWidth { decl.get(v).copied().or_else(|| widths.get(v).copied()).unwrap_or(BitWidth::W64) };
+    let var_w = |v: &str| -> BitWidth {
+        decl.get(v)
+            .copied()
+            .or_else(|| widths.get(v).copied())
+            .unwrap_or(BitWidth::W64)
+    };
     let mut all_vars: BTreeSet<String> = decl.keys().cloned().collect();
     all_vars.extend(live_in.iter().cloned());
     let mut prologue: Vec<Stmt> = Vec::new();
@@ -311,13 +332,18 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
         if decl.contains_key(p) {
             let dn = display_name(p, w);
             names.insert(p.clone(), dn);
-            prologue.push(Stmt::Assign(p.clone(), vmpx_vm::Expr::register(w, format!("\u{1}{arg}"))));
+            prologue.push(Stmt::Assign(
+                p.clone(),
+                vmpx_vm::Expr::register(w, format!("\u{1}{arg}")),
+            ));
         } else {
             names.insert(p.clone(), arg);
         }
     }
     for v in &all_vars {
-        names.entry(v.clone()).or_insert_with(|| display_name(v, var_w(v)));
+        names
+            .entry(v.clone())
+            .or_insert_with(|| display_name(v, var_w(v)));
     }
     names.insert("\u{1}a0".into(), "a0".into());
     for i in 0..params.len() {
@@ -336,7 +362,9 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
                     ret_width(then, w);
                     ret_width(els, w);
                 }
-                Stmt::Loop(b) | Stmt::While { body: b, .. } | Stmt::DoWhile { body: b, .. } => ret_width(b, w),
+                Stmt::Loop(b) | Stmt::While { body: b, .. } | Stmt::DoWhile { body: b, .. } => {
+                    ret_width(b, w)
+                }
                 _ => {}
             }
         }
@@ -379,7 +407,12 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
     // on each return line.
     let exit_common = render::common_exit_components(&all_stmts);
     let mut ctx = Ctx {
-        r: Renderer { names: &names, image_base: symbols.image_base(), temps: &temps.map, exit_common: &exit_common },
+        r: Renderer {
+            names: &names,
+            image_base: symbols.image_base(),
+            temps: &temps.map,
+            exit_common: &exit_common,
+        },
         out: String::new(),
         log: Vec::new(),
     };
@@ -475,7 +508,10 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
             let got = run_structured(&full, &sinputs, &pw)?;
             let got_ret = got.ret;
             let mask = rw.map_or(u64::MAX, |w| w.mask());
-            if (want.ret & mask) != got_ret || (rw.is_some_and(|w| w.bits() < 64) && want.ret >> rw.unwrap().bits() != 0) || want.stores != got.stores {
+            if (want.ret & mask) != got_ret
+                || (rw.is_some_and(|w| w.bits() < 64) && want.ret >> rw.unwrap().bits() != 0)
+                || want.stores != got.stores
+            {
                 return Err(format!(
                     "MISMATCH on vector {k}: reference ret {:#x}, decompiled ret {:#x}",
                     want.ret, got_ret
@@ -488,7 +524,10 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
 
     // Opt-in readable dialect (rust / c99 / c23 / cpp / pseudo): re-render the
     // same recovered tree. The C cross-check above is unchanged and already ran.
-    if let Some(d) = readable::dialect().as_deref().and_then(readable::Dialect::parse) {
+    if let Some(d) = readable::dialect()
+        .as_deref()
+        .and_then(readable::Dialect::parse)
+    {
         text = readable::preamble(d)
             + "\n"
             + &readable::render_function(
@@ -505,7 +544,16 @@ pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompi
             );
     }
 
-    Ok(Decompiled { text, structured, fallback_reason, check, text_check, loops, ifs, gotos })
+    Ok(Decompiled {
+        text,
+        structured,
+        fallback_reason,
+        check,
+        text_check,
+        loops,
+        ifs,
+        gotos,
+    })
 }
 
 /// Every intrinsic in `f`, named as a free input. These are seeded like the
@@ -554,14 +602,21 @@ fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {
 
 /// Re-evaluates every rendered expression/condition as C text (real C typing
 /// rules, UB detection) against the IR expression it came from.
-fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>, image_base: u64) -> Result<(usize, usize), String> {
+fn check_text(
+    log: &[(render::Logged, String)],
+    names: &BTreeMap<String, String>,
+    image_base: u64,
+) -> Result<(usize, usize), String> {
     let mut rng = Rng(0xC0DE_C0DE_1357_9BDF);
     let (mut checked, mut skipped) = (0, 0);
     for (item, text) in log {
         let mut regs = BTreeMap::new();
         match item {
             render::Logged::E(e) => registers_of(e, &mut regs),
-            render::Logged::C(c) => c.exprs().into_iter().for_each(|e| registers_of(e, &mut regs)),
+            render::Logged::C(c) => c
+                .exprs()
+                .into_iter()
+                .for_each(|e| registers_of(e, &mut regs)),
         }
         if let render::Logged::C(ir::Cond::Opaque { .. }) = item {
             skipped += 1;
@@ -602,9 +657,15 @@ fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>
             };
             match ctext::eval(text, &env_c) {
                 Ok(got) => {
-                    let got = if matches!(item, render::Logged::C(_)) { u64::from(got != 0) } else { got & width_mask };
+                    let got = if matches!(item, render::Logged::C(_)) {
+                        u64::from(got != 0)
+                    } else {
+                        got & width_mask
+                    };
                     if got != want {
-                        return Err(format!("rendered text `{text}` evaluates to {got:#x}, IR says {want:#x} (sample {k})"));
+                        return Err(format!(
+                            "rendered text `{text}` evaluates to {got:#x}, IR says {want:#x} (sample {k})"
+                        ));
                     }
                 }
                 Err(e) if e.contains("unsupported call") || e.contains("unknown identifier") => {

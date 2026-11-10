@@ -59,7 +59,9 @@ impl Tag {
             Self::FreshAllocation => "PAYLOAD -> uses a freshly allocated address",
             Self::ConstantGate => "GATE -> compares against a constant and returns a constant",
             Self::Network => "NETWORK -> calls an imported network function",
-            Self::License => "LICENSE -> licensing api, or a gate on an integrity/environment check",
+            Self::License => {
+                "LICENSE -> licensing api, or a gate on an integrity/environment check"
+            }
             Self::AntiDebug => "ANTI-DEBUG -> inspects the process for a debugger",
             Self::DynamicLoad => "DYNAMIC LOAD -> resolves or loads code at run time",
         }
@@ -124,7 +126,10 @@ fn tags_of_with(expr: &Expr, symbols: &crate::symbols::Symbols, out: &mut Vec<Ta
             | ExprKind::Extract { value, .. }
             | ExprKind::Resize { value, .. } => pending.push((**value).clone()),
             ExprKind::Binary { left, right, .. }
-            | ExprKind::Concat { high: left, low: right } => {
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
                 pending.push((**left).clone());
                 pending.push((**right).clone());
             }
@@ -153,7 +158,10 @@ fn tags_of(expr: &Expr, out: &mut Vec<Tag>) {
             | ExprKind::Extract { value, .. }
             | ExprKind::Resize { value, .. } => pending.push((**value).clone()),
             ExprKind::Binary { left, right, .. }
-            | ExprKind::Concat { high: left, low: right } => {
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
                 pending.push((**left).clone());
                 pending.push((**right).clone());
             }
@@ -348,13 +356,19 @@ mod tests {
             intrinsic("table_checksum_low_byte_xor_recurrence_w32"),
         )];
         annotate(&mut stmts);
-        assert!(comments(&stmts).iter().any(|c| c.starts_with("INTEGRITY ->")));
+        assert!(
+            comments(&stmts)
+                .iter()
+                .any(|c| c.starts_with("INTEGRITY ->"))
+        );
     }
 
     #[test]
     fn a_timestamp_read_is_labelled_timing() {
-        let mut stmts =
-            vec![Stmt::Assign("x".to_owned(), intrinsic("read_timestamp_counter_7"))];
+        let mut stmts = vec![Stmt::Assign(
+            "x".to_owned(),
+            intrinsic("read_timestamp_counter_7"),
+        )];
         annotate(&mut stmts);
         assert!(comments(&stmts).iter().any(|c| c.starts_with("TIMING ->")));
     }
@@ -366,14 +380,21 @@ mod tests {
             Stmt::Assign("y".to_owned(), intrinsic("read_timestamp_counter_7")),
         ];
         annotate(&mut stmts);
-        let timing = comments(&stmts).iter().filter(|c| c.starts_with("TIMING ->")).count();
+        let timing = comments(&stmts)
+            .iter()
+            .filter(|c| c.starts_with("TIMING ->"))
+            .count();
         assert_eq!(timing, 1, "the label belongs on the first occurrence only");
     }
 
     #[test]
     fn a_comparison_against_a_constant_guarding_a_constant_return_is_a_gate() {
         let mut stmts = vec![Stmt::If {
-            cond: Cond::Cmp { op: Cmp::Eq, a: reg("checksum"), b: k(0xdead) },
+            cond: Cond::Cmp {
+                op: Cmp::Eq,
+                a: reg("checksum"),
+                b: k(0xdead),
+            },
             then: vec![Stmt::Return(vec![("r".to_owned(), k(0))])],
             els: Vec::new(),
         }];
@@ -388,13 +409,20 @@ mod tests {
             Expr::binary(BinaryOp::Add, reg("a"), reg("b")).expect("add"),
         )];
         annotate(&mut stmts);
-        assert!(comments(&stmts).is_empty(), "a plain add is not protector machinery");
+        assert!(
+            comments(&stmts).is_empty(),
+            "a plain add is not protector machinery"
+        );
     }
 
     #[test]
     fn a_branch_that_does_not_return_a_constant_is_not_a_gate() {
         let mut stmts = vec![Stmt::If {
-            cond: Cond::Cmp { op: Cmp::Eq, a: reg("x"), b: k(1) },
+            cond: Cond::Cmp {
+                op: Cmp::Eq,
+                a: reg("x"),
+                b: k(1),
+            },
             then: vec![Stmt::Return(vec![("r".to_owned(), reg("a"))])],
             els: Vec::new(),
         }];

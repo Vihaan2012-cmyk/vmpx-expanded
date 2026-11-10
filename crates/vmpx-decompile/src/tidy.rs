@@ -65,7 +65,11 @@ fn pass(stmts: &mut Vec<Stmt>) -> bool {
                 out.extend(then);
                 changed = true;
             }
-            Stmt::If { cond, mut then, mut els } => {
+            Stmt::If {
+                cond,
+                mut then,
+                mut els,
+            } => {
                 let tail = common_tail(&then, &els);
                 if tail == 0 {
                     out.push(Stmt::If { cond, then, els });
@@ -149,8 +153,16 @@ fn same(a: &Stmt, b: &Stmt) -> bool {
         (Stmt::Assign(x, xe), Stmt::Assign(y, ye)) => x == y && xe == ye,
         (Stmt::Store(x), Stmt::Store(y)) => same_store(x, y),
         (
-            Stmt::If { cond: ca, then: ta, els: ea },
-            Stmt::If { cond: cb, then: tb, els: eb },
+            Stmt::If {
+                cond: ca,
+                then: ta,
+                els: ea,
+            },
+            Stmt::If {
+                cond: cb,
+                then: tb,
+                els: eb,
+            },
         ) => same_cond(ca, cb) && same_list(ta, tb) && same_list(ea, eb),
         (Stmt::Loop(x), Stmt::Loop(y)) => same_list(x, y),
         (Stmt::While { cond: ca, body: xa }, Stmt::While { cond: cb, body: xb })
@@ -160,12 +172,21 @@ fn same(a: &Stmt, b: &Stmt) -> bool {
         (Stmt::Break, Stmt::Break) | (Stmt::Continue, Stmt::Continue) => true,
         (Stmt::Return(x), Stmt::Return(y)) => {
             x.len() == y.len()
-                && x.iter().zip(y).all(|((xn, xe), (yn, ye))| xn == yn && xe == ye)
+                && x.iter()
+                    .zip(y)
+                    .all(|((xn, xe), (yn, ye))| xn == yn && xe == ye)
         }
         (Stmt::Label(x), Stmt::Label(y)) | (Stmt::Goto(x), Stmt::Goto(y)) => x == y,
-        (Stmt::IfGoto { cond: ca, target: x }, Stmt::IfGoto { cond: cb, target: y }) => {
-            x == y && same_cond(ca, cb)
-        }
+        (
+            Stmt::IfGoto {
+                cond: ca,
+                target: x,
+            },
+            Stmt::IfGoto {
+                cond: cb,
+                target: y,
+            },
+        ) => x == y && same_cond(ca, cb),
         (Stmt::Comment(x), Stmt::Comment(y)) => x == y,
         _ => false,
     }
@@ -177,9 +198,18 @@ fn same_store(a: &Store, b: &Store) -> bool {
 
 fn same_cond(a: &Cond, b: &Cond) -> bool {
     match (a, b) {
-        (Cond::Cmp { op: oa, a: xa, b: ya }, Cond::Cmp { op: ob, a: xb, b: yb }) => {
-            oa == ob && xa == xb && ya == yb
-        }
+        (
+            Cond::Cmp {
+                op: oa,
+                a: xa,
+                b: ya,
+            },
+            Cond::Cmp {
+                op: ob,
+                a: xb,
+                b: yb,
+            },
+        ) => oa == ob && xa == xb && ya == yb,
         (Cond::Opaque { desc: da, args: aa }, Cond::Opaque { desc: db, args: ab }) => {
             da == db && aa == ab
         }
@@ -255,7 +285,11 @@ mod tests {
     fn a_nest_whose_arms_all_agree_collapses_entirely() {
         // Mirrors vm_c43d80e: four conditions over the same body.
         let leaf = || vec![ret(7)];
-        let mut inner = Stmt::If { cond: eq_cond(1), then: leaf(), els: leaf() };
+        let mut inner = Stmt::If {
+            cond: eq_cond(1),
+            then: leaf(),
+            els: leaf(),
+        };
         for level in 2..=4 {
             inner = Stmt::If {
                 cond: eq_cond(level),

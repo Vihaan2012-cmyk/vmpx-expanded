@@ -47,14 +47,14 @@ impl Kind {
     /// SGR colour for the glyph and label.
     fn colour(self) -> &'static str {
         match self {
-            Self::Start => "1;37",     // bold white
-            Self::Step => "36",        // cyan
-            Self::Layer => "35",       // magenta
-            Self::Info => "34",        // blue
-            Self::Success => "32",     // green
-            Self::Warn => "33",        // yellow
-            Self::Error => "1;31",     // bold red
-            Self::File => "90",        // grey
+            Self::Start => "1;37", // bold white
+            Self::Step => "36",    // cyan
+            Self::Layer => "35",   // magenta
+            Self::Info => "34",    // blue
+            Self::Success => "32", // green
+            Self::Warn => "33",    // yellow
+            Self::Error => "1;31", // bold red
+            Self::File => "90",    // grey
         }
     }
 }
@@ -93,7 +93,10 @@ impl Log {
     pub fn with_file(mut self, path: &std::path::Path) -> Self {
         match std::fs::File::create(path) {
             Ok(file) => self.file = Some(std::sync::Mutex::new(file)),
-            Err(error) => self.warn(&format!("cannot write log file {}: {error}", path.display())),
+            Err(error) => self.warn(&format!(
+                "cannot write log file {}: {error}",
+                path.display()
+            )),
         }
         self
     }
@@ -197,11 +200,7 @@ impl Log {
 
     /// Run `body`, timing it, and log one `step` with the elapsed time as the
     /// right-aligned detail. The body's own `Ok` value is returned.
-    pub fn timed<T, E>(
-        &self,
-        message: &str,
-        body: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, E> {
+    pub fn timed<T, E>(&self, message: &str, body: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let at = Instant::now();
         let result = body();
         if result.is_ok() {

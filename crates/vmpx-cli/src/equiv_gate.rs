@@ -66,7 +66,11 @@ pub(crate) fn obligation_for(pair: &RecompiledPair) -> Obligation {
         _ => true,
     });
     for (name, recovered, recompiled) in &pair.extra_cells {
-        obligation.add(CellId::Named(name.clone()), recovered.clone(), recompiled.clone());
+        obligation.add(
+            CellId::Named(name.clone()),
+            recovered.clone(),
+            recompiled.clone(),
+        );
     }
     obligation
 }
@@ -97,23 +101,60 @@ fn cell_kind(id: &CellId) -> String {
     }
 }
 
-fn first_difference<'a>(a: &'a vmpx_vm::Expr, b: &'a vmpx_vm::Expr) -> (&'a vmpx_vm::Expr, &'a vmpx_vm::Expr) {
+fn first_difference<'a>(
+    a: &'a vmpx_vm::Expr,
+    b: &'a vmpx_vm::Expr,
+) -> (&'a vmpx_vm::Expr, &'a vmpx_vm::Expr) {
     use vmpx_vm::ExprKind as K;
     if a == b {
         return (a, b);
     }
     let pairs: Vec<(&vmpx_vm::Expr, &vmpx_vm::Expr)> = match (&a.kind, &b.kind) {
-        (K::Unary { op: x, value: p }, K::Unary { op: y, value: q }) if x == y && a.width == b.width => vec![(p, q)],
-        (K::Binary { op: x, left: l1, right: r1 }, K::Binary { op: y, left: l2, right: r2 }) if x == y && a.width == b.width => {
+        (K::Unary { op: x, value: p }, K::Unary { op: y, value: q })
+            if x == y && a.width == b.width =>
+        {
+            vec![(p, q)]
+        }
+        (
+            K::Binary {
+                op: x,
+                left: l1,
+                right: r1,
+            },
+            K::Binary {
+                op: y,
+                left: l2,
+                right: r2,
+            },
+        ) if x == y && a.width == b.width => {
             vec![(l1, l2), (r1, r2)]
         }
         (K::Load { address: p }, K::Load { address: q }) if a.width == b.width => vec![(p, q)],
-        (K::Intrinsic { name: x, arguments: p }, K::Intrinsic { name: y, arguments: q }) if x == y && p.len() == q.len() => {
-            p.iter().zip(q).collect()
+        (
+            K::Intrinsic {
+                name: x,
+                arguments: p,
+            },
+            K::Intrinsic {
+                name: y,
+                arguments: q,
+            },
+        ) if x == y && p.len() == q.len() => p.iter().zip(q).collect(),
+        (K::Resize { op: x, value: p }, K::Resize { op: y, value: q })
+            if x == y && a.width == b.width =>
+        {
+            vec![(p, q)]
         }
-        (K::Resize { op: x, value: p }, K::Resize { op: y, value: q }) if x == y && a.width == b.width => vec![(p, q)],
-        (K::Extract { value: p, lsb: x }, K::Extract { value: q, lsb: y }) if x == y && a.width == b.width => vec![(p, q)],
-        (K::Concat { high: h1, low: l1 }, K::Concat { high: h2, low: l2 }) if a.width == b.width => vec![(h1, h2), (l1, l2)],
+        (K::Extract { value: p, lsb: x }, K::Extract { value: q, lsb: y })
+            if x == y && a.width == b.width =>
+        {
+            vec![(p, q)]
+        }
+        (K::Concat { high: h1, low: l1 }, K::Concat { high: h2, low: l2 })
+            if a.width == b.width =>
+        {
+            vec![(h1, h2), (l1, l2)]
+        }
         _ => return (a, b),
     };
     for (x, y) in pairs {
@@ -128,9 +169,14 @@ fn dump_first_unproven(obligations: &[Obligation], report: &FunctionReport) {
     for (path, obligation) in report.paths.iter().zip(obligations) {
         for ((id, verdict), cell) in path.cells.iter().zip(&obligation.cells) {
             if !matches!(verdict, CellVerdict::Proven(_)) {
-                let short = |e: &vmpx_vm::Expr| format!("{e:?}").chars().take(420).collect::<String>();
+                let short =
+                    |e: &vmpx_vm::Expr| format!("{e:?}").chars().take(420).collect::<String>();
                 let (x, y) = first_difference(&cell.vm, &cell.recovered);
-                println!("    first unproven cell {id:?}\n      differs at recovered   {}\n                 recompiled  {}", short(x), short(y));
+                println!(
+                    "    first unproven cell {id:?}\n      differs at recovered   {}\n                 recompiled  {}",
+                    short(x),
+                    short(y)
+                );
                 return;
             }
         }
@@ -188,12 +234,15 @@ fn account(tally: &mut Tally, rva: Rva, verdict: &Result<FunctionReport, String>
                         _ => None,
                     })
                     .collect();
-                if methods.iter().all(|m| matches!(m, Method::Structural | Method::FpCanonical)) {
-                    tally.proven_structural += 1;
-                } else if methods
+                if methods
                     .iter()
-                    .any(|m| matches!(m, Method::Solver(n) if n != "native-bounded") || matches!(m, Method::FpSolver(_)))
+                    .all(|m| matches!(m, Method::Structural | Method::FpCanonical))
                 {
+                    tally.proven_structural += 1;
+                } else if methods.iter().any(|m| {
+                    matches!(m, Method::Solver(n) if n != "native-bounded")
+                        || matches!(m, Method::FpSolver(_))
+                }) {
                     tally.proven_solver += 1;
                 } else {
                     tally.proven_enumerated += 1;
@@ -284,19 +333,24 @@ pub(crate) fn run(options: &GateOptions) -> Result<()> {
             }
         };
         let mut assumes_memory_order = false;
-        let verdict = recompiled_cfg_pairs(&lifted, options.optimize, options.strict_memory).map(|readback| {
-            assumes_memory_order = readback.pairs.iter().any(|p| p.memory_order_assumed);
-            tally.paths += readback.pairs.len();
-            tally.ops_before += readback.stats.operations_before;
-            tally.ops_after += readback.stats.operations_after;
-            tally.rewrites += readback.stats.rewrites;
-            let obligations: Vec<Obligation> = readback.pairs.iter().map(obligation_for).collect();
-            let report = verifier.check_function(&obligations, true);
-            if std::env::var_os("VMPX_GATE_DUMP").is_some() && report.verdict != EquivVerdict::Proven {
-                dump_first_unproven(&obligations, &report);
-            }
-            report
-        });
+        let verdict = recompiled_cfg_pairs(&lifted, options.optimize, options.strict_memory).map(
+            |readback| {
+                assumes_memory_order = readback.pairs.iter().any(|p| p.memory_order_assumed);
+                tally.paths += readback.pairs.len();
+                tally.ops_before += readback.stats.operations_before;
+                tally.ops_after += readback.stats.operations_after;
+                tally.rewrites += readback.stats.rewrites;
+                let obligations: Vec<Obligation> =
+                    readback.pairs.iter().map(obligation_for).collect();
+                let report = verifier.check_function(&obligations, true);
+                if std::env::var_os("VMPX_GATE_DUMP").is_some()
+                    && report.verdict != EquivVerdict::Proven
+                {
+                    dump_first_unproven(&obligations, &report);
+                }
+                report
+            },
+        );
         let proven = matches!(&verdict, Ok(r) if r.verdict == EquivVerdict::Proven);
         if proven && assumes_memory_order {
             tally.proven_assuming_memory_order += 1;
@@ -322,7 +376,10 @@ pub(crate) fn run(options: &GateOptions) -> Result<()> {
     for (reason, count) in &tally.not_lifted {
         println!("    not lifted {count:>4}  {reason}");
     }
-    println!("verified population: {total} lifted functions, {} paths", tally.paths);
+    println!(
+        "verified population: {total} lifted functions, {} paths",
+        tally.paths
+    );
     println!(
         "PROVEN {}  (structural {}, bounded-enumeration {}, external-solver {})",
         tally.proven, tally.proven_structural, tally.proven_enumerated, tally.proven_solver

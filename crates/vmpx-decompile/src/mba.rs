@@ -63,7 +63,10 @@ fn children_of(expr: &Expr) -> Vec<Expr> {
         | ExprKind::Extract { value, .. }
         | ExprKind::Resize { value, .. } => vec![(**value).clone()],
         ExprKind::Binary { left, right, .. }
-        | ExprKind::Concat { high: left, low: right } => {
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => {
             vec![(**left).clone(), (**right).clone()]
         }
         ExprKind::Intrinsic { arguments, .. } => arguments.clone(),
@@ -116,7 +119,11 @@ fn twos_complement(expr: &Expr) -> Option<Expr> {
     let ExprKind::Unary { op: outer, value } = &expr.kind else {
         return None;
     };
-    let ExprKind::Unary { op: inner, value: x } = &value.kind else {
+    let ExprKind::Unary {
+        op: inner,
+        value: x,
+    } = &value.kind
+    else {
         return None;
     };
     let one = Expr::constant(expr.width, 1);
@@ -145,7 +152,11 @@ fn collapse_casts(expr: &Expr) -> Option<Expr> {
             if value.width == expr.width {
                 return Some((**value).clone());
             }
-            let ExprKind::Resize { op: inner_op, value: inner } = &value.kind else {
+            let ExprKind::Resize {
+                op: inner_op,
+                value: inner,
+            } = &value.kind
+            else {
                 return None;
             };
             match (op, inner_op) {
@@ -174,22 +185,27 @@ fn collapse_casts(expr: &Expr) -> Option<Expr> {
             }
         }
         // Extracting the whole of a value, from bit 0, is the value.
-        ExprKind::Extract { value, lsb: 0 } if value.width == expr.width => {
-            Some((**value).clone())
-        }
+        ExprKind::Extract { value, lsb: 0 } if value.width == expr.width => Some((**value).clone()),
         // A zero-extended value has nothing but zeros above its own width, so
         // shifting those bits down leaves zero. This is what makes
         // `(u16)(u8)((u16)byte >> 8)` -- a shape the lifter emits constantly --
         // collapse to a constant instead of surviving as four casts.
-        ExprKind::Binary { op: vmpx_vm::BinaryOp::Shr, left, right } => {
+        ExprKind::Binary {
+            op: vmpx_vm::BinaryOp::Shr,
+            left,
+            right,
+        } => {
             let ExprKind::Const { value: amount } = right.kind else {
                 return None;
             };
-            let ExprKind::Resize { op: ResizeOp::ZeroExtend, value: inner } = &left.kind else {
+            let ExprKind::Resize {
+                op: ResizeOp::ZeroExtend,
+                value: inner,
+            } = &left.kind
+            else {
                 return None;
             };
-            (amount >= u64::from(inner.width.bits()))
-                .then(|| Expr::constant(expr.width, 0))
+            (amount >= u64::from(inner.width.bits())).then(|| Expr::constant(expr.width, 0))
         }
         _ => None,
     }
@@ -256,8 +272,10 @@ pub fn simplify(root: &Expr, memo: &mut HashMap<Expr, Expr>) -> Expr {
         }
         let children = children_of(&expr);
         if expanded {
-            let mapped: Vec<Expr> =
-                children.iter().map(|c| memo.get(c).cloned().unwrap_or_else(|| c.clone())).collect();
+            let mapped: Vec<Expr> = children
+                .iter()
+                .map(|c| memo.get(c).cloned().unwrap_or_else(|| c.clone()))
+                .collect();
             let rebuilt = rebuild(&expr, &mapped).unwrap_or_else(|| expr.clone());
             memo.insert(expr, attempt(&rebuilt));
         } else {
@@ -319,11 +337,7 @@ pub fn simplify_stmts(stmts: &mut [crate::opt::Stmt], memo: &mut HashMap<Expr, E
             }
             Stmt::IfGoto { cond: c, .. } => cond(c, memo),
             Stmt::Loop(body) => simplify_stmts(body, memo),
-            Stmt::Break
-            | Stmt::Continue
-            | Stmt::Label(_)
-            | Stmt::Goto(_)
-            | Stmt::Comment(_) => {}
+            Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
         }
     }
 }
@@ -365,8 +379,8 @@ mod tests {
         let a = reg("a");
         let inner = Expr::unary(UnaryOp::Not, a.clone());
         let folded = Expr::unary(UnaryOp::Not, bin(BinaryOp::Add, inner, k(1)));
-        let address = Expr::resize(vmpx_vm::ResizeOp::ZeroExtend, BitWidth::W64, folded)
-            .expect("resize");
+        let address =
+            Expr::resize(vmpx_vm::ResizeOp::ZeroExtend, BitWidth::W64, folded).expect("resize");
         let expr = Expr::load(BitWidth::W64, address);
         let mut memo = HashMap::new();
         let out = simplify(&expr, &mut memo);
@@ -434,7 +448,11 @@ mod tests {
         let two = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W32, one).expect("2");
         let three = Expr::resize(ResizeOp::Truncate, BitWidth::W8, two).expect("3");
         let mut memo = HashMap::new();
-        assert_eq!(simplify(&three, &mut memo), a, "three casts cancel to nothing");
+        assert_eq!(
+            simplify(&three, &mut memo),
+            a,
+            "three casts cancel to nothing"
+        );
     }
 
     #[test]
@@ -443,10 +461,13 @@ mod tests {
         // `(u16)byte >> 8`: the high half of a zero-extended byte is all zero.
         let byte = Expr::register(BitWidth::W8, "b");
         let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W16, byte).expect("zext");
-        let shifted = Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 8))
-            .expect("shr");
+        let shifted =
+            Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 8)).expect("shr");
         let mut memo = HashMap::new();
-        assert_eq!(simplify(&shifted, &mut memo), Expr::constant(BitWidth::W16, 0));
+        assert_eq!(
+            simplify(&shifted, &mut memo),
+            Expr::constant(BitWidth::W16, 0)
+        );
     }
 
     #[test]
@@ -454,11 +475,15 @@ mod tests {
         use vmpx_vm::ResizeOp;
         let byte = Expr::register(BitWidth::W8, "b");
         let wide = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W16, byte).expect("zext");
-        let shifted = Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 4))
-            .expect("shr");
+        let shifted =
+            Expr::binary(BinaryOp::Shr, wide, Expr::constant(BitWidth::W16, 4)).expect("shr");
         let mut memo = HashMap::new();
         let out = simplify(&shifted, &mut memo);
-        assert_ne!(out, Expr::constant(BitWidth::W16, 0), "a shift of 4 keeps real bits");
+        assert_ne!(
+            out,
+            Expr::constant(BitWidth::W16, 0),
+            "a shift of 4 keeps real bits"
+        );
     }
 
     #[test]

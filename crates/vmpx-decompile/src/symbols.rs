@@ -29,8 +29,16 @@ const NETWORK_MODULES: [&str; 7] = [
 
 /// Function-name fragments that reach the network from a general module.
 const NETWORK_FUNCTIONS: [&str; 10] = [
-    "socket", "connect", "send", "recv", "gethostby", "getaddrinfo", "inet_",
-    "internetopen", "httpsendrequest", "winhttpsend",
+    "socket",
+    "connect",
+    "send",
+    "recv",
+    "gethostby",
+    "getaddrinfo",
+    "inet_",
+    "internetopen",
+    "httpsendrequest",
+    "winhttpsend",
 ];
 
 /// VMProtect's licensing API, and the usual serial/licence spellings.
@@ -55,8 +63,12 @@ const ANTI_DEBUG_FUNCTIONS: [&str; 7] = [
     "ntsetinformationthread",
 ];
 
-const DYNAMIC_LOAD_FUNCTIONS: [&str; 4] =
-    ["loadlibrary", "getprocaddress", "ldrloaddll", "ldrgetprocedureaddress"];
+const DYNAMIC_LOAD_FUNCTIONS: [&str; 4] = [
+    "loadlibrary",
+    "getprocaddress",
+    "ldrloaddll",
+    "ldrgetprocedureaddress",
+];
 
 /// Import names by the virtual address of their IAT slot.
 #[derive(Clone, Debug, Default)]
@@ -75,13 +87,19 @@ impl Symbols {
     ) -> Self {
         let mut imports = BTreeMap::new();
         for (module, entries) in modules {
-            let module = module.trim_end_matches(".dll").trim_end_matches(".DLL").to_owned();
+            let module = module
+                .trim_end_matches(".dll")
+                .trim_end_matches(".DLL")
+                .to_owned();
             for (iat_rva, name) in entries {
                 let name = name.unwrap_or_else(|| format!("ordinal_{iat_rva:#x}"));
                 imports.insert(image_base + u64::from(iat_rva), format!("{module}!{name}"));
             }
         }
-        Self { imports, image_base }
+        Self {
+            imports,
+            image_base,
+        }
     }
 
     /// The image base the IR's absolute addresses are relative to, 0 if unknown.
@@ -130,9 +148,7 @@ pub fn facility_of(full: &str) -> Option<Facility> {
     if LICENSE_FUNCTIONS.iter().any(|f| function.contains(f)) {
         return Some(Facility::License);
     }
-    if NETWORK_MODULES.contains(&module)
-        || NETWORK_FUNCTIONS.iter().any(|f| function.contains(f))
-    {
+    if NETWORK_MODULES.contains(&module) || NETWORK_FUNCTIONS.iter().any(|f| function.contains(f)) {
         return Some(Facility::Network);
     }
     if ANTI_DEBUG_FUNCTIONS.iter().any(|f| function.contains(f)) {
@@ -152,7 +168,10 @@ mod tests {
         Symbols::from_imports(
             0x1_0000,
             [
-                ("ws2_32.dll".to_owned(), vec![(0x200, Some("send".to_owned()))]),
+                (
+                    "ws2_32.dll".to_owned(),
+                    vec![(0x200, Some("send".to_owned()))],
+                ),
                 (
                     "kernel32.dll".to_owned(),
                     vec![
@@ -169,7 +188,10 @@ mod tests {
     fn an_iat_slot_resolves_to_its_import_and_identifier() {
         let s = table();
         assert_eq!(s.import_at(0x1_0200), Some("ws2_32!send"));
-        assert_eq!(s.identifier_at(0x1_0200).as_deref(), Some("iat_ws2_32_send"));
+        assert_eq!(
+            s.identifier_at(0x1_0200).as_deref(),
+            Some("iat_ws2_32_send")
+        );
         assert_eq!(s.import_at(0x1_0201), None, "only the exact slot resolves");
     }
 
@@ -179,7 +201,11 @@ mod tests {
         assert_eq!(s.facility_at(0x1_0200), Some(Facility::Network));
         assert_eq!(s.facility_at(0x1_0300), Some(Facility::AntiDebug));
         assert_eq!(s.facility_at(0x1_0308), Some(Facility::DynamicLoad));
-        assert_eq!(s.facility_at(0x1_0310), None, "an ordinary string call is not a facility");
+        assert_eq!(
+            s.facility_at(0x1_0310),
+            None,
+            "an ordinary string call is not a facility"
+        );
     }
 
     #[test]

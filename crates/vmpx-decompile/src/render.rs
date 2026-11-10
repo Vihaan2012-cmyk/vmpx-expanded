@@ -140,7 +140,11 @@ impl Renderer<'_> {
                     right
                         && !matches!(
                             pop,
-                            BinaryOp::Add | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul
+                            BinaryOp::Add
+                                | BinaryOp::Xor
+                                | BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::Mul
                         )
                 } else {
                     !(matches!(pop, BinaryOp::Add | BinaryOp::Sub) && *op == BinaryOp::Mul)
@@ -197,7 +201,10 @@ impl Renderer<'_> {
             }
             ExprKind::Intrinsic { name, arguments } => {
                 let args: Vec<String> = arguments.iter().map(|a| self.rx(a, false).0).collect();
-                (format!("{}({})", intrinsic_display(name), args.join(", ")), P_ATOM)
+                (
+                    format!("{}({})", intrinsic_display(name), args.join(", ")),
+                    P_ATOM,
+                )
             }
             ExprKind::Extract { value, lsb } => {
                 let v = self.wrap_child(value, None, false);
@@ -222,7 +229,12 @@ impl Renderer<'_> {
                     ResizeOp::Truncate => (format!("({}){v}", ty(e.width)), P_UN),
                     ResizeOp::ZeroExtend => (format!("({}){v}", ty(e.width)), P_UN),
                     ResizeOp::SignExtend => (
-                        format!("({})({})({}){v}", ty(e.width), sty(e.width), sty(value.width)),
+                        format!(
+                            "({})({})({}){v}",
+                            ty(e.width),
+                            sty(e.width),
+                            sty(value.width)
+                        ),
                         P_UN,
                     ),
                 }
@@ -246,7 +258,11 @@ impl Renderer<'_> {
         if let ExprKind::Const { value } = n.kind {
             return (value & mask).to_string();
         }
-        if let ExprKind::Binary { op: BinaryOp::And, right, .. } = &n.kind
+        if let ExprKind::Binary {
+            op: BinaryOp::And,
+            right,
+            ..
+        } = &n.kind
             && let ExprKind::Const { value } = right.kind
             && value == mask
         {
@@ -310,7 +326,11 @@ impl Renderer<'_> {
                 }
                 let a = self.wrap_child(l, None, false);
                 let c = self.count(r, w);
-                let a = if narrow && op == BinaryOp::Shl { format!("(u32){a}") } else { a };
+                let a = if narrow && op == BinaryOp::Shl {
+                    format!("(u32){a}")
+                } else {
+                    a
+                };
                 let s = format!("{a} {sym} {c}");
                 if narrow {
                     (format!("({}){}", ty(w), paren(&s)), P_UN)
@@ -338,7 +358,11 @@ impl Renderer<'_> {
                     let mut o = op;
                     if c > bits / 2 {
                         c = bits - c;
-                        o = if op == BinaryOp::Rol { BinaryOp::Ror } else { BinaryOp::Rol };
+                        o = if op == BinaryOp::Rol {
+                            BinaryOp::Ror
+                        } else {
+                            BinaryOp::Rol
+                        };
                     }
                     let f = if o == BinaryOp::Rol { "rol" } else { "ror" };
                     let a = self.rx(l, false).0;
@@ -400,7 +424,14 @@ fn signed_value(w: BitWidth, v: u64) -> i64 {
 fn is_infix(op: BinaryOp) -> bool {
     matches!(
         op,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Xor
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Mul
+            | BinaryOp::Shl
+            | BinaryOp::Shr
     )
 }
 
@@ -410,7 +441,10 @@ fn is_ring(e: &Expr) -> bool {
 }
 
 fn is_low_bits_op(op: BinaryOp) -> bool {
-    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or)
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or
+    )
 }
 
 fn is_cast_wrapped(_e: &Expr) -> bool {

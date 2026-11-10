@@ -20,11 +20,23 @@ fn wrap(val: i128, bits: u32, signed: bool) -> V {
     if signed && r >= m / 2 {
         r -= m;
     }
-    V { val: r, bits, signed }
+    V {
+        val: r,
+        bits,
+        signed,
+    }
 }
 
 fn promote(x: V) -> V {
-    if x.bits < 32 { V { val: x.val, bits: 32, signed: true } } else { x }
+    if x.bits < 32 {
+        V {
+            val: x.val,
+            bits: 32,
+            signed: true,
+        }
+    } else {
+        x
+    }
 }
 
 fn common(a: V, b: V) -> (u32, bool) {
@@ -105,7 +117,9 @@ impl P<'_> {
     fn binary(&mut self, min: u8) -> Result<V, String> {
         let mut l = self.unary()?;
         loop {
-            let Some(op) = self.peek().map(str::to_owned) else { break };
+            let Some(op) = self.peek().map(str::to_owned) else {
+                break;
+            };
             let prec = match op.as_str() {
                 "|" => 1,
                 "^" => 2,
@@ -149,7 +163,11 @@ impl P<'_> {
                 self.eat(")")?;
                 let (bits, _) = ty_of(&ty).ok_or("deref type")?;
                 let a = self.unary()?;
-                Ok(wrap(i128::from(mem_read(a.val.rem_euclid(1 << 64) as u64, bw(bits))), bits, false))
+                Ok(wrap(
+                    i128::from(mem_read(a.val.rem_euclid(1 << 64) as u64, bw(bits))),
+                    bits,
+                    false,
+                ))
             }
             "(" => {
                 // cast or parenthesized expression
@@ -192,7 +210,11 @@ impl P<'_> {
                     };
                     return Ok(wrap(r as i128, bits, false));
                 }
-                let (v, bits) = self.vars.get(&t).copied().ok_or_else(|| format!("unknown identifier `{t}`"))?;
+                let (v, bits) = self
+                    .vars
+                    .get(&t)
+                    .copied()
+                    .ok_or_else(|| format!("unknown identifier `{t}`"))?;
                 Ok(wrap(i128::from(v), bits, false))
             }
         }
@@ -210,7 +232,10 @@ fn number(t: &str) -> Result<V, String> {
         (t[..s].to_owned(), t[s..].to_ascii_lowercase())
     };
     let (val, hex) = if let Some(h) = body.strip_prefix("0x") {
-        (i128::from_str_radix(h, 16).map_err(|e| e.to_string())?, true)
+        (
+            i128::from_str_radix(h, 16).map_err(|e| e.to_string())?,
+            true,
+        )
     } else {
         (body.parse::<i128>().map_err(|e| e.to_string())?, false)
     };
@@ -228,7 +253,11 @@ fn number(t: &str) -> Result<V, String> {
         if !hex && !unsigned && !signed {
             continue; // decimal without u never becomes unsigned
         }
-        let max = if signed { (1_i128 << (bits - 1)) - 1 } else { (1_i128 << bits) - 1 };
+        let max = if signed {
+            (1_i128 << (bits - 1)) - 1
+        } else {
+            (1_i128 << bits) - 1
+        };
         if val <= max {
             return Ok(V { val, bits, signed });
         }
@@ -242,7 +271,10 @@ fn apply(op: &str, a: V, b: V) -> Result<V, String> {
             let l = promote(a);
             let c = promote(b).val;
             if c < 0 || c >= i128::from(l.bits) {
-                return Err(format!("shift count {c} out of range for {}-bit type (UB)", l.bits));
+                return Err(format!(
+                    "shift count {c} out of range for {}-bit type (UB)",
+                    l.bits
+                ));
             }
             let r = if op == "<<" {
                 if l.signed && (l.val < 0 || (l.val << c) >= (1_i128 << (l.bits - 1))) {
@@ -265,7 +297,11 @@ fn apply(op: &str, a: V, b: V) -> Result<V, String> {
                 ">" => x > y,
                 _ => x >= y,
             };
-            Ok(V { val: i128::from(r), bits: 32, signed: true })
+            Ok(V {
+                val: i128::from(r),
+                bits: 32,
+                signed: true,
+            })
         }
         _ => {
             let (bits, signed) = common(a, b);
@@ -293,7 +329,10 @@ mod tests {
     use super::*;
 
     fn ev(t: &str, vars: &[(&str, u64, u32)]) -> Result<u64, String> {
-        let m = vars.iter().map(|(n, v, b)| ((*n).to_owned(), (*v, *b))).collect();
+        let m = vars
+            .iter()
+            .map(|(n, v, b)| ((*n).to_owned(), (*v, *b)))
+            .collect();
         eval(t, &m)
     }
 
@@ -302,12 +341,18 @@ mod tests {
         // `a >> n & 63` parses as `(a >> n) & 63`, not `a >> (n & 63)`
         assert_eq!(ev("a >> 1 & 63", &[("a", 0x1ff, 64)]).unwrap(), 0xff & 63);
         // u16 + u16 promotes to int; the cast truncates
-        assert_eq!(ev("(u16)(a + b)", &[("a", 0xffff, 16), ("b", 2, 16)]).unwrap(), 1);
+        assert_eq!(
+            ev("(u16)(a + b)", &[("a", 0xffff, 16), ("b", 2, 16)]).unwrap(),
+            1
+        );
         // shifting by >= width is flagged as UB
         assert!(ev("a << 32", &[("a", 1, 32)]).is_err());
         // signed overflow via promoted multiply is flagged
         assert!(ev("a * b", &[("a", 0xffff, 16), ("b", 0xffff, 16)]).is_err());
-        assert_eq!(ev("rol32(a, 8)", &[("a", 0x1234_5678, 32)]).unwrap(), 0x3456_7812);
+        assert_eq!(
+            ev("rol32(a, 8)", &[("a", 0x1234_5678, 32)]).unwrap(),
+            0x3456_7812
+        );
     }
 
     #[test]
@@ -316,7 +361,11 @@ mod tests {
         let r = |n: &str| Expr::register(BitWidth::W32, n);
         let bin = |op, a: Expr, b: Expr| Expr::binary(op, a, b).unwrap();
         let not = |a: Expr| Expr::unary(UnaryOp::Not, a);
-        let p = bin(B::Xor, bin(B::Xor, r("a"), r("b")), bin(B::And, r("c"), r("d")));
+        let p = bin(
+            B::Xor,
+            bin(B::Xor, r("a"), r("b")),
+            bin(B::And, r("c"), r("d")),
+        );
         let k = r("k");
         let e = bin(
             B::Or,
@@ -337,10 +386,18 @@ mod tests {
         use vmpx_vm::{BinaryOp, BitWidth, Expr, UnaryOp};
         let a = Expr::register(BitWidth::W32, "a");
         let b = Expr::register(BitWidth::W32, "b");
-        let nand = Expr::unary(UnaryOp::Not, Expr::binary(BinaryOp::And, a.clone(), b.clone()).unwrap());
+        let nand = Expr::unary(
+            UnaryOp::Not,
+            Expr::binary(BinaryOp::And, a.clone(), b.clone()).unwrap(),
+        );
         let or = Expr::unary(
             UnaryOp::Not,
-            Expr::binary(BinaryOp::And, Expr::unary(UnaryOp::Not, a.clone()), Expr::unary(UnaryOp::Not, b.clone())).unwrap(),
+            Expr::binary(
+                BinaryOp::And,
+                Expr::unary(UnaryOp::Not, a.clone()),
+                Expr::unary(UnaryOp::Not, b.clone()),
+            )
+            .unwrap(),
         );
         let xor = Expr::binary(BinaryOp::And, or, nand).unwrap();
         let folded = crate::xu::mba_fold(&xor);
@@ -351,7 +408,11 @@ mod tests {
 /// Evaluates `text` as a C expression; variables are `(value, declared bits)`
 /// (all declared unsigned). Returns the value truncated to its own type.
 pub fn eval(text: &str, vars: &HashMap<String, (u64, u32)>) -> Result<u64, String> {
-    let mut p = P { toks: tokenize(text), pos: 0, vars };
+    let mut p = P {
+        toks: tokenize(text),
+        pos: 0,
+        vars,
+    };
     let v = p.binary(1)?;
     if p.pos != p.toks.len() {
         return Err(format!("trailing tokens after position {}", p.pos));

@@ -17,20 +17,20 @@ use vmpx_pe::{PeImage, PeReport};
 use vmpx_unpack::{UnpackLimits, unpack_to_mapped_image};
 use vmpx_vm::{VmDiscoveryLimits, VmDiscoveryReport, VmEntrySource, discover_vm_entries};
 
+mod auto_cmd;
+mod auto_imports;
 mod clean;
 mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
-mod auto_cmd;
-mod auto_imports;
 mod decompile_cmd;
 mod devirt_cmd;
-mod logkit;
 mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
 mod input_closed_functions;
+mod logkit;
 mod native_chain;
 mod report_cmd;
 mod strip_wiring;
@@ -322,10 +322,7 @@ enum Command {
     /// dynamic unpack to OEP, writing the rebuilt (OBSERVED) PE. Fails closed if
     /// OEP is not reached within the step bound; never fabricates output for an
     /// unsupported/heuristic detection. The sample is never executed natively.
-    GenericUnpack {
-        input: PathBuf,
-        output: PathBuf,
-    },
+    GenericUnpack { input: PathBuf, output: PathBuf },
     /// Discover evidence-scored VM entry stubs and mutated bootstrap profiles.
     VmList {
         input: PathBuf,
@@ -1086,13 +1083,12 @@ fn main() -> Result<()> {
                 );
             }
             let input_data = read_file(&input)?;
-            let (mut clean, conventional, reintegrated) =
-                clean::analyze_clean_with_image(
-                    &input.display().to_string(),
-                    &input_data,
-                    decoded_lift,
-                    dynamic,
-                )?;
+            let (mut clean, conventional, reintegrated) = clean::analyze_clean_with_image(
+                &input.display().to_string(),
+                &input_data,
+                decoded_lift,
+                dynamic,
+            )?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
                 clean.protection.verdict,
@@ -1262,7 +1258,10 @@ fn main() -> Result<()> {
                     "[dump-pe] rebuilt standalone PE: {} bytes, {} section(s), size_of_image={:#X}",
                     outcome.file_size, outcome.sections, outcome.size_of_image
                 );
-                println!("[dump-pe] loader validation passed: {}", outcome.loader_summary);
+                println!(
+                    "[dump-pe] loader validation passed: {}",
+                    outcome.loader_summary
+                );
                 println!("[dump-pe] {}", path.display());
                 println!("[verify] dumped PE reparsed successfully from disk");
             }
@@ -1317,8 +1316,11 @@ fn main() -> Result<()> {
         } => {
             let data = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
             if let Some(snapshot) = &volatility_snapshot {
-                let (ranges, bytes) = report_cmd::install_volatility_veto(&data, snapshot, serve_observed_ro)?;
-                eprintln!("[report] volatility veto: {bytes} byte(s) in {ranges} range(s) differ from the post-init snapshot");
+                let (ranges, bytes) =
+                    report_cmd::install_volatility_veto(&data, snapshot, serve_observed_ro)?;
+                eprintln!(
+                    "[report] volatility veto: {bytes} byte(s) in {ranges} range(s) differ from the post-init snapshot"
+                );
             }
             let mut opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
             opts.serve_ro = serve_ro;
@@ -1412,7 +1414,11 @@ fn main() -> Result<()> {
             original,
             probe,
             instruction_limit,
-            dialect: if readable && dialect == "c" { "rust".to_owned() } else { dialect },
+            dialect: if readable && dialect == "c" {
+                "rust".to_owned()
+            } else {
+                dialect
+            },
             fold,
         })?,
         Command::Auto {
@@ -1635,7 +1641,12 @@ fn main() -> Result<()> {
                         kind.label()
                     );
                 }
-                generic_unpack::UnpackOutcome::UnpackedToOep { kind, oep, steps, pe_bytes } => {
+                generic_unpack::UnpackOutcome::UnpackedToOep {
+                    kind,
+                    oep,
+                    steps,
+                    pe_bytes,
+                } => {
                     fs::write(&output, &pe_bytes)
                         .with_context(|| format!("failed to write {}", output.display()))?;
                     let disk = read_file(&output)?;

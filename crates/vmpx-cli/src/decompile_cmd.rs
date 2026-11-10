@@ -21,9 +21,14 @@ fn fold_proven_expr(e: &vmpx_vm::Expr, pe: &PeImage<'_>) -> vmpx_vm::Expr {
     let timing = vmpx_vm::fold_timing_invariant_loads(pe, e, modulo)
         .map(|r| r.expression)
         .unwrap_or_else(|_| e.clone());
-    vmpx_vm::concretize_with_immutable_image(pe, &timing, &std::collections::BTreeMap::new(), limits)
-        .map(|r| r.expression)
-        .unwrap_or(timing)
+    vmpx_vm::concretize_with_immutable_image(
+        pe,
+        &timing,
+        &std::collections::BTreeMap::new(),
+        limits,
+    )
+    .map(|r| r.expression)
+    .unwrap_or(timing)
 }
 
 /// Fold the rolled tree's exprs BEFORE lowering: lowering rewrites the image
@@ -125,7 +130,9 @@ fn go(o: &Options) -> Result<()> {
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
     let mut targets: Vec<(String, u32)> = Vec::new();
     for sym in symbols {
-        let Some(name) = sym.name.clone() else { continue };
+        let Some(name) = sym.name.clone() else {
+            continue;
+        };
         if !o.only.is_empty() && !o.only.contains(&name) {
             continue;
         }
@@ -151,27 +158,45 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
     if o.probe {
         crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
             let cfg = input.cfg;
-            println!("// cfg: entry={} blocks={} edges={} stalls={} complete={}", cfg.entry, cfg.blocks.len(), cfg.edges.len(), cfg.stalls.len(), cfg.is_complete());
+            println!(
+                "// cfg: entry={} blocks={} edges={} stalls={} complete={}",
+                cfg.entry,
+                cfg.blocks.len(),
+                cfg.edges.len(),
+                cfg.stalls.len(),
+                cfg.is_complete()
+            );
             for (k, b) in &cfg.blocks {
-                println!("//  block {k} addr={:?} instrs={} exit={:?}", b.address, b.instructions.len(), b.exit);
+                println!(
+                    "//  block {k} addr={:?} instrs={} exit={:?}",
+                    b.address,
+                    b.instructions.len(),
+                    b.exit
+                );
             }
             for e in &cfg.edges {
                 println!("//  edge {} -> {} {:?}", e.from, e.to, e.kind);
             }
         })?;
-        let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-            {
-            let resolver = vmpx_vmlift::PeNestedEntries {
-                pe,
-                limits: vmpx_vm::EntryProfileRecoveryLimits {
-                    instruction_limit: o.instruction_limit,
-                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
-                },
-            };
-            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
-        }
-        })??;
-        println!("// rolled: loops={} forks={} blocks_walked={}", rolled.loops, rolled.forks, rolled.straight_blocks);
+        let rolled = crate::decoded_splice::with_entry_input(
+            pe,
+            Rva(stub),
+            o.instruction_limit,
+            |input| {
+                let resolver = vmpx_vmlift::PeNestedEntries {
+                    pe,
+                    limits: vmpx_vm::EntryProfileRecoveryLimits {
+                        instruction_limit: o.instruction_limit,
+                        ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                    },
+                };
+                vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+            },
+        )??;
+        println!(
+            "// rolled: loops={} forks={} blocks_walked={}",
+            rolled.loops, rolled.forks, rolled.straight_blocks
+        );
         print_tree(&rolled.root, 0);
         return Ok(());
     }
@@ -180,22 +205,26 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         // unrolled one has no such guard. Reports which of the two can reach this
         // entry at all, so the size of an unrolled fallback is measurable before
         // anyone builds the lowering it would need.
-        let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-            {
-            let resolver = vmpx_vmlift::PeNestedEntries {
-                pe,
-                limits: vmpx_vm::EntryProfileRecoveryLimits {
-                    instruction_limit: o.instruction_limit,
-                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
-                },
-            };
-            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
-        }
-        })
-        .map_err(|e| e.to_string())
-        .and_then(|r| r.map_err(|e| e.to_string()));
-        let unrolled =
-            crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64);
+        let rolled =
+            crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+                let resolver = vmpx_vmlift::PeNestedEntries {
+                    pe,
+                    limits: vmpx_vm::EntryProfileRecoveryLimits {
+                        instruction_limit: o.instruction_limit,
+                        ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                    },
+                };
+                vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+            })
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        let unrolled = crate::decoded_splice::unroll_entry_cfg(
+            pe,
+            Rva(stub),
+            o.instruction_limit,
+            200_000,
+            64,
+        );
         println!(
             "// probe-unrolled {name}: rolled={} unrolled={}",
             match &rolled {
@@ -209,8 +238,8 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         );
         return Ok(());
     }
-    let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-        {
+    let rolled =
+        crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
             let resolver = vmpx_vmlift::PeNestedEntries {
                 pe,
                 limits: vmpx_vm::EntryProfileRecoveryLimits {
@@ -219,8 +248,7 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
                 },
             };
             vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
-        }
-    })??;
+        })??;
     let mut rolled = rolled;
     if o.fold == "proven" {
         fold_rolled(&mut rolled.root, pe);
@@ -244,10 +272,16 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
     );
     // linkage 1: the decompiled function against the unrolled (PROVEN) paths
-    let unrolled = crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64)?;
+    let unrolled =
+        crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64)?;
     let mut targets = Vec::new();
     for path in unrolled.paths.iter().filter(|p| !p.region_exit) {
-        if let Some(rax) = path.semantics.exit.registers.get(&vmpx_vm::X64NativeRegister::Rax) {
+        if let Some(rax) = path
+            .semantics
+            .exit
+            .registers
+            .get(&vmpx_vm::X64NativeRegister::Rax)
+        {
             targets.push(vmpx_decompile::vm::fix(rax));
         }
     }
@@ -267,7 +301,8 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
             .into_iter()
             .find(|s| s.name.as_deref() == Some(name))
             .ok_or("no such export in the original")?;
-        let cfg = recover_native_cfg_pe_with(&ope, Rva(osym.rva.0), CfgOptions::PROVEN).map_err(|e| e.to_string())?;
+        let cfg = recover_native_cfg_pe_with(&ope, Rva(osym.rva.0), CfgOptions::PROVEN)
+            .map_err(|e| e.to_string())?;
         let nf = vmpx_decompile::native::lower(&cfg, name)?;
         println!(
             "// linkage vs ORIGINAL native function (both lifted to IR): {:?}",
@@ -292,12 +327,25 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
         RNode::Stores { stores, next } => {
             println!("// {pad}STORES ({})", stores.len());
             for st in stores {
-                println!("// {pad}  [{}] <- {} ({:?})", p(&st.address, 7), p(&st.value, 7), st.width);
+                println!(
+                    "// {pad}  [{}] <- {} ({:?})",
+                    p(&st.address, 7),
+                    p(&st.value, 7),
+                    st.width
+                );
             }
             print_tree(next, depth);
         }
-        RNode::Fork { selector, env, block, arms } => {
-            println!("// {pad}FORK at {block} env={env} selector={}", p(selector, 9));
+        RNode::Fork {
+            selector,
+            env,
+            block,
+            arms,
+        } => {
+            println!(
+                "// {pad}FORK at {block} env={env} selector={}",
+                p(selector, 9)
+            );
             for (v, a) in arms {
                 println!("// {pad} arm {v:#x}:");
                 print_tree(a, depth + 2);
@@ -306,7 +354,12 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
         RNode::Loop { header, phis, body } => {
             println!("// {pad}LOOP header={header} phis={}", phis.len());
             for ph in phis {
-                println!("// {pad}  {} ({:?}) init={}", ph.name, ph.width, p(&ph.init, 7));
+                println!(
+                    "// {pad}  {} ({:?}) init={}",
+                    ph.name,
+                    ph.width,
+                    p(&ph.init, 7)
+                );
             }
             print_tree(body, depth + 1);
         }
@@ -324,7 +377,9 @@ fn native(o: &Options, bytes: &[u8]) -> Result<()> {
     let pe = PeImage::parse(bytes).context("not a supported PE")?;
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
     for sym in symbols {
-        let Some(name) = sym.name.clone() else { continue };
+        let Some(name) = sym.name.clone() else {
+            continue;
+        };
         if !o.only.is_empty() && !o.only.contains(&name) {
             continue;
         }
@@ -335,7 +390,8 @@ fn native(o: &Options, bytes: &[u8]) -> Result<()> {
                 continue;
             }
         };
-        match vmpx_decompile::native::lower(&cfg, &name).and_then(|f| vmpx_decompile::decompile(&f)) {
+        match vmpx_decompile::native::lower(&cfg, &name).and_then(|f| vmpx_decompile::decompile(&f))
+        {
             Err(e) => println!("// {name}: {e}\n"),
             Ok(d) => {
                 print!("{}", d.text);

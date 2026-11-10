@@ -43,7 +43,10 @@ fn reg_name(r: X64NativeRegister) -> &'static str {
 
 fn is_callee_saved(r: X64NativeRegister) -> bool {
     use X64NativeRegister as R;
-    matches!(r, R::Rbx | R::Rbp | R::Rsi | R::Rdi | R::R12 | R::R13 | R::R14 | R::R15)
+    matches!(
+        r,
+        R::Rbx | R::Rbp | R::Rsi | R::Rdi | R::R12 | R::R13 | R::R14 | R::R15
+    )
 }
 
 /// Entry symbols -> register variables; memory-epoch reads -> loads; double
@@ -56,7 +59,9 @@ pub fn fix(e: &Expr) -> Expr {
         }
         ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
             name["memory_load_epoch_".len()..].parse::<u64>().ok()?;
-            let [addr] = arguments.as_slice() else { return None };
+            let [addr] = arguments.as_slice() else {
+                return None;
+            };
             Some(Expr::load(n.width, fix(addr)))
         }
         _ => None,
@@ -91,8 +96,14 @@ fn sub_epoch(e: &Expr, rename: &BTreeMap<String, String>) -> Expr {
     rewrite(e, &mut |x| match &x.kind {
         ExprKind::Register { name } => rename.get(name).map(|r| Expr::register(x.width, r.clone())),
         ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
-            let [a] = arguments.as_slice() else { return None };
-            Some(Expr::intrinsic(x.width, "memory_load", vec![sub_epoch(a, rename)]))
+            let [a] = arguments.as_slice() else {
+                return None;
+            };
+            Some(Expr::intrinsic(
+                x.width,
+                "memory_load",
+                vec![sub_epoch(a, rename)],
+            ))
         }
         _ => None,
     })
@@ -103,12 +114,18 @@ fn signature(n: &RNode, rename: &BTreeMap<String, String>, h: &mut impl Hasher) 
     let sub = |e: &Expr| -> Expr {
         // memory-epoch numbers differ between otherwise identical copies: drop them
         rewrite(e, &mut |x| match &x.kind {
-            ExprKind::Register { name } => rename
-                .get(name)
-                .map(|r| Expr::register(x.width, r.clone())),
+            ExprKind::Register { name } => {
+                rename.get(name).map(|r| Expr::register(x.width, r.clone()))
+            }
             ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
-                let [a] = arguments.as_slice() else { return None };
-                Some(Expr::intrinsic(x.width, "memory_load", vec![sub_epoch(a, rename)]))
+                let [a] = arguments.as_slice() else {
+                    return None;
+                };
+                Some(Expr::intrinsic(
+                    x.width,
+                    "memory_load",
+                    vec![sub_epoch(a, rename)],
+                ))
             }
             _ => None,
         })
@@ -136,7 +153,12 @@ fn signature(n: &RNode, rename: &BTreeMap<String, String>, h: &mut impl Hasher) 
             }
             signature(next, rename, h);
         }
-        RNode::Fork { selector, env, arms, .. } => {
+        RNode::Fork {
+            selector,
+            env,
+            arms,
+            ..
+        } => {
             1_u8.hash(h);
             env.hash(h);
             hash_expr(&sub(selector), h);
@@ -174,7 +196,12 @@ fn sig(n: &RNode) -> u64 {
 /// when several live arms remain they must be structurally identical.
 fn collapse(n: &RNode, notes: &mut Vec<String>) -> Result<RNode, String> {
     match n {
-        RNode::Fork { selector, env: true, block, arms } => {
+        RNode::Fork {
+            selector,
+            env: true,
+            block,
+            arms,
+        } => {
             // Keyed by arm value: the differing-arms fallback below rebuilds a
             // fork, and a fork without its selector values is not lowerable.
             let mut live: Vec<(u64, RNode)> = Vec::new();
@@ -188,15 +215,22 @@ fn collapse(n: &RNode, notes: &mut Vec<String>) -> Result<RNode, String> {
                 }
             }
             match live.len() {
-                0 => Ok(RNode::Dead(format!("every arm of the gate at {block} fails"))),
+                0 => Ok(RNode::Dead(format!(
+                    "every arm of the gate at {block} fails"
+                ))),
                 1 => {
-                    notes.push(format!("environment gate at {block}: {} failing arm(s) dropped", arms.len() - 1));
+                    notes.push(format!(
+                        "environment gate at {block}: {} failing arm(s) dropped",
+                        arms.len() - 1
+                    ));
                     Ok(live.remove(0).1)
                 }
                 n => {
                     let first = sig(&live[0].1);
                     if live.iter().all(|(_, a)| sig(a) == first) {
-                        notes.push(format!("environment gate at {block}: {n} identical live arms collapsed"));
+                        notes.push(format!(
+                            "environment gate at {block}: {n} identical live arms collapsed"
+                        ));
                         return Ok(live.remove(0).1);
                     }
                     // Collapsing is a SIMPLIFICATION — it removes anti-analysis
@@ -219,7 +253,12 @@ fn collapse(n: &RNode, notes: &mut Vec<String>) -> Result<RNode, String> {
                 }
             }
         }
-        RNode::Fork { selector, env, block, arms } => Ok(RNode::Fork {
+        RNode::Fork {
+            selector,
+            env,
+            block,
+            arms,
+        } => Ok(RNode::Fork {
             selector: selector.clone(),
             env: *env,
             block: *block,
@@ -277,7 +316,11 @@ fn ext_lane(e: &Expr) -> Option<(&Expr, u32)> {
 
 /// Finds 8-lane byte-phi groups of one loop and the rewrite that replaces them
 /// with one 64-bit phi each.
-fn merge_lanes(phis: &[RPhi], backs: &[&Vec<Expr>], uid: &mut usize) -> (Vec<Group>, Vec<Option<Expr>>) {
+fn merge_lanes(
+    phis: &[RPhi],
+    backs: &[&Vec<Expr>],
+    uid: &mut usize,
+) -> (Vec<Group>, Vec<Option<Expr>>) {
     // key: hash of the inner expression of the first back edge's next, per phi
     let mut by_key: HashMap<u64, Vec<(usize, u32)>> = HashMap::new();
     let mut inner: HashMap<u64, Expr> = HashMap::new();
@@ -286,7 +329,9 @@ fn merge_lanes(phis: &[RPhi], backs: &[&Vec<Expr>], uid: &mut usize) -> (Vec<Gro
             continue;
         }
         let Some(first) = backs.first() else { continue };
-        let Some((h, lane)) = ext_lane(&first[i]) else { continue };
+        let Some((h, lane)) = ext_lane(&first[i]) else {
+            continue;
+        };
         if lane % 8 != 0 {
             continue;
         }
@@ -318,7 +363,9 @@ fn merge_lanes(phis: &[RPhi], backs: &[&Vec<Expr>], uid: &mut usize) -> (Vec<Gro
         let order: Vec<usize> = order.into_iter().map(|x| x.expect("lane")).collect();
         // every back edge must agree on the inner expression and lane
         let consistent = backs.iter().all(|b| {
-            let Some((h0, _)) = ext_lane(&b[order[0]]) else { return false };
+            let Some((h0, _)) = ext_lane(&b[order[0]]) else {
+                return false;
+            };
             order.iter().enumerate().all(|(lane, &i)| {
                 ext_lane(&b[i]).is_some_and(|(h, l)| l == (lane as u32) * 8 && h == h0)
             })
@@ -328,14 +375,21 @@ fn merge_lanes(phis: &[RPhi], backs: &[&Vec<Expr>], uid: &mut usize) -> (Vec<Gro
         }
         // init: concatenate lane inits (balanced; Expr widths are 8/16/32/64 only)
         let lane_inits: Vec<Expr> = order.iter().rev().map(|&i| phis[i].init.clone()).collect();
-        let Some(init) = concat_balanced(&lane_inits) else { continue };
+        let Some(init) = concat_balanced(&lane_inits) else {
+            continue;
+        };
         let init = Some(init);
         *uid += 1;
         let wide = format!("v{}", *uid - 1);
         let first = order[0];
         wide_inits[first] = init;
         let width = BitWidth::from_bits(8 * order.len() as u32).expect("lane width");
-        groups.push(Group { wide, width, next_from: None, lanes: order.iter().map(|&i| phis[i].name.clone()).collect() });
+        groups.push(Group {
+            wide,
+            width,
+            next_from: None,
+            lanes: order.iter().map(|&i| phis[i].name.clone()).collect(),
+        });
     }
     // copy groups: byte phis whose next is just lane l of an existing group
     let mut lane_of: HashMap<String, (usize, usize)> = HashMap::new();
@@ -380,7 +434,9 @@ fn merge_lanes(phis: &[RPhi], backs: &[&Vec<Expr>], uid: &mut usize) -> (Vec<Gro
             continue;
         }
         let lane_inits: Vec<Expr> = order.iter().rev().map(|&i| phis[i].init.clone()).collect();
-        let Some(init) = concat_balanced(&lane_inits) else { continue };
+        let Some(init) = concat_balanced(&lane_inits) else {
+            continue;
+        };
         *uid += 1;
         let wide = format!("v{}", *uid - 1);
         wide_inits[order[0]] = Some(init);
@@ -402,7 +458,12 @@ fn apply_groups(e: &Expr, groups: &[Group]) -> Expr {
     let lane_of: HashMap<&str, (usize, usize)> = groups
         .iter()
         .enumerate()
-        .flat_map(|(g, grp)| grp.lanes.iter().enumerate().map(move |(l, n)| (n.as_str(), (g, l))))
+        .flat_map(|(g, grp)| {
+            grp.lanes
+                .iter()
+                .enumerate()
+                .map(move |(l, n)| (n.as_str(), (g, l)))
+        })
         .collect();
     rewrite(e, &mut |n| {
         if let ExprKind::Concat { .. } = &n.kind {
@@ -498,13 +559,21 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     }
     // all flag words must be the same comparison of the same operands
     let first = &nodes[0];
-    let ExprKind::Intrinsic { name, arguments } = &first.kind else { return direct("shape", notes) };
+    let ExprKind::Intrinsic { name, arguments } = &first.kind else {
+        return direct("shape", notes);
+    };
     let (x, y) = match arguments.as_slice() {
         [x, y] => (x.clone(), y.clone()),
         _ => return direct("flag intrinsic arity", notes),
     };
     let tied = nodes.iter().all(|n| {
-        let ExprKind::Intrinsic { name: n2, arguments: a2 } = &n.kind else { return false };
+        let ExprKind::Intrinsic {
+            name: n2,
+            arguments: a2,
+        } = &n.kind
+        else {
+            return false;
+        };
         if n2 != name || a2.len() != 2 {
             return false;
         }
@@ -528,18 +597,41 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     }
     // crafted operand pairs
     let mut rng = Rng(0x00C0_FFEE_1234_5678);
-    let mut pairs: Vec<(u64, u64)> = vec![(0, 0), (1, 0), (0, 1), (5, 5), (w.mask(), w.mask()), (w.mask(), 0), (0, w.mask())];
+    let mut pairs: Vec<(u64, u64)> = vec![
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (5, 5),
+        (w.mask(), w.mask()),
+        (w.mask(), 0),
+        (0, w.mask()),
+    ];
     let top = 1_u64 << (w.bits() - 1);
-    pairs.extend([(top, 0), (0, top), (top, 1), (top - 1, w.mask()), (top, top), (top - 1, top)]);
+    pairs.extend([
+        (top, 0),
+        (0, top),
+        (top, 1),
+        (top - 1, w.mask()),
+        (top, top),
+        (top - 1, top),
+    ]);
     for _ in 0..40 {
         let a = w.truncate(rng.next());
-        let b = if rng.next() % 4 == 0 { a } else { w.truncate(rng.next()) };
+        let b = if rng.next() % 4 == 0 {
+            a
+        } else {
+            w.truncate(rng.next())
+        };
         pairs.push((a, b));
         pairs.push((a, w.truncate(a.wrapping_add(1))));
         pairs.push((w.truncate(a.wrapping_add(1)), a));
     }
     let eval_sel = |a: u64, b: u64| -> Option<u64> {
-        let word = Expr::intrinsic(first.width, name.clone(), vec![Expr::constant(w, a), Expr::constant(w, b)]);
+        let word = Expr::intrinsic(
+            first.width,
+            name.clone(),
+            vec![Expr::constant(w, a), Expr::constant(w, b)],
+        );
         let word = word.simplify();
         if !matches!(word.kind, ExprKind::Const { .. }) {
             return None;
@@ -547,7 +639,9 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
         let mut s = selector.clone();
         for n in &nodes {
             let n2 = n.clone();
-            s = rewrite(&s, &mut |q| if q == &n2 { Some(word.clone()) } else { None });
+            s = rewrite(&s, &mut |q| {
+                if q == &n2 { Some(word.clone()) } else { None }
+            });
         }
         match s.simplify().kind {
             ExprKind::Const { value } => Some(value),
@@ -556,14 +650,31 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
     };
     let mut samples: Vec<(u64, u64, bool)> = Vec::new();
     for (a, b) in pairs {
-        let Some(sv) = eval_sel(a, b) else { return direct("flag word does not fold", notes) };
+        let Some(sv) = eval_sel(a, b) else {
+            return direct("flag word does not fold", notes);
+        };
         samples.push((a, b, sv == value));
     }
     let ops = [
-        Cmp::Eq, Cmp::Ne, Cmp::Ult, Cmp::Uge, Cmp::Ule, Cmp::Ugt, Cmp::Slt, Cmp::Sge, Cmp::Sle, Cmp::Sgt,
+        Cmp::Eq,
+        Cmp::Ne,
+        Cmp::Ult,
+        Cmp::Uge,
+        Cmp::Ule,
+        Cmp::Ugt,
+        Cmp::Slt,
+        Cmp::Sge,
+        Cmp::Sle,
+        Cmp::Sgt,
     ];
     let sext = |v: u64| -> i64 {
-        if w.bits() == 64 { v.cast_signed() } else if v & top != 0 { (v | (u64::MAX << w.bits())).cast_signed() } else { v.cast_signed() }
+        if w.bits() == 64 {
+            v.cast_signed()
+        } else if v & top != 0 {
+            (v | (u64::MAX << w.bits())).cast_signed()
+        } else {
+            v.cast_signed()
+        }
     };
     let truth = |op: Cmp, a: u64, b: u64| -> bool {
         match op {
@@ -593,7 +704,9 @@ fn decode_selector(selector: &Expr, value: u64, notes: &mut Vec<String>) -> Cond
         let ok = if is_sub {
             samples.iter().all(|(a, b, t)| truth(op, *a, *b) == *t)
         } else {
-            samples.iter().all(|(a, b, t)| truth(op, flagged(*a, *b), 0) == *t)
+            samples
+                .iter()
+                .all(|(a, b, t)| truth(op, flagged(*a, *b), 0) == *t)
         };
         if ok {
             let (a, b) = if is_sub {
@@ -664,7 +777,10 @@ impl Lower<'_> {
                         assigns: vec![],
                         stores: stores
                             .iter()
-                            .map(|s| Store { address: fix(&s.address), value: fix(&s.value) })
+                            .map(|s| Store {
+                                address: fix(&s.address),
+                                value: fix(&s.value),
+                            })
                             .collect(),
                         term: Term::Goto(rest),
                     },
@@ -689,32 +805,61 @@ impl Lower<'_> {
                     );
                     self.blocks.insert(
                         id,
-                        Block { id, assigns: vec![], stores: vec![], term: Term::Return(parts) },
+                        Block {
+                            id,
+                            assigns: vec![],
+                            stores: vec![],
+                            term: Term::Return(parts),
+                        },
                     );
                     return Ok(id);
                 }
-                let rax = x.registers.get(&X64NativeRegister::Rax).ok_or("exit has no rax")?;
+                let rax = x
+                    .registers
+                    .get(&X64NativeRegister::Rax)
+                    .ok_or("exit has no rax")?;
                 for (r, e) in &x.registers {
                     if is_callee_saved(*r) {
                         let f = fix(e);
-                        let same = matches!(&f.kind, ExprKind::Register { name } if name == reg_name(*r));
+                        let same =
+                            matches!(&f.kind, ExprKind::Register { name } if name == reg_name(*r));
                         if !same {
-                            self.notes.push(format!("exit: callee-saved {} is not restored verbatim", reg_name(*r)));
+                            self.notes.push(format!(
+                                "exit: callee-saved {} is not restored verbatim",
+                                reg_name(*r)
+                            ));
                         }
                     }
                 }
                 self.blocks.insert(
                     id,
-                    Block { id, assigns: vec![], stores: vec![], term: Term::Return(vec![("rax".to_owned(), fix(rax))]) },
+                    Block {
+                        id,
+                        assigns: vec![],
+                        stores: vec![],
+                        term: Term::Return(vec![("rax".to_owned(), fix(rax))]),
+                    },
                 );
             }
             RNode::BackEdge { next } => {
-                let (header, names) = self.loops.last().cloned().ok_or("back edge outside a loop")?;
+                let (header, names) = self
+                    .loops
+                    .last()
+                    .cloned()
+                    .ok_or("back edge outside a loop")?;
                 if names.len() != next.len() {
                     return Err("back edge arity does not match the loop".to_owned());
                 }
                 let assigns = names.iter().cloned().zip(next.iter().map(fix)).collect();
-                self.blocks.insert(id, Block { id, assigns, stores: vec![], term: Term::Goto(header) });
+                self.blocks.insert(
+                    id,
+                    Block {
+                        id,
+                        assigns,
+                        stores: vec![],
+                        term: Term::Goto(header),
+                    },
+                );
             }
             RNode::Fork { selector, arms, .. } => {
                 // An N-way fork becomes a chain of equality tests. Only the
@@ -737,14 +882,26 @@ impl Lower<'_> {
                     tests.push(self.alloc());
                 }
                 if arms.len() > 2 {
-                    self.notes.push(format!("{}-way branch lowered as a chain of equality tests", arms.len()));
+                    self.notes.push(format!(
+                        "{}-way branch lowered as a chain of equality tests",
+                        arms.len()
+                    ));
                 }
                 for (i, &test) in tests.iter().enumerate() {
                     let cond = decode_selector(&sel, arms[i].0, self.notes);
                     let els = tests.get(i + 1).copied().unwrap_or(bodies[arms.len() - 1]);
                     self.blocks.insert(
                         test,
-                        Block { id: test, assigns: vec![], stores: vec![], term: Term::Branch { cond, then: bodies[i], els } },
+                        Block {
+                            id: test,
+                            assigns: vec![],
+                            stores: vec![],
+                            term: Term::Branch {
+                                cond,
+                                then: bodies[i],
+                                els,
+                            },
+                        },
                     );
                 }
             }
@@ -786,7 +943,9 @@ impl Lower<'_> {
                 let rewrite_all = |e: &Expr| -> Expr {
                     let g = apply_groups(e, &groups);
                     rewrite(&g, &mut |n| match &n.kind {
-                        ExprKind::Register { name } => single.get(name).map(|r| Expr::register(n.width, r.clone())),
+                        ExprKind::Register { name } => {
+                            single.get(name).map(|r| Expr::register(n.width, r.clone()))
+                        }
                         _ => None,
                     })
                 };
@@ -794,8 +953,20 @@ impl Lower<'_> {
                 // pre-header block: phi := init
                 let pre = id;
                 let header = self.alloc();
-                let assigns = names.iter().cloned().zip(inits.iter().map(|e| fix(&rewrite_all(e)))).collect();
-                self.blocks.insert(pre, Block { id: pre, assigns, stores: vec![], term: Term::Goto(header) });
+                let assigns = names
+                    .iter()
+                    .cloned()
+                    .zip(inits.iter().map(|e| fix(&rewrite_all(e))))
+                    .collect();
+                self.blocks.insert(
+                    pre,
+                    Block {
+                        id: pre,
+                        assigns,
+                        stores: vec![],
+                        term: Term::Goto(header),
+                    },
+                );
                 self.loops.push((header, names));
                 let r = self.lower(&body2, Some(header));
                 self.loops.pop();
@@ -829,11 +1000,17 @@ impl Lower<'_> {
                 if !lower_spin_arms() {
                     return Err(format!("a dead arm remained after gate collapse: {why}"));
                 }
-                self.notes
-                    .push(format!("arm with no reachable exit lowered as a spin: {why}"));
+                self.notes.push(format!(
+                    "arm with no reachable exit lowered as a spin: {why}"
+                ));
                 self.blocks.insert(
                     id,
-                    Block { id, assigns: vec![], stores: vec![], term: Term::Goto(id) },
+                    Block {
+                        id,
+                        assigns: vec![],
+                        stores: vec![],
+                        term: Term::Goto(id),
+                    },
                 );
             }
         }
@@ -875,15 +1052,34 @@ fn rewrite_tree(
                 .collect(),
             next: Box::new(rewrite_tree(next, f, keep, groups, phis)),
         },
-        RNode::Fork { selector, env, block, arms } => RNode::Fork {
+        RNode::Fork {
+            selector,
+            env,
+            block,
+            arms,
+        } => RNode::Fork {
             selector: f(selector),
             env: *env,
             block: *block,
-            arms: arms.iter().map(|(v, a)| (*v, rewrite_tree(a, f, keep, groups, phis))).collect(),
+            arms: arms
+                .iter()
+                .map(|(v, a)| (*v, rewrite_tree(a, f, keep, groups, phis)))
+                .collect(),
         },
-        RNode::Loop { header, phis: ip, body } => RNode::Loop {
+        RNode::Loop {
+            header,
+            phis: ip,
+            body,
+        } => RNode::Loop {
             header: *header,
-            phis: ip.iter().map(|p| RPhi { name: p.name.clone(), width: p.width, init: f(&p.init) }).collect(),
+            phis: ip
+                .iter()
+                .map(|p| RPhi {
+                    name: p.name.clone(),
+                    width: p.width,
+                    init: f(&p.init),
+                })
+                .collect(),
             // nested loop: only expressions are rewritten (its own back edges keep their arity)
             body: Box::new(rewrite_exprs_only(body, f)),
         },
@@ -905,11 +1101,13 @@ fn rewrite_tree(
                         if let Some(src) = grp.next_from {
                             return_register(&groups[src])
                         } else {
-                        let gw = grp.width;
-                        match &e.kind {
-                            ExprKind::Extract { value, .. } => crate::xu::trunc_to(gw, &f(value)),
-                            _ => f(e),
-                        }
+                            let gw = grp.width;
+                            match &e.kind {
+                                ExprKind::Extract { value, .. } => {
+                                    crate::xu::trunc_to(gw, &f(value))
+                                }
+                                _ => f(e),
+                            }
                         }
                     } else {
                         f(e)
@@ -944,18 +1142,35 @@ fn rewrite_exprs_only(n: &RNode, f: &dyn Fn(&Expr) -> Expr) -> RNode {
                 .collect(),
             next: Box::new(rewrite_exprs_only(next, f)),
         },
-        RNode::Fork { selector, env, block, arms } => RNode::Fork {
+        RNode::Fork {
+            selector,
+            env,
+            block,
+            arms,
+        } => RNode::Fork {
             selector: f(selector),
             env: *env,
             block: *block,
-            arms: arms.iter().map(|(v, a)| (*v, rewrite_exprs_only(a, f))).collect(),
+            arms: arms
+                .iter()
+                .map(|(v, a)| (*v, rewrite_exprs_only(a, f)))
+                .collect(),
         },
         RNode::Loop { header, phis, body } => RNode::Loop {
             header: *header,
-            phis: phis.iter().map(|p| RPhi { name: p.name.clone(), width: p.width, init: f(&p.init) }).collect(),
+            phis: phis
+                .iter()
+                .map(|p| RPhi {
+                    name: p.name.clone(),
+                    width: p.width,
+                    init: f(&p.init),
+                })
+                .collect(),
             body: Box::new(rewrite_exprs_only(body, f)),
         },
-        RNode::BackEdge { next } => RNode::BackEdge { next: next.iter().map(|e| f(e)).collect() },
+        RNode::BackEdge { next } => RNode::BackEdge {
+            next: next.iter().map(|e| f(e)).collect(),
+        },
         RNode::Dead(w) => RNode::Dead(w.clone()),
     }
 }
@@ -973,12 +1188,24 @@ pub fn lower(rolled: &RolledFunction, name: &str) -> Result<VmLowered, String> {
         ));
     }
     let tree = collapse(&rolled.root, &mut notes)?;
-    let mut lw = Lower { blocks: BTreeMap::new(), next: 0, notes: &mut notes, loops: Vec::new(), uid: 0 };
+    let mut lw = Lower {
+        blocks: BTreeMap::new(),
+        next: 0,
+        notes: &mut notes,
+        loops: Vec::new(),
+        uid: 0,
+    };
     let entry = lw.lower(&tree, None)?;
     let blocks = lw.blocks;
     notes.dedup();
     Ok(VmLowered {
-        func: Func { name: name.to_owned(), entry, blocks, params: vec![], notes: vec![] },
+        func: Func {
+            name: name.to_owned(),
+            entry,
+            blocks,
+            params: vec![],
+            notes: vec![],
+        },
         notes,
     })
 }

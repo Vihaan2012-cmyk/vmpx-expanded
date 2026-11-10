@@ -39,7 +39,11 @@ fn is_const(e: &Expr, v: u64) -> bool {
 
 fn sub_args(e: &Expr) -> Option<(&Expr, &Expr)> {
     match &e.kind {
-        ExprKind::Binary { op: BinaryOp::Sub, left, right } => Some((left, right)),
+        ExprKind::Binary {
+            op: BinaryOp::Sub,
+            left,
+            right,
+        } => Some((left, right)),
         _ => None,
     }
 }
@@ -51,20 +55,32 @@ fn build_cond(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Cond {
         desc: format!("cc_{cc}[{why}]"),
         args: flags.values().cloned().collect(),
     };
-    let zf_r = flags.get(&Flag::Zf).and_then(|e| intr(e, "zf")).and_then(|a| a.first());
-    let sf_r = flags.get(&Flag::Sf).and_then(|e| intr(e, "sf")).and_then(|a| a.first());
+    let zf_r = flags
+        .get(&Flag::Zf)
+        .and_then(|e| intr(e, "zf"))
+        .and_then(|a| a.first());
+    let sf_r = flags
+        .get(&Flag::Sf)
+        .and_then(|e| intr(e, "sf"))
+        .and_then(|a| a.first());
     let cf = flags.get(&Flag::Cf);
     let of = flags.get(&Flag::Of);
     let cf_sub = cf.and_then(|e| intr(e, "cf_sub"));
     let of_sub = of.and_then(|e| intr(e, "of_sub"));
     let zero = |e: &Expr| Expr::constant(e.width, 0);
-    let cmp = |op: Cmp, a: &Expr, b: &Expr| Cond::Cmp { op, a: a.clone(), b: b.clone() };
+    let cmp = |op: Cmp, a: &Expr, b: &Expr| Cond::Cmp {
+        op,
+        a: a.clone(),
+        b: b.clone(),
+    };
     // the (a, b) of a `cmp a, b` / `sub a, b` whose result is `r`
     let sub_pair = |r: &Expr| sub_args(r).map(|(a, b)| (a.clone(), b.clone()));
     let logic = cf.is_some_and(|e| is_const(e, 0)) && of.is_some_and(|e| is_const(e, 0));
     match cc {
         "e" | "ne" => {
-            let Some(r) = zf_r else { return opaque("zf undefined") };
+            let Some(r) = zf_r else {
+                return opaque("zf undefined");
+            };
             let op = if cc == "e" { Cmp::Eq } else { Cmp::Ne };
             match sub_pair(r) {
                 Some((a, b)) => cmp(op, &a, &b),
@@ -100,7 +116,9 @@ fn build_cond(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Cond {
                 _ => Cmp::Sgt,
             };
             if logic {
-                let Some(r) = sf_r else { return opaque("sf undefined") };
+                let Some(r) = sf_r else {
+                    return opaque("sf undefined");
+                };
                 return cmp(op_s, r, &zero(r));
             }
             let (Some(args), Some(r), Some(sr)) = (of_sub, zf_r, sf_r) else {
@@ -139,7 +157,9 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
             let s = e.substitute(&env).map_err(|x| x.to_string())?;
             let s = cleanup(&s);
             if let Some(stray) = s.dependencies().into_iter().find(|d| d.ends_with("_in")) {
-                return Err(format!("block {addr:#x} reads carried flag/input `{stray}`"));
+                return Err(format!(
+                    "block {addr:#x} reads carried flag/input `{stray}`"
+                ));
             }
             Ok(s)
         };
@@ -151,7 +171,10 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
         let mut stores = Vec::new();
         for w in &sem.writes {
             let _ = bw(w.width);
-            stores.push(Store { address: subst(&w.address)?, value: subst(&w.value)? });
+            stores.push(Store {
+                address: subst(&w.address)?,
+                value: subst(&w.value)?,
+            });
         }
         let mut flags: BTreeMap<Flag, Expr> = BTreeMap::new();
         for (f, st) in &sem.flags {
@@ -161,7 +184,11 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
         }
         let term = match &nb.terminator {
             Terminator::FallThrough(t) | Terminator::Jump(t) => Term::Goto(*t),
-            Terminator::CondJump { cc, taken, not_taken } => Term::Branch {
+            Terminator::CondJump {
+                cc,
+                taken,
+                not_taken,
+            } => Term::Branch {
                 cond: build_cond(cc, &flags),
                 then: *taken,
                 els: *not_taken,
@@ -175,7 +202,9 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
                 Term::Return(vec![("rax".to_owned(), rax)])
             }
             Terminator::Call { .. } | Terminator::TailCall { .. } => {
-                return Err(format!("block {addr:#x}: calls are not lifted by the decompiler"));
+                return Err(format!(
+                    "block {addr:#x}: calls are not lifted by the decompiler"
+                ));
             }
             Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),
         };
@@ -186,7 +215,15 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
                 return Err(format!("block {addr:#x} mixes stores and loads"));
             }
         }
-        blocks.insert(*addr, Block { id: *addr, assigns, stores, term });
+        blocks.insert(
+            *addr,
+            Block {
+                id: *addr,
+                assigns,
+                stores,
+                term,
+            },
+        );
     }
     // The Return block of a native function reads rax only; remaining
     // assignments in it are dead and removed by DCE.

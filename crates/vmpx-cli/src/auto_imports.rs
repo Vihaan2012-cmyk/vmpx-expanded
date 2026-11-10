@@ -125,10 +125,7 @@ pub fn bind_slots(
         .iter()
         .map(|(module, _, funcs)| ImportModuleSpec {
             name: module.clone(),
-            symbols: funcs
-                .iter()
-                .map(|name| import_target(name))
-                .collect(),
+            symbols: funcs.iter().map(|name| import_target(name)).collect(),
         })
         .collect();
     let section_rva = vmpx_rebuild::next_section_rva(stripped).map_err(|e| e.to_string())?;
@@ -163,7 +160,12 @@ pub fn bind_slots(
         image[at..at + 4].copy_from_slice(&rva.to_le_bytes());
         image[at + 4..at + 8].copy_from_slice(&sz.to_le_bytes());
     };
-    put(&mut image, IMPORT_DIRECTORY, table.import_directory.rva.0, table.import_directory.size);
+    put(
+        &mut image,
+        IMPORT_DIRECTORY,
+        table.import_directory.rva.0,
+        table.import_directory.size,
+    );
     let low = runs.iter().map(|(_, s, _)| *s).min().unwrap_or(0);
     let high = runs
         .iter()
@@ -175,7 +177,11 @@ pub fn bind_slots(
     let _ = intact_bytes;
     log.step(
         "imports bound",
-        &format!("{total} symbol(s) in {} descriptor(s) over {} module(s)", runs.len(), by_module.len()),
+        &format!(
+            "{total} symbol(s) in {} descriptor(s) over {} module(s)",
+            runs.len(),
+            by_module.len()
+        ),
     );
     Ok(image)
 }
@@ -196,7 +202,10 @@ mod tests {
     fn real_names_stay_by_name() {
         assert_eq!(
             import_target("MessageBoxW"),
-            ImportTarget::Name { name: "MessageBoxW".to_owned(), hint: 0 }
+            ImportTarget::Name {
+                name: "MessageBoxW".to_owned(),
+                hint: 0
+            }
         );
     }
 
@@ -205,11 +214,17 @@ mod tests {
         // A `#` not followed by a u16 is not an ordinal sentinel.
         assert_eq!(
             import_target("#notanumber"),
-            ImportTarget::Name { name: "#notanumber".to_owned(), hint: 0 }
+            ImportTarget::Name {
+                name: "#notanumber".to_owned(),
+                hint: 0
+            }
         );
         assert_eq!(
             import_target("#99999"),
-            ImportTarget::Name { name: "#99999".to_owned(), hint: 0 }
+            ImportTarget::Name {
+                name: "#99999".to_owned(),
+                hint: 0
+            }
         );
     }
 }

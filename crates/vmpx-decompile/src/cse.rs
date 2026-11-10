@@ -49,7 +49,10 @@ fn children(expr: &Expr) -> Vec<&Expr> {
         | ExprKind::Extract { value, .. }
         | ExprKind::Resize { value, .. } => vec![value],
         ExprKind::Binary { left, right, .. }
-        | ExprKind::Concat { high: left, low: right } => vec![left, right],
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => vec![left, right],
         ExprKind::Intrinsic { arguments, .. } => arguments.iter().collect(),
     }
 }
@@ -66,7 +69,11 @@ fn is_const(e: &Expr, v: u64) -> bool {
 /// claims more than the definition shows.
 fn role_prefix(expr: &Expr, image_base: u64) -> &'static str {
     if image_base != 0
-        && let ExprKind::Binary { op: BinaryOp::Add, left, right } = &expr.kind
+        && let ExprKind::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } = &expr.kind
         && (is_const(left, image_base) || is_const(right, image_base))
     {
         return "ptr";
@@ -118,7 +125,10 @@ fn trivial(expr: &Expr) -> bool {
         ExprKind::Unary { value, .. }
         | ExprKind::Extract { value, .. }
         | ExprKind::Resize { value, .. } => {
-            matches!(value.kind, ExprKind::Const { .. } | ExprKind::Register { .. })
+            matches!(
+                value.kind,
+                ExprKind::Const { .. } | ExprKind::Register { .. }
+            )
         }
         _ => false,
     }
@@ -174,11 +184,7 @@ fn roots_and_conditions(stmts: &[Stmt], out: &mut Vec<Expr>, conditions: &mut Ve
             }
             Stmt::IfGoto { cond: c, .. } => cond(c, out, conditions),
             Stmt::Loop(body) => roots_and_conditions(body, out, conditions),
-            Stmt::Break
-            | Stmt::Continue
-            | Stmt::Label(_)
-            | Stmt::Goto(_)
-            | Stmt::Comment(_) => {}
+            Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
         }
     }
 }
@@ -216,8 +222,10 @@ fn survey(roots: &[Expr]) -> (HashMap<Expr, usize>, HashMap<Expr, usize>) {
             continue;
         }
         if expanded {
-            let total =
-                1 + children(&expr).iter().map(|c| size.get(*c).copied().unwrap_or(1)).sum::<usize>();
+            let total = 1 + children(&expr)
+                .iter()
+                .map(|c| size.get(*c).copied().unwrap_or(1))
+                .sum::<usize>();
             size.insert(expr, total);
         } else {
             // Children are pushed AFTER the marker, so they are sized first.
@@ -238,13 +246,14 @@ fn survey(roots: &[Expr]) -> (HashMap<Expr, usize>, HashMap<Expr, usize>) {
 /// `taken` are names already in use in the function, so a temporary can never
 /// shadow a recovered variable.
 #[must_use]
-pub fn extract(
-    stmts: &[Stmt],
-    min_uses: usize,
-    min_size: usize,
-    taken: &HashSet<String>,
-) -> Temps {
-    extract_with(stmts, min_uses, min_size, taken, &crate::symbols::Symbols::default())
+pub fn extract(stmts: &[Stmt], min_uses: usize, min_size: usize, taken: &HashSet<String>) -> Temps {
+    extract_with(
+        stmts,
+        min_uses,
+        min_size,
+        taken,
+        &crate::symbols::Symbols::default(),
+    )
 }
 
 /// As [`extract`], naming a global that is an import slot after the import
@@ -292,12 +301,18 @@ pub fn extract_with(
     }
     // Globals first and in address order: they depend on nothing, and sorting
     // by address makes the block scan like a memory map.
-    globals.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.width.bits().cmp(&b.1.width.bits())));
+    globals.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.width.bits().cmp(&b.1.width.bits()))
+    });
     globals.dedup_by(|a, b| a.1 == b.1);
     // Smaller subtrees first: a temporary can only contain strictly smaller
     // subtrees, so size order IS a dependency order. `{expr:?}` breaks ties so
     // the output does not depend on hash iteration order.
-    chosen.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+    chosen.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
+    });
 
     let free = |stem: &str, count: usize| {
         let mut prefix = stem.to_owned();
@@ -363,8 +378,14 @@ mod tests {
             Stmt::Assign("z".to_owned(), once.clone()),
         ];
         let temps = extract(&stmts, 2, 2, &HashSet::new());
-        assert!(temps.map.contains_key(&shared), "a twice-used subtree earns a name");
-        assert!(!temps.map.contains_key(&once), "a once-used subtree does not");
+        assert!(
+            temps.map.contains_key(&shared),
+            "a twice-used subtree earns a name"
+        );
+        assert!(
+            !temps.map.contains_key(&once),
+            "a once-used subtree does not"
+        );
     }
 
     #[test]
@@ -375,7 +396,10 @@ mod tests {
             Stmt::Assign("y".to_owned(), add(a.clone(), reg("c"))),
         ];
         let temps = extract(&stmts, 2, 1, &HashSet::new());
-        assert!(!temps.map.contains_key(&a), "naming a bare register adds noise");
+        assert!(
+            !temps.map.contains_key(&a),
+            "naming a bare register adds noise"
+        );
     }
 
     #[test]
@@ -402,7 +426,10 @@ mod tests {
     #[test]
     fn a_temporary_never_shadows_an_existing_name() {
         let shared = add(reg("a"), reg("b"));
-        let stmts = vec![Stmt::Assign("x".to_owned(), add(shared.clone(), shared.clone()))];
+        let stmts = vec![Stmt::Assign(
+            "x".to_owned(),
+            add(shared.clone(), shared.clone()),
+        )];
         let taken: HashSet<String> = ["t0".to_owned()].into_iter().collect();
         let temps = extract(&stmts, 2, 2, &taken);
         assert!(temps.order.iter().all(|(n, _)| !taken.contains(n)));
@@ -413,8 +440,14 @@ mod tests {
         let global = Expr::load(BitWidth::W64, Expr::constant(BitWidth::W64, 0x3781_54c1_6));
         let stmts = vec![Stmt::Assign("x".to_owned(), add(global.clone(), reg("a")))];
         let temps = extract(&stmts, 2, 6, &HashSet::new());
-        let name = temps.map.get(&global).expect("a global earns a name on first use");
-        assert!(name.starts_with('g'), "globals get their own prefix, got {name}");
+        let name = temps
+            .map
+            .get(&global)
+            .expect("a global earns a name on first use");
+        assert!(
+            name.starts_with('g'),
+            "globals get their own prefix, got {name}"
+        );
     }
 
     #[test]
@@ -430,7 +463,10 @@ mod tests {
         let (Some(g), Some(t)) = (position(&global), position(&shared)) else {
             panic!("both should be named");
         };
-        assert!(g < t, "a global must be defined before anything that reads it");
+        assert!(
+            g < t,
+            "a global must be defined before anything that reads it"
+        );
     }
 
     #[test]
@@ -469,7 +505,10 @@ mod tests {
             els: Vec::new(),
         }];
         let temps = extract(&stmts, 2, 6, &HashSet::new());
-        assert!(!temps.map.contains_key(&small), "a short guard reads better inline");
+        assert!(
+            !temps.map.contains_key(&small),
+            "a short guard reads better inline"
+        );
     }
 
     #[test]
@@ -480,6 +519,9 @@ mod tests {
             Stmt::Assign("y".to_owned(), add(shared.clone(), reg("d"))),
         ])];
         let temps = extract(&stmts, 2, 2, &HashSet::new());
-        assert!(temps.map.contains_key(&shared), "a loop body is part of the function");
+        assert!(
+            temps.map.contains_key(&shared),
+            "a loop body is part of the function"
+        );
     }
 }

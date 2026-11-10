@@ -75,8 +75,11 @@ fn resolved_imports(
     let calls = cfg.native_calls();
     let mut found = BTreeSet::new();
     let mut budget = MAX_WALK_BLOCKS;
-    let mut work: Vec<(Va, SymbolicVmInitialState, Vec<Va>)> =
-        vec![(cfg.entry, frame_initial_state(frame, top_offset).0, Vec::new())];
+    let mut work: Vec<(Va, SymbolicVmInitialState, Vec<Va>)> = vec![(
+        cfg.entry,
+        frame_initial_state(frame, top_offset).0,
+        Vec::new(),
+    )];
     while let Some((mut key, mut state, mut trail)) = work.pop() {
         loop {
             if budget == 0 || trail.contains(&key) {
@@ -233,7 +236,8 @@ pub(crate) fn lift_entry(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
+            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings()),
             false,
         )
     };
@@ -268,7 +272,13 @@ pub(crate) fn lift_entry(
     let lifted = lift_decoded_cfg(&input, address)
         .map_err(|error| format!("linear: {linear_error}; cfg: {error}"))?;
     let imports = if lifted.native_calls > 0 {
-        resolved_imports(&cfg, &frame, top_offset, image, SymbolicExecutionLimits::default())
+        resolved_imports(
+            &cfg,
+            &frame,
+            top_offset,
+            image,
+            SymbolicExecutionLimits::default(),
+        )
     } else {
         BTreeSet::new()
     };
@@ -347,7 +357,9 @@ pub(crate) fn with_entry_input<R>(
         // carries `AssumesImageProtectionStable` — so this widens what can be
         // decompiled, never what is claimed proven.
         symbolic: vmpx_vm::SymbolicExecutionLimits {
-            serve_read_only_when_suppressed: (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
+            serve_read_only_when_suppressed: (std::env::var_os("VMPX_DECOMPILE_SERVE_RO")
+                .is_some()
+                || crate::auto_cmd::auto_settings()),
             ..vmpx_vm::SymbolicExecutionLimits::default()
         },
         ..EntryProfileRecoveryLimits::default()
@@ -369,7 +381,8 @@ pub(crate) fn with_entry_input<R>(
         entry: entry_limits,
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
-            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some() || crate::auto_cmd::auto_settings()),
+            (std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings()),
             false,
         )
     };

@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use vmpx_pe::{PeImage, Rva};
-use vmpx_recompile::{CodeAddress, PhysicalRegister};
 use vmpx_rebuild::{
     AppendSection, append_section, next_section_rva, retarget_direct_branch, validate_for_loader,
 };
+use vmpx_recompile::{CodeAddress, PhysicalRegister};
 use vmpx_vm::{
     Expr, ImageConcretizationLimits, X64NativeRegister, concretize_with_immutable_image,
 };
@@ -65,7 +65,10 @@ fn replacement_inputs() -> Vec<(String, PhysicalRegister)> {
         .map(|r| (r.symbolic_name().to_owned(), physical_for(*r)))
         .collect();
     inputs.push(("vsp_initial".to_owned(), PhysicalRegister::Rbp));
-    inputs.push(("native_return_address_initial".to_owned(), PhysicalRegister::Rbp));
+    inputs.push((
+        "native_return_address_initial".to_owned(),
+        PhysicalRegister::Rbp,
+    ));
     inputs.sort();
     inputs.dedup();
     inputs
@@ -123,16 +126,17 @@ pub(crate) fn build_one(
     instruction_limit: usize,
     va: u64,
 ) -> Result<Vec<u8>, String> {
-    let rolled = crate::decoded_splice::with_entry_input(intact, Rva(rva), instruction_limit, |input| {
-        let resolver = vmpx_vmlift::PeNestedEntries {
-            pe: intact,
-            limits: vmpx_vm::EntryProfileRecoveryLimits {
-                instruction_limit,
-                ..vmpx_vm::EntryProfileRecoveryLimits::default()
-            },
-        };
-        vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
-    })??;
+    let rolled =
+        crate::decoded_splice::with_entry_input(intact, Rva(rva), instruction_limit, |input| {
+            let resolver = vmpx_vmlift::PeNestedEntries {
+                pe: intact,
+                limits: vmpx_vm::EntryProfileRecoveryLimits {
+                    instruction_limit,
+                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                },
+            };
+            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+        })??;
     let mut has_loop = false;
     let mut paths = Vec::new();
     collect_legit_paths(&rolled.root, &mut Vec::new(), &mut has_loop, &mut paths);
@@ -167,8 +171,9 @@ pub(crate) fn build_one(
         let timing = vmpx_vm::fold_timing_invariant_loads(intact, expr, modulo_limits)
             .map_err(|error| format!("timing fold: {error}"))?;
         *folded += timing.folded;
-        let report = concretize_with_immutable_image(intact, &timing.expression, &BTreeMap::new(), limits)
-            .map_err(|error| format!("concretize: {error}"))?;
+        let report =
+            concretize_with_immutable_image(intact, &timing.expression, &BTreeMap::new(), limits)
+                .map_err(|error| format!("concretize: {error}"))?;
         *folded += report.resolved_intrinsics;
         // A `memory_load_epoch_N(addr)` concretize could not fold is a runtime
         // read of a location no store on this path touched -- e.g. the caller's
@@ -350,7 +355,9 @@ pub(crate) fn retarget_sites(
         };
         let from = offset.0 as usize;
         let to = from.saturating_add((end - begin) as usize).min(image.len());
-        let Some(code) = image.get(from..to) else { continue };
+        let Some(code) = image.get(from..to) else {
+            continue;
+        };
         let mut decoder = Decoder::with_ip(64, code, base + u64::from(begin), DecoderOptions::NONE);
         while decoder.can_decode() {
             let at = decoder.position();
@@ -387,10 +394,18 @@ pub fn run(o: Options) -> Result<(), String> {
     let intact = PeImage::parse(&intact_bytes).map_err(|e| e.to_string())?;
     let stripped_bytes = std::fs::read(&o.stripped).map_err(|e| e.to_string())?;
     let base = intact.optional.image_base.0;
-    if base != PeImage::parse(&stripped_bytes).map_err(|e| e.to_string())?.optional.image_base.0 {
+    if base
+        != PeImage::parse(&stripped_bytes)
+            .map_err(|e| e.to_string())?
+            .optional
+            .image_base
+            .0
+    {
         return Err("intact and stripped image bases differ".to_owned());
     }
-    let section_rva = next_section_rva(&stripped_bytes).map_err(|e| e.to_string())?.0;
+    let section_rva = next_section_rva(&stripped_bytes)
+        .map_err(|e| e.to_string())?
+        .0;
 
     // Emit each guard sequentially; x64 body size is position-independent, so
     // building at the running VA places each one correctly in one pass.

@@ -101,7 +101,9 @@ impl<'a> Structurer<'a> {
         let out = self.chain(self.entry, None)?;
         let reachable = self.reachable();
         if let Some(missed) = reachable.iter().find(|n| !self.done.contains(n)) {
-            return Err(format!("block {missed:#x} was not placed by the structurer"));
+            return Err(format!(
+                "block {missed:#x} was not placed by the structurer"
+            ));
         }
         let _ = &self.dom;
         Ok(simplify(out))
@@ -209,7 +211,9 @@ impl<'a> Structurer<'a> {
                     return Ok(out);
                 }
                 if !top.body.contains(&n) {
-                    return Err(format!("jump from loop to {n:#x}, which is not its single exit"));
+                    return Err(format!(
+                        "jump from loop to {n:#x}, which is not its single exit"
+                    ));
                 }
             }
             if self.done.contains(&n) {
@@ -266,7 +270,11 @@ impl<'a> Structurer<'a> {
         Ok(stmts)
     }
 
-    fn block_and_term(&mut self, n: NodeId, merge: Option<NodeId>) -> Result<(Vec<Stmt>, Next), String> {
+    fn block_and_term(
+        &mut self,
+        n: NodeId,
+        merge: Option<NodeId>,
+    ) -> Result<(Vec<Stmt>, Next), String> {
         self.done.insert(n);
         let mut out = self.lower_stmts(n);
         let term = self.blocks[&n].term.clone();
@@ -364,7 +372,10 @@ fn simplify_one(s: Stmt) -> Stmt {
                 }
                 // if (c) break; else { rest }  ==  while (!c) { rest }
                 if matches!(then.as_slice(), [Stmt::Break]) && !els.is_empty() && body.len() == 1 {
-                    return Stmt::While { cond: negate(cond), body: els.clone() };
+                    return Stmt::While {
+                        cond: negate(cond),
+                        body: els.clone(),
+                    };
                 }
             }
             Stmt::Loop(body)

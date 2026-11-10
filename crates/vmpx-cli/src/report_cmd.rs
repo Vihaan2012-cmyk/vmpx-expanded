@@ -34,7 +34,8 @@ pub struct ReportOptions {
 }
 
 /// Why incomplete entries stopped (limit hit, or `stall`), diagnostic only.
-static LIMIT_HITS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
+static LIMIT_HITS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 /// Recovery errors by message. `classify` used to drop the `CfgError`, so the
 /// headline's "errors N" named neither the entries nor the reason.
@@ -203,8 +204,12 @@ pub(crate) fn cfg_limits(
         // Post-transition exploration caps scale by VMPX_TRANSITION_BUDGET (integer
         // multiplier, default 1). A larger cap only lets the walk explore further;
         // completion still requires no stall and no limit hit.
-        max_visits: VmCfgLimits::default().max_visits.saturating_mul(env_scale("VMPX_VISITS")),
-        max_blocks: VmCfgLimits::default().max_blocks.saturating_mul(env_scale("VMPX_VISITS")),
+        max_visits: VmCfgLimits::default()
+            .max_visits
+            .saturating_mul(env_scale("VMPX_VISITS")),
+        max_blocks: VmCfgLimits::default()
+            .max_blocks
+            .saturating_mul(env_scale("VMPX_VISITS")),
         max_total_instructions: VmCfgLimits::default()
             .max_total_instructions
             .saturating_mul(env_scale("VMPX_TOTAL_INSTRUCTIONS")),
@@ -224,7 +229,9 @@ pub(crate) fn cfg_limits(
         max_nested_entries: VmCfgLimits::default()
             .max_nested_entries
             .saturating_mul(env_scale("VMPX_NESTED_ENTRIES")),
-        max_transition_visits: VmCfgLimits::default().max_transition_visits.saturating_mul(transition_scale()),
+        max_transition_visits: VmCfgLimits::default()
+            .max_transition_visits
+            .saturating_mul(transition_scale()),
         max_transition_instructions: VmCfgLimits::default()
             .max_transition_instructions
             .saturating_mul(transition_scale()),
@@ -237,14 +244,19 @@ pub(crate) fn cfg_limits(
                 .saturating_mul(env_scale("VMPX_DOMAIN_COMBINATIONS")),
             ..vmpx_vm::SymbolicDomainLimits::default()
         },
-        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some() || crate::auto_cmd::auto_settings(),
+        follow_cross_vm_section: std::env::var_os("VMPX_FOLLOW_CROSS_VMP_SECTION").is_some()
+            || crate::auto_cmd::auto_settings(),
         // VMPX_WALL_SECS sets the per-entry budget, and a budget-pass sweep bounds
         // each rerun entry by VMPX_PASS_WALL_SECS instead. A lower cap only stops
         // an entry sooner, as WallClock, i.e. incomplete — so this knob is
         // soundness-neutral in both directions, and it sizes how much of the
         // incomplete set is blocked by TIME rather than by a stall.
         max_wall_time: wall_secs(
-            if SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+            if SCALE_OVERRIDE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            {
                 "VMPX_PASS_WALL_SECS"
             } else {
                 "VMPX_WALL_SECS"
@@ -273,7 +285,10 @@ static SCALE_OVERRIDE: std::sync::Mutex<Option<[usize; 4]>> = std::sync::Mutex::
 static DUMP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn env_scale(name: &str) -> usize {
-    if let Some(a) = *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+    if let Some(a) = *SCALE_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return match name {
             "VMPX_TRANSITION_BUDGET" => a[0],
             "VMPX_VISITS" => a[1],
@@ -304,10 +319,15 @@ fn transition_scale() -> usize {
 fn trace_entry(
     entry: &VmEntryCandidate,
     index: usize,
-    finished: Option<(std::time::Duration, &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>)>,
+    finished: Option<(
+        std::time::Duration,
+        &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>,
+    )>,
 ) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("VMPX_ENTRY_TRACE") else { return };
+    let Some(path) = std::env::var_os("VMPX_ENTRY_TRACE") else {
+        return;
+    };
     let rva = format!("{:#x}", entry.rva.0);
     let line = match finished {
         None => format!("start {index} {rva}"),
@@ -325,8 +345,14 @@ fn trace_entry(
             format!("done  {index} {rva} {:.1}s {outcome}", took.as_secs_f64())
         }
     };
-    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let _guard = DUMP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -334,9 +360,14 @@ fn trace_entry(
 /// Diagnostic: with `VMPX_STALL_DUMP=<file>` set, appends one JSON line per
 /// incomplete entry (rva, limit hit, stalls in discovery order), on the base
 /// sweep as well as during a budget pass.
-fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) {
+fn dump_stalls(
+    entry: &VmEntryCandidate,
+    result: &std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>,
+) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("VMPX_STALL_DUMP") else { return };
+    let Some(path) = std::env::var_os("VMPX_STALL_DUMP") else {
+        return;
+    };
     let Ok(Ok(cfg)) = result else { return };
     if cfg.all_paths_reach_vm_exit() {
         return;
@@ -353,8 +384,14 @@ fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmC
         "n_stalls": cfg.stalls.len(),
         "stalls": stalls,
     });
-    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let _guard = DUMP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -366,7 +403,9 @@ fn dump_stalls(entry: &VmEntryCandidate, result: &std::thread::Result<Result<VmC
 /// checked for exactly that and any violation is recorded.
 fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("VMPX_CFG_AUDIT") else { return };
+    let Some(path) = std::env::var_os("VMPX_CFG_AUDIT") else {
+        return;
+    };
     // Every block that is not itself a VM exit has to lead somewhere. The earlier
     // form of this check listed only Branch and NativeCall, so a block whose exit
     // was never classified at all — `BlockExit::Stalled`, the case the lifter
@@ -390,8 +429,14 @@ fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
         "blocks": cfg.blocks.len(),
         "dangling": dangling,
     });
-    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let _guard = DUMP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -402,8 +447,12 @@ fn audit_complete(entry: &VmEntryCandidate, cfg: &VmCfg) {
 /// not completing more CFGs.
 fn dump_discharge(entry: &VmEntryCandidate, cfg: &VmCfg) {
     use std::io::Write;
-    let Some(path) = std::env::var_os("VMPX_DISCHARGE_DUMP") else { return };
-    let Some(reason) = cfg.discharge_refusal.as_ref() else { return };
+    let Some(path) = std::env::var_os("VMPX_DISCHARGE_DUMP") else {
+        return;
+    };
+    let Some(reason) = cfg.discharge_refusal.as_ref() else {
+        return;
+    };
     if !cfg.all_paths_reach_vm_exit() {
         return;
     }
@@ -412,8 +461,14 @@ fn dump_discharge(entry: &VmEntryCandidate, cfg: &VmCfg) {
         "why": reason,
         "assumptions": cfg.assumptions.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
     });
-    let _guard = DUMP_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    let _guard = DUMP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -433,10 +488,9 @@ fn classify(result: std::thread::Result<Result<VmCfg, vmpx_vm::CfgError>>) -> Ou
             Outcome::Complete(cfg.assumptions.iter().copied().collect())
         }
         Ok(Ok(cfg)) => {
-            let label = cfg.limit_hit.map_or_else(
-                || "stall".to_owned(),
-                |hit| format!("{hit:?}"),
-            );
+            let label = cfg
+                .limit_hit
+                .map_or_else(|| "stall".to_owned(), |hit| format!("{hit:?}"));
             *LIMIT_HITS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -456,7 +510,9 @@ fn recover_all(
     if entries.is_empty() {
         return Vec::new();
     }
-    let instruction_limit = opts.instruction_limit.saturating_mul(env_scale("VMPX_INSTRUCTION_LIMIT"));
+    let instruction_limit = opts
+        .instruction_limit
+        .saturating_mul(env_scale("VMPX_INSTRUCTION_LIMIT"));
     let limits = cfg_limits(instruction_limit, opts.serve_ro, opts.serve_observed_ro);
     let prev_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
@@ -475,7 +531,9 @@ fn recover_all(
                     let mut mine: Vec<(usize, Outcome)> = Vec::new();
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(entry) = entries.get(index) else { break };
+                        let Some(entry) = entries.get(index) else {
+                            break;
+                        };
                         let began = std::time::Instant::now();
                         trace_entry(entry, index, None);
                         let result = panic::catch_unwind(AssertUnwindSafe(|| match observed {
@@ -537,7 +595,9 @@ fn note_progress(outcome: &Outcome) {
     let Some(path) = std::env::var_os("VMPX_PROGRESS") else {
         return;
     };
-    let mut counts = PROGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut counts = PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     counts.0 += 1;
     match outcome {
         Outcome::Complete(assumptions) => {
@@ -565,7 +625,9 @@ fn write_progress(path: &std::ffi::OsStr, counts: (usize, usize, usize, usize, u
 /// Final flush, so the last partial batch is not lost.
 pub(crate) fn flush_progress() {
     if let Some(path) = std::env::var_os("VMPX_PROGRESS") {
-        let counts = *PROGRESS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counts = *PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         write_progress(&path, counts);
     }
 }
@@ -737,9 +799,13 @@ pub fn install_volatility_veto(
                     Some((_, end)) if *end + 1 == address => *end = address,
                     _ => ranges.push((address, address)),
                 }
-                if capture_seed && SymbolicMemorySource::is_read_only_address(&read_only, Va(address)) {
+                if capture_seed
+                    && SymbolicMemorySource::is_read_only_address(&read_only, Va(address))
+                {
                     match seed.last_mut() {
-                        Some((start, bytes)) if *start + bytes.len() as u64 == address => bytes.push(runtime),
+                        Some((start, bytes)) if *start + bytes.len() as u64 == address => {
+                            bytes.push(runtime)
+                        }
                         _ => seed.push((address, vec![runtime])),
                     }
                 }
@@ -755,7 +821,10 @@ pub fn install_volatility_veto(
         let _ = SNAPSHOT_SEED.set(vmpx_vm::ObservedMemory::from_slots(seed));
     }
     if let Some(path) = std::env::var_os("VMPX_DUMP_VOLATILE") {
-        let text: String = ranges.iter().map(|(a, b)| format!("{a:x} {b:x}\n")).collect();
+        let text: String = ranges
+            .iter()
+            .map(|(a, b)| format!("{a:x} {b:x}\n"))
+            .collect();
         let _ = std::fs::write(path, text);
     }
     let bytes = ranges.iter().map(|(s, e)| e - s + 1).sum();
@@ -805,20 +874,29 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
     );
     let snapshot_run = if opts.serve_observed_ro {
         SNAPSHOT_SEED.get().map(|memory| {
-            ObservedRun::new(memory.clone(), vmpx_vm::ObservedLoopDepths::from_depths(std::iter::empty()))
+            ObservedRun::new(
+                memory.clone(),
+                vmpx_vm::ObservedLoopDepths::from_depths(std::iter::empty()),
+            )
         })
     } else {
         None
     };
     if opts.serve_observed_ro && snapshot_run.is_none() {
-        eprintln!("[report] --serve-observed-ro needs --volatility-snapshot; no snapshot seed was captured");
+        eprintln!(
+            "[report] --serve-observed-ro needs --volatility-snapshot; no snapshot seed was captured"
+        );
     }
     let mut outcomes = recover_all(&pe, &entries, opts, None);
     eprintln!(
         "[report] incomplete entries by stop reason: {:?}",
-        LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        LIMIT_HITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     );
-    let errors = ERRORS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let errors = ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !errors.is_empty() {
         eprintln!("[report] recovery errors by message: {errors:?}");
     }
@@ -836,15 +914,28 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
             .filter(|(_, o)| matches!(o, Outcome::Incomplete))
             .map(|(i, _)| i)
             .collect();
-        let pending: Vec<VmEntryCandidate> = base_incomplete.iter().map(|&i| entries[i].clone()).collect();
+        let pending: Vec<VmEntryCandidate> = base_incomplete
+            .iter()
+            .map(|&i| entries[i].clone())
+            .collect();
         for pass in spec.split(';') {
-            let k: Vec<usize> = pass.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            let k: Vec<usize> = pass
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
             let [a, b, c, d] = k[..] else { continue };
-            *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some([a, b, c, d]);
-            LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            *SCALE_OVERRIDE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some([a, b, c, d]);
+            LIMIT_HITS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             let t0 = std::time::Instant::now();
             let rerun = recover_all(&pe, &pending, opts, None);
-            *SCALE_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *SCALE_OVERRIDE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             let (mut done, mut n2) = (0_usize, 0_usize);
             for (i, outcome) in base_incomplete.iter().zip(rerun) {
                 if let Outcome::Complete(assumptions) = &outcome {
@@ -859,7 +950,9 @@ pub fn build_report(input_path: &str, input: &[u8], opts: &ReportOptions) -> Res
                 "[report] budget pass tb={a} visits={b} total={c} instr={d}: {done} of {} incomplete entries now complete ({n2} with empty assumptions), {:.0}s; still stopped by {:?}",
                 pending.len(),
                 t0.elapsed().as_secs_f64(),
-                LIMIT_HITS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                LIMIT_HITS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
             );
         }
     }
@@ -1058,7 +1151,11 @@ pub fn render(r: &Report) -> String {
     let _ = writeln!(
         o,
         "  caps: {}",
-        if caps.is_empty() { "all default".to_owned() } else { caps.join(", ") }
+        if caps.is_empty() {
+            "all default".to_owned()
+        } else {
+            caps.join(", ")
+        }
     );
     let _ = writeln!(
         o,
@@ -1100,7 +1197,10 @@ pub fn render(r: &Report) -> String {
     for (k, n) in &s.assumption_sets {
         let _ = writeln!(o, "    {n:>4} x {k}");
     }
-    let _ = writeln!(o, "\nEXPERIMENTAL TIERS (--dynamic is reported separately; snapshot-served completions appear on the OBSERVED line above)");
+    let _ = writeln!(
+        o,
+        "\nEXPERIMENTAL TIERS (--dynamic is reported separately; snapshot-served completions appear on the OBSERVED line above)"
+    );
     let _ = writeln!(
         o,
         "  serve-RO completions : {} ({})",

@@ -204,8 +204,12 @@ fn generic(e: &Expr, t: BitWidth, memo: &mut HashMap<(Expr, u32), Expr>) -> Expr
 
 fn peel_shift_count(e: &Expr) -> Expr {
     if let ExprKind::Binary { op, left, right } = &e.kind
-        && matches!(op, BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar | BinaryOp::Rol | BinaryOp::Ror)
-        && let Some(p) = crate::xu::peel_count(right, e.width, matches!(op, BinaryOp::Rol | BinaryOp::Ror))
+        && matches!(
+            op,
+            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar | BinaryOp::Rol | BinaryOp::Ror
+        )
+        && let Some(p) =
+            crate::xu::peel_count(right, e.width, matches!(op, BinaryOp::Rol | BinaryOp::Ror))
         && p != **right
         && let Ok(n) = Expr::binary(*op, (**left).clone(), p)
     {
@@ -240,10 +244,18 @@ fn ne_inner(e: &Expr, k: u32, memo: &mut HashMap<(Expr, u32), Expr>) -> Expr {
                     }
                     let dmd = round_up(64 - ct.leading_zeros()).min(t.bits());
                     let inner = ne(x, dmd, memo);
-                    let masked = bin(BinaryOp::And, inner.clone(), Expr::constant(inner.width, ct));
+                    let masked = bin(
+                        BinaryOp::And,
+                        inner.clone(),
+                        Expr::constant(inner.width, ct),
+                    );
                     return zext_to(t, masked);
                 }
-                bin(BinaryOp::And, ne(left, t.bits(), memo), ne(right, t.bits(), memo))
+                bin(
+                    BinaryOp::And,
+                    ne(left, t.bits(), memo),
+                    ne(right, t.bits(), memo),
+                )
             }
             BinaryOp::Shl => {
                 if let ExprKind::Const { value } = right.kind {
@@ -276,9 +288,15 @@ fn ne_inner(e: &Expr, k: u32, memo: &mut HashMap<(Expr, u32), Expr>) -> Expr {
             }
             _ => generic(e, t, memo),
         },
-        ExprKind::Resize { op: ResizeOp::Truncate, value } => ne(value, t.bits(), memo),
+        ExprKind::Resize {
+            op: ResizeOp::Truncate,
+            value,
+        } => ne(value, t.bits(), memo),
         ExprKind::Extract { value, lsb: 0 } => ne(value, t.bits(), memo),
-        ExprKind::Resize { op: ResizeOp::ZeroExtend, value } => {
+        ExprKind::Resize {
+            op: ResizeOp::ZeroExtend,
+            value,
+        } => {
             if t.bits() <= value.width.bits() {
                 ne(value, t.bits(), memo)
             } else {
@@ -330,7 +348,9 @@ pub fn narrow(func: &mut Func, live_in: &BTreeSet<String>) -> BTreeMap<String, B
                     .exprs()
                     .into_iter()
                     .for_each(|e| scan(e, None, &mut reads, &mut seen)),
-                Term::Return(v) => v.iter().for_each(|(_, e)| scan(e, None, &mut reads, &mut seen)),
+                Term::Return(v) => v
+                    .iter()
+                    .for_each(|(_, e)| scan(e, None, &mut reads, &mut seen)),
             }
         }
         let mut changed = false;
@@ -368,7 +388,10 @@ pub fn narrow(func: &mut Func, live_in: &BTreeSet<String>) -> BTreeMap<String, B
                     continue;
                 }
                 match &cleanup(d).kind {
-                    ExprKind::Resize { op: ResizeOp::ZeroExtend, value } => {
+                    ExprKind::Resize {
+                        op: ResizeOp::ZeroExtend,
+                        value,
+                    } => {
                         wmax = wmax.max(value.width.bits());
                     }
                     ExprKind::Const { value } => {
@@ -413,7 +436,11 @@ pub fn narrow(func: &mut Func, live_in: &BTreeSet<String>) -> BTreeMap<String, B
         for (v, d) in &mut b.assigns {
             let nd = fix(d);
             let w = widths[v];
-            *d = if nd.width.bits() > w.bits() { cleanup(&trunc_to(w, &nd)) } else { nd };
+            *d = if nd.width.bits() > w.bits() {
+                cleanup(&trunc_to(w, &nd))
+            } else {
+                nd
+            };
         }
         for_each_expr_mut_nonassign(b, &fix);
     }
@@ -445,16 +472,29 @@ fn for_each_expr_mut_nonassign(b: &mut Block, f: &dyn Fn(&Expr) -> Expr) {
 pub enum Stmt {
     Assign(String, Expr),
     Store(Store),
-    If { cond: Cond, then: Vec<Stmt>, els: Vec<Stmt> },
+    If {
+        cond: Cond,
+        then: Vec<Stmt>,
+        els: Vec<Stmt>,
+    },
     Loop(Vec<Stmt>),
-    While { cond: Cond, body: Vec<Stmt> },
-    DoWhile { body: Vec<Stmt>, cond: Cond },
+    While {
+        cond: Cond,
+        body: Vec<Stmt>,
+    },
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Cond,
+    },
     Break,
     Continue,
     Return(Vec<(String, Expr)>),
     Label(NodeId),
     Goto(NodeId),
-    IfGoto { cond: Cond, target: NodeId },
+    IfGoto {
+        cond: Cond,
+        target: NodeId,
+    },
     Comment(String),
 }
 
@@ -521,8 +561,13 @@ fn cse(
             }
             return Some(new_ref(v, var_w[v]));
         }
-        let ExprKind::Binary { op, .. } = &n.kind else { return None };
-        if !matches!(op, BinaryOp::Add | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul) {
+        let ExprKind::Binary { op, .. } = &n.kind else {
+            return None;
+        };
+        if !matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul
+        ) {
             return None;
         }
         let mut ln = Vec::new();
@@ -580,7 +625,8 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
             table.entry(d.clone()).or_insert_with(|| v.clone());
         }
     }
-    let var_w: HashMap<String, BitWidth> = assigns.iter().map(|(v, d)| (v.clone(), d.width)).collect();
+    let var_w: HashMap<String, BitWidth> =
+        assigns.iter().map(|(v, d)| (v.clone(), d.width)).collect();
     let replace = |e: &Expr, own_root_of: Option<&str>| -> Expr {
         cse(e, own_root_of, &table, &assigns, &var_w)
     };
@@ -596,7 +642,11 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
             then: *then,
             els: *els,
         },
-        Term::Return(v) => Term::Return(v.iter().map(|(n, e)| (n.clone(), replace(e, None))).collect()),
+        Term::Return(v) => Term::Return(
+            v.iter()
+                .map(|(n, e)| (n.clone(), replace(e, None)))
+                .collect(),
+        ),
     };
     let mut tails: Vec<Expr> = Vec::new();
     match &term {
@@ -621,7 +671,11 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
         let ready: Vec<usize> = remaining
             .iter()
             .copied()
-            .filter(|&j| deps_new(&rhs[j].1).iter().all(|u| emitted.contains(u) || *u == rhs[j].0))
+            .filter(|&j| {
+                deps_new(&rhs[j].1)
+                    .iter()
+                    .all(|u| emitted.contains(u) || *u == rhs[j].0)
+            })
             .collect();
         if ready.is_empty() {
             return Err(format!("block {:#x}: cyclic new-value dependencies", b.id));
@@ -664,7 +718,10 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
         {
             j
         } else {
-            *ready.iter().min_by_key(|&&j| pending_readers(j)).expect("ready")
+            *ready
+                .iter()
+                .min_by_key(|&&j| pending_readers(j))
+                .expect("ready")
         };
         let v = rhs[pick].0.clone();
         let readers: Vec<usize> = remaining
@@ -702,5 +759,9 @@ pub fn sequentialize(b: &Block) -> Result<LBlock, String> {
         },
         Term::Return(v) => Term::Return(v.into_iter().map(|(n, e)| (n, fix_tail(&e))).collect()),
     };
-    Ok(LBlock { id: b.id, stmts, term })
+    Ok(LBlock {
+        id: b.id,
+        stmts,
+        term,
+    })
 }

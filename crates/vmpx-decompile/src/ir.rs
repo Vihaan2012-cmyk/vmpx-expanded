@@ -118,7 +118,11 @@ pub struct Store {
 #[derive(Clone, Debug)]
 pub enum Term {
     Goto(NodeId),
-    Branch { cond: Cond, then: NodeId, els: NodeId },
+    Branch {
+        cond: Cond,
+        then: NodeId,
+        els: NodeId,
+    },
     /// Named return components (first is the C return value; the rest are
     /// reported as comments, e.g. callee-saved registers).
     Return(Vec<(String, Expr)>),

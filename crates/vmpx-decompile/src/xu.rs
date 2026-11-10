@@ -27,9 +27,11 @@ pub fn map_children(e: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         ExprKind::Resize { op, value } => {
             Expr::resize(*op, e.width, f(value)).unwrap_or_else(|_| e.clone())
         }
-        ExprKind::Intrinsic { name, arguments } => {
-            Expr::intrinsic(e.width, name.clone(), arguments.iter().map(&mut *f).collect())
-        }
+        ExprKind::Intrinsic { name, arguments } => Expr::intrinsic(
+            e.width,
+            name.clone(),
+            arguments.iter().map(&mut *f).collect(),
+        ),
         ExprKind::Load { address } => Expr::load(e.width, f(address)),
     }
 }
@@ -77,7 +79,10 @@ pub fn rewrite_up(e: &Expr, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
 /// `Some(inner)` when `e` is `Truncate`/`Extract@0` of `inner` (or `inner` itself at equal width).
 pub fn as_trunc(e: &Expr) -> Option<&Expr> {
     match &e.kind {
-        ExprKind::Resize { op: ResizeOp::Truncate, value } => Some(value),
+        ExprKind::Resize {
+            op: ResizeOp::Truncate,
+            value,
+        } => Some(value),
         ExprKind::Extract { value, lsb: 0 } => Some(value),
         _ => None,
     }
@@ -95,7 +100,13 @@ pub fn trunc_to(width: BitWidth, e: &Expr) -> Expr {
 /// `w` actually reads (a mask covering them, a zero-extension of a byte-or-wider
 /// truncation of a `w`-wide value).
 pub fn peel_count(c: &Expr, w: BitWidth, rotate: bool) -> Option<Expr> {
-    let need: u64 = if rotate { u64::from(w.bits() - 1) } else if w == BitWidth::W64 { 63 } else { 31 };
+    let need: u64 = if rotate {
+        u64::from(w.bits() - 1)
+    } else if w == BitWidth::W64 {
+        63
+    } else {
+        31
+    };
     Some(fit(w, lowbits(c, need)))
 }
 
@@ -114,13 +125,24 @@ fn fit(w: BitWidth, r: Expr) -> Expr {
 /// affect those bits removed.
 fn lowbits(c: &Expr, need: u64) -> Expr {
     match &c.kind {
-        ExprKind::Binary { op: BinaryOp::And, left, right } => match (&left.kind, &right.kind) {
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => match (&left.kind, &right.kind) {
             (_, ExprKind::Const { value }) if value & need == need => lowbits(left, need),
             (ExprKind::Const { value }, _) if value & need == need => lowbits(right, need),
             _ => c.clone(),
         },
-        ExprKind::Resize { op: ResizeOp::ZeroExtend, value } => lowbits(value, need),
-        ExprKind::Resize { op: ResizeOp::Truncate, value } | ExprKind::Extract { value, lsb: 0 }
+        ExprKind::Resize {
+            op: ResizeOp::ZeroExtend,
+            value,
+        } => lowbits(value, need),
+        ExprKind::Resize {
+            op: ResizeOp::Truncate,
+            value,
+        }
+        | ExprKind::Extract { value, lsb: 0 }
             if (need + 1).is_power_of_two() && c.width.bits() >= 64 - need.leading_zeros() =>
         {
             lowbits(value, need)
@@ -129,19 +151,20 @@ fn lowbits(c: &Expr, need: u64) -> Expr {
     }
 }
 
-
 fn local_rules(e: &Expr) -> Option<Expr> {
     // Trunc(ZExt(x)) / Trunc(Trunc(x)) / Trunc(SExt(x)) / ZExt(Trunc(Const))
     if let Some(inner) = as_trunc(e) {
         match &inner.kind {
-            ExprKind::Resize { op: ResizeOp::ZeroExtend | ResizeOp::SignExtend, value }
-                if value.width.bits() >= e.width.bits() =>
-            {
+            ExprKind::Resize {
+                op: ResizeOp::ZeroExtend | ResizeOp::SignExtend,
+                value,
+            } if value.width.bits() >= e.width.bits() => {
                 return Some(trunc_to(e.width, value));
             }
-            ExprKind::Resize { op: ResizeOp::ZeroExtend | ResizeOp::SignExtend, value }
-                if value.width == e.width =>
-            {
+            ExprKind::Resize {
+                op: ResizeOp::ZeroExtend | ResizeOp::SignExtend,
+                value,
+            } if value.width == e.width => {
                 return Some((**value).clone());
             }
             _ => {}
@@ -190,17 +213,31 @@ fn local_rules(e: &Expr) -> Option<Expr> {
     }
     // Shift/rotate counts only use their low bits: peel masks and byte truncations.
     if let ExprKind::Binary { op, left, right } = &e.kind
-        && matches!(op, BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar | BinaryOp::Rol | BinaryOp::Ror)
-        && let Some(peeled) = peel_count(right, e.width, matches!(op, BinaryOp::Rol | BinaryOp::Ror))
+        && matches!(
+            op,
+            BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Sar | BinaryOp::Rol | BinaryOp::Ror
+        )
+        && let Some(peeled) =
+            peel_count(right, e.width, matches!(op, BinaryOp::Rol | BinaryOp::Ror))
         && peeled != **right
     {
         return Expr::binary(*op, (**left).clone(), peeled).ok();
     }
     // And(ZExt(x), c) with c < 2^|x|  ->  ZExt(And(x, c))
-    if let ExprKind::Binary { op: BinaryOp::And, left, right } = &e.kind {
+    if let ExprKind::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+    } = &e.kind
+    {
         for (a, b) in [(left, right), (right, left)] {
-            if let (ExprKind::Resize { op: ResizeOp::ZeroExtend, value }, ExprKind::Const { value: c }) =
-                (&a.kind, &b.kind)
+            if let (
+                ExprKind::Resize {
+                    op: ResizeOp::ZeroExtend,
+                    value,
+                },
+                ExprKind::Const { value: c },
+            ) = (&a.kind, &b.kind)
                 && *c <= value.width.mask()
             {
                 let narrow_c = Expr::constant(value.width, *c);
@@ -211,11 +248,24 @@ fn local_rules(e: &Expr) -> Option<Expr> {
         }
     }
     // Or(Shl(x,a), Shr(x,b)) with a+b == width -> Rol(x,a)
-    if let ExprKind::Binary { op: BinaryOp::Or, left, right } = &e.kind {
+    if let ExprKind::Binary {
+        op: BinaryOp::Or,
+        left,
+        right,
+    } = &e.kind
+    {
         for (l, r) in [(left, right), (right, left)] {
             if let (
-                ExprKind::Binary { op: BinaryOp::Shl, left: x1, right: a },
-                ExprKind::Binary { op: BinaryOp::Shr, left: x2, right: b },
+                ExprKind::Binary {
+                    op: BinaryOp::Shl,
+                    left: x1,
+                    right: a,
+                },
+                ExprKind::Binary {
+                    op: BinaryOp::Shr,
+                    left: x2,
+                    right: b,
+                },
             ) = (&l.kind, &r.kind)
                 && x1 == x2
                 && let (ExprKind::Const { value: ca }, ExprKind::Const { value: cb }) =
@@ -273,15 +323,26 @@ fn b_collect(e: &Expr, atoms: &mut Vec<Expr>, budget: &mut usize, depth: usize) 
         // separate atoms it reads as a four-atom table with no cheaper circuit,
         // so nothing folded. Peeling costs no depth, which is the point: it is
         // the operands that are worth spending the atom budget on.
-        if let ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, value } = &e.kind {
+        if let ExprKind::Unary {
+            op: vmpx_vm::UnaryOp::Not,
+            value,
+        } = &e.kind
+        {
             return B::Not(Box::new(b_collect(value, atoms, budget, 0)));
         }
         return b_atom(e, atoms);
     }
     *budget -= 1;
     match &e.kind {
-        ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, value } => B::Not(Box::new(b_collect(value, atoms, budget, depth - 1))),
-        ExprKind::Binary { op: op @ (BinaryOp::And | BinaryOp::Or | BinaryOp::Xor), left, right } => {
+        ExprKind::Unary {
+            op: vmpx_vm::UnaryOp::Not,
+            value,
+        } => B::Not(Box::new(b_collect(value, atoms, budget, depth - 1))),
+        ExprKind::Binary {
+            op: op @ (BinaryOp::And | BinaryOp::Or | BinaryOp::Xor),
+            left,
+            right,
+        } => {
             let l = b_collect(left, atoms, budget, depth - 1);
             let r = b_collect(right, atoms, budget, depth - 1);
             B::Bin(*op, Box::new(l), Box::new(r))
@@ -320,8 +381,13 @@ fn b_eval(b: &B, row: u32) -> bool {
 /// k = 4 is searched to cost 3, k <= 3 to cost 7).
 fn b_best(k: usize) -> &'static HashMap<u16, (usize, B)> {
     use std::sync::OnceLock;
-    static TABLES: [OnceLock<HashMap<u16, (usize, B)>>; 5] =
-        [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static TABLES: [OnceLock<HashMap<u16, (usize, B)>>; 5] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
     TABLES[k].get_or_init(|| {
         let rows = 1_u32 << k;
         let mask: u16 = ((1_u32 << rows) - 1) as u16;
@@ -376,13 +442,14 @@ fn b_best(k: usize) -> &'static HashMap<u16, (usize, B)> {
     })
 }
 
-
 fn b_build(b: &B, atoms: &[Expr], width: BitWidth) -> Option<Expr> {
     Some(match b {
         B::Atom(i) => atoms[*i].clone(),
         B::Const(v) => Expr::constant(width, if *v { width.mask() } else { 0 }),
         B::Not(x) => Expr::unary(vmpx_vm::UnaryOp::Not, b_build(x, atoms, width)?),
-        B::Bin(op, l, r) => Expr::binary(*op, b_build(l, atoms, width)?, b_build(r, atoms, width)?).ok()?,
+        B::Bin(op, l, r) => {
+            Expr::binary(*op, b_build(l, atoms, width)?, b_build(r, atoms, width)?).ok()?
+        }
     })
 }
 
@@ -392,8 +459,13 @@ pub fn mba_fold(e: &Expr) -> Expr {
     rewrite_up(e, &mut |n| {
         let is_bool = matches!(
             &n.kind,
-            ExprKind::Unary { op: vmpx_vm::UnaryOp::Not, .. }
-                | ExprKind::Binary { op: BinaryOp::And | BinaryOp::Or | BinaryOp::Xor, .. }
+            ExprKind::Unary {
+                op: vmpx_vm::UnaryOp::Not,
+                ..
+            } | ExprKind::Binary {
+                op: BinaryOp::And | BinaryOp::Or | BinaryOp::Xor,
+                ..
+            }
         );
         if !is_bool {
             return None;
