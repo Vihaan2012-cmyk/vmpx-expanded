@@ -397,40 +397,7 @@ pub(crate) fn neutralize_residual_guard_sites(
 
         // `.pdata` extents merged with each executable section's uncovered gaps --
         // the same coverage `retarget_sites` walks, so a branch in a gap is seen.
-        let mut ranges: Vec<(u32, u32)> = pe
-            .report()
-            .exception_functions
-            .iter()
-            .map(|f| (f.begin.0, f.end.0))
-            .filter(|(b, e)| e > b && e - b <= 0x10_0000 && mapped(*b))
-            .collect();
-        ranges.sort_unstable();
-        let mut merged: Vec<(u32, u32)> = Vec::new();
-        for (b, e) in ranges.clone() {
-            match merged.last_mut() {
-                Some(last) if b <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((b, e)),
-            }
-        }
-        for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
-            let start = section.virtual_address.0;
-            let size = section.virtual_size.max(section.size_of_raw_data);
-            let mut cursor = start;
-            for (b, e) in &merged {
-                if *e <= start || *b >= start + size {
-                    continue;
-                }
-                if *b > cursor {
-                    ranges.push((cursor, (*b).min(start + size)));
-                }
-                cursor = cursor.max(*e);
-            }
-            if cursor < start + size {
-                ranges.push((cursor, start + size));
-            }
-        }
-
-        for (begin, end) in ranges {
+        for (begin, end) in executable_scan_ranges(&pe) {
             if !mapped(begin) {
                 continue;
             }
@@ -1104,6 +1071,49 @@ fn detonate_imports(
 }
 
 /// Count references from surviving code into removed (unmapped) space.
+/// Executable code ranges to scan for control flow: every `.pdata` function body
+/// merged with the uncovered gaps of each executable section. A branch living in
+/// a gap -- code outside any `.pdata` record -- is therefore still decoded. This
+/// is the coverage the native rewriters (`retarget_sites`,
+/// `neutralize_residual_guard_sites`) walk, so the dangling-ref checker can never
+/// be weaker than the passes that rewrite into that same space.
+fn executable_scan_ranges(pe: &PeImage<'_>) -> Vec<(u32, u32)> {
+    let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+    let mut ranges: Vec<(u32, u32)> = pe
+        .report()
+        .exception_functions
+        .iter()
+        .map(|f| (f.begin.0, f.end.0))
+        .filter(|(b, e)| e > b && e - b <= 0x10_0000 && mapped(*b))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (b, e) in ranges.clone() {
+        match merged.last_mut() {
+            Some(last) if b <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((b, e)),
+        }
+    }
+    for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
+        let start = section.virtual_address.0;
+        let size = section.virtual_size.max(section.size_of_raw_data);
+        let mut cursor = start;
+        for (b, e) in &merged {
+            if *e <= start || *b >= start + size {
+                continue;
+            }
+            if *b > cursor {
+                ranges.push((cursor, (*b).min(start + size)));
+            }
+            cursor = cursor.max(*e);
+        }
+        if cursor < start + size {
+            ranges.push((cursor, start + size));
+        }
+    }
+    ranges
+}
+
 fn count_dangling(image: &[u8]) -> usize {
     let Ok(pe) = PeImage::parse(image) else {
         return 0;
@@ -1112,16 +1122,19 @@ fn count_dangling(image: &[u8]) -> usize {
     let soi = pe.optional.size_of_image;
     let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
     let mut count = 0;
-    for function in &pe.report().exception_functions {
-        let (b, e) = (function.begin.0, function.end.0);
-        if e <= b || e - b > 0x10_0000 || !mapped(b) {
+    // `.pdata` bodies AND executable gaps -- a branch into removed space that
+    // lives in a gap (outside any `.pdata` record) must be counted, or the
+    // checker would be blind exactly where the rewriters can still reach.
+    for (b, e) in executable_scan_ranges(&pe) {
+        if !mapped(b) {
             continue;
         }
         let Ok(off) = pe.rva_to_file_offset(Rva(b)) else {
             continue;
         };
         let from = off.0 as usize;
-        let Some(code) = image.get(from..(from + (e - b) as usize).min(image.len())) else {
+        let to = from.saturating_add((e - b) as usize).min(image.len());
+        let Some(code) = image.get(from..to) else {
             continue;
         };
         let mut d = Decoder::with_ip(64, code, base + u64::from(b), DecoderOptions::NONE);
@@ -1663,5 +1676,34 @@ mod tests {
         let done = neutralize_residual_guard_sites(&mut image, &[]).unwrap();
         assert!(done.is_empty());
         assert_eq!(image, before);
+    }
+
+    /// A near rel32 branch (`op`) at RVA 0x1000 whose target is `target_rva`.
+    fn branch_at_text(op: u8, target_rva: u32) -> Vec<u8> {
+        let site_va = BASE + 0x1000;
+        let rel = (BASE + u64::from(target_rva)) as i64 - (site_va as i64 + 5);
+        let mut code = vec![op];
+        code.extend_from_slice(&(rel as i32).to_le_bytes());
+        code.push(0xC3); // trailing ret
+        code
+    }
+
+    #[test]
+    fn gap_branch_into_removed_space_is_counted() {
+        // A `jmp` in `.text` -- an uncovered gap, no `.pdata` -- to RVA 0x1900,
+        // which is within SizeOfImage (0x2000) but mapped by no section: removed
+        // space. The old `.pdata`-only checker decoded nothing here and saw 0;
+        // the gap-aware scan must count it.
+        let image = pe_with_text(&branch_at_text(0xE9, 0x1900));
+        assert_eq!(count_dangling(&image), 1);
+    }
+
+    #[test]
+    fn gap_branch_into_live_space_is_not_counted() {
+        // Same gap, but the branch targets live `.text` (RVA 0x1010) -- a mapped
+        // address, so it is not a dangling reference. Broadening coverage must
+        // not turn a legitimate in-image branch into a false positive.
+        let image = pe_with_text(&branch_at_text(0xE9, 0x1010));
+        assert_eq!(count_dangling(&image), 0);
     }
 }
