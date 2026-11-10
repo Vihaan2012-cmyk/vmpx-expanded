@@ -22,7 +22,8 @@ fn decompile_help_lists_readable_flags() {
 /// End-to-end golden for `--dialect rust --fold proven` on the integrity guard at
 /// 0xc4a0add. `proven` must net the whole rdtsc-timing + .vmp2-checksum chain down
 /// to its proven constant, leaving only the frame store and the INT3 probe; the
-/// context argument is recognised and shown as `ctx`.
+/// context argument is recognised, modeled as a packed `Ctx` struct, and its
+/// `ctx + off` accesses render as struct fields.
 ///
 /// Gated on the sample image: CI without `xpl_mapped.bin` skips rather than fails.
 /// Point `VMPX_GOLDEN_IMAGE` at the mapped post-init image to run it.
@@ -58,21 +59,34 @@ fn proven_fold_collapses_c4a0add_guard() {
     let text = String::from_utf8_lossy(&out.stdout);
 
     // The exact collapsed body: timing + checksum net to a proven constant, over
-    // the recognised context pointer `ctx`. The repeated field load is factored
-    // into `v98` (per-statement CSE) and the scaled indicator reads as a
-    // conditional, not `(cond as u64) * 2`.
+    // the recognised context pointer `ctx`, modeled as a packed `Ctx` struct so
+    // `ctx + off` accesses read as fields. The repeated field load is factored into
+    // `v98` (per-statement CSE) and the scaled indicator reads as a conditional,
+    // not `(cond as u64) * 2`.
     assert!(
-        text.contains("let v98 = read_u64(ctx.wrapping_add(0x98));"),
-        "repeated field load not factored into v98:\n{text}"
+        text.contains("#[repr(C, packed)]\nstruct Ctx {"),
+        "ctx struct not synthesized:\n{text}"
+    );
+    assert!(
+        text.contains("const _: () = assert!(core::mem::offset_of!(Ctx, f98) == 0x98);"),
+        "field offset not pinned by a compile-time assertion:\n{text}"
+    );
+    assert!(
+        text.contains("(*ctx).fa0 = a0;"),
+        "store not rendered as a struct field:\n{text}"
+    );
+    assert!(
+        text.contains("let v98 = (*ctx).f98;"),
+        "repeated field load not factored into a struct-field local:\n{text}"
     );
     assert!(
         text.contains("return (if read_u8(v98) == INT3 { 2 } else { 0 }).wrapping_add(v98);"),
         "proven body changed:\n{text}"
     );
-    // The context argument is renamed, not left as a bare `a14`.
+    // The context argument is a struct pointer, not a bare integer address.
     assert!(
-        text.contains("ctx: u64) -> u64"),
-        "ctx not named in signature:\n{text}"
+        text.contains("ctx: *mut Ctx) -> u64"),
+        "ctx not modeled as a struct pointer in the signature:\n{text}"
     );
     // None of the raw timing/checksum machinery may survive a proven fold.
     for leaked in ["rdtsc", "table_checksum", "memory_snapshot_epoch", "udiv32"] {

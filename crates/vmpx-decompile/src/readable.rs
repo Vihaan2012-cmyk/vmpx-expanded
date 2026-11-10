@@ -152,6 +152,11 @@ pub struct Renderer<'a> {
     pub temps: &'a HashMap<Expr, String>,
     /// Role-named constants (a recurring XOR mask -> `DECODE_KEY`, etc.).
     pub consts: &'a BTreeMap<u64, String>,
+    /// A sound `Ctx` struct layout was synthesized for this function, so a
+    /// compilable dialect renders `ctx + off` loads/stores as struct fields
+    /// (`ctx->fNN` / `(*ctx).fNN`) instead of `read_u*`/`write_*`. `false` keeps
+    /// the raw helpers (the fail-closed form).
+    pub ctx_struct: bool,
 }
 
 impl Renderer<'_> {
@@ -443,18 +448,22 @@ impl Renderer<'_> {
         }
     }
 
-    /// Pseudo-code struct-field access for `ctx + off` when `ctx` is the inferred
-    /// context pointer: `read_u64(ctx + 0x98)` -> `ctx.f98`. Compilable dialects
-    /// keep `read_u*`/`write_*` so the output stays real code.
+    /// Struct-field access for `ctx + off` when `ctx` is the inferred context
+    /// pointer: `read_u64(ctx + 0x98)` -> `ctx.f98` / `ctx->f98` / `(*ctx).f98`.
+    /// Pseudo always sugars (it is not compiled). A compilable dialect sugars only
+    /// when a sound `Ctx` struct was synthesized (`ctx_struct`); otherwise it keeps
+    /// `read_u*`/`write_*`, the fail-closed form.
     fn field_sugar(&self, address: &Expr) -> Option<String> {
-        if self.dialect != Dialect::Pseudo {
-            return None;
-        }
         let (r, off) = base_offset(address)?;
         if self.name(r) != "ctx" {
             return None;
         }
-        Some(format!("ctx.f{off:x}"))
+        match self.dialect {
+            Dialect::Pseudo => Some(format!("ctx.f{off:x}")),
+            Dialect::Rust if self.ctx_struct => Some(format!("(*ctx).f{off:x}")),
+            _ if self.ctx_struct => Some(format!("ctx->f{off:x}")),
+            _ => None,
+        }
     }
 
     /// A loop/branch condition, parenthesised for the C-style `if (...)`/`while
@@ -509,6 +518,7 @@ impl Renderer<'_> {
             image_base: self.image_base,
             temps: &overlay,
             consts: self.consts,
+            ctx_struct: self.ctx_struct,
         };
         let pad = "    ".repeat(depth);
         for (nm, def) in &binds {
@@ -770,6 +780,171 @@ fn infer_struct_base(
         .map(|(r, _)| r)
 }
 
+fn width_bytes(w: BitWidth) -> u64 {
+    u64::from(w.bits()) / 8
+}
+
+/// Apply `f` to every `Store` statement, recursing through compound statements.
+fn each_store(list: &[Stmt], f: &mut impl FnMut(&crate::ir::Store)) {
+    for s in list {
+        match s {
+            Stmt::Store(st) => f(st),
+            Stmt::If { then, els, .. } => {
+                each_store(then, f);
+                each_store(els, f);
+            }
+            Stmt::Loop(b) | Stmt::While { body: b, .. } | Stmt::DoWhile { body: b, .. } => {
+                each_store(b, f);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A sound `Ctx` struct layout for context base `b`, or `None` to fall back to
+/// raw `read_u*`/`write_*`. The layout is the sorted `(offset, width)` of every
+/// field, and it is only returned when it is provably safe to model `b` as a
+/// struct pointer:
+///
+/// - **Every** occurrence of `b` is the base of a `b + const` address that is
+///   directly a load or store (never bare, never arithmetic, never an intrinsic
+///   argument) -- so promoting `b` to `Ctx *` leaves no use that still needs the
+///   integer address. Checked by counting: one `b` register per field access.
+/// - No offset is accessed at two different widths (one field, one type).
+/// - No two fields overlap.
+///
+/// Any violation returns `None`; the caller then keeps the faithful helpers.
+fn ctx_struct_layout(
+    b: &str,
+    temps: &[(String, Expr)],
+    prologue: &[Stmt],
+    body: &[Stmt],
+) -> Option<Vec<(u64, BitWidth)>> {
+    let mut fields: BTreeMap<u64, BitWidth> = BTreeMap::new();
+    let mut conflict = false;
+    let mut n_ctx = 0usize;
+    let mut n_use = 0usize;
+    let mut record = |off: u64, w: BitWidth, fields: &mut BTreeMap<u64, BitWidth>| {
+        if let Some(prev) = fields.insert(off, w)
+            && prev != w
+        {
+            conflict = true;
+        }
+    };
+
+    // Walk 1: count `b` registers and collect load fields.
+    {
+        let mut visit = |e: &Expr| match &e.kind {
+            ExprKind::Register { name } if name == b => n_ctx += 1,
+            ExprKind::Load { address } => {
+                if let Some((r, off)) = base_offset(address)
+                    && r == b
+                {
+                    record(off, e.width, &mut fields);
+                    n_use += 1;
+                }
+            }
+            _ => {}
+        };
+        for (_, def) in temps {
+            each_subexpr(def, &mut visit);
+        }
+        for s in prologue.iter().chain(body) {
+            stmt_exprs(s, &mut visit);
+        }
+    }
+    // Walk 2: collect store fields (their `b` register is already in `n_ctx`).
+    {
+        let mut visit = |st: &crate::ir::Store| {
+            if let Some((r, off)) = base_offset(&st.address)
+                && r == b
+            {
+                record(off, st.value.width, &mut fields);
+                n_use += 1;
+            }
+        };
+        each_store(prologue, &mut visit);
+        each_store(body, &mut visit);
+    }
+
+    if conflict || fields.is_empty() || n_ctx != n_use {
+        return None;
+    }
+    // Reject overlapping fields.
+    let sorted: Vec<(u64, BitWidth)> = fields.into_iter().collect();
+    let mut end = 0u64;
+    for (off, w) in &sorted {
+        if *off < end {
+            return None;
+        }
+        end = off + width_bytes(*w);
+    }
+    Some(sorted)
+}
+
+/// The synthesized `Ctx` struct declaration for `d`: a packed struct with a
+/// `fNN` field at each accessed offset (explicit `_padN` between them so the
+/// layout is exact) plus a compile-time offset assertion per field, so a layout
+/// mismatch breaks the build rather than mis-mapping silently.
+fn emit_ctx_struct(d: Dialect, fields: &[(u64, BitWidth)]) -> String {
+    let field_name = |off: u64| format!("f{off:x}");
+    let mut members = String::new();
+    let mut cursor = 0u64;
+    let mut padn = 0;
+    for (off, w) in fields {
+        if *off > cursor {
+            let gap = off - cursor;
+            match d {
+                Dialect::Rust => members += &format!("    _pad{padn}: [u8; {gap}],\n"),
+                _ => members += &format!("    uint8_t _pad{padn}[{gap}];\n"),
+            }
+            padn += 1;
+        }
+        match d {
+            Dialect::Rust => members += &format!("    {}: {},\n", field_name(*off), uty(*w)),
+            _ => members += &format!("    {} {};\n", cty(*w), field_name(*off)),
+        }
+        cursor = off + width_bytes(*w);
+    }
+
+    let mut out = String::new();
+    match d {
+        Dialect::Rust => {
+            out += &format!("#[repr(C, packed)]\nstruct Ctx {{\n{members}}}\n");
+            for (off, _) in fields {
+                out += &format!(
+                    "const _: () = assert!(core::mem::offset_of!(Ctx, {}) == 0x{off:x});\n",
+                    field_name(*off)
+                );
+            }
+        }
+        _ => {
+            let open = if d == Dialect::Cpp {
+                "struct Ctx {"
+            } else {
+                "typedef struct {"
+            };
+            let close = if d == Dialect::Cpp { "};" } else { "} Ctx;" };
+            out += &format!("#pragma pack(push, 1)\n{open}\n{members}{close}\n#pragma pack(pop)\n");
+            // C23/C++ spell it `static_assert`; C99/C11 use the `_Static_assert`
+            // keyword (no <assert.h> needed). `offsetof` comes from the prelude's
+            // <stddef.h>/<cstddef>.
+            let kw = if d == Dialect::C99 {
+                "_Static_assert"
+            } else {
+                "static_assert"
+            };
+            for (off, _) in fields {
+                out += &format!(
+                    "{kw}(offsetof(Ctx, {}) == 0x{off:x}, \"ctx layout\");\n",
+                    field_name(*off)
+                );
+            }
+        }
+    }
+    out
+}
+
 fn xor_masks(e: &Expr, counts: &mut BTreeMap<u64, usize>) {
     if let ExprKind::Binary {
         op: BinaryOp::Xor,
@@ -997,9 +1172,9 @@ pub fn preamble(d: Dialect) -> String {
             .to_owned(),
         _ => {
             let header = if d == Dialect::Cpp {
-                "#include <cstdint>"
+                "#include <cstdint>\n#include <cstddef>"
             } else {
-                "#include <stdint.h>"
+                "#include <stdint.h>\n#include <stddef.h>"
             };
             let mut s = format!("// ---- prelude (generated) ----\n{header}\n#define INT3 0xCC\n");
             for b in [8u32, 16, 32, 64] {
@@ -1068,18 +1243,26 @@ pub fn render_function(
     let mut names_owned = names.clone();
     // Display name the signature shows for the context arg, if any (`a14` -> `ctx`).
     let mut ctx_sig: Option<(String, String)> = None;
+    // A sound `Ctx` struct layout for the compilable dialects (pseudo sugars
+    // fields without a declared type, so it needs none).
+    let mut ctx_fields: Option<Vec<(u64, BitWidth)>> = None;
     if let Some(b) = infer_struct_base(names, temps_order, prologue, body) {
         let old = names.get(&b).cloned().unwrap_or_else(|| b.clone());
+        if d != Dialect::Pseudo {
+            ctx_fields = ctx_struct_layout(&b, temps_order, prologue, body);
+        }
         names_owned.insert(b, "ctx".to_owned());
         ctx_sig = Some((old, "ctx".to_owned()));
     }
     let names = &names_owned;
+    let ctx_struct = ctx_fields.is_some();
     let r = Renderer {
         dialect: d,
         names,
         image_base,
         temps: temps_map,
         consts: &consts,
+        ctx_struct,
     };
 
     // Signature: `u64 a1` -> `a1: u64` (Rust) / `uint64_t a1` (C) / `a1` (pseudo),
@@ -1092,10 +1275,18 @@ pub fn render_function(
                     Some((old, new)) if old == raw => new.as_str(),
                     _ => raw,
                 };
-                match d {
-                    Dialect::Rust => format!("{nm}: {ty}"),
-                    Dialect::Pseudo => nm.to_owned(),
-                    _ => format!("{} {nm}", sig_ty(d, ty)),
+                if nm == "ctx" && ctx_struct {
+                    // Modeled as a struct pointer; field accesses carry the offsets.
+                    match d {
+                        Dialect::Rust => "ctx: *mut Ctx".to_owned(),
+                        _ => "Ctx *ctx".to_owned(),
+                    }
+                } else {
+                    match d {
+                        Dialect::Rust => format!("{nm}: {ty}"),
+                        Dialect::Pseudo => nm.to_owned(),
+                        _ => format!("{} {nm}", sig_ty(d, ty)),
+                    }
                 }
             }
             None => a.clone(),
@@ -1120,6 +1311,12 @@ pub fn render_function(
         out.push_str(&decl_const(nm, *v));
     }
     if image_base != 0 || !consts.is_empty() {
+        out.push('\n');
+    }
+
+    // Synthesized context struct (compilable dialects, when a sound layout exists).
+    if let Some(fields) = &ctx_fields {
+        out.push_str(&emit_ctx_struct(d, fields));
         out.push('\n');
     }
 
@@ -1194,6 +1391,7 @@ mod tests {
             image_base,
             temps: &temps,
             consts: &consts,
+            ctx_struct: false,
         }
         .body(e)
         .0
@@ -1303,6 +1501,7 @@ mod tests {
             image_base: 0,
             temps: &temps,
             consts: &consts,
+            ctx_struct: false,
         }
         .stmt(s, &mut out, 1);
         out
@@ -1373,6 +1572,7 @@ mod tests {
             image_base: 0,
             temps: &temps,
             consts: &consts,
+            ctx_struct: false,
         }
         .stmts(&[store, read_then], &mut out, 1);
         assert!(
@@ -1424,5 +1624,92 @@ mod tests {
         // A plain 0/1 indicator (no scale) stays a widened boolean, not a ternary.
         let one = flag_scaled(false);
         assert_eq!(render_as(Dialect::Rust, &one, 0), "(b == INT3) as u64");
+    }
+
+    fn render_ctx(dialect: Dialect, ctx_struct: bool, e: &Expr) -> String {
+        let names = ctx_names();
+        let temps = HashMap::new();
+        let consts = BTreeMap::new();
+        Renderer {
+            dialect,
+            names: &names,
+            image_base: 0,
+            temps: &temps,
+            consts: &consts,
+            ctx_struct,
+        }
+        .body(e)
+        .0
+    }
+
+    #[test]
+    fn ctx_access_becomes_a_struct_field() {
+        let f98 = ctx_field(0x98, BitWidth::W64);
+        assert_eq!(render_ctx(Dialect::C99, true, &f98), "ctx->f98");
+        assert_eq!(render_ctx(Dialect::Rust, true, &f98), "(*ctx).f98");
+        assert_eq!(
+            render_ctx(Dialect::Cpp, true, &ctx_field(0xa0, BitWidth::W8)),
+            "ctx->fa0"
+        );
+        // Without a synthesized struct, a compilable dialect keeps the helper.
+        assert_eq!(
+            render_ctx(Dialect::C99, false, &f98),
+            "read_u64(ctx + 0x98)"
+        );
+    }
+
+    #[test]
+    fn non_ctx_pointer_load_stays_a_helper() {
+        // A loaded value used as an address is not a ctx field, even with a struct.
+        let load = Expr::load(BitWidth::W8, reg("v98"));
+        assert_eq!(render_ctx(Dialect::C99, true, &load), "read_u8(v98)");
+    }
+
+    #[test]
+    fn ctx_struct_decl_pins_offsets_with_assertions() {
+        let fields = vec![(0x98u64, BitWidth::W64), (0xa0u64, BitWidth::W8)];
+        let c = emit_ctx_struct(Dialect::C99, &fields);
+        assert!(c.contains("uint8_t _pad0[152];"), "pad to 0x98:\n{c}"); // 0x98 == 152
+        assert!(c.contains("uint64_t f98;"), "{c}");
+        assert!(c.contains("uint8_t fa0;"), "{c}");
+        assert!(
+            c.contains("_Static_assert(offsetof(Ctx, f98) == 0x98"),
+            "offset assert:\n{c}"
+        );
+        assert!(
+            c.contains("_Static_assert(offsetof(Ctx, fa0) == 0xa0"),
+            "{c}"
+        );
+        let r = emit_ctx_struct(Dialect::Rust, &fields);
+        assert!(r.contains("#[repr(C, packed)]"), "{r}");
+        assert!(r.contains("offset_of!(Ctx, f98) == 0x98"), "{r}");
+    }
+
+    #[test]
+    fn layout_is_sound_or_absent() {
+        // Two distinct, non-overlapping fields through a14 -> a sound layout.
+        let temps = vec![("v98".to_owned(), ctx_field(0x98, BitWidth::W64))];
+        let store = Stmt::Store(crate::ir::Store {
+            address: Expr::binary(
+                BinaryOp::Add,
+                reg("a14"),
+                Expr::constant(BitWidth::W64, 0xa0),
+            )
+            .unwrap(),
+            value: Expr::register(BitWidth::W8, "a0"),
+        });
+        assert_eq!(
+            ctx_struct_layout("a14", &temps, &[], &[store]),
+            Some(vec![(0x98, BitWidth::W64), (0xa0, BitWidth::W8)])
+        );
+        // A bare deref of a14 is not a field access -> fall back (no struct).
+        let bare = Stmt::Assign("r".to_owned(), Expr::load(BitWidth::W8, reg("a14")));
+        assert_eq!(ctx_struct_layout("a14", &temps, &[], &[bare]), None);
+        // A W64 at 0x98 covers 0x98..0x9f, so a W32 at 0x9c overlaps -> fall back.
+        let overlap = vec![
+            ("v98".to_owned(), ctx_field(0x98, BitWidth::W64)),
+            ("v9c".to_owned(), ctx_field(0x9c, BitWidth::W32)),
+        ];
+        assert_eq!(ctx_struct_layout("a14", &overlap, &[], &[]), None);
     }
 }
