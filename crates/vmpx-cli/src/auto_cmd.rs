@@ -209,6 +209,9 @@ pub(crate) struct GuardNeutralized {
     pub guard_rva: u32,
     pub thunk_begin: u32,
     pub thunk_bytes: u32,
+    /// How it was neutralized: a whole `.pdata` thunk body ("thunk"), or a single
+    /// direct branch instruction in an uncovered gap ("site").
+    pub via: &'static str,
 }
 
 /// Neutralize residual guard functions devirtualization could not lift. Each is
@@ -356,9 +359,129 @@ fn apply_guard_neutralizations(
             guard_rva,
             thunk_begin: begin,
             thunk_bytes: u32::try_from(end - from).unwrap_or(0),
+            via: "thunk",
         });
     }
     done
+}
+
+/// `mov eax, 1` -- the guard's pass value, written over a `call` site in place.
+const MOV_EAX_1: [u8; 5] = [0xB8, 0x01, 0x00, 0x00, 0x00];
+
+/// Neutralize a residual guard reached by a direct branch that `.pdata` does not
+/// describe -- a branch sitting in an executable *gap*, which
+/// [`neutralize_residual_guards`] (which scans only `.pdata` function bodies)
+/// cannot see, and which `count_dangling` likewise misses. The guard VA now
+/// points into removed space, so the branch is a live dangling reference; patch
+/// the 5-byte branch instruction in place so the clean (pass) path is taken
+/// without entering the removed guard:
+///   - a tail `jmp`  -> `xor eax,eax; inc eax; ret` (return 1 to the original caller)
+///   - a `call`      -> `mov eax, 1`                (set the pass value, fall through)
+/// Both are exactly 5 bytes, the width of a near rel32 branch, so only the branch
+/// is overwritten. Behaviour-changing (forces the anti-tamper pass), same as the
+/// thunk path; every site is returned for the caller to log.
+pub(crate) fn neutralize_residual_guard_sites(
+    image: &mut [u8],
+    guard_rvas: &[u32],
+) -> Result<Vec<GuardNeutralized>, String> {
+    if guard_rvas.is_empty() {
+        return Ok(Vec::new());
+    }
+    // (guard_rva, site rva, branch file offset, is the branch a `call`?)
+    let mut hits: Vec<(u32, u32, usize, bool)> = Vec::new();
+    {
+        let pe = PeImage::parse(image).map_err(|e| e.to_string())?;
+        let base = pe.optional.image_base.0;
+        let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+        let targets: BTreeSet<u64> = guard_rvas.iter().map(|r| base + u64::from(*r)).collect();
+
+        // `.pdata` extents merged with each executable section's uncovered gaps --
+        // the same coverage `retarget_sites` walks, so a branch in a gap is seen.
+        let mut ranges: Vec<(u32, u32)> = pe
+            .report()
+            .exception_functions
+            .iter()
+            .map(|f| (f.begin.0, f.end.0))
+            .filter(|(b, e)| e > b && e - b <= 0x10_0000 && mapped(*b))
+            .collect();
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for (b, e) in ranges.clone() {
+            match merged.last_mut() {
+                Some(last) if b <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((b, e)),
+            }
+        }
+        for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
+            let start = section.virtual_address.0;
+            let size = section.virtual_size.max(section.size_of_raw_data);
+            let mut cursor = start;
+            for (b, e) in &merged {
+                if *e <= start || *b >= start + size {
+                    continue;
+                }
+                if *b > cursor {
+                    ranges.push((cursor, (*b).min(start + size)));
+                }
+                cursor = cursor.max(*e);
+            }
+            if cursor < start + size {
+                ranges.push((cursor, start + size));
+            }
+        }
+
+        for (begin, end) in ranges {
+            if !mapped(begin) {
+                continue;
+            }
+            let Ok(off) = pe.rva_to_file_offset(Rva(begin)) else {
+                continue;
+            };
+            let from = off.0 as usize;
+            let to = from.saturating_add((end - begin) as usize).min(image.len());
+            let Some(code) = image.get(from..to) else {
+                continue;
+            };
+            let mut decoder = Decoder::with_ip(64, code, base + u64::from(begin), DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let at = decoder.position();
+                let instruction = decoder.decode();
+                if instruction.is_invalid() {
+                    break;
+                }
+                // Only a 5-byte near rel32 branch (E8/E9) can be patched in place;
+                // the guards sit far away, so every real site is exactly that.
+                if matches!(
+                    instruction.flow_control(),
+                    FlowControl::Call | FlowControl::UnconditionalBranch
+                ) && instruction.near_branch64() != 0
+                    && targets.contains(&instruction.near_branch64())
+                    && instruction.len() == 5
+                {
+                    let guard_rva = u32::try_from(instruction.near_branch64() - base).unwrap_or(0);
+                    let site_rva = begin + u32::try_from(at).unwrap_or(0);
+                    let is_call = instruction.flow_control() == FlowControl::Call;
+                    hits.push((guard_rva, site_rva, from + at, is_call));
+                }
+            }
+        }
+    }
+
+    let mut done: Vec<GuardNeutralized> = Vec::new();
+    for (guard_rva, site_rva, from, is_call) in hits {
+        if from + 5 > image.len() {
+            continue;
+        }
+        let patch = if is_call { MOV_EAX_1 } else { RETURN_TRUE };
+        image[from..from + 5].copy_from_slice(&patch);
+        done.push(GuardNeutralized {
+            guard_rva,
+            thunk_begin: site_rva,
+            thunk_bytes: 5,
+            via: "site",
+        });
+    }
+    Ok(done)
 }
 
 /// The CRT-obligation OEP rule (loader-only root, takes the Win64 triple,
@@ -765,13 +888,27 @@ pub fn run(o: Options) -> Result<(), String> {
         log.start("Neutralizing residual guards");
         log.info("forces the anti-tamper pass path -- behaviour-changing, not a faithful lift");
         match neutralize_residual_guards(&mut image, &residual_guards) {
-            Ok(done) => {
+            Ok(mut done) => {
+                // A guard reached only by a direct branch `.pdata` does not
+                // describe (a branch in an uncovered gap) is invisible to the
+                // thunk scan above -- and to `count_dangling` -- so patch those
+                // branch sites in place before declaring anything left as-is.
+                let by_thunk: BTreeSet<u32> = done.iter().map(|a| a.guard_rva).collect();
+                let still: Vec<u32> = residual_guards
+                    .iter()
+                    .copied()
+                    .filter(|rva| !by_thunk.contains(rva))
+                    .collect();
+                match neutralize_residual_guard_sites(&mut image, &still) {
+                    Ok(site_done) => done.extend(site_done),
+                    Err(reason) => log.warn(&format!("site neutralization failed: {reason}")),
+                }
                 for action in &done {
                     log.step(
                         &format!("{:#x} neutralized", action.guard_rva),
                         &format!(
-                            "thunk {:#x}, {} byte(s) -> return 1 (pass)",
-                            action.thunk_begin, action.thunk_bytes
+                            "{} {:#x}, {} byte(s) -> return 1 (pass)",
+                            action.via, action.thunk_begin, action.thunk_bytes
                         ),
                     );
                 }
@@ -785,13 +922,13 @@ pub fn run(o: Options) -> Result<(), String> {
                     "neutralized",
                     &format!(
                         "{} of {} residual guard(s)",
-                        done.len(),
+                        reached.len(),
                         residual_guards.len()
                     ),
                 );
                 if !missed.is_empty() {
                     log.warn(&format!(
-                        "{} residual guard(s) not reached by a .pdata thunk, left as-is: {}",
+                        "{} residual guard(s) not reached by any thunk or direct branch, left as-is: {}",
                         missed.len(),
                         missed.join(", ")
                     ));
@@ -1432,4 +1569,99 @@ fn devirt_guards(
     let retargeted = crate::devirt_cmd::retarget_sites(&mut out, &mapping)?;
     log.step("retargeted", &format!("{retargeted} transfer(s)"));
     Ok((out, residual))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: u64 = 0x1_4000_0000;
+    const GUARD_RVA: u32 = 0xc6f2115; // far enough to force a rel32 branch
+
+    /// Minimal PE64 with one executable `.text` (RVA 0x1000, file 0x200) holding
+    /// `code`, and no `.pdata` -- so `.text` is an uncovered gap, exactly the case
+    /// the thunk scanner misses.
+    fn pe_with_text(code: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; 0x400];
+        d[0..2].copy_from_slice(&0x5A4D_u16.to_le_bytes());
+        d[0x3C..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        d[0x80..0x84].copy_from_slice(&0x0000_4550_u32.to_le_bytes());
+        let coff = 0x84;
+        d[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
+        d[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        d[coff + 16..coff + 18].copy_from_slice(&0xF0_u16.to_le_bytes());
+        d[coff + 18..coff + 20].copy_from_slice(&0x2022_u16.to_le_bytes());
+        let o = coff + 20;
+        d[o..o + 2].copy_from_slice(&0x020B_u16.to_le_bytes());
+        d[o + 16..o + 20].copy_from_slice(&0x1000_u32.to_le_bytes());
+        d[o + 20..o + 24].copy_from_slice(&0x1000_u32.to_le_bytes());
+        d[o + 24..o + 32].copy_from_slice(&BASE.to_le_bytes());
+        d[o + 32..o + 36].copy_from_slice(&0x1000_u32.to_le_bytes());
+        d[o + 36..o + 40].copy_from_slice(&0x200_u32.to_le_bytes());
+        d[o + 56..o + 60].copy_from_slice(&0x2000_u32.to_le_bytes());
+        d[o + 60..o + 64].copy_from_slice(&0x200_u32.to_le_bytes());
+        d[o + 68..o + 70].copy_from_slice(&3_u16.to_le_bytes());
+        d[o + 72..o + 80].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+        d[o + 80..o + 88].copy_from_slice(&0x1000_u64.to_le_bytes());
+        d[o + 88..o + 96].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+        d[o + 96..o + 104].copy_from_slice(&0x1000_u64.to_le_bytes());
+        d[o + 108..o + 112].copy_from_slice(&16_u32.to_le_bytes());
+        let s = o + 0xF0;
+        d[s..s + 5].copy_from_slice(b".text");
+        d[s + 8..s + 12].copy_from_slice(&0x180_u32.to_le_bytes());
+        d[s + 12..s + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        d[s + 16..s + 20].copy_from_slice(&0x200_u32.to_le_bytes());
+        d[s + 20..s + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        d[s + 36..s + 40].copy_from_slice(&0x6000_0020_u32.to_le_bytes());
+        d[0x200..0x200 + code.len()].copy_from_slice(code);
+        d
+    }
+
+    /// A near rel32 branch (`op`) at RVA 0x1000 whose target is the guard VA.
+    fn branch_to_guard(op: u8) -> Vec<u8> {
+        let site_va = BASE + 0x1000;
+        let rel = (BASE + u64::from(GUARD_RVA)) as i64 - (site_va as i64 + 5);
+        let mut code = vec![op];
+        code.extend_from_slice(&(rel as i32).to_le_bytes());
+        code.push(0xC3); // a trailing ret, never reached
+        code
+    }
+
+    #[test]
+    fn tail_jmp_to_residual_guard_becomes_return_true() {
+        let mut image = pe_with_text(&branch_to_guard(0xE9));
+        let done = neutralize_residual_guard_sites(&mut image, &[GUARD_RVA]).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].guard_rva, GUARD_RVA);
+        assert_eq!(done[0].via, "site");
+        assert_eq!(done[0].thunk_bytes, 5);
+        assert_eq!(&image[0x200..0x205], &RETURN_TRUE);
+    }
+
+    #[test]
+    fn call_to_residual_guard_becomes_mov_eax_1() {
+        let mut image = pe_with_text(&branch_to_guard(0xE8));
+        let done = neutralize_residual_guard_sites(&mut image, &[GUARD_RVA]).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].via, "site");
+        assert_eq!(&image[0x200..0x205], &MOV_EAX_1);
+    }
+
+    #[test]
+    fn no_branch_to_guard_patches_nothing() {
+        let mut image = pe_with_text(&[0xC3]); // just `ret`
+        let before = image.clone();
+        let done = neutralize_residual_guard_sites(&mut image, &[GUARD_RVA]).unwrap();
+        assert!(done.is_empty());
+        assert_eq!(image, before);
+    }
+
+    #[test]
+    fn empty_guard_list_is_a_noop() {
+        let mut image = pe_with_text(&branch_to_guard(0xE9));
+        let before = image.clone();
+        let done = neutralize_residual_guard_sites(&mut image, &[]).unwrap();
+        assert!(done.is_empty());
+        assert_eq!(image, before);
+    }
 }
