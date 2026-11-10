@@ -16,19 +16,28 @@ use crate::opt::Stmt;
 use crate::symbols::Symbols;
 
 const ATOM: u8 = 100;
+/// A conditional (`?:` / `if {} else {}`) binds looser than any binary operator,
+/// so it parenthesises whenever it is embedded as an operand.
+const COND: u8 = 5;
 
 static DIALECT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Select the output dialect (`"rust"`, ...), or `None` for the default C. Set
 /// by the CLI `--dialect` flag; falls back to `VMPX_DECOMPILE_DIALECT`.
 pub fn set_dialect(d: Option<String>) {
-    *DIALECT.write().unwrap_or_else(std::sync::PoisonError::into_inner) = d;
+    *DIALECT
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
 }
 
 /// The selected dialect: the CLI flag if set, else the env var.
 #[must_use]
 pub fn dialect() -> Option<String> {
-    if let Some(d) = DIALECT.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+    if let Some(d) = DIALECT
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
         return Some(d);
     }
     std::env::var("VMPX_DECOMPILE_DIALECT").ok()
@@ -152,7 +161,11 @@ impl Renderer<'_> {
 
     /// Unsigned type name for this dialect (`u32` / `uint32_t`).
     fn ty(&self, w: BitWidth) -> &'static str {
-        if self.dialect.is_c_family() { cty(w) } else { uty(w) }
+        if self.dialect.is_c_family() {
+            cty(w)
+        } else {
+            uty(w)
+        }
     }
     /// Signed type name (`i32` / `int32_t` / `s32`).
     fn sty(&self, w: BitWidth) -> &'static str {
@@ -181,7 +194,11 @@ impl Renderer<'_> {
         if let Some(n) = self.consts.get(&v) {
             return n.clone();
         }
-        if v <= 9 { v.to_string() } else { format!("0x{v:x}") }
+        if v <= 9 {
+            v.to_string()
+        } else {
+            format!("0x{v:x}")
+        }
     }
 
     /// Render with a precedence; the caller parenthesises when it embeds a
@@ -210,13 +227,15 @@ impl Renderer<'_> {
     /// over `x`'s whole (<=16-bit) domain it either is a clean indicator of a
     /// comparison or it is not; if it is, emit `(x CMP C) [as T] [* scale]`,
     /// else fall through to the literal rendering. Never emits an unproven form.
-    fn flag_predicate(&self, e: &Expr) -> Option<String> {
+    fn flag_predicate(&self, e: &Expr) -> Option<(String, u8)> {
         // The one `vm_flags_*` intrinsic in `e` (bail on zero or several), and
         // its single non-constant operand `x` -- the value the predicate tests.
         let mut flags = Vec::new();
         collect_vm_flags(e, &mut flags);
         let [intrin] = flags[..] else { return None };
-        let ExprKind::Intrinsic { arguments, .. } = &intrin.kind else { return None };
+        let ExprKind::Intrinsic { arguments, .. } = &intrin.kind else {
+            return None;
+        };
         let nonconst: Vec<&Expr> = arguments.iter().filter(|a| cst(a).is_none()).collect();
         let [x] = nonconst[..] else { return None };
         let xw = x.width;
@@ -243,28 +262,25 @@ impl Renderer<'_> {
         let (op, c) = recognize_cmp(&hits, n)?;
         let xr = self.child(x, 10);
         let cname = self.lit(xw, c);
-        // `x CMP C` is a two-valued indicator; widen it to the result type, then
-        // scale. The comparison binds looser than a cast, so it parenthesises.
-        let (mut s, mut p) = self.widen(format!("{xr} {op} {cname}"), 10, out_w);
-        if scale != 1 {
-            (s, p) = self.mul_const(s, p, scale);
+        let cond = format!("{xr} {op} {cname}");
+        if scale == 1 {
+            // A 0/1 indicator: widen the boolean to the result type.
+            let (s, p) = self.widen(cond, 10, out_w);
+            return Some((s, p));
         }
-        let _ = p;
-        Some(s)
-    }
-
-    /// `value * k` with the dialect's multiply (wrapping in Rust, plain in C).
-    fn mul_const(&self, value: String, p: u8, k: u64) -> (String, u8) {
-        if self.dialect == Dialect::Rust {
-            (format!("({}.wrapping_mul({k}))", paren(value, p, ATOM)), ATOM)
-        } else {
-            (format!("{} * {k}", paren(value, p, 61)), 60)
-        }
+        // A scaled indicator reads as a conditional, not `(cond as T) * k` -- the
+        // two are identical because `cond` is exactly 0 or 1.
+        let k = self.lit(out_w, scale);
+        let s = match self.dialect {
+            Dialect::Rust => format!("if {cond} {{ {k} }} else {{ 0 }}"),
+            _ => format!("{cond} ? {k} : 0"),
+        };
+        Some((s, COND))
     }
 
     fn body(&self, e: &Expr) -> (String, u8) {
         if let Some(pred) = self.flag_predicate(e) {
-            return (pred, ATOM);
+            return pred;
         }
         match &e.kind {
             ExprKind::Const { value } => (self.lit(e.width, *value), ATOM),
@@ -272,7 +288,11 @@ impl Renderer<'_> {
             ExprKind::Unary { op, value } => match op {
                 // Rust `!` is bitwise-not on integers; C/pseudo spell it `~`.
                 UnaryOp::Not => {
-                    let tilde = if self.dialect == Dialect::Rust { "!" } else { "~" };
+                    let tilde = if self.dialect == Dialect::Rust {
+                        "!"
+                    } else {
+                        "~"
+                    };
                     (format!("{tilde}{}", self.child(value, 90)), 90)
                 }
                 // Unsigned negation is defined mod 2^n in both Rust (wrapping) and C.
@@ -284,7 +304,10 @@ impl Renderer<'_> {
             ExprKind::Binary { op, left, right } => self.binary(e.width, *op, left, right),
             ExprKind::Load { address } => match self.field_sugar(address) {
                 Some(f) => (f, ATOM),
-                None => (format!("read_u{}({})", e.width.bits(), self.child(address, 0)), ATOM),
+                None => (
+                    format!("read_u{}({})", e.width.bits(), self.child(address, 0)),
+                    ATOM,
+                ),
             },
             ExprKind::Intrinsic { name, arguments } => {
                 let args: Vec<String> = arguments.iter().map(|a| self.child(a, 0)).collect();
@@ -323,7 +346,12 @@ impl Renderer<'_> {
         let (from, to) = (value.width, w);
         match self.dialect {
             Dialect::Rust => {
-                format!("{v} as {} as {} as {}", self.sty(from), self.sty(to), self.ty(w))
+                format!(
+                    "{v} as {} as {} as {}",
+                    self.sty(from),
+                    self.sty(to),
+                    self.ty(w)
+                )
             }
             Dialect::Pseudo => format!("({})({}){v}", self.sty(to), self.sty(from)),
             _ => format!("({})({})({}){v}", self.ty(w), self.sty(to), self.sty(from)),
@@ -337,7 +365,10 @@ impl Renderer<'_> {
         // C-family and pseudo: unsigned arithmetic wraps by definition, so plain
         // infix is already faithful -- no wrapping verbs needed.
         let infix = |sym: &str, prec: u8| -> (String, u8) {
-            (format!("{} {sym} {}", self.child(l, prec), self.child(r, prec + 1)), prec)
+            (
+                format!("{} {sym} {}", self.child(l, prec), self.child(r, prec + 1)),
+                prec,
+            )
         };
         match op {
             BinaryOp::Mul => infix("*", 75),
@@ -366,7 +397,13 @@ impl Renderer<'_> {
     /// Faithful Rust: every op the VM relies on to wrap gets an explicit
     /// `.wrapping_*`, so debug and release agree.
     fn binary_rust(&self, w: BitWidth, op: BinaryOp, l: &Expr, r: &Expr) -> (String, u8) {
-        let as_w = |s: String, need_as: bool| if need_as { format!("{s} as {}", uty(w)) } else { s };
+        let as_w = |s: String, need_as: bool| {
+            if need_as {
+                format!("{s} as {}", uty(w))
+            } else {
+                s
+            }
+        };
         let method = |name: &str| -> (String, u8) {
             let a = self.child(l, ATOM);
             let b = self.child(r, 0);
@@ -394,7 +431,11 @@ impl Renderer<'_> {
                 (as_w(format!("({a} as {}) >> {b}", ity(w)), true), 80)
             }
             BinaryOp::Rol | BinaryOp::Ror => {
-                let f = if op == BinaryOp::Rol { "rotate_left" } else { "rotate_right" };
+                let f = if op == BinaryOp::Rol {
+                    "rotate_left"
+                } else {
+                    "rotate_right"
+                };
                 let a = self.child(l, ATOM);
                 let b = self.child(r, 0);
                 (format!("{a}.{f}({b} as u32)"), ATOM)
@@ -438,13 +479,125 @@ impl Renderer<'_> {
         }
     }
 
+    /// Per-statement common-subexpression elimination, then the statement.
+    ///
+    /// Any non-trivial subexpression that occurs more than once inside this one
+    /// statement is bound to a local emitted immediately before it, and the
+    /// repeats become that name. Sound because every use sits in the same
+    /// statement: no store executes between the binding and the uses, so
+    /// collapsing a repeated load to a single evaluation is value-preserving.
+    /// Never hoists across statements or across a store.
     fn stmt(&self, s: &Stmt, out: &mut String, depth: usize) {
+        let mut tops: Vec<&Expr> = Vec::new();
+        stmt_top_exprs(s, &mut tops);
+        let binds = if tops.is_empty() {
+            Vec::new()
+        } else {
+            self.plan_cse(&tops)
+        };
+        if binds.is_empty() {
+            self.stmt_leaf(s, out, depth);
+            return;
+        }
+        let mut overlay = self.temps.clone();
+        for (nm, def) in &binds {
+            overlay.insert(def.clone(), nm.clone());
+        }
+        let r2 = Renderer {
+            dialect: self.dialect,
+            names: self.names,
+            image_base: self.image_base,
+            temps: &overlay,
+            consts: self.consts,
+        };
+        let pad = "    ".repeat(depth);
+        for (nm, def) in &binds {
+            let rhs = r2.define(def);
+            let line = match self.dialect {
+                Dialect::Rust => format!("{pad}let {nm} = {rhs};\n"),
+                Dialect::Pseudo => format!("{pad}{nm} = {rhs}\n"),
+                _ if self.dialect.auto_temps() => format!("{pad}auto {nm} = {rhs};\n"),
+                _ => format!("{pad}{} {nm} = {rhs};\n", cty(def.width)),
+            };
+            out.push_str(&line);
+        }
+        r2.stmt_leaf(s, out, depth);
+    }
+
+    /// The CSE bindings for one statement: maximal, non-trivial, repeated
+    /// subexpressions, in first-appearance order, with names that don't collide.
+    fn plan_cse(&self, tops: &[&Expr]) -> Vec<(String, Expr)> {
+        let mut counts: HashMap<Expr, usize> = HashMap::new();
+        let mut order: Vec<Expr> = Vec::new();
+        for e in tops {
+            each_subexpr(e, &mut |se| {
+                let c = counts.entry(se.clone()).or_insert(0);
+                *c += 1;
+                if *c == 1 {
+                    order.push(se.clone());
+                }
+            });
+        }
+        let repeated: Vec<Expr> = order
+            .into_iter()
+            .filter(|e| counts[e] >= 2 && cse_worthy(e))
+            .collect();
+        // Keep only the maximal candidates -- drop any nested inside another.
+        let maximal: Vec<Expr> = repeated
+            .iter()
+            .filter(|e| !repeated.iter().any(|o| proper_contains(o, e)))
+            .cloned()
+            .collect();
+        let mut used: std::collections::HashSet<String> = self
+            .names
+            .values()
+            .cloned()
+            .chain(self.temps.values().cloned())
+            .collect();
+        let mut tn = 0usize;
+        let mut out = Vec::new();
+        for e in maximal {
+            let base = self.cse_name(&e, &mut tn);
+            let mut nm = base.clone();
+            let mut k = 2;
+            while !used.insert(nm.clone()) {
+                nm = format!("{base}_{k}");
+                k += 1;
+            }
+            out.push((nm, e));
+        }
+        out
+    }
+
+    /// A readable name for a CSE temp: `vNN` for a context field load
+    /// `ctx + 0xNN`, else a fresh `tN`.
+    fn cse_name(&self, e: &Expr, tn: &mut usize) -> String {
+        if let ExprKind::Load { address } = &e.kind
+            && let Some((r, off)) = base_offset(address)
+            && self.name(r) == "ctx"
+        {
+            return format!("v{off:x}");
+        }
+        let n = *tn;
+        *tn += 1;
+        format!("t{n}")
+    }
+
+    fn stmt_leaf(&self, s: &Stmt, out: &mut String, depth: usize) {
         let pad = "    ".repeat(depth);
         // Pseudo-code drops statement terminators; every real dialect keeps them.
-        let semi = if self.dialect == Dialect::Pseudo { "" } else { ";" };
+        let semi = if self.dialect == Dialect::Pseudo {
+            ""
+        } else {
+            ";"
+        };
         match s {
             Stmt::Assign(n, e) => {
-                out.push_str(&format!("{pad}{} = {}{semi}\n", self.name(n), self.body(e).0));
+                out.push_str(&format!(
+                    "{pad}{} = {}{semi}\n",
+                    self.name(n),
+                    self.body(e).0
+                ));
             }
             Stmt::Store(st) => {
                 let val = self.body(&st.value).0;
@@ -470,7 +623,11 @@ impl Renderer<'_> {
                 }
             }
             Stmt::Loop(body) => {
-                let head = if self.dialect == Dialect::Rust { "loop {" } else { "for (;;) {" };
+                let head = if self.dialect == Dialect::Rust {
+                    "loop {"
+                } else {
+                    "for (;;) {"
+                };
                 out.push_str(&format!("{pad}{head}\n"));
                 self.stmts(body, out, depth + 1);
                 out.push_str(&format!("{pad}}}\n"));
@@ -487,14 +644,23 @@ impl Renderer<'_> {
             }
             Stmt::DoWhile { body, cond } => {
                 // Rust/pseudo: no do-while, so a loop with a trailing break.
-                let head = if self.dialect == Dialect::Rust { "loop {" } else { "for (;;) {" };
+                let head = if self.dialect == Dialect::Rust {
+                    "loop {"
+                } else {
+                    "for (;;) {"
+                };
                 out.push_str(&format!("{pad}{head}\n"));
                 self.stmts(body, out, depth + 1);
-                out.push_str(&format!("{pad}    if !({}) {{ break; }}\n", self.cond(cond)));
+                out.push_str(&format!(
+                    "{pad}    if !({}) {{ break; }}\n",
+                    self.cond(cond)
+                ));
                 out.push_str(&format!("{pad}}}\n"));
             }
             Stmt::Return(vals) => {
-                let v = vals.first().map_or_else(|| "0".to_owned(), |(_, e)| self.body(e).0);
+                let v = vals
+                    .first()
+                    .map_or_else(|| "0".to_owned(), |(_, e)| self.body(e).0);
                 out.push_str(&format!("{pad}return {v}{semi}\n"));
             }
             Stmt::Break => out.push_str(&format!("{pad}break{semi}\n")),
@@ -503,7 +669,10 @@ impl Renderer<'_> {
             Stmt::Label(n) => out.push_str(&format!("{pad}// label {n:?}\n")),
             Stmt::Goto(n) => out.push_str(&format!("{pad}// goto {n:?}\n")),
             Stmt::IfGoto { cond, target } => {
-                out.push_str(&format!("{pad}if {} {{ /* goto {target:?} */ }}\n", self.guard(cond)));
+                out.push_str(&format!(
+                    "{pad}if {} {{ /* goto {target:?} */ }}\n",
+                    self.guard(cond)
+                ));
             }
         }
     }
@@ -531,19 +700,32 @@ fn classify_constants(
     for s in prologue.iter().chain(body) {
         stmt_exprs(s, &mut visit);
     }
-    let mut ranked: Vec<(u64, usize)> =
-        counts.into_iter().filter(|(v, c)| *v > 0xff && *c >= 2).collect();
+    let mut ranked: Vec<(u64, usize)> = counts
+        .into_iter()
+        .filter(|(v, c)| *v > 0xff && *c >= 2)
+        .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut out = BTreeMap::new();
     for (i, (v, _)) in ranked.into_iter().enumerate() {
-        out.insert(v, if i == 0 { "DECODE_KEY".to_owned() } else { format!("DECODE_KEY{}", i + 1) });
+        out.insert(
+            v,
+            if i == 0 {
+                "DECODE_KEY".to_owned()
+            } else {
+                format!("DECODE_KEY{}", i + 1)
+            },
+        );
     }
     out
 }
 
 /// `reg + const` as `(reg, const)` -- a struct-field address shape.
 fn base_offset(e: &Expr) -> Option<(&str, u64)> {
-    if let ExprKind::Binary { op: BinaryOp::Add, left, right } = &e.kind
+    if let ExprKind::Binary {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = &e.kind
         && let (ExprKind::Register { name }, ExprKind::Const { value }) = (&left.kind, &right.kind)
     {
         return Some((name, *value));
@@ -589,7 +771,12 @@ fn infer_struct_base(
 }
 
 fn xor_masks(e: &Expr, counts: &mut BTreeMap<u64, usize>) {
-    if let ExprKind::Binary { op: BinaryOp::Xor, left, right } = &e.kind {
+    if let ExprKind::Binary {
+        op: BinaryOp::Xor,
+        left,
+        right,
+    } = &e.kind
+    {
         for side in [left, right] {
             if let ExprKind::Const { value } = side.kind {
                 *counts.entry(value).or_default() += 1;
@@ -605,7 +792,11 @@ fn each_subexpr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | ExprKind::Load { address: value }
         | ExprKind::Extract { value, .. }
         | ExprKind::Resize { value, .. } => each_subexpr(value, f),
-        ExprKind::Binary { left, right, .. } | ExprKind::Concat { high: left, low: right } => {
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => {
             each_subexpr(left, f);
             each_subexpr(right, f);
         }
@@ -636,6 +827,50 @@ fn stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
     }
 }
 
+/// The top-level expressions a leaf statement carries (`Assign`/`Store`/
+/// `Return`). Compound statements carry none here -- their inner leaves are
+/// reached by recursion, each getting its own per-statement CSE.
+fn stmt_top_exprs<'a>(s: &'a Stmt, out: &mut Vec<&'a Expr>) {
+    match s {
+        Stmt::Assign(_, e) => out.push(e),
+        Stmt::Store(st) => {
+            out.push(&st.address);
+            out.push(&st.value);
+        }
+        Stmt::Return(vals) => vals.iter().for_each(|(_, e)| out.push(e)),
+        _ => {}
+    }
+}
+
+/// `true` when `needle` occurs strictly below `hay` (not as `hay` itself).
+fn proper_contains(hay: &Expr, needle: &Expr) -> bool {
+    if hay == needle {
+        return false;
+    }
+    let mut found = false;
+    each_subexpr(hay, &mut |se| {
+        if se == needle {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Worth binding to a name: not a bare register or constant, and more than a
+/// couple of nodes -- a load or an arithmetic tree, not a lone cast.
+fn cse_worthy(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Const { .. } | ExprKind::Register { .. } => false,
+        _ => expr_size(e) >= 3,
+    }
+}
+
+fn expr_size(e: &Expr) -> usize {
+    let mut n = 0usize;
+    each_subexpr(e, &mut |_| n += 1);
+    n
+}
+
 fn collect_vm_flags<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     if let ExprKind::Intrinsic { name, .. } = &e.kind
         && name.starts_with("vm_flags_")
@@ -647,7 +882,11 @@ fn collect_vm_flags<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         | ExprKind::Load { address: value }
         | ExprKind::Extract { value, .. }
         | ExprKind::Resize { value, .. } => collect_vm_flags(value, out),
-        ExprKind::Binary { left, right, .. } | ExprKind::Concat { high: left, low: right } => {
+        ExprKind::Binary { left, right, .. }
+        | ExprKind::Concat {
+            high: left,
+            low: right,
+        } => {
             collect_vm_flags(left, out);
             collect_vm_flags(right, out);
         }
@@ -757,7 +996,11 @@ pub fn preamble(d: Dialect) -> String {
              // read_uN(a) = load N bits at a; rotlN/rotrN = rotate; INT3 = 0xCC.\n"
             .to_owned(),
         _ => {
-            let header = if d == Dialect::Cpp { "#include <cstdint>" } else { "#include <stdint.h>" };
+            let header = if d == Dialect::Cpp {
+                "#include <cstdint>"
+            } else {
+                "#include <stdint.h>"
+            };
             let mut s = format!("// ---- prelude (generated) ----\n{header}\n#define INT3 0xCC\n");
             for b in [8u32, 16, 32, 64] {
                 s += &format!(
@@ -831,7 +1074,13 @@ pub fn render_function(
         ctx_sig = Some((old, "ctx".to_owned()));
     }
     let names = &names_owned;
-    let r = Renderer { dialect: d, names, image_base, temps: temps_map, consts: &consts };
+    let r = Renderer {
+        dialect: d,
+        names,
+        image_base,
+        temps: temps_map,
+        consts: &consts,
+    };
 
     // Signature: `u64 a1` -> `a1: u64` (Rust) / `uint64_t a1` (C) / `a1` (pseudo),
     // with the context pointer shown under its inferred name.
@@ -877,11 +1126,19 @@ pub fn render_function(
     // Header.
     match d {
         Dialect::Rust => {
-            let ret = if ret_ty == "void" { String::new() } else { format!(" -> {ret_ty}") };
+            let ret = if ret_ty == "void" {
+                String::new()
+            } else {
+                format!(" -> {ret_ty}")
+            };
             out.push_str(&format!("unsafe fn {name}({}){ret} {{\n", args.join(", ")));
         }
         Dialect::Pseudo => out.push_str(&format!("{name}({}):\n", args.join(", "))),
-        _ => out.push_str(&format!("{} {name}({}) {{\n", sig_ty(d, ret_ty), args.join(", "))),
+        _ => out.push_str(&format!(
+            "{} {name}({}) {{\n",
+            sig_ty(d, ret_ty),
+            args.join(", ")
+        )),
     }
 
     // Mutable locals the body assigns across branches.
@@ -931,7 +1188,15 @@ mod tests {
         let names = BTreeMap::new();
         let temps = HashMap::new();
         let consts = BTreeMap::new();
-        Renderer { dialect, names: &names, image_base, temps: &temps, consts: &consts }.body(e).0
+        Renderer {
+            dialect,
+            names: &names,
+            image_base,
+            temps: &temps,
+            consts: &consts,
+        }
+        .body(e)
+        .0
     }
     fn reg(n: &str) -> Expr {
         Expr::register(BitWidth::W64, n)
@@ -954,7 +1219,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn recognize_cmp_characterises_indicator_sets() {
         // The flag-idiom collapse only fires when the exhaustive table is a
@@ -974,7 +1238,10 @@ mod tests {
     #[test]
     fn not_loads_and_named_constants() {
         assert_eq!(render(&Expr::unary(UnaryOp::Not, reg("x")), 0), "!x");
-        assert_eq!(render(&Expr::load(BitWidth::W32, reg("a")), 0), "read_u32(a)");
+        assert_eq!(
+            render(&Expr::load(BitWidth::W32, reg("a")), 0),
+            "read_u32(a)"
+        );
         assert_eq!(render(&Expr::constant(BitWidth::W8, 0xCC), 0), "INT3");
         assert_eq!(
             render(&Expr::constant(BitWidth::W64, 0x1_4000_0000), 0x1_4000_0000),
@@ -1017,9 +1284,145 @@ mod tests {
             ("t2".to_owned(), field("a2", 0x8, BitWidth::W64)),
         ];
         let names = BTreeMap::new();
-        assert_eq!(infer_struct_base(&names, &temps, &[], &[]).as_deref(), Some("a14"));
+        assert_eq!(
+            infer_struct_base(&names, &temps, &[], &[]).as_deref(),
+            Some("a14")
+        );
         // A single field access is not enough to call something a struct pointer.
         let one = vec![("t0".to_owned(), field("a2", 0x8, BitWidth::W64))];
         assert_eq!(infer_struct_base(&names, &one, &[], &[]), None);
+    }
+
+    fn render_stmt(dialect: Dialect, names: &BTreeMap<String, String>, s: &Stmt) -> String {
+        let temps = HashMap::new();
+        let consts = BTreeMap::new();
+        let mut out = String::new();
+        Renderer {
+            dialect,
+            names,
+            image_base: 0,
+            temps: &temps,
+            consts: &consts,
+        }
+        .stmt(s, &mut out, 1);
+        out
+    }
+    fn ctx_field(off: u64, w: BitWidth) -> Expr {
+        Expr::load(
+            w,
+            Expr::binary(
+                BinaryOp::Add,
+                reg("a14"),
+                Expr::constant(BitWidth::W64, off),
+            )
+            .unwrap(),
+        )
+    }
+    fn ctx_names() -> BTreeMap<String, String> {
+        let mut names = BTreeMap::new();
+        names.insert("a14".to_owned(), "ctx".to_owned());
+        names
+    }
+
+    #[test]
+    fn per_statement_cse_factors_a_repeated_load() {
+        // r = read_u64(ctx+0x98) + read_u64(ctx+0x98)
+        let fld = ctx_field(0x98, BitWidth::W64);
+        let val = Expr::binary(BinaryOp::Add, fld.clone(), fld).unwrap();
+        let out = render_stmt(
+            Dialect::Rust,
+            &ctx_names(),
+            &Stmt::Assign("r".to_owned(), val),
+        );
+        // The load is evaluated once, in a `let v98`, and used twice by name.
+        assert_eq!(
+            out.matches("read_u64(").count(),
+            1,
+            "load evaluated once:\n{out}"
+        );
+        assert!(
+            out.contains("let v98 = read_u64("),
+            "binding present:\n{out}"
+        );
+        assert_eq!(out.matches("v98").count(), 3, "one def + two uses:\n{out}");
+    }
+
+    #[test]
+    fn cse_never_hoists_across_a_store() {
+        // A store, then a read of the same field in the next statement. The read
+        // appears once in each statement -- no repeat WITHIN either -- so nothing
+        // is factored across the store between them.
+        let fld = ctx_field(0x98, BitWidth::W64);
+        let store = Stmt::Store(crate::ir::Store {
+            address: Expr::binary(
+                BinaryOp::Add,
+                reg("a14"),
+                Expr::constant(BitWidth::W64, 0xa0),
+            )
+            .unwrap(),
+            value: Expr::register(BitWidth::W8, "a0"),
+        });
+        let read_then = Stmt::Assign("r".to_owned(), fld);
+        let names = ctx_names();
+        let temps = HashMap::new();
+        let consts = BTreeMap::new();
+        let mut out = String::new();
+        Renderer {
+            dialect: Dialect::Rust,
+            names: &names,
+            image_base: 0,
+            temps: &temps,
+            consts: &consts,
+        }
+        .stmts(&[store, read_then], &mut out, 1);
+        assert!(
+            !out.contains("let v98"),
+            "no binding across statements:\n{out}"
+        );
+        assert_eq!(
+            out.matches("read_u64(").count(),
+            1,
+            "the one read stays inline:\n{out}"
+        );
+    }
+
+    // A two-valued indicator `(x == 0xCC)` scaled by 2, built from the VM's own
+    // flag-word intrinsic so `flag_predicate` recognises it exhaustively.
+    fn flag_scaled(scaled: bool) -> Expr {
+        // The folder evaluates `vm_flags_*` only at W64 (see expr::simplify_intrinsic).
+        let sub = Expr::intrinsic(
+            BitWidth::W64,
+            "vm_flags_sub_w8".to_owned(),
+            vec![reg_w8("b"), Expr::constant(BitWidth::W8, 0xCC)],
+        );
+        // ZF (bit 6) is set iff b == 0xCC.
+        let zf = Expr::binary(
+            BinaryOp::And,
+            Expr::binary(BinaryOp::Shr, sub, Expr::constant(BitWidth::W64, 6)).unwrap(),
+            Expr::constant(BitWidth::W64, 1),
+        )
+        .unwrap();
+        if scaled {
+            Expr::binary(BinaryOp::Mul, zf, Expr::constant(BitWidth::W64, 2)).unwrap()
+        } else {
+            zf
+        }
+    }
+    fn reg_w8(n: &str) -> Expr {
+        Expr::register(BitWidth::W8, n)
+    }
+
+    #[test]
+    fn scaled_indicator_renders_as_a_conditional() {
+        let two = flag_scaled(true);
+        assert_eq!(
+            render_as(Dialect::Rust, &two, 0),
+            "if b == INT3 { 2 } else { 0 }"
+        );
+        assert_eq!(render_as(Dialect::C99, &two, 0), "b == INT3 ? 2 : 0");
+        assert_eq!(render_as(Dialect::Pseudo, &two, 0), "b == INT3 ? 2 : 0");
+        // A plain 0/1 indicator (no scale) stays a widened boolean, not a ternary.
+        let one = flag_scaled(false);
+        assert_eq!(render_as(Dialect::Rust, &one, 0), "(b == INT3) as u64");
     }
 }
