@@ -551,6 +551,9 @@ struct SymbolicMachine<'a> {
     /// which point the address is just `0` and the slot is unrecoverable -- so
     /// the slot is recorded here and reported with the refusal.
     last_zero_image_read: Option<u64>,
+    /// Index of the instruction currently being applied, so helpers without the
+    /// index in scope (e.g. `load_external`) can label a havoc with it.
+    current_instruction_index: usize,
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
@@ -650,6 +653,7 @@ impl<'a> SymbolicMachine<'a> {
             opaque_store_epoch: initial.memory_epoch,
             byte_versions: BTreeMap::new(),
             last_zero_image_read: None,
+            current_instruction_index: 0,
             memory_tainted: initial.memory_tainted,
             // A tainted state must never serve a file constant: the store that
             // tainted it could have written that very address. The broad havoc
@@ -1122,6 +1126,37 @@ impl<'a> SymbolicMachine<'a> {
                 self.last_zero_image_read
                     .map_or_else(|| "none".to_owned(), |slot| format!("{slot:#x}")),
             ));
+        }
+        // A load whose pointer collapsed into the null page (a small non-zero
+        // constant). The base is a VM register holding a proven-zero seed --
+        // VMProtect's static placeholder for a pointer the OS/exception
+        // dispatcher supplies at run time (e.g. the CONTEXT an anti-debug guard
+        // reads: ContextFlags at +0x30, the Dr0-Dr3 debug registers at
+        // +0x48..+0x60) -- so the literal address is `base(=0) + field_offset`.
+        // Emitting a bare `read(0x30)` would present a faulting null dereference
+        // as recovered behaviour. Instead bind the base to a symbolic
+        // exception-supplied pointer, so the field offset is preserved
+        // (`exception_context + 0x30`), and record the dependency as a labeled
+        // havoc so the entry is reported as resting on that assumption rather
+        // than as proven. The exact-zero case above keeps refusing: it is
+        // load-bearing for the zero-seed VM-exit (unwind) detection, and a read
+        // at offset 0 has no field to anchor the CONTEXT interpretation.
+        if let ExprKind::Const { value } = address.kind
+            && value < 0x1000
+        {
+            let base = Expr::register(BitWidth::W64, "exception_context");
+            let redirected = add_pointer_offset(base, value.cast_signed())
+                .map_err(|error| error.to_string())?;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index: self.current_instruction_index,
+                cause: format!(
+                    "null-page read at field offset {value:#x} bound to a symbolic \
+                     exception-supplied CONTEXT base; the base is a proven-zero VM \
+                     register seed that VMProtect populates via exception flow, which \
+                     is not statically modelled"
+                ),
+            });
+            return self.load_memory(redirected, width);
         }
         self.load_memory(address, width)
     }
@@ -2672,6 +2707,7 @@ fn execute_instruction(
         return Ok(());
     }
     let width = operation_width(instruction)?;
+    machine.current_instruction_index = instruction_index;
     match instruction.semantic {
         VmHandlerSemantic::ConstantPush => {
             let operand = instruction
