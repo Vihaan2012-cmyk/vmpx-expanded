@@ -201,9 +201,12 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
                 };
                 Term::Return(vec![("rax".to_owned(), rax)])
             }
-            Terminator::Call { .. } | Terminator::TailCall { .. } => {
+            // A modeled call (PROVEN_FP) carries its clobber in the block
+            // semantics; control continues at the fall-through.
+            Terminator::Call { next, .. } => Term::Goto(*next),
+            Terminator::TailCall { .. } => {
                 return Err(format!(
-                    "block {addr:#x}: calls are not lifted by the decompiler"
+                    "block {addr:#x}: tail calls are not lifted by the decompiler"
                 ));
             }
             Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),

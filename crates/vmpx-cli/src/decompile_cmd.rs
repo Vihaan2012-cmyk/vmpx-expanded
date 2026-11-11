@@ -381,7 +381,9 @@ fn native(o: &Options, bytes: &[u8]) -> Result<()> {
         for rva in &o.rvas {
             let name = format!("native_{rva:x}");
             println!("// ==== {name} [{rva:#x}]");
-            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), CfgOptions::PROVEN) {
+            // PROVEN_FP models call terminators (a `call` becomes Terminator::Call
+            // with the clobber modeled), so the lift can follow past it.
+            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), CfgOptions::PROVEN_FP) {
                 Ok(c) => c,
                 Err(e) => {
                     println!("// {name}: cfg recovery failed: {e}\n");
