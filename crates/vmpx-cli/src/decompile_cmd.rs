@@ -375,6 +375,34 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
 
 fn native(o: &Options, bytes: &[u8]) -> Result<()> {
     let pe = PeImage::parse(bytes).context("not a supported PE")?;
+    // Explicit RVAs take precedence over the export scan: decompile exactly
+    // those native functions (e.g. the mutated natives that `auto` relocates).
+    if !o.rvas.is_empty() {
+        for rva in &o.rvas {
+            let name = format!("native_{rva:x}");
+            println!("// ==== {name} [{rva:#x}]");
+            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), CfgOptions::PROVEN) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("// {name}: cfg recovery failed: {e}\n");
+                    continue;
+                }
+            };
+            match vmpx_decompile::native::lower(&cfg, &name)
+                .and_then(|f| vmpx_decompile::decompile(&f))
+            {
+                Err(e) => println!("// {name}: {e}\n"),
+                Ok(d) => {
+                    print!("{}", d.text);
+                    println!(
+                        "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?} ctext={:?}\n",
+                        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
     for sym in symbols {
         let Some(name) = sym.name.clone() else {
