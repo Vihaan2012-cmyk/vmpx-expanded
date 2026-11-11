@@ -106,10 +106,15 @@ The parts worth knowing before trusting any output:
   recorded with its cause and the entry stays incomplete.
 - **Labeled, not silent.** Anything unproven becomes a named assumption attached
   to that entry's result.
-- **Three self-checks** per emitted function: an IR round-trip (the structured
-  program against its own IR on random vectors), a C-text re-evaluation under real
-  C typing and UB rules, and a linkage check against the independently unrolled
-  recovered paths.
+- **Self-checks, where they can run.** Each emitted function is put through an IR
+  round-trip (the structured program against its own IR on random vectors), a
+  C-text re-evaluation under real C typing and UB rules, and a linkage check
+  against the independently unrolled recovered paths. The round-trip only runs
+  when the function's values are evaluable: one that reads hardware state
+  (`cpuid`, `gs`/TEB, `rdtsc`) has no fixed value to evaluate, so that check
+  reports *not evaluable* rather than a pass — such a function is compile- and
+  (partially) C-checked but **not round-trip-verified**. Each result records
+  which checks actually ran; *emitted* is not *fully verified*.
 - **Honest widening.** Where abstract interpretation must generalize, it widens to
   an explicit unknown rather than narrowing to a convenient value, and the
   resulting imprecision shows up as a refusal downstream instead of as output.
