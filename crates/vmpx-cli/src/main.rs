@@ -269,6 +269,10 @@ enum Command {
         /// (implies yes to the detonation prompt).
         #[arg(long = "detonate-steps")]
         detonate_steps: Option<u64>,
+        /// Also write the detonation's post-init state here as a reusable VMPXSNP1
+        /// snapshot (implies detonation); reuse it later with --snapshot.
+        #[arg(long = "save-snapshot")]
+        save_snapshot: Option<PathBuf>,
         /// Embed DWARF debug symbols (named functions + ranges) in the clean PE.
         #[arg(long = "emit-dwarf")]
         emit_dwarf: bool,
@@ -1435,6 +1439,7 @@ fn main() -> Result<()> {
             unpack,
             no_prompt,
             detonate_steps,
+            save_snapshot,
             emit_dwarf,
         } => auto_cmd::run(auto_cmd::Options {
             input,
@@ -1446,6 +1451,7 @@ fn main() -> Result<()> {
             unpack,
             yes_to_all_defaults: no_prompt,
             detonate_steps,
+            save_snapshot,
             emit_dwarf,
         })
         .map_err(|error| anyhow::anyhow!(error))?,

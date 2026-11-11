@@ -117,6 +117,10 @@ pub struct DetonateOptions {
     /// Restore CPU+memory from this snapshot instead of running the entry/init
     /// (skips the ~27B-step `.xpl` startup); init is then treated as `Reached`.
     pub start_from_snapshot: Option<std::path::PathBuf>,
+    /// After the run completes, persist the emulator's post-init CPU+memory as a
+    /// reusable VMPXSNP1 snapshot at this path -- the same format `start_from_snapshot`
+    /// and the CLI's `--snapshot` consume, so a later run can skip the long init.
+    pub save_snapshot: Option<std::path::PathBuf>,
 }
 
 /// Bounds for the in-model plugin lifecycle (all offline, step-capped).
@@ -160,6 +164,7 @@ impl Default for DetonateOptions {
             iat_region: IatRegion::Auto,
             lifecycle: None,
             start_from_snapshot: None,
+            save_snapshot: None,
         }
     }
 }
@@ -525,6 +530,13 @@ fn detonate_with(
         run_lifecycle(lc, &mut emu, &env, &stop)
     });
     let steps = emu.steps() as usize;
+
+    // Persist the post-init state as a reusable VMPXSNP1 so a later run can
+    // `--snapshot` it and skip this ~billions-of-steps init.
+    if let Some(path) = &opts.save_snapshot {
+        crate::snapshot::save(&emu.cpu, &emu.mem, path)
+            .map_err(|e| DetonateError::Snapshot(e.kind()))?;
+    }
 
     let mut observed = facts.borrow().clone();
     if !opts.capture_globals.is_empty() {

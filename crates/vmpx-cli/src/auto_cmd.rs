@@ -44,6 +44,11 @@ pub struct Options {
     /// Detonate to recover imports when no snapshot is given, running up to this
     /// many instructions. `None` leaves detonation to the interactive prompt.
     pub detonate_steps: Option<u64>,
+    /// When detonating to recover imports, also persist the post-init emulator
+    /// state as a reusable VMPXSNP1 snapshot at this path (the same format
+    /// `--snapshot` consumes). Setting it implies detonation when no snapshot is
+    /// given, so a later run can skip detonation with `--snapshot`.
+    pub save_snapshot: Option<PathBuf>,
     /// Embed DWARF debug symbols (named reconstructed functions) in the clean PE.
     pub emit_dwarf: bool,
 }
@@ -968,6 +973,7 @@ pub fn run(o: Options) -> Result<(), String> {
         // so it is gated.
         let steps = o.detonate_steps.unwrap_or(20_000_000_000);
         let detonate = o.detonate_steps.is_some()
+            || o.save_snapshot.is_some()
             || confirm(
                 &log,
                 &format!("detonate to recover imports now (~minutes, up to {steps} steps)?"),
@@ -975,7 +981,7 @@ pub fn run(o: Options) -> Result<(), String> {
                 o.yes_to_all_defaults,
             );
         if detonate {
-            match detonate_imports(&log, &o.input, &pe, steps) {
+            match detonate_imports(&log, &o.input, &pe, steps, o.save_snapshot.as_deref()) {
                 Ok(slots) if !slots.is_empty() => {
                     match crate::auto_imports::bind_slots(&log, &pe, &bytes, &image, slots) {
                         Ok(bound) => {
@@ -1068,6 +1074,7 @@ fn detonate_imports(
     input_path: &std::path::Path,
     pe: &PeImage<'_>,
     max_steps: u64,
+    save_snapshot: Option<&std::path::Path>,
 ) -> Result<Vec<(u32, String, String)>, String> {
     let base = pe.optional.image_base.0;
     let xplm = pe.report().imports.iter().any(|m| {
@@ -1091,6 +1098,7 @@ fn detonate_imports(
         export_reference,
         max_steps,
         xplm,
+        save_snapshot: save_snapshot.map(std::path::Path::to_path_buf),
         ..vmpx_emulate::DetonateOptions::default()
     };
     let result = vmpx_emulate::detonate(pe, &options).map_err(|e| format!("{e:?}"))?;
@@ -1103,6 +1111,12 @@ fn detonate_imports(
             result.observed.imports.len()
         ),
     );
+    if let Some(path) = save_snapshot {
+        log.step(
+            "snapshot saved",
+            &format!("{} (reuse with --snapshot to skip detonation)", path.display()),
+        );
+    }
     let slots = result
         .observed
         .imports
