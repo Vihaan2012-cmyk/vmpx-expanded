@@ -44,6 +44,8 @@ pub struct Options {
     /// Detonate to recover imports when no snapshot is given, running up to this
     /// many instructions. `None` leaves detonation to the interactive prompt.
     pub detonate_steps: Option<u64>,
+    /// Embed DWARF debug symbols (named reconstructed functions) in the clean PE.
+    pub emit_dwarf: bool,
 }
 
 const EXEC: u32 = 0x2000_0000;
@@ -801,11 +803,19 @@ pub fn run(o: Options) -> Result<(), String> {
     );
     // Recover and set the OEP before stripping: the header entry is in `.vmp3`,
     // and the strip refuses an entry point that would dangle.
+    let base = pe.optional.image_base.0;
+    // Reconstructed functions to describe in DWARF, collected as they are placed.
+    let mut subprograms: Vec<crate::dwarf_syms::Subprogram> = Vec::new();
     let mut dir_bytes = dirs.bytes;
     match recover_oep(&pe, &bytes) {
         Some(oep) => {
             dir_bytes = set_entry_point(&dir_bytes, Rva(oep)).map_err(|e| e.to_string())?;
             log.step("entry point", &format!("{oep:#x} (CRT DllEntryPoint)"));
+            subprograms.push(crate::dwarf_syms::Subprogram {
+                name: "OEP_DllEntryPoint".to_owned(),
+                low_pc: base + u64::from(oep),
+                high_pc: None,
+            });
         }
         None => log.warn("no CRT entry recovered; the strip may refuse the header entry"),
     }
@@ -833,16 +843,31 @@ pub fn run(o: Options) -> Result<(), String> {
         let (new_image, mapping) = relocate_natives(&log, &pe, &bytes, &image, &targets.natives)?;
         image = new_image;
         image = repoint(&log, &pe, &bytes, image, &mapping)?;
+        for (orig, new) in &mapping {
+            subprograms.push(crate::dwarf_syms::Subprogram {
+                name: format!("native_{orig:x}"),
+                low_pc: base + u64::from(*new),
+                high_pc: None,
+            });
+        }
     }
 
     // --- devirtualize guards ---
     let mut residual_guards: Vec<u32> = Vec::new();
     if !targets.guards.is_empty() {
         log.start("Devirtualizing guard functions");
-        let (new_image, residual) =
+        let (new_image, residual, placements) =
             devirt_guards(&log, &pe, image, instruction_limit, &targets.guards)?;
         image = new_image;
         residual_guards = residual;
+        for (orig, new, size) in &placements {
+            let low = base + u64::from(*new);
+            subprograms.push(crate::dwarf_syms::Subprogram {
+                name: format!("vmp_guard_{orig:x}"),
+                low_pc: low,
+                high_pc: Some(low + u64::from(*size)),
+            });
+        }
     }
 
     // --- neutralize residual guards ---
@@ -878,6 +903,12 @@ pub fn run(o: Options) -> Result<(), String> {
                             action.via, action.thunk_begin, action.thunk_bytes
                         ),
                     );
+                    let low = base + u64::from(action.thunk_begin);
+                    subprograms.push(crate::dwarf_syms::Subprogram {
+                        name: format!("vmp_guard_neutralized_{:x}", action.guard_rva),
+                        low_pc: low,
+                        high_pc: Some(low + u64::from(action.thunk_bytes)),
+                    });
                 }
                 let reached: BTreeSet<u32> = done.iter().map(|a| a.guard_rva).collect();
                 let missed: Vec<String> = residual_guards
@@ -962,6 +993,24 @@ pub fn run(o: Options) -> Result<(), String> {
             if !confirm(&log, "write the image anyway?", true, o.yes_to_all_defaults) {
                 return Err("aborted: run with --snapshot or allow detonation".to_owned());
             }
+        }
+    }
+
+    // --- embed debug symbols (opt-in) ---
+    // Append the `.debug_*` sections BEFORE verify so the dangling-ref check and
+    // loader validation run over the final image. The sections are non-exec, so
+    // `count_dangling` (which scans only executable ranges) ignores them.
+    if o.emit_dwarf {
+        if subprograms.is_empty() {
+            log.warn("no reconstructed functions to describe; skipping DWARF");
+        } else {
+            log.start("Embedding debug symbols");
+            image = crate::dwarf_syms::embed_dwarf(image, &subprograms)
+                .map_err(|e| format!("dwarf embed failed: {e}"))?;
+            log.step(
+                "debug symbols",
+                &format!("DWARF for {} reconstructed function(s)", subprograms.len()),
+            );
         }
     }
 
@@ -1529,11 +1578,13 @@ fn devirt_guards(
     image: Vec<u8>,
     instruction_limit: usize,
     guards: &[u32],
-) -> Result<(Vec<u8>, Vec<u32>), String> {
+) -> Result<(Vec<u8>, Vec<u32>, Vec<(u32, u32, u32)>), String> {
     let base = intact.optional.image_base.0;
     let section_rva = next_section_rva(&image).map_err(|e| e.to_string())?.0;
     let mut payload: Vec<u8> = Vec::new();
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
+    // (original rva, reconstructed rva, byte length) per devirtualized guard.
+    let mut placements: Vec<(u32, u32, u32)> = Vec::new();
     let mut ok = 0_usize;
     let mut residual: Vec<u32> = Vec::new();
     for &rva in guards {
@@ -1564,6 +1615,7 @@ fn devirt_guards(
                     format!("{} byte(s), budget {used}", bytes.len())
                 };
                 log.step(&format!("{rva:#x} devirtualized"), &detail);
+                placements.push((rva, new_rva, u32::try_from(bytes.len()).unwrap_or(0)));
                 payload.extend_from_slice(&bytes);
                 mapping.insert(rva, new_rva);
                 ok += 1;
@@ -1586,7 +1638,7 @@ fn devirt_guards(
         ),
     );
     if mapping.is_empty() {
-        return Ok((image, residual));
+        return Ok((image, residual, placements));
     }
     let rebuilt = append_section(
         &image,
@@ -1600,7 +1652,7 @@ fn devirt_guards(
     let mut out = rebuilt.bytes;
     let retargeted = crate::devirt_cmd::retarget_sites(&mut out, &mapping)?;
     log.step("retargeted", &format!("{retargeted} transfer(s)"));
-    Ok((out, residual))
+    Ok((out, residual, placements))
 }
 
 #[cfg(test)]

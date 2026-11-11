@@ -25,6 +25,7 @@ mod clean_wiring;
 mod coverage_gate;
 mod decoded_splice;
 mod decompile_cmd;
+mod dwarf_syms;
 mod devirt_cmd;
 mod diff_original;
 mod equiv_gate;
@@ -268,6 +269,9 @@ enum Command {
         /// (implies yes to the detonation prompt).
         #[arg(long = "detonate-steps")]
         detonate_steps: Option<u64>,
+        /// Embed DWARF debug symbols (named functions + ranges) in the clean PE.
+        #[arg(long = "emit-dwarf")]
+        emit_dwarf: bool,
     },
     /// Devirtualize guard functions to native code and reintegrate them into a
     /// stripped image, folding the integrity checksum to a constant.
@@ -1431,6 +1435,7 @@ fn main() -> Result<()> {
             unpack,
             no_prompt,
             detonate_steps,
+            emit_dwarf,
         } => auto_cmd::run(auto_cmd::Options {
             input,
             output,
@@ -1441,6 +1446,7 @@ fn main() -> Result<()> {
             unpack,
             yes_to_all_defaults: no_prompt,
             detonate_steps,
+            emit_dwarf,
         })
         .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {
