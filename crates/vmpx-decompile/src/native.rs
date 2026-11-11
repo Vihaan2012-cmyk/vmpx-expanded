@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use vmpx_disasm::{Flag, FlagState, Gpr, Width};
-use vmpx_mutation::cfg_recovery::{NativeCfg, Terminator};
+use vmpx_mutation::cfg_recovery::{CallTarget, NativeCfg, Terminator};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind};
 
 use crate::ir::{Block, Cmp, Cond, Func, NodeId, Store, Term};
@@ -204,10 +204,28 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
             // A modeled call (PROVEN_FP) carries its clobber in the block
             // semantics; control continues at the fall-through.
             Terminator::Call { next, .. } => Term::Goto(*next),
-            Terminator::TailCall { .. } => {
-                return Err(format!(
-                    "block {addr:#x}: tail calls are not lifted by the decompiler"
-                ));
+            // A tail call `jmp target`: the function IS the callee, so its result
+            // is `target(args)`. Faithful: emit a call intrinsic over the Win64
+            // integer-arg registers and return it (opaque result -- sound).
+            Terminator::TailCall { target } => {
+                let callee = match target {
+                    CallTarget::Direct(a) => format!("sub_{a:x}"),
+                    CallTarget::Import(a) => format!("import_at_{a:x}"),
+                    CallTarget::Indirect(_) => "tailcall_indirect".to_owned(),
+                };
+                let args = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9]
+                    .into_iter()
+                    .map(|g| {
+                        let v = if sem.written.contains(&g) {
+                            sem.regs[&g].clone()
+                        } else {
+                            reg(g)
+                        };
+                        subst(&v)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let call = Expr::intrinsic(BitWidth::W64, callee, args);
+                Term::Return(vec![("rax".to_owned(), call)])
             }
             Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),
         };
