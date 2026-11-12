@@ -127,27 +127,14 @@ pub fn eval(e: &Expr, env: &Env) -> Result<u64, String> {
                     });
                 match constant {
                     Some(value) => value,
-                    // Otherwise it is an UNKNOWN, exactly like an uninitialized
-                    // register, and gets a seeded input of its own rather than
-                    // failing the whole check. Refusing here is why a function
-                    // whose recovery widened a loop could not be verified at all:
-                    // a dropped VM-stack cell reads back as `memory_load_epoch_*`,
-                    // an intrinsic, where a generalized cell reads back as
-                    // `loop_havoc_*`, a register, which was already seeded.
-                    // Otherwise it is an UNKNOWN, like an uninitialized register.
-                    // Seeding it would let the check run -- and 346 of the 385
-                    // functions emitted on systems.xpl fail for exactly this
-                    // reason, with ZERO mismatches among those that do run, so
-                    // this is the single biggest verification lever there is.
-                    //
-                    // OFF by default because the first attempt is not trustworthy
-                    // yet: seeding turned "not evaluable" into MISMATCH rather
-                    // than into agreement. One unknown read at two widths across
-                    // `opt::narrow` has to denote one value, and until a concrete
-                    // case is traced it is not established that this keying does
-                    // that. Reporting ~300 fresh mismatches on a decompiler that
-                    // currently disagrees with its own IR nowhere would be worse
-                    // than reporting them unverified.
+                    // An unfoldable intrinsic (`cpuid`/`gs`/`rdtsc`, a
+                    // `memory_load_epoch_*`) is an UNKNOWN, seeded as a free input
+                    // keyed by `intrinsic_key` so a function whose values depend on
+                    // hardware state can still round-trip. The key is identical on
+                    // both sides of the check (width-independent), so a seed can
+                    // only lose discriminating power, never turn agreement into a
+                    // mismatch. Set VMPX_SEED_UNKNOWN_INTRINSICS=0 to refuse
+                    // instead.
                     None if seed_unknown_intrinsics() => e.width.truncate(
                         *env.get(&intrinsic_key(e))
                             .ok_or_else(|| format!("intrinsic `{name}` not evaluable"))?,
@@ -162,10 +149,11 @@ pub fn eval(e: &Expr, env: &Env) -> Result<u64, String> {
     go(e, env, &mut HashMap::new())
 }
 
-/// `VMPX_SEED_UNKNOWN_INTRINSICS=1`: see the note in [`eval`].
+/// Seed unfoldable intrinsics as free inputs (see the note in [`eval`]). On by
+/// default; `VMPX_SEED_UNKNOWN_INTRINSICS=0` refuses them instead.
 fn seed_unknown_intrinsics() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VMPX_SEED_UNKNOWN_INTRINSICS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("VMPX_SEED_UNKNOWN_INTRINSICS").as_deref() != Ok("0"))
 }
 
 /// A stable name for an intrinsic treated as a free input.
