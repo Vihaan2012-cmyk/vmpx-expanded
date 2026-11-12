@@ -20,7 +20,7 @@ use vmpx_rebuild::{
 };
 use vmpx_recompile::{CodeAddress, PhysicalRegister};
 use vmpx_vm::{
-    Expr, ImageConcretizationLimits, X64NativeRegister, concretize_with_immutable_image,
+    Expr, ExprKind, ImageConcretizationLimits, X64NativeRegister, concretize_with_immutable_image,
 };
 use vmpx_vmlift::{EffectStore, RExit, RNode, RStore, ReplacementConfig, build_replacement};
 
@@ -119,6 +119,165 @@ fn collect_legit_paths<'a>(
     }
 }
 
+/// One step of the loop body: either it reached a function exit with a constant
+/// register state, or it took the back edge with new phi values.
+enum LoopStep {
+    Exit(BTreeMap<X64NativeRegister, Expr>),
+    Back(BTreeMap<String, Expr>),
+}
+
+fn is_entry_value(expr: &Expr, register: &X64NativeRegister) -> bool {
+    matches!(&expr.kind, ExprKind::Register { name } if *name == register.symbolic_name())
+}
+
+fn fold_store(
+    store: &RStore,
+    env: &BTreeMap<String, Expr>,
+    fold: &dyn Fn(&Expr) -> Result<Expr, String>,
+) -> Option<EffectStore> {
+    Some(EffectStore {
+        address: fold(&store.address.substitute(env).ok()?).ok()?,
+        value: fold(&store.value.substitute(env).ok()?).ok()?,
+        width: store.width,
+    })
+}
+
+/// Evaluates one pass over the loop body with the phis bound to constants.
+/// Returns `None` when a selector/exit/back-edge value does not fold to a
+/// constant, which means the loop cannot be collapsed at build time.
+fn eval_loop_body(
+    node: &RNode,
+    env: &BTreeMap<String, Expr>,
+    phi_names: &[String],
+    effects: &mut Vec<EffectStore>,
+    fold: &dyn Fn(&Expr) -> Result<Expr, String>,
+) -> Option<LoopStep> {
+    match node {
+        RNode::Stores { stores, next } => {
+            for store in stores {
+                effects.push(fold_store(store, env, fold)?);
+            }
+            eval_loop_body(next, env, phi_names, effects, fold)
+        }
+        RNode::Fork { selector, arms, .. } => {
+            let selector = fold(&selector.substitute(env).ok()?).ok()?;
+            let ExprKind::Const { value } = selector.kind else {
+                return None;
+            };
+            let arm = arms
+                .iter()
+                .find(|(key, _)| *key == value)
+                .map(|(_, arm)| arm)
+                .or_else(|| arms.last().map(|(_, arm)| arm))?;
+            eval_loop_body(arm, env, phi_names, effects, fold)
+        }
+        RNode::Exit(exit) => {
+            if exit.region {
+                return None;
+            }
+            let mut registers = BTreeMap::new();
+            for (register, expr) in &exit.registers {
+                let folded = fold(&expr.substitute(env).ok()?).ok()?;
+                // A constant output, or a nonvolatile register left at its entry
+                // value (preserved by the callee contract), is representable.
+                if matches!(folded.kind, ExprKind::Const { .. }) || is_entry_value(&folded, register) {
+                    registers.insert(*register, folded);
+                } else {
+                    return None;
+                }
+            }
+            Some(LoopStep::Exit(registers))
+        }
+        RNode::BackEdge { next } => {
+            if next.len() != phi_names.len() {
+                return None;
+            }
+            let mut new_env = BTreeMap::new();
+            for (name, expr) in phi_names.iter().zip(next) {
+                let folded = fold(&expr.substitute(env).ok()?).ok()?;
+                if !matches!(folded.kind, ExprKind::Const { .. }) {
+                    return None;
+                }
+                new_env.insert(name.clone(), folded);
+            }
+            Some(LoopStep::Back(new_env))
+        }
+        RNode::Loop { .. } | RNode::Dead(_) => None,
+    }
+}
+
+/// An integrity-checksum loop iterates a fixed number of times over fixed image
+/// data; once its loop-carried accumulator is a constant, every expression
+/// (the checksum intrinsic included) folds. Evaluate the loop at build time with
+/// the phis bound to their constant inits: if it reaches an exit with a constant
+/// register state, the whole loop collapses to that flat state and needs no back
+/// edge. Returns the exit registers and the observable stores, or `None` when any
+/// value stays symbolic (so the caller falls back to native loop emission).
+fn try_fold_loop_to_constant(
+    root: &RNode,
+    fold: &dyn Fn(&Expr) -> Result<Expr, String>,
+) -> Option<(BTreeMap<X64NativeRegister, Expr>, Vec<EffectStore>)> {
+    // Descend through any pre-loop stores and constant-selector forks to the loop.
+    let empty = BTreeMap::new();
+    let mut effects = Vec::new();
+    let mut cursor = root;
+    loop {
+        match cursor {
+            RNode::Stores { stores, next } => {
+                for store in stores {
+                    effects.push(fold_store(store, &empty, fold)?);
+                }
+                cursor = next;
+            }
+            RNode::Fork { selector, arms, .. } => {
+                let selector = fold(&selector.substitute(&empty).ok()?).ok()?;
+                let ExprKind::Const { value } = selector.kind else {
+                    return None;
+                };
+                cursor = arms
+                    .iter()
+                    .find(|(key, _)| *key == value)
+                    .map(|(_, arm)| arm)
+                    .or_else(|| arms.last().map(|(_, arm)| arm))?;
+            }
+            RNode::Loop { .. } => break,
+            _ => return None,
+        }
+    }
+    let RNode::Loop { phis, body, .. } = cursor else {
+        return None;
+    };
+    let phi_names: Vec<String> = phis.iter().map(|phi| phi.name.clone()).collect();
+    let mut env: BTreeMap<String, Expr> = BTreeMap::new();
+    for phi in phis {
+        let folded = fold(&phi.init).ok()?;
+        if !matches!(folded.kind, ExprKind::Const { .. }) {
+            return None;
+        }
+        env.insert(phi.name.clone(), folded);
+    }
+    // A fixed-region checksum terminates well within this bound; a loop that does
+    // not is not a build-time-constant loop and falls back to native emission.
+    for _ in 0..4_000_000_u32 {
+        let mut iteration_effects = Vec::new();
+        match eval_loop_body(body, &env, &phi_names, &mut iteration_effects, fold)? {
+            LoopStep::Exit(registers) => {
+                effects.extend(iteration_effects);
+                return Some((registers, effects));
+            }
+            LoopStep::Back(next) => {
+                // A store on a non-final iteration is a per-iteration side effect
+                // the flat form cannot reproduce; fall back rather than drop it.
+                if !iteration_effects.is_empty() {
+                    return None;
+                }
+                env = next;
+            }
+        }
+    }
+    None
+}
+
 /// Native bytes for one devirtualized guard, built at its final VA.
 pub(crate) fn build_one(
     intact: &PeImage<'_>,
@@ -178,6 +337,25 @@ pub(crate) fn build_one(
                 })
                 .map_err(|error| format!("rewrite memory_load_epoch: {error}"))
         };
+        // A fixed-iteration checksum loop collapses to a flat constant exit state
+        // once its accumulator is bound to its constant init -- preferred, because
+        // it reuses the proven flat emitter and leaves no runtime table read.
+        if let Some((registers, effects)) = try_fold_loop_to_constant(&rolled.root, &loop_fold) {
+            let config = ReplacementConfig {
+                inputs: replacement_inputs(),
+                max_expression_nodes: 400_000,
+                max_spill_slots: 128,
+                import_calls: BTreeMap::new(),
+                continuation: None,
+                effects,
+                effect_calls: Vec::new(),
+                rflags: None,
+                symbol_rewrites: BTreeMap::new(),
+            };
+            return build_replacement(&registers, &config, CodeAddress(va))
+                .map(|replacement| replacement.compiled.bytes)
+                .map_err(|error| format!("build: {error}"));
+        }
         let config = ReplacementConfig {
             inputs: replacement_inputs(),
             max_expression_nodes: 400_000,
