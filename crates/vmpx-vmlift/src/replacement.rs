@@ -28,7 +28,7 @@ use crate::{ExpressionCodegenConfig, ExpressionInput, lower_expression};
 
 /// Registers the expression backend may use as scratch. `RCX` is excluded
 /// because it is the mandatory variable-shift count register.
-const SCRATCH: [PhysicalRegister; 6] = [
+pub(crate) const SCRATCH: [PhysicalRegister; 6] = [
     PhysicalRegister::R10,
     PhysicalRegister::R11,
     PhysicalRegister::R8,
@@ -1308,7 +1308,7 @@ pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
     }
 }
 
-fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
+pub(crate) fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
     match operation {
         Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => vec![slot],
         Operation::Rdtsc { out } => vec![out],
@@ -1340,7 +1340,7 @@ fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSlot> {
 }
 
 /// Rewrites the virtual registers of one operation through `map`.
-fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>) -> Operation {
+pub(crate) fn rename_registers(operation: &Operation, map: &BTreeMap<u32, VirtualRegister>) -> Operation {
     let register = |value: VirtualRegister| -> VirtualRegister {
         map.get(&value.id)
             .map_or(value, |mapped| VirtualRegister::new(mapped.id, value.width))

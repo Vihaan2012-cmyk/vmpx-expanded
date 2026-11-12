@@ -14,6 +14,7 @@ mod equivalence;
 mod expr_codegen;
 mod ir_semantics;
 mod live_in;
+mod loop_replacement;
 mod nested_entry;
 mod passthrough;
 mod replacement;
@@ -67,6 +68,7 @@ pub use replacement::{
 /// The VM-model symbol for the entry condition state, which a replacement
 /// captures for itself. Exported so the closedness check can admit it.
 pub use replacement::NATIVE_RFLAGS_INITIAL as ENTRY_FLAGS_SYMBOL;
+pub use loop_replacement::build_loop_replacement;
 
 use std::collections::{BTreeMap, BTreeSet};
 

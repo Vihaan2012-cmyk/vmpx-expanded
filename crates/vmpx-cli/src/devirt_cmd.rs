@@ -140,10 +140,7 @@ pub(crate) fn build_one(
     let mut has_loop = false;
     let mut paths = Vec::new();
     collect_legit_paths(&rolled.root, &mut Vec::new(), &mut has_loop, &mut paths);
-    if has_loop {
-        return Err("has a loop; flat-exit emission does not cover it".to_owned());
-    }
-    if paths.is_empty() {
+    if !has_loop && paths.is_empty() {
         return Err("no exit path (all nested, dead, or loop)".to_owned());
     }
 
@@ -158,6 +155,48 @@ pub(crate) fn build_one(
         concretization: limits,
         ..vmpx_vm::ModuloImageTargetLimits::default()
     };
+
+    // A function with a back edge cannot collapse to one straight-line leg. Lower
+    // its structured tree to native code WITH control flow, folding every
+    // expression the same way the flat path folds each leg.
+    if has_loop {
+        let loop_fold = |expr: &Expr| -> Result<Expr, String> {
+            let timing = vmpx_vm::fold_timing_invariant_loads(intact, expr, modulo_limits)
+                .map_err(|error| format!("timing fold: {error}"))?;
+            let report = concretize_with_immutable_image(
+                intact,
+                &timing.expression,
+                &BTreeMap::new(),
+                limits,
+            )
+            .map_err(|error| format!("concretize: {error}"))?;
+            report
+                .expression
+                .rewrite_intrinsics(&mut |width, name, args| {
+                    (name.starts_with("memory_load_epoch_") && args.len() == 1)
+                        .then(|| Expr::load(width, args[0].clone()))
+                })
+                .map_err(|error| format!("rewrite memory_load_epoch: {error}"))
+        };
+        let config = ReplacementConfig {
+            inputs: replacement_inputs(),
+            max_expression_nodes: 400_000,
+            max_spill_slots: 1024,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        return vmpx_vmlift::build_loop_replacement(
+            &rolled.root,
+            &config,
+            CodeAddress(va),
+            &loop_fold,
+        );
+    }
+
     let mut folded = 0_usize;
     let mut unresolved = std::collections::BTreeSet::new();
     let fold = |expr: &Expr,
