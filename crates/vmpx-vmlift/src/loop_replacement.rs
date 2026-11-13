@@ -70,6 +70,10 @@ struct Ctx<'a> {
     next_label: u32,
     epilogue: vmpx_recompile::Label,
     header: vmpx_recompile::Label,
+    /// Set when the tree has a region (staged-continuation) exit. The slot holds
+    /// the computed continuation target; the region epilogue transfers through it.
+    region_epilogue: Option<vmpx_recompile::Label>,
+    continuation_slot: SpillSlot,
 }
 
 impl Ctx<'_> {
@@ -214,9 +218,11 @@ impl Ctx<'_> {
     }
 
     fn emit_exit(&mut self, exit: &RExit) -> Result<(), String> {
-        if exit.region {
-            return Err("region (staged-continuation) exit not yet supported in a loop".to_owned());
-        }
+        // A region exit tail-transfers to a computed continuation rather than
+        // returning to the caller, so it hands that target its computed register
+        // values and need not honour callee-save. The target is staged in its own
+        // slot and the region epilogue returns through it (see the build below).
+        let tail_transfer = exit.region;
         // Compute each output register's value and park it in that register's
         // shared result slot; the epilogue loads them all after the loop.
         let registers: Vec<(X64NativeRegister, Expr)> = exit
@@ -226,8 +232,13 @@ impl Ctx<'_> {
             .collect();
         for (register, expr) in &registers {
             // A nonvolatile register the body never clobbers keeps its entry
-            // value, so an exit that leaves it equal to entry needs no work.
-            if physical_for(register).is_win64_nonvolatile() && is_entry_value(expr, register) {
+            // value, so an exit that leaves it equal to entry needs no work --
+            // but only when it returns to the caller; a tail transfer hands every
+            // value on, so nothing is skipped.
+            if !tail_transfer
+                && physical_for(register).is_win64_nonvolatile()
+                && is_entry_value(expr, register)
+            {
                 continue;
             }
             let value = self.lower(expr)?;
@@ -240,7 +251,23 @@ impl Ctx<'_> {
                 source: value,
             });
         }
-        self.operations.push(Operation::Jump(self.epilogue));
+        if exit.region {
+            let target = exit
+                .continuation
+                .as_ref()
+                .ok_or_else(|| "region exit without a continuation target".to_owned())?;
+            let region_epilogue = self
+                .region_epilogue
+                .ok_or_else(|| "region exit but no region epilogue was reserved".to_owned())?;
+            let value = self.lower(target)?;
+            self.operations.push(Operation::SpillStore {
+                slot: self.continuation_slot,
+                source: value,
+            });
+            self.operations.push(Operation::Jump(region_epilogue));
+        } else {
+            self.operations.push(Operation::Jump(self.epilogue));
+        }
         Ok(())
     }
 
@@ -293,7 +320,12 @@ fn collect_exit_registers(node: &RNode, out: &mut BTreeMap<X64NativeRegister, ()
     match node {
         RNode::Exit(exit) => {
             for (register, expr) in &exit.registers {
-                if !(physical_for(register).is_win64_nonvolatile() && is_entry_value(expr, register))
+                // A region exit tail-transfers, so it writes every register (it
+                // keeps nothing for the caller); a normal exit may skip a
+                // nonvolatile it leaves at its entry value. Must match emit_exit.
+                if exit.region
+                    || !(physical_for(register).is_win64_nonvolatile()
+                        && is_entry_value(expr, register))
                 {
                     out.insert(*register, ());
                 }
@@ -307,6 +339,18 @@ fn collect_exit_registers(node: &RNode, out: &mut BTreeMap<X64NativeRegister, ()
         }
         RNode::Loop { body, .. } => collect_exit_registers(body, out),
         RNode::BackEdge { .. } | RNode::Dead(_) => {}
+    }
+}
+
+/// Whether any exit in the tree is a region (staged-continuation) exit, which
+/// needs a continuation slot and the transfer epilogue reserved up front.
+fn tree_has_region_exit(node: &RNode) -> bool {
+    match node {
+        RNode::Stores { next, .. } => tree_has_region_exit(next),
+        RNode::Fork { arms, .. } => arms.iter().any(|(_, arm)| tree_has_region_exit(arm)),
+        RNode::Exit(exit) => exit.region,
+        RNode::Loop { body, .. } => tree_has_region_exit(body),
+        RNode::BackEdge { .. } | RNode::Dead(_) => false,
     }
 }
 
@@ -436,7 +480,13 @@ pub fn build_control_flow_replacement(
         result_slots.insert(*register, slot);
     }
     let result_count = u16::try_from(result_slots.len()).map_err(|_| "too many results".to_owned())?;
-    let park_base = input_count + phi_count + result_count;
+    // A region (staged-continuation) exit stages its computed target in a slot of
+    // its own, placed right after the result slots; the region epilogue returns
+    // through it. Reserved only when the tree actually has such an exit.
+    let has_region = tree_has_region_exit(cursor);
+    let continuation_slot = SpillSlot(input_count + phi_count + result_count);
+    let continuation_count = u16::from(has_region);
+    let park_base = input_count + phi_count + result_count + continuation_count;
     // Park region: [0] store value, [1] fork selector, [2..2+phis] back-edge temps.
     let park_size = 2 + phi_count;
     let shared_end = park_base + park_size;
@@ -486,6 +536,7 @@ pub fn build_control_flow_replacement(
 
     let header = vmpx_recompile::Label(0);
     let epilogue = vmpx_recompile::Label(1);
+    let region_epilogue = has_region.then(|| vmpx_recompile::Label(2));
     let mut ctx = Ctx {
         fold,
         config,
@@ -499,9 +550,11 @@ pub fn build_control_flow_replacement(
         assignments,
         next_register,
         trust: Trust::default(),
-        next_label: 2,
+        next_label: if has_region { 3 } else { 2 },
         epilogue,
         header,
+        region_epilogue,
+        continuation_slot,
     };
 
     // Pre-loop stores run once, before the header.
@@ -530,6 +583,23 @@ pub fn build_control_flow_replacement(
     }
     ctx.operations.push(Operation::Return);
 
+    // Region epilogue: load the result registers, then transfer through the
+    // staged continuation slot instead of returning. `ReturnRetaining` tears the
+    // frame down with a `lea` (not pops), leaving RSP pointing at the staged
+    // target, so the following `ret` jumps to it. The retained byte count is
+    // patched once the frame size is final.
+    let mut retain_index: Option<usize> = None;
+    if let Some(region_epilogue) = region_epilogue {
+        ctx.operations.push(Operation::Label(region_epilogue));
+        let result_slots = ctx.result_slots.clone();
+        for (register, slot) in &result_slots {
+            let destination = ctx.scratch(physical_for(register));
+            ctx.operations.push(Operation::SpillLoad { destination, slot: *slot });
+        }
+        retain_index = Some(ctx.operations.len());
+        ctx.operations.push(Operation::ReturnRetaining { bytes: 0 });
+    }
+
     // Size the frame to cover every spill slot the body references.
     let mut operations = ctx.operations;
     let max_slot = operations
@@ -539,12 +609,23 @@ pub fn build_control_flow_replacement(
         .max()
         .unwrap_or(0);
     let stack_allocation = (u32::from(max_slot) + 1) * 8;
+    // Patch the retained byte count: popping slot k (which sits k*8 above the
+    // body RSP) needs `stack_allocation - k*8` retained so the `lea` lands RSP on
+    // it. No preserved pushes here, so that is the whole total.
+    if let Some(index) = retain_index {
+        let offset = u32::from(continuation_slot.0) * 8;
+        let bytes = stack_allocation
+            .checked_sub(offset)
+            .filter(|bytes| *bytes >= 8)
+            .ok_or_else(|| "continuation slot outside the frame".to_owned())?;
+        operations[index] = Operation::ReturnRetaining { bytes };
+    }
     let frame = StackFrame {
         stack_allocation,
         preserve: Vec::new(),
         call_ready: false,
         preinitialized_slots: Vec::new(),
-        tail_transfer: false,
+        tail_transfer: has_region,
     };
     let function = vmpx_recompile::Function {
         operations,
@@ -610,5 +691,46 @@ mod tests {
         let bytes = build_control_flow_replacement(&root, &empty_config(), CodeAddress(0x1000), &fold)
             .expect("loop should compile");
         assert!(!bytes.is_empty(), "emitted code must be non-empty");
+    }
+
+    /// A loop whose exit is a region (staged-continuation) exit: it tail-transfers
+    /// to a computed target rather than returning. Previously refused; it must now
+    /// compile, staging the target and transferring through it.
+    #[test]
+    fn a_region_exit_in_a_loop_compiles() {
+        let counter = Expr::register(BitWidth::W64, "c");
+        let phi = RPhi {
+            name: "c".to_owned(),
+            width: BitWidth::W64,
+            init: Expr::constant(BitWidth::W64, 0),
+        };
+        // On exit, hand Rax = c and tail-transfer to the computed target (here the
+        // counter itself stands in for a recovered continuation address).
+        let exit = RNode::Exit(RExit {
+            registers: BTreeMap::from([(X64NativeRegister::Rax, counter.clone())]),
+            region: true,
+            continuation: Some(counter.clone()),
+        });
+        let back = RNode::BackEdge {
+            next: vec![
+                Expr::binary(BinaryOp::Add, counter.clone(), Expr::constant(BitWidth::W64, 1))
+                    .unwrap(),
+            ],
+        };
+        let fork = RNode::Fork {
+            selector: counter,
+            env: false,
+            block: Va(0),
+            arms: vec![(10, exit), (0, back)],
+        };
+        let root = RNode::Loop {
+            header: Va(0),
+            phis: vec![phi],
+            body: Box::new(fork),
+        };
+        let fold = |expr: &Expr| -> Result<Expr, String> { Ok(expr.clone()) };
+        let bytes = build_control_flow_replacement(&root, &empty_config(), CodeAddress(0x1000), &fold)
+            .expect("region-exit loop should compile");
+        assert!(!bytes.is_empty(), "region exit must emit native code");
     }
 }
