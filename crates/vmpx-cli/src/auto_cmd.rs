@@ -56,6 +56,28 @@ pub struct Options {
 const EXEC: u32 = 0x2000_0000;
 const RX: u32 = 0x6000_0020;
 
+/// Whether a section belongs to the protector rather than the original image.
+///
+/// VMProtect names its sections `.vmp0`/`.vmp1`/... in some builds but randomizes
+/// them to garbage (`.>QI`, `..O>`) in others, so identity cannot be a `.vmp`
+/// prefix match -- that overfits to the one sample. Instead a section is the
+/// protector's unless its name is one a normal toolchain emits. Our own rebuilt
+/// sections (`.vmpxdir`, `.vmpxdv`) are added only after the strip list is taken,
+/// so they never reach this test during discovery.
+fn is_protector_section(name: &str) -> bool {
+    // Known toolchain / loader sections (8-char truncations included, e.g.
+    // `.eh_frame` -> `.eh_fram`). A `.debug_*` or `.rsrc$xx` matches by prefix.
+    const STANDARD: &[&str] = &[
+        ".text", ".data", ".rdata", ".idata", ".edata", ".pdata", ".xdata",
+        ".bss", ".tls", ".reloc", ".rsrc", ".eh_fram", ".crt", ".gfids",
+        ".giats", ".00cfg", ".sxdata", ".debug", ".ndata", ".didat", ".drectve",
+    ];
+    if name.starts_with(".vmp") {
+        return true;
+    }
+    !STANDARD.iter().any(|s| name == *s || name.starts_with(s))
+}
+
 /// A protector reference the application's own code makes.
 struct Targets {
     /// VM entries reached from native code (guards) -> confidence.
@@ -72,7 +94,7 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
         pe.sections
             .iter()
             .find(|s| s.contains_mapped_rva(Rva(rva)))
-            .is_some_and(|s| s.name.as_str().starts_with(".vmp"))
+            .is_some_and(|s| is_protector_section(s.name.as_str()))
     };
     // `.pdata` extents plus every executable section's uncovered gaps.
     let mut ranges: Vec<(u32, u32)> = pe
@@ -91,7 +113,7 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
         }
     }
     for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
-        if section.name.as_str().starts_with(".vmp") {
+        if is_protector_section(section.name.as_str()) {
             continue;
         }
         let start = section.virtual_address.0;
@@ -117,7 +139,7 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
             .sections
             .iter()
             .find(|s| s.contains_mapped_rva(Rva(begin)))
-            .is_some_and(|s| s.name.as_str().starts_with(".vmp"));
+            .is_some_and(|s| is_protector_section(s.name.as_str()));
         if section_is_vmp {
             continue;
         }
@@ -165,6 +187,20 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
                     mark(q);
                 }
             }
+        }
+    }
+
+    // Seed every function the exception table places inside a protector section.
+    // The transfer scan above finds only functions reached by a direct call/jmp
+    // from scanned code; a mutated or virtualized function is often reached only
+    // indirectly, through the export table, or from inside the protector, so the
+    // scan misses it. `.pdata` still records its entry, so seeding from it lifts
+    // coverage from "directly reachable" to "every protector-resident function
+    // with unwind info".
+    for function in &pe.report().exception_functions {
+        let rva = function.begin.0;
+        if rva < soi && protector(rva) {
+            targets.insert(rva);
         }
     }
 
@@ -754,7 +790,7 @@ pub fn run(o: Options) -> Result<(), String> {
         .sections
         .iter()
         .map(|s| s.name.as_str())
-        .filter(|n| n.starts_with(".vmp"))
+        .filter(|n| is_protector_section(n))
         .collect();
     let removed_owned: Vec<String> = removed.iter().map(|s| (*s).to_owned()).collect();
     log.trace("removing sections", &removed.join(", "));
@@ -1672,6 +1708,22 @@ fn devirt_guards(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protector_sections_are_identified_by_exclusion_not_name() {
+        // Toolchain sections are never the protector's, including 8-char
+        // truncations and prefixed families.
+        for ok in [
+            ".text", ".data", ".rdata", ".pdata", ".xdata", ".reloc", ".bss",
+            ".tls", ".edata", ".idata", ".eh_fram", ".debug_info", ".rsrc",
+        ] {
+            assert!(!is_protector_section(ok), "{ok} is a normal section");
+        }
+        // VMProtect: both the `.vmp` builds and the randomized-name retail builds.
+        for vmp in [".vmp0", ".vmp1", ".vmp2", ".>QI", "..O>", ".D|s", ".AG'"] {
+            assert!(is_protector_section(vmp), "{vmp} is a protector section");
+        }
+    }
 
     const BASE: u64 = 0x1_4000_0000;
     const GUARD_RVA: u32 = 0xc6f2115; // far enough to force a rel32 branch
