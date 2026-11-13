@@ -367,8 +367,25 @@ fn submasks(observed: u64, limits: InputDomainLimits) -> Option<Vec<u64>> {
 pub fn abstract_epoch_loads(expr: &Expr) -> Result<Expr, crate::ExprError> {
     expr.rewrite_intrinsics(&mut |width, name, arguments| {
         (name.starts_with("memory_load_epoch_") && arguments.len() == 1)
-            .then(|| Expr::register(width, format!("{name}@{arguments:?}")))
+            .then(|| Expr::register(width, format!("{name}@{:032x}", arguments_identity(arguments))))
     })
+}
+
+/// A bounded 128-bit identity of an intrinsic's arguments, used to name the free
+/// variable one abstracts to. Expressions are hash-consed, so each argument's
+/// `Hash` reads a precomputed per-node hash in O(1) -- there is no walk of the
+/// shared DAG. Debug-formatting them instead expands that DAG into a tree, which
+/// on a pathological input reached tens of gigabytes and aborted the process.
+/// 128 bits makes a collision (which would wrongly merge two distinct reads)
+/// negligible for any realistic function.
+fn arguments_identity(arguments: &[Expr]) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut high = std::collections::hash_map::DefaultHasher::new();
+    arguments.hash(&mut high);
+    let mut low = std::collections::hash_map::DefaultHasher::new();
+    0x9E37_79B9_7F4A_7C15_u64.hash(&mut low);
+    arguments.hash(&mut low);
+    (u128::from(high.finish()) << 64) | u128::from(low.finish())
 }
 
 /// The inverse of [`abstract_epoch_loads`], for reads that already observe every
@@ -408,7 +425,10 @@ pub const OPAQUE_STATE_PREFIX: &str = "__opaque_state@";
 pub fn abstract_opaque_intrinsics(expression: &Expr) -> Result<Expr, crate::ExprError> {
     expression.rewrite_intrinsics(&mut |width, name, arguments| {
         (!crate::is_pure_intrinsic(name)).then(|| {
-            Expr::register(width, format!("{OPAQUE_STATE_PREFIX}{name}@{arguments:?}"))
+            Expr::register(
+                width,
+                format!("{OPAQUE_STATE_PREFIX}{name}@{:032x}", arguments_identity(arguments)),
+            )
         })
     })
 }
@@ -481,8 +501,8 @@ fn opaque_fill(seed: u64, name: &str, arguments: &[Expr]) -> u64 {
     for byte in name.as_bytes() {
         absorb(*byte);
     }
-    for byte in format!("{arguments:?}").as_bytes() {
-        absorb(*byte);
+    for byte in arguments_identity(arguments).to_le_bytes() {
+        absorb(byte);
     }
     hash
 }
