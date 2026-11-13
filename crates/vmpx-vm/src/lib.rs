@@ -636,6 +636,20 @@ fn analyze_stub(
             ),
         );
     }
+    // A near-full save of the general registers is the VM capturing the entire
+    // native state before it begins interpreting -- pushad-style, which compiled
+    // code never does. It is near-conclusive on its own, so it earns extra credit
+    // beyond the >= 8 band; without it a build whose bootstrap reserves its frame
+    // in a shape the stack/dispatch checks miss can save all 13 registers and
+    // still fall short of the VM-entry bar.
+    if features.pushed_registers.len() >= 12 {
+        add_evidence(
+            &mut candidate,
+            &mut score,
+            10,
+            "downstream chain captures nearly the full native register file",
+        );
+    }
     if features.pushes_flags {
         add_evidence(
             &mut candidate,

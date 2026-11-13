@@ -122,9 +122,10 @@ fn discovers_synthetic_vm_entry() {
         .expect("direct analysis");
     assert_eq!(direct.seed, entry.seed);
     assert_eq!(direct.bootstrap_rva, entry.bootstrap_rva);
-    // Direct analysis is never loader-reachable, so it lacks the 10-point root bonus.
+    // Direct analysis is never loader-reachable, so it lacks the 10-point root
+    // bonus. Confidence saturates at 100, so compare the bonus under that cap.
     assert_eq!(direct.source, VmEntrySource::ExecutableScan);
-    assert_eq!(direct.confidence + 10, entry.confidence);
+    assert_eq!((direct.confidence + 10).min(100), entry.confidence);
 }
 
 #[test]
