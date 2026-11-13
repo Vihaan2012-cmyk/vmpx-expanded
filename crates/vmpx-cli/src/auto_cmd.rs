@@ -1742,11 +1742,14 @@ fn devirt_guards(
     // faults -- and each guard can hold up to ~1.5 GiB of symbolic state, so the
     // thread count is capped to keep the peak within RAM. VMPX_GUARD_THREADS
     // overrides the cap.
+    // Actual per-guard memory is ~100 MiB (the 1.5 GiB figure is a rarely-hit
+    // self-limit), so most cores can run concurrently; a little headroom is left
+    // for the occasional heavy guard. VMPX_GUARD_THREADS overrides.
     let thread_count = std::env::var("VMPX_GUARD_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
-        .unwrap_or_else(|| rayon::current_num_threads().min(8));
+        .unwrap_or_else(|| rayon::current_num_threads().saturating_sub(2).max(1));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .stack_size(1 << 30)
