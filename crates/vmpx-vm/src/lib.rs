@@ -506,6 +506,64 @@ fn follow_direct_thunk(pe: &PeImage<'_>, mut rva: Rva, max_hops: usize) -> Rva {
     rva
 }
 
+/// What the entry prologue reveals before it transfers into the VM bootstrap.
+struct Prologue {
+    /// The first immediate pushed before the bootstrap call: the VM seed.
+    seed: Option<u64>,
+    /// The target of the first direct call the prologue reaches: the bootstrap.
+    call_target: Option<Rva>,
+}
+
+/// Parse an entry prologue tolerant of mutation. A clean VMProtect entry is
+/// `push seed; call bootstrap`, but Ultra (mutate-then-virtualize) scatters junk
+/// across the entry, so the seed push and bootstrap call are no longer the first
+/// two instructions. Walk fall-through (and single direct jumps, the mutation
+/// trampolines) up to a bounded instruction count, take the first immediate push
+/// as the seed, and stop at the first direct call -- the bootstrap. Any other
+/// control-flow break (conditional branch, return, indirect transfer) ends the
+/// prologue. This keeps the clean case exact (seed at 0, call at 1) while
+/// recovering the same skeleton through intervening obfuscation.
+fn scan_prologue(pe: &PeImage<'_>, rva: Rva) -> Prologue {
+    const MAX_INSNS: usize = 64;
+    let mut cursor = rva;
+    let mut seed = None;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_INSNS {
+        if !seen.insert(cursor) {
+            break;
+        }
+        let Ok(decoded) = decode_one(pe, cursor) else {
+            break;
+        };
+        if seed.is_none() && decoded.instruction.mnemonic() == Mnemonic::Push {
+            if let Some(value) = immediate(&decoded) {
+                seed = Some(value);
+            }
+        }
+        match decoded.instruction.flow_control() {
+            FlowControl::Call => {
+                return Prologue {
+                    seed,
+                    call_target: decoded.direct_target_rva(pe),
+                };
+            }
+            FlowControl::UnconditionalBranch => match decoded.direct_target_rva(pe) {
+                Some(target) => cursor = target,
+                None => break,
+            },
+            FlowControl::Next => match decoded.next_rva() {
+                Some(next) => cursor = next,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    Prologue {
+        seed,
+        call_target: None,
+    }
+}
+
 fn analyze_stub(
     pe: &PeImage<'_>,
     rva: Rva,
@@ -543,32 +601,26 @@ fn analyze_stub(
     ) {
         add_evidence(&mut candidate, &mut score, 10, "loader-reachable root");
     }
-    if first.instruction.mnemonic() != Mnemonic::Push {
-        candidate.confidence = u8::try_from(score).unwrap_or(u8::MAX);
-        return Some(candidate);
-    }
-    candidate.seed = immediate(&first);
-    if candidate.seed.is_some() {
+    let prologue = scan_prologue(pe, rva);
+    candidate.seed = prologue.seed;
+    if prologue.seed.is_some() {
         add_evidence(
             &mut candidate,
             &mut score,
             15,
-            "entry begins by pushing an immediate seed",
+            "prologue pushes an immediate seed",
         );
     }
-    let second_rva = first.next_rva()?;
-    let second = decode_one(pe, second_rva).ok()?;
-    if second.instruction.flow_control() != FlowControl::Call {
+    let Some(target) = prologue.call_target else {
         candidate.confidence = u8::try_from(score).unwrap_or(u8::MAX);
         return Some(candidate);
-    }
-    let target = second.direct_target_rva(pe)?;
+    };
     candidate.call_target = Some(target);
     add_evidence(
         &mut candidate,
         &mut score,
         15,
-        format!("seed is followed by a direct call to executable RVA {target}"),
+        format!("prologue reaches a direct call to executable RVA {target}"),
     );
     let features = chain_cache
         .entry(target)
