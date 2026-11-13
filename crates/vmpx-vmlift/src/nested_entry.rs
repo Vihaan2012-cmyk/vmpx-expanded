@@ -4,7 +4,7 @@
 //! not that entry's native frame, which composing its state needs. A resolver
 //! supplies it, and the lift cross-checks it against the CFG's nested block.
 
-use vmpx_pe::{PeImage, Va};
+use vmpx_pe::{PeImage, Rva, Va};
 use vmpx_vm::{
     EntryProfileRecoveryLimits, ExprKind, NativeFrameSource, nested_entry_stub, recover_entry_stream,
 };
@@ -27,6 +27,12 @@ pub struct NestedEntry {
 pub trait NestedEntryResolver {
     /// The entry a VM exit returns into, proven from its return address.
     fn resolve(&self, return_address: &vmpx_vm::Expr) -> Option<NestedEntry>;
+
+    /// The entry whose stub is at `rva` -- a return address the CFG walk already
+    /// resolved. The lift uses this when the walk recorded the resolution, so it
+    /// does not have to re-derive it from a return address its own (less
+    /// concretized) state leaves symbolic.
+    fn resolve_by_rva(&self, rva: Rva) -> Option<NestedEntry>;
 }
 
 /// Resolves a constant return address that is a VM entry stub of the image.
@@ -57,6 +63,11 @@ impl NestedEntryResolver for PeNestedEntries<'_, '_> {
             }
             report.targets[0].rva?
         };
+        self.resolve_by_rva(rva)
+    }
+
+    fn resolve_by_rva(&self, rva: Rva) -> Option<NestedEntry> {
+        let base = self.pe.optional.image_base;
         let (frame_entry, candidate) = nested_entry_stub(self.pe, rva)?;
         let stream = recover_entry_stream(self.pe, &candidate, self.limits).ok()?;
         let (frame, top_offset) = recover_entry_frame(

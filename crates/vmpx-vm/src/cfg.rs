@@ -557,6 +557,11 @@ pub struct VmCfg {
     /// Diagnostic only. Such an entry is CFG-complete but not proven, so this
     /// names the condition standing between it and the proven tier.
     pub discharge_refusal: Option<String>,
+    /// For each block that exits into a nested VM entry, the stub RVA the walk
+    /// resolved its return address to. The CFG walk concretizes the image reads
+    /// the return address depends on; a later lift that re-derives it from a less
+    /// concretized state would not, so it reuses this resolution instead.
+    pub nested_entry_stubs: BTreeMap<Va, Rva>,
 }
 
 impl VmCfg {
@@ -4875,8 +4880,10 @@ impl Walker<'_, '_> {
             .filter(|report| report.complete && report.targets.len() == 1)
             .and_then(|report| report.targets[0].rva)
         };
-        let Some((frame_entry, candidate)) = target.and_then(|rva| nested_entry_stub(self.pe, rva))
-        else {
+        let Some(target_rva) = target else {
+            return;
+        };
+        let Some((frame_entry, candidate)) = nested_entry_stub(self.pe, target_rva) else {
             return;
         };
         let at = candidate.rva;
@@ -4967,6 +4974,9 @@ impl Walker<'_, '_> {
         };
         self.nested_followed += 1;
         self.nested_sites.insert(at);
+        // Record the resolution so a later lift reuses it rather than re-deriving
+        // the return address from a less concretized state (and failing).
+        self.cfg.nested_entry_stubs.insert(key, target_rva);
         self.add_edge(CfgEdge {
             from: key,
             to: setup.first_state.vip,
@@ -5512,6 +5522,7 @@ pub fn recover_vm_cfg_with_observed(
             frame_note,
             assumptions: BTreeSet::new(),
             discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
         },
         total_instructions: 0,
         live_bytes: 0,
@@ -5774,6 +5785,7 @@ mod tests {
                 frame_note: None,
                 assumptions: BTreeSet::new(),
             discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
             },
             total_instructions: 0,
             live_bytes: 0,
@@ -6535,6 +6547,7 @@ mod tests {
             frame_note: None,
             assumptions: BTreeSet::new(),
             discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
         }
     }
 

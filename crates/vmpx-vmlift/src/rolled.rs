@@ -704,9 +704,14 @@ impl Walker<'_, '_> {
                         let resolver = self.nested.ok_or("exit re-enters a nested VM entry")?;
                         let exit = vmpx_vm::recover_native_exit_state(&report, layout)
                             .map_err(|e| format!("nested exit state unrecovered: {e}"))?;
-                        let entry = resolver
-                            .resolve(&exit.return_address)
-                            .ok_or("the nested VM entry is not provably resolved")?;
+                        // Prefer the stub RVA the CFG walk resolved for this block:
+                        // it concretized the image reads the return address depends
+                        // on, while this re-execution leaves them symbolic.
+                        let entry = match self.input.cfg.nested_entry_stubs.get(&key) {
+                            Some(rva) => resolver.resolve_by_rva(*rva),
+                            None => resolver.resolve(&exit.return_address),
+                        }
+                        .ok_or("the nested VM entry is not provably resolved")?;
                         if cfg.blocks.get(&to).and_then(|b| b.address) != Some(entry.bytecode_start) {
                             return Err("the resolved nested entry is not the CFG's nested block".to_owned());
                         }
