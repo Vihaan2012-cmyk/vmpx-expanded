@@ -103,8 +103,12 @@ impl<'a> At<'a> {
     }
 
     /// A NUL-terminated string, capped so a missing terminator cannot run away.
+    /// The cap must clear a real symbol name: deeply-monomorphized Rust v0
+    /// mangled exports (nested generics) run past 1 KiB -- a380_systems has
+    /// export names over 1080 bytes -- so the bound is sized for those, not for
+    /// a plain identifier.
     fn string(&self, rva: Rva) -> Result<Vec<u8>, DirectoryRelocateError> {
-        const LIMIT: usize = 1024;
+        const LIMIT: usize = 16 * 1024;
         let offset = self
             .pe
             .rva_to_file_offset(rva)
