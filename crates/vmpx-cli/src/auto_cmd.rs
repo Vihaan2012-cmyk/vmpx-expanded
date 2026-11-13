@@ -86,15 +86,53 @@ struct Targets {
     natives: Vec<u32>,
 }
 
+/// Protector-named sections that are really relocated application code, kept in
+/// place rather than stripped. VMProtect can rename `.text` and move application
+/// functions into the renamed section; such a section is pure executable code
+/// (the `.text` characteristics) that the exception table densely describes, and
+/// its functions already work at their RVAs and reference only retained sections,
+/// so removing it and relocating 1000+ functions is both unnecessary and fragile.
+/// The opaque protector sections -- VM runtime, bytecode, the rebuilt IAT -- are
+/// not pure code and stay removable.
+fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
+    const PURE_CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    const DENSE: usize = 64;
+    let mut pdata: BTreeMap<usize, usize> = BTreeMap::new();
+    for function in &pe.report().exception_functions {
+        if let Some(section) = pe
+            .sections
+            .iter()
+            .find(|s| s.contains_mapped_rva(function.begin))
+        {
+            *pdata.entry(section.index).or_default() += 1;
+        }
+    }
+    pe.sections
+        .iter()
+        .filter(|s| {
+            is_protector_section(s.name.as_str())
+                && s.characteristics == PURE_CODE
+                && pdata.get(&s.index).copied().unwrap_or(0) >= DENSE
+        })
+        .map(|s| s.name.as_str().to_owned())
+        .collect()
+}
+
 /// Every protector address the application's `.text` transfers into, classified.
 fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
     let base = pe.optional.image_base.0;
     let soi = pe.optional.size_of_image;
-    let protector = |rva: u32| {
+    // Relocated application code (e.g. a renamed `.text`) is retained in place, so
+    // only a reference into a *removed* protector section needs an action: a
+    // transfer into retained code already resolves.
+    let retained = retained_protector_sections(pe);
+    let removed_target = |rva: u32| {
         pe.sections
             .iter()
             .find(|s| s.contains_mapped_rva(Rva(rva)))
-            .is_some_and(|s| is_protector_section(s.name.as_str()))
+            .is_some_and(|s| {
+                is_protector_section(s.name.as_str()) && !retained.contains(s.name.as_str())
+            })
     };
     // `.pdata` extents plus every executable section's uncovered gaps.
     let mut ranges: Vec<(u32, u32)> = pe
@@ -160,7 +198,7 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
             let mut mark = |va: u64| {
                 if let Some(rva) = va.checked_sub(base).and_then(|v| u32::try_from(v).ok())
                     && rva < soi
-                    && protector(rva)
+                    && removed_target(rva)
                 {
                     targets.insert(rva);
                 }
@@ -199,7 +237,7 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
     // with unwind info".
     for function in &pe.report().exception_functions {
         let rva = function.begin.0;
-        if rva < soi && protector(rva) {
+        if rva < soi && removed_target(rva) {
             targets.insert(rva);
         }
     }
@@ -816,11 +854,15 @@ pub fn run(o: Options) -> Result<(), String> {
         vmpx_rebuild::relayout_conventional(&bytes).map_err(|e| format!("relayout: {e}"))?;
     log.step("conventional layout", "file-aligned on-disk image");
     let laid = PeImage::parse(&conventional).map_err(|e| e.to_string())?;
+    // Remove the protector's own sections, but keep any it filled with relocated
+    // application code -- those stay in place; stripping them would force a
+    // fragile relocation of every function they hold.
+    let retained = retained_protector_sections(&laid);
     let removed: Vec<&str> = laid
         .sections
         .iter()
         .map(|s| s.name.as_str())
-        .filter(|n| is_protector_section(n))
+        .filter(|n| is_protector_section(n) && !retained.contains(*n))
         .collect();
     let removed_owned: Vec<String> = removed.iter().map(|s| (*s).to_owned()).collect();
     log.trace("removing sections", &removed.join(", "));
