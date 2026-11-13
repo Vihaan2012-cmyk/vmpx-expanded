@@ -1737,35 +1737,56 @@ fn devirt_guards(
     // bytes depend on -- is known before building, which is what lets the builds
     // run independently. A body that overflows its slot is left residual.
     const SLOT_STRIDE: u32 = 0x1_0000;
+    // Guard recovery recurses deeply (the serial path ran it on a 1 GiB stack),
+    // so the worker threads need a big stack too or they overflow and the process
+    // faults -- and each guard can hold up to ~1.5 GiB of symbolic state, so the
+    // thread count is capped to keep the peak within RAM. VMPX_GUARD_THREADS
+    // overrides the cap.
+    let thread_count = std::env::var("VMPX_GUARD_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| rayon::current_num_threads().min(16));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .stack_size(1 << 30)
+        .build()
+        .map_err(|e| format!("guard thread pool: {e}"))?;
     log.step(
         "building",
-        &format!("{} guard(s) across cores (fixed 64 KiB slots)", guards.len()),
+        &format!(
+            "{} guard(s) across {thread_count} thread(s), fixed 64 KiB slots",
+            guards.len()
+        ),
     );
     // Recover and emit every guard in parallel: VM CFG recovery is independent
     // per guard and is the whole cost, so this scales across the machine.
-    let built: Vec<(usize, u32, Result<Vec<u8>, String>)> = guards
-        .par_iter()
-        .enumerate()
-        .map(|(index, &rva)| {
-            let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
-            let va = base + u64::from(new_rva);
-            // Escalate a guard's budget only when more budget can actually help
-            // (CFG building exhausted its budget); a structural stall returns the
-            // same result at any budget, so retrying it only burns time.
-            let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
-            let mut used = instruction_limit;
-            while let Err(reason) = &result {
-                let budget_bound =
-                    reason.contains("limit hit: Some") || reason.contains("budget exhausted");
-                if !budget_bound || used >= 65536 {
-                    break;
+    let built: Vec<(usize, u32, Result<Vec<u8>, String>)> = pool.install(|| {
+        guards
+            .par_iter()
+            .enumerate()
+            .map(|(index, &rva)| {
+                let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
+                let va = base + u64::from(new_rva);
+                // Escalate a guard's budget only when more budget can actually
+                // help (CFG building exhausted its budget); a structural stall
+                // returns the same result at any budget, so retrying only burns
+                // time.
+                let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
+                let mut used = instruction_limit;
+                while let Err(reason) = &result {
+                    let budget_bound =
+                        reason.contains("limit hit: Some") || reason.contains("budget exhausted");
+                    if !budget_bound || used >= 65536 {
+                        break;
+                    }
+                    used *= 2;
+                    result = crate::devirt_cmd::build_one(intact, rva, used, va);
                 }
-                used *= 2;
-                result = crate::devirt_cmd::build_one(intact, rva, used, va);
-            }
-            (index, rva, result)
-        })
-        .collect();
+                (index, rva, result)
+            })
+            .collect()
+    });
 
     let mut payload: Vec<u8> = Vec::new();
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
