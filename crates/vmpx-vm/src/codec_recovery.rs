@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use iced_x86::{InstructionInfoFactory, Register};
 use serde::Serialize;
@@ -345,7 +346,57 @@ fn resume_after_role_restore(
 }
 
 
+/// Process-global memo of handler-codec recoveries. Every guard of one VM
+/// re-recovers the same handlers, and the recovery is a deterministic function
+/// of the handler's bytes and config, so caching it lets guards after the first
+/// skip it (worth minutes across a thousand-guard image). The key is a content
+/// hash of the handler's bytes, not its address, so two different images that
+/// happen to share a base and RVA never alias (the address-keyed version
+/// contaminated the synthetic-PE tests); the config is compared too. The `Mutex`
+/// makes it safe for the parallel guard devirtualization.
+type HandlerCodecMemo =
+    HashMap<u64, (HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport)>;
+static HANDLER_CODEC_MEMO: OnceLock<Mutex<HandlerCodecMemo>> = OnceLock::new();
+
+/// A cheap FNV-1a hash of up to 1 KiB of the handler's bytes, enough to tell
+/// distinct handlers apart. `None` when the bytes are not addressable.
+fn handler_content_key(pe: &PeImage<'_>, entry: Rva) -> Option<u64> {
+    let offset = pe.rva_to_file_offset(entry).ok()?.0 as usize;
+    let bytes = pe.data().get(offset..(offset + 1024).min(pe.data().len()))?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    // Fold the RVA in so two identical byte windows at different addresses (a
+    // handler and its padding-identical neighbour) stay distinct.
+    Some(hash ^ u64::from(entry.0))
+}
+
 pub fn recover_handler_codecs(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    config: &HandlerCodecRecoveryConfig,
+) -> Result<HandlerCodecRecoveryReport, DisasmError> {
+    let key = handler_content_key(pe, entry);
+    let memo = HANDLER_CODEC_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(key) = key
+        && let Ok(cache) = memo.lock()
+        && let Some((cached_config, report)) = cache.get(&key)
+        && cached_config == config
+    {
+        return Ok(report.clone());
+    }
+    let report = recover_handler_codecs_inner(pe, entry, config)?;
+    if let Some(key) = key
+        && let Ok(mut cache) = memo.lock()
+    {
+        cache.insert(key, (config.clone(), report.clone()));
+    }
+    Ok(report)
+}
+
+fn recover_handler_codecs_inner(
     pe: &PeImage<'_>,
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,
