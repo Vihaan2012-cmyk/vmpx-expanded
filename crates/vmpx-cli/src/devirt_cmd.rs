@@ -335,6 +335,7 @@ pub(crate) fn build_one(
                     (name.starts_with("memory_load_epoch_") && args.len() == 1)
                         .then(|| Expr::load(width, args[0].clone()))
                 })
+                .map(|expression| expression.fold_reads_through_register("exception_context"))
                 .map_err(|error| format!("rewrite memory_load_epoch: {error}"))
         };
         // A fixed-iteration checksum loop collapses to a flat constant exit state
@@ -405,7 +406,9 @@ pub(crate) fn build_one(
             })
             .map_err(|error| format!("rewrite memory_load_epoch: {error}"))?;
         let _ = unresolved; // build_replacement is the judge of remaining intrinsics
-        Ok(rewritten)
+        // Neutralize anti-debug CONTEXT reads to their clean-run value so the
+        // function lowers instead of failing on the unmapped symbolic base.
+        Ok(rewritten.fold_reads_through_register("exception_context"))
     };
 
     // Concretize every legit path. The forks here are checksum-tamper gates:
@@ -504,6 +507,7 @@ pub(crate) fn build_one(
                     (name.starts_with("memory_load_epoch_") && args.len() == 1)
                         .then(|| Expr::load(width, args[0].clone()))
                 })
+                .map(|expression| expression.fold_reads_through_register("exception_context"))
                 .map_err(|error| format!("rewrite memory_load_epoch: {error}"))
         };
         let config = ReplacementConfig {

@@ -607,6 +607,61 @@ impl Expr {
         self.rw_memo(rewrite, &mut HashMap::default())
     }
 
+    /// Folds every memory read whose address depends on `register` to zero.
+    ///
+    /// VMProtect's anti-debug guards read the OS-supplied exception CONTEXT (the
+    /// debug registers Dr0-Dr3, ContextFlags) through a base the recovery binds
+    /// to a symbolic register (`exception_context`). On a clean run -- the only
+    /// run a devirtualized image has -- those fields read zero (no hardware
+    /// breakpoints set), so the check takes its pass path. Folding the reads to
+    /// zero emits that clean-run behaviour: the same anti-debug neutralization
+    /// the residual-guard stage applies, done at the expression level so the
+    /// surrounding function still lowers instead of failing on an unmapped input.
+    #[must_use]
+    pub fn fold_reads_through_register(&self, register: &str) -> Self {
+        let rebuilt = match &self.kind {
+            ExprKind::Const { .. } | ExprKind::Register { .. } => self.clone(),
+            ExprKind::Load { address } => {
+                if address.dependencies().contains(register) {
+                    Self::constant(self.width, 0)
+                } else {
+                    Self::load(self.width, address.fold_reads_through_register(register))
+                }
+            }
+            ExprKind::Unary { op, value } => {
+                Self::unary(*op, value.fold_reads_through_register(register))
+            }
+            ExprKind::Binary { op, left, right } => Self::binary(
+                *op,
+                left.fold_reads_through_register(register),
+                right.fold_reads_through_register(register),
+            )
+            .expect("width preserved: a read folds to a same-width constant"),
+            ExprKind::Intrinsic { name, arguments } => Self::intrinsic(
+                self.width,
+                name.clone(),
+                arguments
+                    .iter()
+                    .map(|argument| argument.fold_reads_through_register(register))
+                    .collect(),
+            ),
+            ExprKind::Extract { value, lsb } => {
+                Self::extract(self.width, *lsb, value.fold_reads_through_register(register))
+                    .expect("width preserved")
+            }
+            ExprKind::Concat { high, low } => Self::concat(
+                high.fold_reads_through_register(register),
+                low.fold_reads_through_register(register),
+            )
+            .expect("width preserved"),
+            ExprKind::Resize { op, value } => {
+                Self::resize(*op, self.width, value.fold_reads_through_register(register))
+                    .expect("width preserved")
+            }
+        };
+        rebuilt.simplify()
+    }
+
     fn sub_memo(
         &self,
         replacements: &BTreeMap<String, Self>,
