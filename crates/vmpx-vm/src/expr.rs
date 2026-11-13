@@ -1261,6 +1261,38 @@ fn simplify_mba(op: BinaryOp, left: &Expr, right: &Expr) -> Option<Expr> {
         } => Some((*op, l.as_ref().clone(), r.as_ref().clone())),
         _ => None,
     };
+    // (a & ~b) | (~a & b) == a ^ b. The and-or form of XOR; recognizing it keeps
+    // the simplifier from leaving a disjunction of masked complements where a
+    // single XOR belongs (and restores the collapse `mba_fold` relies on).
+    if op == BinaryOp::Or {
+        let strip_not = |e: &Expr| match &e.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                value,
+            } => Some(value.as_ref().clone()),
+            _ => None,
+        };
+        // An `And` where exactly one operand is a `Not`: returns (plain, inner).
+        let and_parts = |e: &Expr| -> Option<(Expr, Expr)> {
+            let (iop, a, b) = as_bin(e)?;
+            if iop != BinaryOp::And {
+                return None;
+            }
+            if let Some(inner) = strip_not(&a) {
+                return Some((b, inner));
+            }
+            if let Some(inner) = strip_not(&b) {
+                return Some((a, inner));
+            }
+            None
+        };
+        if let (Some((lp, ln)), Some((rp, rn))) = (and_parts(left), and_parts(right))
+            && lp == rn
+            && ln == rp
+        {
+            return Expr::binary(BinaryOp::Xor, lp, rp).ok();
+        }
+    }
     // Match `x OP (inner_l IOP inner_r)` for both operand orders; `other` is the
     // inner operand that is NOT `x`.
     for (x, inner) in [(left, right), (right, left)] {
@@ -1523,6 +1555,13 @@ mod tests {
                 // a | (a & b) == a  and  a & (a | b) == a
                 assert_eq!(evaluate_binary(BinaryOp::Or, w, a, and), a);
                 assert_eq!(evaluate_binary(BinaryOp::And, w, a, or), a);
+                // (a & ~b) | (~a & b) == a ^ b
+                let a_nb = evaluate_binary(BinaryOp::And, w, a, (!b) & m);
+                let na_b = evaluate_binary(BinaryOp::And, w, (!a) & m, b);
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Or, w, a_nb, na_b),
+                    evaluate_binary(BinaryOp::Xor, w, a, b),
+                );
             }
         }
     }
