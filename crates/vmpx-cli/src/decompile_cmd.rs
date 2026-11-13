@@ -92,8 +92,9 @@ pub(crate) struct Options {
 /// reaches (network, licensing, anti-debug, dynamic loading).
 fn image_symbols(pe: &PeImage<'_>) -> vmpx_decompile::symbols::Symbols {
     let report = pe.report();
-    vmpx_decompile::symbols::Symbols::from_imports(
-        report.optional.image_base.0,
+    let image_base = report.optional.image_base.0;
+    let mut symbols = vmpx_decompile::symbols::Symbols::from_imports(
+        image_base,
         report.imports.iter().map(|module| {
             (
                 module.name.clone(),
@@ -104,7 +105,21 @@ fn image_symbols(pe: &PeImage<'_>) -> vmpx_decompile::symbols::Symbols {
                     .collect::<Vec<_>>(),
             )
         }),
-    )
+    );
+    // A recovered code address is usually a tail-call to another export; name it.
+    if let Some(exports) = report.exports.as_ref() {
+        symbols.set_functions(
+            exports
+                .symbols
+                .iter()
+                .filter_map(|sym| {
+                    let name = sym.name.as_ref()?;
+                    Some((image_base + u64::from(sym.rva.0), short_name(name)))
+                })
+                .collect(),
+        );
+    }
+    symbols
 }
 
 pub(crate) fn run(o: Options) -> Result<()> {

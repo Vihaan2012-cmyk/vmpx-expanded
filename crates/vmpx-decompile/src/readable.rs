@@ -701,6 +701,8 @@ fn classify_constants(
     temps: &[(String, Expr)],
     prologue: &[Stmt],
     body: &[Stmt],
+    image_base: u64,
+    symbols: &Symbols,
 ) -> BTreeMap<u64, String> {
     let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
     let mut visit = |e: &Expr| xor_masks(e, &mut counts);
@@ -725,6 +727,41 @@ fn classify_constants(
                 format!("DECODE_KEY{}", i + 1)
             },
         );
+    }
+    // Hoist recurring large address/data constants into `data1`, `data2`, ...
+    // A checksum pointer or image offset read several times is far clearer as a
+    // named binding than the same 9-hex literal repeated through the equations.
+    let mut all: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut count_all = |e: &Expr| {
+        if let ExprKind::Const { value } = &e.kind {
+            *all.entry(*value).or_default() += 1;
+        }
+    };
+    for (_, def) in temps {
+        each_subexpr(def, &mut count_all);
+    }
+    for s in prologue.iter().chain(body) {
+        stmt_exprs(s, &mut count_all);
+    }
+    // A constant that is the entry of a known function is a code address -- a
+    // tail-call continuation. Name it after the function it reaches (no repeat
+    // threshold: a tail-call appears once), taking priority over `data_N`.
+    for &v in all.keys() {
+        if !out.contains_key(&v)
+            && let Some(func) = symbols.function_at(v)
+        {
+            out.insert(v, func.to_owned());
+        }
+    }
+    let mut data_ranked: Vec<(u64, usize)> = all
+        .into_iter()
+        .filter(|(v, c)| {
+            *v > 0xffff && *c >= 2 && !out.contains_key(v) && *v != image_base
+        })
+        .collect();
+    data_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (i, (v, _)) in data_ranked.into_iter().enumerate() {
+        out.insert(v, format!("data{}", i + 1));
     }
     out
 }
@@ -1235,8 +1272,8 @@ pub fn render_function(
     symbols: &Symbols,
 ) -> String {
     let d = Dialect::parse(dialect().as_deref().unwrap_or("")).unwrap_or(Dialect::Rust);
-    let consts = classify_constants(temps_order, prologue, body);
     let image_base = symbols.image_base();
+    let consts = classify_constants(temps_order, prologue, body, image_base, symbols);
 
     // Stage B: the argument that is a struct/context pointer becomes `ctx`. Only
     // in the readable path -- the C cross-check already ran on the original names.
@@ -1445,6 +1482,22 @@ mod tests {
             render(&Expr::constant(BitWidth::W64, 0x1_4000_0000), 0x1_4000_0000),
             "IMAGE_BASE"
         );
+    }
+
+    #[test]
+    fn a_code_address_is_named_after_the_function_it_reaches() {
+        let addr = 0x1_4000_2500u64;
+        let mut symbols = Symbols::default();
+        symbols.set_functions([(addr, "other_fn".to_owned())].into_iter().collect());
+        // A code address appears once (a tail-call), so without the function
+        // table it would stay a raw number; the table names it anyway.
+        let temps = vec![("t".to_owned(), Expr::constant(BitWidth::W64, addr))];
+        let consts = classify_constants(&temps, &[], &[], 0x1_4000_0000, &symbols);
+        assert_eq!(consts.get(&addr).map(String::as_str), Some("other_fn"));
+        // A large constant that is no known function and is used once stays raw.
+        let other = vec![("t".to_owned(), Expr::constant(BitWidth::W64, 0xdead_beef))];
+        let consts = classify_constants(&other, &[], &[], 0x1_4000_0000, &symbols);
+        assert_eq!(consts.get(&0xdead_beef), None);
     }
 
     #[test]

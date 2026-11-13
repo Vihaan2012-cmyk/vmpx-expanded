@@ -74,6 +74,9 @@ const DYNAMIC_LOAD_FUNCTIONS: [&str; 4] = [
 #[derive(Clone, Debug, Default)]
 pub struct Symbols {
     imports: BTreeMap<u64, String>,
+    /// Function virtual address -> a C-identifier name, so a recovered code
+    /// address (a tail-call continuation) can print as the function it reaches.
+    functions: BTreeMap<u64, String>,
     image_base: u64,
 }
 
@@ -98,8 +101,20 @@ impl Symbols {
         }
         Self {
             imports,
+            functions: BTreeMap::new(),
             image_base,
         }
+    }
+
+    /// Registers function virtual addresses by their (already C-identifier) name.
+    pub fn set_functions(&mut self, functions: BTreeMap<u64, String>) {
+        self.functions = functions;
+    }
+
+    /// The function whose entry is at `address`, if one is named there.
+    #[must_use]
+    pub fn function_at(&self, address: u64) -> Option<&str> {
+        self.functions.get(&address).map(String::as_str)
     }
 
     /// The image base the IR's absolute addresses are relative to, 0 if unknown.
