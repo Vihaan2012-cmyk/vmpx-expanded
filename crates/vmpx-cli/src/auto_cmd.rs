@@ -1702,6 +1702,35 @@ fn devirt_guards(
     guards: &[u32],
 ) -> Result<(Vec<u8>, Vec<u32>, Vec<(u32, u32, u32)>), String> {
     use rayon::prelude::*;
+    // Development subset: devirtualize only a handful of guards so an engine
+    // change can be tested in seconds instead of the whole image's minutes.
+    // VMPX_ONLY_ENTRIES=0xaaa,0xbbb keeps just those; VMPX_MAX_GUARDS=N keeps the
+    // first N. Unset (production), every guard is devirtualized as before.
+    let guards: Vec<u32> = {
+        let mut selected = guards.to_vec();
+        if let Ok(only) = std::env::var("VMPX_ONLY_ENTRIES") {
+            let wanted: BTreeSet<u32> = only
+                .split(',')
+                .filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .collect();
+            if !wanted.is_empty() {
+                selected.retain(|rva| wanted.contains(rva));
+            }
+        }
+        if let Ok(max) = std::env::var("VMPX_MAX_GUARDS")
+            && let Ok(max) = max.parse::<usize>()
+        {
+            selected.truncate(max);
+        }
+        if selected.len() != guards.len() {
+            log.step(
+                "guard subset",
+                &format!("{} of {} (dev knob)", selected.len(), guards.len()),
+            );
+        }
+        selected
+    };
+    let guards = guards.as_slice();
     let base = intact.optional.image_base.0;
     let section_rva = next_section_rva(&image).map_err(|e| e.to_string())?.0;
     // Each guard gets a fixed-stride slot so its final VA -- which the emitted
