@@ -583,6 +583,63 @@ impl LoweringContext<'_> {
         self.lower(&product)
     }
 
+    /// Lowers one half of a 64-bit wide multiply: emits the `mul`/`imul` whose
+    /// 128-bit product lands in RDX:RAX and reads back the requested half (RAX
+    /// low, RDX high). The narrower forms fit one qword and go through
+    /// `lower_wide_multiply`; only the 64-bit product is split this way.
+    fn lower_wide_multiply_half(
+        &mut self,
+        name: &str,
+        signed: bool,
+        half: MultiplyHalf,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "a wide multiply takes two operands"));
+        };
+        if left.width != BitWidth::W64
+            || right.width != BitWidth::W64
+            || expression.width != BitWidth::W64
+        {
+            return Err(malformed(name, "a 64-bit wide-multiply half is a qword"));
+        }
+        self.lower(left)?;
+        let left_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: left_slot,
+            source: accumulator(BitWidth::W64),
+        });
+        self.lower(right)?;
+        let right_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: right_slot,
+            source: accumulator(BitWidth::W64),
+        });
+        let low_slot = self.allocate_slot()?;
+        let high_slot = self.allocate_slot()?;
+        self.operations.push(Operation::WideMultiply {
+            signed,
+            width: native_width(BitWidth::W64),
+            left: left_slot,
+            right: right_slot,
+            out_low: low_slot,
+            out_high: high_slot,
+        });
+        let wanted = match half {
+            MultiplyHalf::Low => low_slot,
+            MultiplyHalf::High => high_slot,
+        };
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(BitWidth::W64),
+            slot: wanted,
+        });
+        for _ in 0..4 {
+            self.release_slot();
+        }
+        Ok(())
+    }
+
     /// Lowers a VM multiply-flag word by re-emitting the exact `mul`/`imul` the
     /// handler ran and reading its raw flags. `CF`/`OF` are defined by the
     /// product; the `SF`/`ZF`/`AF`/`PF` the ISA leaves undefined are reproduced by
@@ -974,6 +1031,35 @@ fn wide_multiply_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
     Some((signed, width))
 }
 
+/// Which half of the 128-bit product a 64-bit wide multiply names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MultiplyHalf {
+    Low,
+    High,
+}
+
+/// `x86_signed_multiply_w64_K_{low,high}` / `x86_unsigned_multiply_w64_K_{low,high}`:
+/// the 64-bit wide multiply's signedness and which half of the 128-bit product
+/// (RAX / RDX) this names. The narrower widths fit one qword and are handled by
+/// `wide_multiply_intrinsic`; only the 64-bit form splits into low/high.
+fn wide_multiply_half_intrinsic(name: &str) -> Option<(bool, MultiplyHalf)> {
+    let (signed, rest) = if let Some(rest) = name.strip_prefix("x86_signed_multiply_w64_") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix("x86_unsigned_multiply_w64_")?)
+    };
+    let mut parts = rest.split('_');
+    if !is_index(parts.next()?) {
+        return None;
+    }
+    let half = match parts.next()? {
+        "low" => MultiplyHalf::Low,
+        "high" => MultiplyHalf::High,
+        _ => return None,
+    };
+    parts.next().is_none().then_some((signed, half))
+}
+
 fn width_from_digits(text: &str) -> Option<BitWidth> {
     match text {
         "8" => Some(BitWidth::W8),
@@ -1152,6 +1238,8 @@ impl LoweringContext<'_> {
                     self.lower_shift_flags(name, shift, width, expression, arguments)?;
                 } else if let Some((signed, width)) = wide_multiply_intrinsic(name) {
                     self.lower_wide_multiply(name, signed, width, expression, arguments)?;
+                } else if let Some((signed, half)) = wide_multiply_half_intrinsic(name) {
+                    self.lower_wide_multiply_half(name, signed, half, expression, arguments)?;
                 } else if let Some((signed, width)) = multiply_flags_intrinsic(name) {
                     self.lower_multiply_flags(name, signed, width, expression, arguments)?;
                 } else if let Some((width, part)) = unsigned_divide_value_intrinsic(name) {
@@ -1822,6 +1910,32 @@ mod tests {
                 ],
             );
             lowers_to(&expression, iced_x86::Mnemonic::Div);
+        }
+    }
+
+    #[test]
+    fn wide_multiply_sixty_four_bit_halves_each_lower_to_a_mul() {
+        // The 128-bit product splits into _low (RAX) and _high (RDX); both halves
+        // are emitted by the same one-operand multiply.
+        for half in ["low", "high"] {
+            let operands = || {
+                vec![
+                    Expr::register(BitWidth::W64, "p"),
+                    Expr::constant(BitWidth::W64, 3),
+                ]
+            };
+            let unsigned = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_unsigned_multiply_w64_7_{half}"),
+                operands(),
+            );
+            lowers_to(&unsigned, iced_x86::Mnemonic::Mul);
+            let signed = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_signed_multiply_w64_7_{half}"),
+                operands(),
+            );
+            lowers_to(&signed, iced_x86::Mnemonic::Imul);
         }
     }
 

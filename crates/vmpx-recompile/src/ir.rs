@@ -337,6 +337,19 @@ pub enum Operation {
         out_remainder: SpillSlot,
         out_flags: SpillSlot,
     },
+    /// One-operand `MUL`/`IMUL` of two width-sized frame slots, writing the
+    /// double-width product's low and high halves (`RAX` and `RDX` after the
+    /// instruction) to two qword frame slots. Register-transparent: `RAX`/`RDX`
+    /// are saved and restored around it. The flags it leaves are discarded (a VM
+    /// that needs them emits a separate `MultiplyFlags`).
+    WideMultiply {
+        signed: bool,
+        width: Width,
+        left: SpillSlot,
+        right: SpillSlot,
+        out_low: SpillSlot,
+        out_high: SpillSlot,
+    },
 }
 
 /// One lowered function and the allocation/frame facts required to emit it.

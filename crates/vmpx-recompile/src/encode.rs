@@ -509,6 +509,38 @@ fn emit_multiply_flags(
     assembler.pop(rax)
 }
 
+/// Emits a one-operand `MUL`/`IMUL` of two width-sized frame slots, writing the
+/// double-width product's low (`RAX`) and high (`RDX`) halves to qword slots.
+/// `RAX`/`RDX` hold the product, so both are saved first and displacements are
+/// rebased by the sixteen saved bytes. Only the 64-bit form is emitted (the VM
+/// names narrower products as a single value, lowered without this operation).
+fn emit_wide_multiply(
+    assembler: &mut CodeAssembler,
+    signed: bool,
+    width: Width,
+    left: i32,
+    right: i32,
+    out_low: i32,
+    out_high: i32,
+) -> Result<(), iced_x86::IcedError> {
+    const SAVED: i32 = 16;
+    assembler.push(rax)?;
+    assembler.push(rdx)?;
+    // 64-bit `mul/imul r/m64` leaves the product in RDX:RAX; a narrower op would
+    // not zero the upper halves, so this operation is only built for W64.
+    let _ = width;
+    assembler.mov(rax, qword_ptr(rsp + (left + SAVED)))?;
+    if signed {
+        assembler.imul(qword_ptr(rsp + (right + SAVED)))?;
+    } else {
+        assembler.mul(qword_ptr(rsp + (right + SAVED)))?;
+    }
+    assembler.mov(qword_ptr(rsp + (out_low + SAVED)), rax)?;
+    assembler.mov(qword_ptr(rsp + (out_high + SAVED)), rdx)?;
+    assembler.pop(rdx)?;
+    assembler.pop(rax)
+}
+
 /// Emits an unsigned one-operand `DIV` of the double-width dividend `high:low`
 /// by `divisor` (all width-sized frame slots), writing the quotient, remainder
 /// and raw `RFLAGS` to frame slots, without disturbing any general register.
@@ -1249,6 +1281,25 @@ pub fn compile(
                 let out_flags = spill_displacement(&function.frame, *out_flags)?;
                 append_assembled(&mut output, address, operation_index, |assembler| {
                     emit_multiply_flags(assembler, *signed, *width, left, right, out_flags)
+                })?;
+            }
+            Operation::WideMultiply {
+                signed,
+                width,
+                left,
+                right,
+                out_low,
+                out_high,
+            } => {
+                if *width != Width::W64 {
+                    return Err(CompileError::UnsupportedWidth { width: *width });
+                }
+                let left = spill_displacement(&function.frame, *left)?;
+                let right = spill_displacement(&function.frame, *right)?;
+                let out_low = spill_displacement(&function.frame, *out_low)?;
+                let out_high = spill_displacement(&function.frame, *out_high)?;
+                append_assembled(&mut output, address, operation_index, |assembler| {
+                    emit_wide_multiply(assembler, *signed, *width, left, right, out_low, out_high)
                 })?;
             }
             Operation::UnsignedDivide {

@@ -389,6 +389,21 @@ impl Renamer {
                 out_remainder: self.slot(out_remainder)?,
                 out_flags: self.slot(out_flags)?,
             },
+            Operation::WideMultiply {
+                signed,
+                width,
+                left,
+                right,
+                out_low,
+                out_high,
+            } => Operation::WideMultiply {
+                signed,
+                width,
+                left: self.slot(left)?,
+                right: self.slot(right)?,
+                out_low: self.slot(out_low)?,
+                out_high: self.slot(out_high)?,
+            },
             Operation::BranchIf { condition, target } => Operation::BranchIf {
                 condition,
                 target: self.label(target)?,

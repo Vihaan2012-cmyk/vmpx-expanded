@@ -75,6 +75,7 @@ pub(crate) fn operation_register_accesses(
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
+        | Operation::WideMultiply { .. }
         | Operation::ReturnPopping { .. }
         | Operation::ReturnRetaining { .. }
         | Operation::Return => {}
@@ -312,6 +313,7 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
+        | Operation::WideMultiply { .. }
         | Operation::ReturnPopping { .. }
         | Operation::ReturnRetaining { .. }
         | Operation::Return => Ok(()),
@@ -473,6 +475,32 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
                 }
                 let existing = state.get(out_flags).copied().unwrap_or(0);
                 state.insert(*out_flags, existing.max(8));
+            }
+            Operation::WideMultiply {
+                width,
+                left,
+                right,
+                out_low,
+                out_high,
+                ..
+            } => {
+                let operand_bytes = u8::try_from(width.bits() / 8)
+                    .map_err(|_| CompileError::UnsupportedWidth { width: *width })?;
+                for slot in [left, right] {
+                    let initialized_bytes = state.get(slot).copied().unwrap_or(0);
+                    if initialized_bytes < operand_bytes {
+                        return Err(CompileError::UninitializedSpill {
+                            operation_index: index,
+                            slot: *slot,
+                            initialized_bytes,
+                            required_bytes: operand_bytes,
+                        });
+                    }
+                }
+                for slot in [out_low, out_high] {
+                    let existing = state.get(slot).copied().unwrap_or(0);
+                    state.insert(*slot, existing.max(8));
+                }
             }
             Operation::UnsignedDivide {
                 width,
@@ -774,6 +802,17 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
                 ..
             } => {
                 for slot in [left, right, out_flags] {
+                    let _ = spill_displacement(&function.frame, *slot)?;
+                }
+            }
+            Operation::WideMultiply {
+                left,
+                right,
+                out_low,
+                out_high,
+                ..
+            } => {
+                for slot in [left, right, out_low, out_high] {
                     let _ = spill_displacement(&function.frame, *slot)?;
                 }
             }

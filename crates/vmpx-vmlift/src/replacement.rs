@@ -1304,6 +1304,13 @@ pub(crate) fn operation_slots(operation: &Operation) -> Vec<u16> {
             out_remainder.0,
             out_flags.0,
         ],
+        Operation::WideMultiply {
+            left,
+            right,
+            out_low,
+            out_high,
+            ..
+        } => vec![left.0, right.0, out_low.0, out_high.0],
         _ => Vec::new(),
     }
 }
@@ -1335,6 +1342,13 @@ pub(crate) fn operation_slots_mut(operation: &mut Operation) -> Vec<&mut SpillSl
             out_flags,
             ..
         } => vec![high, low, divisor, out_quotient, out_remainder, out_flags],
+        Operation::WideMultiply {
+            left,
+            right,
+            out_low,
+            out_high,
+            ..
+        } => vec![left, right, out_low, out_high],
         _ => Vec::new(),
     }
 }
@@ -1470,7 +1484,8 @@ pub(crate) fn rename_registers(operation: &Operation, map: &BTreeMap<u32, Virtua
         },
         Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
-        | Operation::UnsignedDivide { .. } => operation.clone(),
+        | Operation::UnsignedDivide { .. }
+        | Operation::WideMultiply { .. } => operation.clone(),
         Operation::EntryStackPointer { destination } => Operation::EntryStackPointer {
             destination: register(destination),
         },
