@@ -16,7 +16,7 @@ use vmpx_rebuild::{
     retarget_direct_branch, retarget_rip_relative, set_entry_point, validate_for_loader,
 };
 use vmpx_unpack::{UnpackLimits, locate_packer_table, unpack_to_mapped_image};
-use vmpx_vm::{VmDiscoveryLimits, analyze_vm_entry_at};
+use vmpx_vm::{VmDiscoveryLimits, analyze_vm_entry_at, discover_vm_entries};
 
 use crate::logkit::Log;
 
@@ -204,6 +204,28 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
         }
     }
 
+    // Export-seeded VM entries are the authoritative guard list. The scan above
+    // reaches targets through native transfers and `.pdata`, then re-scores each
+    // with an executable-scan source -- which drops the loader-reachable credit a
+    // genuine export-reached entry earns, so a virtualized function lands one
+    // notch under the bar and is misread as a mutated native. Full discovery
+    // seeds from the export table and scores each entry under its real source, so
+    // its confident entries settle the VM-entry question before the per-target
+    // re-score runs.
+    let vm_entries: BTreeMap<u32, u8> = discover_vm_entries(pe, VmDiscoveryLimits::default())
+        .map(|report| {
+            report
+                .entries
+                .iter()
+                .filter(|entry| entry.confidence >= 80)
+                .map(|entry| (entry.rva.0, entry.confidence))
+                .collect()
+        })
+        .unwrap_or_default();
+    for rva in vm_entries.keys() {
+        targets.insert(*rva);
+    }
+
     // Classify: a VM entry (confidence >= 80) is a guard; a target whose native
     // CFG recovers but is not a VM entry is a mutated native.
     let options = CfgOptions {
@@ -212,6 +234,14 @@ fn discover(log: &Log, pe: &PeImage<'_>, bytes: &[u8]) -> Targets {
     };
     let (mut guards, mut natives) = (Vec::new(), Vec::new());
     for rva in targets {
+        if let Some(confidence) = vm_entries.get(&rva) {
+            log.trace(
+                &format!("{rva:#x}"),
+                &format!("guard (VM entry, export-seeded, confidence {confidence})"),
+            );
+            guards.push(rva);
+            continue;
+        }
         let candidate = analyze_vm_entry_at(pe, Rva(rva), VmDiscoveryLimits::default());
         if candidate.as_ref().is_some_and(|c| c.confidence >= 80) {
             log.trace(
