@@ -231,6 +231,10 @@ pub enum VmEntrySource {
     PeEntryPoint,
     TlsCallback,
     ExecutableScan,
+    /// An exported symbol: a virtualized exported function points at a VM entry
+    /// stub, so the export table seeds discovery of user-function virtualization
+    /// (which an executable scan from the entry region does not reach).
+    Export,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -477,6 +481,31 @@ fn add_evidence(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Follows a chain of unconditional direct jumps (export/import thunks VMProtect
+/// places in front of a VM entry) to the instruction they ultimately reach, so a
+/// root that lands on a `jmp stub` is analyzed at the stub. Bounded; a non-jump
+/// or an indirect/out-of-image target ends the chase and the last RVA is kept.
+fn follow_direct_thunk(pe: &PeImage<'_>, mut rva: Rva, max_hops: usize) -> Rva {
+    let mut seen = 0;
+    while seen < max_hops {
+        let Ok(decoded) = decode_one(pe, rva) else {
+            break;
+        };
+        if decoded.instruction.flow_control() != FlowControl::UnconditionalBranch {
+            break;
+        }
+        let Some(target) = decoded.direct_target_rva(pe) else {
+            break;
+        };
+        if target == rva {
+            break;
+        }
+        rva = target;
+        seen += 1;
+    }
+    rva
+}
+
 fn analyze_stub(
     pe: &PeImage<'_>,
     rva: Rva,
@@ -484,6 +513,9 @@ fn analyze_stub(
     limits: VmDiscoveryLimits,
     chain_cache: &mut HashMap<Rva, ChainFeatures>,
 ) -> Option<VmEntryCandidate> {
+    // An exported virtualized function is reached through a `jmp` thunk; resolve
+    // it to the VM entry stub so the push-seed/call shape below is seen.
+    let rva = follow_direct_thunk(pe, rva, 8);
     let first = decode_one(pe, rva).ok()?;
     let va = first.va;
     let mut candidate = VmEntryCandidate {
@@ -492,7 +524,7 @@ fn analyze_stub(
         source,
         reachability: if matches!(
             source,
-            VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback
+            VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback | VmEntrySource::Export
         ) {
             VmEntryReachability::LoaderReachable
         } else {
@@ -507,7 +539,7 @@ fn analyze_stub(
     let mut score = 0_u16;
     if matches!(
         source,
-        VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback
+        VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback | VmEntrySource::Export
     ) {
         add_evidence(&mut candidate, &mut score, 10, "loader-reachable root");
     }
@@ -771,6 +803,17 @@ pub fn discover_vm_entries(
             roots
                 .entry(callback_rva)
                 .or_insert(VmEntrySource::TlsCallback);
+        }
+    }
+    // Seed from the export table: a virtualized exported function is redirected
+    // to a VM entry stub, so each non-forwarder export is a discovery root. This
+    // reaches user-function virtualization (e.g. a protected library) that an
+    // executable scan rooted at the entry region never finds.
+    if let Some(exports) = &pe_report.exports {
+        for symbol in &exports.symbols {
+            if symbol.forwarder.is_none() {
+                roots.entry(symbol.rva).or_insert(VmEntrySource::Export);
+            }
         }
     }
     let (scan_roots, scanned_stub_candidates, resource_limited) = if limits.scan_executable_stubs {

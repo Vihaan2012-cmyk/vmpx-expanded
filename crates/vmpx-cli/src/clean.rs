@@ -411,6 +411,7 @@ pub(crate) fn build_vm_inventory(
                 vmpx_vm::VmEntrySource::PeEntryPoint => "header",
                 vmpx_vm::VmEntrySource::TlsCallback => "tls",
                 vmpx_vm::VmEntrySource::ExecutableScan => "scan",
+                vmpx_vm::VmEntrySource::Export => "export",
             };
             (entry.rva, entry.confidence, label, false)
         })),
