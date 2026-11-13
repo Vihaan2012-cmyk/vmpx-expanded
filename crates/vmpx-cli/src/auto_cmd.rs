@@ -1701,56 +1701,73 @@ fn devirt_guards(
     instruction_limit: usize,
     guards: &[u32],
 ) -> Result<(Vec<u8>, Vec<u32>, Vec<(u32, u32, u32)>), String> {
+    use rayon::prelude::*;
     let base = intact.optional.image_base.0;
     let section_rva = next_section_rva(&image).map_err(|e| e.to_string())?.0;
+    // Each guard gets a fixed-stride slot so its final VA -- which the emitted
+    // bytes depend on -- is known before building, which is what lets the builds
+    // run independently. A body that overflows its slot is left residual.
+    const SLOT_STRIDE: u32 = 0x1_0000;
+    log.step(
+        "building",
+        &format!("{} guard(s) across cores (fixed 64 KiB slots)", guards.len()),
+    );
+    // Recover and emit every guard in parallel: VM CFG recovery is independent
+    // per guard and is the whole cost, so this scales across the machine.
+    let built: Vec<(usize, u32, Result<Vec<u8>, String>)> = guards
+        .par_iter()
+        .enumerate()
+        .map(|(index, &rva)| {
+            let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
+            let va = base + u64::from(new_rva);
+            // Escalate a guard's budget only when more budget can actually help
+            // (CFG building exhausted its budget); a structural stall returns the
+            // same result at any budget, so retrying it only burns time.
+            let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
+            let mut used = instruction_limit;
+            while let Err(reason) = &result {
+                let budget_bound =
+                    reason.contains("limit hit: Some") || reason.contains("budget exhausted");
+                if !budget_bound || used >= 65536 {
+                    break;
+                }
+                used *= 2;
+                result = crate::devirt_cmd::build_one(intact, rva, used, va);
+            }
+            (index, rva, result)
+        })
+        .collect();
+
     let mut payload: Vec<u8> = Vec::new();
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
     // (original rva, reconstructed rva, byte length) per devirtualized guard.
     let mut placements: Vec<(u32, u32, u32)> = Vec::new();
     let mut ok = 0_usize;
     let mut residual: Vec<u32> = Vec::new();
-    for &rva in guards {
-        while payload.len() % 16 != 0 {
-            payload.push(0xCC);
-        }
-        let new_rva = section_rva + u32::try_from(payload.len()).unwrap_or(0);
-        let va = base + u64::from(new_rva);
-        // Try the chosen budget, then escalate ONLY this guard if more budget can
-        // actually help: either CFG building exhausted its instruction budget
-        // ("limit hit: true") or a block-expansion budget was hit. A CFG that
-        // stalled for a structural reason ("limit hit: false" -- an unresolved
-        // dispatch or nested entry) returns the same result at any budget, so
-        // retrying it only burns seconds per doubling for nothing.
-        let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
-        let mut used = instruction_limit;
-        while let Err(reason) = &result {
-            let budget_bound =
-                reason.contains("limit hit: Some") || reason.contains("budget exhausted");
-            if !budget_bound || used >= 65536 {
-                break;
-            }
-            used *= 2;
-            result = crate::devirt_cmd::build_one(intact, rva, used, va);
-        }
+    for (index, rva, result) in built {
+        let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
+        let slot_start = usize::try_from(new_rva - section_rva).unwrap_or(0);
         match result {
-            Ok(bytes) => {
-                let detail = if used == instruction_limit {
-                    format!("{} byte(s)", bytes.len())
-                } else {
-                    format!("{} byte(s), budget {used}", bytes.len())
-                };
-                log.step(&format!("{rva:#x} devirtualized"), &detail);
-                placements.push((rva, new_rva, u32::try_from(bytes.len()).unwrap_or(0)));
+            Ok(bytes) if u32::try_from(bytes.len()).unwrap_or(u32::MAX) <= SLOT_STRIDE => {
+                log.step(&format!("{rva:#x} devirtualized"), &format!("{} byte(s)", bytes.len()));
+                if payload.len() < slot_start {
+                    payload.resize(slot_start, 0xCC);
+                }
                 payload.extend_from_slice(&bytes);
+                placements.push((rva, new_rva, u32::try_from(bytes.len()).unwrap_or(0)));
                 mapping.insert(rva, new_rva);
                 ok += 1;
             }
-            Err(reason) => {
+            Ok(bytes) => {
                 residual.push(rva);
                 log.warn(&format!(
-                    "{rva:#x}: {}",
-                    reason.lines().next().unwrap_or(&reason)
+                    "{rva:#x}: {} byte body exceeds the {SLOT_STRIDE:#x} slot",
+                    bytes.len()
                 ));
+            }
+            Err(reason) => {
+                residual.push(rva);
+                log.warn(&format!("{rva:#x}: {}", reason.lines().next().unwrap_or(&reason)));
             }
         }
     }
