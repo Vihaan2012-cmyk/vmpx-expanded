@@ -1746,7 +1746,7 @@ fn devirt_guards(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
-        .unwrap_or_else(|| rayon::current_num_threads().min(16));
+        .unwrap_or_else(|| rayon::current_num_threads().min(8));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .stack_size(1 << 30)
@@ -1768,11 +1768,25 @@ fn devirt_guards(
             .map(|(index, &rva)| {
                 let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
                 let va = base + u64::from(new_rva);
+                // Per-guard progress to stderr (flushed), so a crash names the
+                // guard it died on -- run with VMPX_GUARD_THREADS=1 to make the
+                // last line the exact culprit.
+                eprintln!("[guard {}/{}] {rva:#x} start", index + 1, guards.len());
                 // Escalate a guard's budget only when more budget can actually
                 // help (CFG building exhausted its budget); a structural stall
                 // returns the same result at any budget, so retrying only burns
                 // time.
-                let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
+                // A single guard must not take the whole batch down. A panic
+                // (e.g. an internal overflow) is caught and turned into a
+                // residual; an allocation abort still cannot be caught, which is
+                // why the per-guard budgets below bound memory.
+                let build = |limit| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::devirt_cmd::build_one(intact, rva, limit, va)
+                    }))
+                    .unwrap_or_else(|_| Err("guard build panicked".to_owned()))
+                };
+                let mut result = build(instruction_limit);
                 let mut used = instruction_limit;
                 while let Err(reason) = &result {
                     let budget_bound =
@@ -1781,7 +1795,16 @@ fn devirt_guards(
                         break;
                     }
                     used *= 2;
-                    result = crate::devirt_cmd::build_one(intact, rva, used, va);
+                    result = build(used);
+                }
+                match &result {
+                    Ok(bytes) => eprintln!("[guard {}/{}] {rva:#x} ok {} bytes", index + 1, guards.len(), bytes.len()),
+                    Err(reason) => eprintln!(
+                        "[guard {}/{}] {rva:#x} fail: {}",
+                        index + 1,
+                        guards.len(),
+                        reason.lines().next().unwrap_or(reason)
+                    ),
                 }
                 (index, rva, result)
             })
