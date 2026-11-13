@@ -310,35 +310,110 @@ fn collect_exit_registers(node: &RNode, out: &mut BTreeMap<X64NativeRegister, ()
     }
 }
 
-/// Build native code for a recovered VM function whose root is a loop (possibly
-/// under leading stores). `fold` concretizes each expression (checksum/image
-/// reads) exactly as the flat path does.
+/// Every symbol any expression in the tree reads, so the prologue knows which
+/// synthetic entry inputs (the flag word, the return address) to capture.
+fn collect_tree_symbols(node: &RNode, out: &mut std::collections::BTreeSet<String>) {
+    match node {
+        RNode::Stores { stores, next } => {
+            for store in stores {
+                out.extend(store.address.dependencies());
+                out.extend(store.value.dependencies());
+            }
+            collect_tree_symbols(next, out);
+        }
+        RNode::Fork { selector, arms, .. } => {
+            out.extend(selector.dependencies());
+            for (_, arm) in arms {
+                collect_tree_symbols(arm, out);
+            }
+        }
+        RNode::Exit(exit) => {
+            for expr in exit.registers.values() {
+                out.extend(expr.dependencies());
+            }
+            if let Some(continuation) = &exit.continuation {
+                out.extend(continuation.dependencies());
+            }
+        }
+        RNode::Loop { phis, body, .. } => {
+            for phi in phis {
+                out.extend(phi.init.dependencies());
+            }
+            collect_tree_symbols(body, out);
+        }
+        RNode::BackEdge { next } => {
+            for expr in next {
+                out.extend(expr.dependencies());
+            }
+        }
+        RNode::Dead(_) => {}
+    }
+}
+
+/// Build native code for a recovered VM function with genuine control flow: a
+/// loop (back edge), input-dependent branches, or both. Loop-carried cells
+/// become spill-slot phis; `Fork` becomes a compare-and-branch; `Exit` sets the
+/// result slots and jumps the shared epilogue. A function whose branches all
+/// collapse after folding is handled by the simpler flat emitter instead; this
+/// is for the ones that do not. `fold` concretizes each expression exactly as
+/// the flat path does.
 ///
 /// # Errors
 ///
 /// Fails when the tree uses a construct this emitter does not yet cover (region
 /// exits, nested loops) or when an expression cannot be lowered.
-pub fn build_loop_replacement(
+pub fn build_control_flow_replacement(
     root: &RNode,
     config: &ReplacementConfig,
     address: CodeAddress,
     fold: &dyn Fn(&Expr) -> Result<Expr, String>,
 ) -> Result<Vec<u8>, String> {
-    // Peel any leading pre-loop stores, then require a loop.
+    // Peel any leading pre-loop stores. The remainder is either a loop or, for a
+    // branchy non-loop function, the body itself (no phis, no back edge).
     let mut leading: Vec<&RStore> = Vec::new();
     let mut cursor = root;
     while let RNode::Stores { stores, next } = cursor {
         leading.extend(stores.iter());
         cursor = next;
     }
-    let RNode::Loop { phis, body, .. } = cursor else {
-        return Err("function root is not a loop".to_owned());
+    const NO_PHIS: &[crate::rolled::RPhi] = &[];
+    let (phis, body): (&[crate::rolled::RPhi], &RNode) = match cursor {
+        RNode::Loop { phis, body, .. } => (phis.as_slice(), body.as_ref()),
+        other => (NO_PHIS, other),
     };
 
-    // Slot layout: [inputs | phis | results | scratch window].
-    let input_count = u16::try_from(config.inputs.len()).map_err(|_| "too many inputs".to_owned())?;
+    // A function may read synthetic entry inputs beyond its GP registers -- the
+    // entry flag word and the caller's return address. Capture only the ones the
+    // tree actually references, appended after the GP inputs (their captures read
+    // flags / the stack and so must run once every GP register is spilled).
+    let mut referenced = std::collections::BTreeSet::<String>::new();
+    collect_tree_symbols(cursor, &mut referenced);
+    for store in &leading {
+        referenced.extend(store.address.dependencies());
+        referenced.extend(store.value.dependencies());
+    }
+    #[derive(Clone, Copy)]
+    enum Cap {
+        Reg(PhysicalRegister),
+        Flags,
+        ReturnAddr,
+    }
+    let mut capture_inputs: Vec<(String, Cap)> = config
+        .inputs
+        .iter()
+        .map(|(name, reg)| (name.clone(), Cap::Reg(*reg)))
+        .collect();
+    if referenced.contains(crate::replacement::NATIVE_RFLAGS_INITIAL) {
+        capture_inputs.push((crate::replacement::NATIVE_RFLAGS_INITIAL.to_owned(), Cap::Flags));
+    }
+    if referenced.contains(crate::replacement::NATIVE_RETURN_ADDRESS_INITIAL) {
+        capture_inputs.push((crate::replacement::NATIVE_RETURN_ADDRESS_INITIAL.to_owned(), Cap::ReturnAddr));
+    }
+
+    // Slot layout: [inputs | phis | results | park | scratch window].
+    let input_count = u16::try_from(capture_inputs.len()).map_err(|_| "too many inputs".to_owned())?;
     let mut inputs: Vec<ExpressionInput> = Vec::new();
-    for (index, (name, _)) in config.inputs.iter().enumerate() {
+    for (index, (name, _)) in capture_inputs.iter().enumerate() {
         inputs.push(ExpressionInput::slot(
             name.clone(),
             BitWidth::W64,
@@ -370,14 +445,43 @@ pub fn build_loop_replacement(
     let mut assignments: Vec<RegisterAssignment> = Vec::new();
     let mut next_register = 0_u32;
 
-    // Prologue: capture each entry register into its input slot.
+    // Prologue: capture each input into its slot. GP registers spill directly;
+    // the flag word and return address are materialised through a carrier (Rax,
+    // already spilled above) with `ReadFlags` / an entry-stack-pointer load.
     let mut prologue: Vec<Operation> = Vec::new();
-    for (index, (_, register)) in config.inputs.iter().enumerate() {
-        let source = canonical_register(*register, &mut canonical, &mut assignments, &mut next_register);
-        prologue.push(Operation::SpillStore {
-            slot: SpillSlot(u16::try_from(index).unwrap_or(0)),
-            source,
-        });
+    for (index, (_, cap)) in capture_inputs.iter().enumerate() {
+        let slot = SpillSlot(u16::try_from(index).unwrap_or(0));
+        match cap {
+            Cap::Reg(register) => {
+                let source =
+                    canonical_register(*register, &mut canonical, &mut assignments, &mut next_register);
+                prologue.push(Operation::SpillStore { slot, source });
+            }
+            Cap::Flags => {
+                let carrier = canonical_register(
+                    PhysicalRegister::Rax,
+                    &mut canonical,
+                    &mut assignments,
+                    &mut next_register,
+                );
+                prologue.push(Operation::ReadFlags { destination: carrier });
+                prologue.push(Operation::SpillStore { slot, source: carrier });
+            }
+            Cap::ReturnAddr => {
+                let carrier = canonical_register(
+                    PhysicalRegister::Rax,
+                    &mut canonical,
+                    &mut assignments,
+                    &mut next_register,
+                );
+                prologue.push(Operation::EntryStackPointer { destination: carrier });
+                prologue.push(Operation::Load {
+                    destination: carrier,
+                    address: Address::new(carrier, 0),
+                });
+                prologue.push(Operation::SpillStore { slot, source: carrier });
+            }
+        }
     }
 
     let header = vmpx_recompile::Label(0);
@@ -503,7 +607,7 @@ mod tests {
             body: Box::new(fork),
         };
         let fold = |expr: &Expr| -> Result<Expr, String> { Ok(expr.clone()) };
-        let bytes = build_loop_replacement(&root, &empty_config(), CodeAddress(0x1000), &fold)
+        let bytes = build_control_flow_replacement(&root, &empty_config(), CodeAddress(0x1000), &fold)
             .expect("loop should compile");
         assert!(!bytes.is_empty(), "emitted code must be non-empty");
     }

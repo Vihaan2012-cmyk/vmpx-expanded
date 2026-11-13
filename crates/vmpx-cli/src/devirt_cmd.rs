@@ -367,7 +367,7 @@ pub(crate) fn build_one(
             rflags: None,
             symbol_rewrites: BTreeMap::new(),
         };
-        return vmpx_vmlift::build_loop_replacement(
+        return vmpx_vmlift::build_control_flow_replacement(
             &rolled.root,
             &config,
             CodeAddress(va),
@@ -485,11 +485,44 @@ pub(crate) fn build_one(
             || path.effects != first.effects
             || path.continuation != first.continuation
     }) {
-        return Err(format!(
-            "{} {} path(s) differ after folding the checksum -- genuinely input-dependent branch",
-            chosen.len(),
-            if region_only { "region" } else { "callee" }
-        ));
+        // Genuinely input-dependent branches (a real user function, not a
+        // checksum-tamper gate that collapses). Emit the recovered control flow
+        // -- `Fork` -> compare/branch, `Exit` -> return -- instead of refusing.
+        let cf_fold = |expr: &Expr| -> Result<Expr, String> {
+            let timing = vmpx_vm::fold_timing_invariant_loads(intact, expr, modulo_limits)
+                .map_err(|error| format!("timing fold: {error}"))?;
+            let report = concretize_with_immutable_image(
+                intact,
+                &timing.expression,
+                &BTreeMap::new(),
+                limits,
+            )
+            .map_err(|error| format!("concretize: {error}"))?;
+            report
+                .expression
+                .rewrite_intrinsics(&mut |width, name, args| {
+                    (name.starts_with("memory_load_epoch_") && args.len() == 1)
+                        .then(|| Expr::load(width, args[0].clone()))
+                })
+                .map_err(|error| format!("rewrite memory_load_epoch: {error}"))
+        };
+        let config = ReplacementConfig {
+            inputs: replacement_inputs(),
+            max_expression_nodes: 400_000,
+            max_spill_slots: 1024,
+            import_calls: BTreeMap::new(),
+            continuation: None,
+            effects: Vec::new(),
+            effect_calls: Vec::new(),
+            rflags: None,
+            symbol_rewrites: BTreeMap::new(),
+        };
+        return vmpx_vmlift::build_control_flow_replacement(
+            &rolled.root,
+            &config,
+            CodeAddress(va),
+            &cf_fold,
+        );
     }
     let (registers, effects) = (first.registers.clone(), first.effects.clone());
     // A region exit emits a `Computed` continuation: the replacement stages the
