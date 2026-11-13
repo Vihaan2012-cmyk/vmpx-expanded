@@ -156,7 +156,24 @@ pub fn roll_decoded_cfg_with_nested(
     max_blocks: usize,
 ) -> Result<RolledFunction, String> {
     if !input.cfg.is_complete() {
-        return Err("the CFG is incomplete".to_owned());
+        // Carry whether the incompleteness is budget-caused: `limit hit: true`
+        // means CFG building ran out of its instruction budget and more may
+        // complete it, while `false` means it stalled for a structural reason
+        // (an unresolved indirect dispatch, a nested entry) that more budget
+        // will not fix. The caller uses this to avoid escalating hopeless cases.
+        let reasons: Vec<&str> = input
+            .cfg
+            .stalls
+            .iter()
+            .map(|s| s.reason.as_str())
+            .take(3)
+            .collect();
+        return Err(format!(
+            "the CFG is incomplete ({} stalls, limit hit: {:?}) [{}]",
+            input.cfg.stalls.len(),
+            input.cfg.limit_hit,
+            reasons.join(" | ")
+        ));
     }
     let (state, _) = frame_initial_state(input.frame, input.top_offset);
     let mut w = Walker {

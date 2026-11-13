@@ -1715,14 +1715,17 @@ fn devirt_guards(
         }
         let new_rva = section_rva + u32::try_from(payload.len()).unwrap_or(0);
         let va = base + u64::from(new_rva);
-        // Try the chosen budget, then escalate ONLY this guard if it fell short
-        // of a complete CFG -- an incomplete-CFG or limit-hit error is the only
-        // kind more budget can fix, so a nested-entry or checksum-pointer
-        // refusal is not retried.
+        // Try the chosen budget, then escalate ONLY this guard if more budget can
+        // actually help: either CFG building exhausted its instruction budget
+        // ("limit hit: true") or a block-expansion budget was hit. A CFG that
+        // stalled for a structural reason ("limit hit: false" -- an unresolved
+        // dispatch or nested entry) returns the same result at any budget, so
+        // retrying it only burns seconds per doubling for nothing.
         let mut result = crate::devirt_cmd::build_one(intact, rva, instruction_limit, va);
         let mut used = instruction_limit;
         while let Err(reason) = &result {
-            let budget_bound = reason.contains("incomplete") || reason.contains("limit");
+            let budget_bound =
+                reason.contains("limit hit: Some") || reason.contains("budget exhausted");
             if !budget_bound || used >= 65536 {
                 break;
             }
