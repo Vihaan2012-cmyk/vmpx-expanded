@@ -1235,6 +1235,9 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         BinaryOp::Xor | BinaryOp::Sub if left == right => return Expr::constant(width, 0),
         _ => {}
     }
+    if let Some(simplified) = simplify_mba(op, &left, &right) {
+        return simplified;
+    }
     Expr {
         width,
         kind: ExprKind::Binary {
@@ -1243,6 +1246,52 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
             right: ExprRef::new(right),
         },
     }
+}
+
+/// Collapses the mixed boolean-arithmetic identities VMProtect's mutation pass
+/// weaves in. Every rule here is a pure bitwise identity, exhaustively verified
+/// per operand pair in the tests, so applying it is sound. These dominate the
+/// recovered output for Ultra-protected code (`a ^ (a | b)` and friends).
+fn simplify_mba(op: BinaryOp, left: &Expr, right: &Expr) -> Option<Expr> {
+    let as_bin = |e: &Expr| match &e.kind {
+        ExprKind::Binary {
+            op,
+            left: l,
+            right: r,
+        } => Some((*op, l.as_ref().clone(), r.as_ref().clone())),
+        _ => None,
+    };
+    // Match `x OP (inner_l IOP inner_r)` for both operand orders; `other` is the
+    // inner operand that is NOT `x`.
+    for (x, inner) in [(left, right), (right, left)] {
+        let Some((iop, a, b)) = as_bin(inner) else {
+            continue;
+        };
+        let other = if &a == x {
+            b
+        } else if &b == x {
+            a
+        } else {
+            continue;
+        };
+        let not = |e: Expr| Expr::unary(UnaryOp::Not, e);
+        match (op, iop) {
+            // a ^ (a | b) == ~a & b
+            (BinaryOp::Xor, BinaryOp::Or) => {
+                return Expr::binary(BinaryOp::And, not(x.clone()), other).ok();
+            }
+            // a ^ (a & b) == a & ~b
+            (BinaryOp::Xor, BinaryOp::And) => {
+                return Expr::binary(BinaryOp::And, x.clone(), not(other)).ok();
+            }
+            // a | (a & b) == a   and   a & (a | b) == a   (absorption)
+            (BinaryOp::Or, BinaryOp::And) | (BinaryOp::And, BinaryOp::Or) => {
+                return Some(x.clone());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn normalize_addition(width: BitWidth, left: Expr, right: Expr) -> Expr {
@@ -1450,6 +1499,49 @@ fn rotate_right(value: u64, width: BitWidth, count: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mba_identities_are_sound_over_w8() {
+        // Exhaustive proof that each MBA rewrite in `simplify_mba` is a true
+        // bitwise identity (every pattern is width-independent, so W8 suffices).
+        let w = BitWidth::W8;
+        let m = w.mask();
+        for a in 0..=0xff_u64 {
+            for b in 0..=0xff_u64 {
+                let or = evaluate_binary(BinaryOp::Or, w, a, b);
+                let and = evaluate_binary(BinaryOp::And, w, a, b);
+                // a ^ (a | b) == ~a & b
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Xor, w, a, or),
+                    evaluate_binary(BinaryOp::And, w, (!a) & m, b),
+                );
+                // a ^ (a & b) == a & ~b
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Xor, w, a, and),
+                    evaluate_binary(BinaryOp::And, w, a, (!b) & m),
+                );
+                // a | (a & b) == a  and  a & (a | b) == a
+                assert_eq!(evaluate_binary(BinaryOp::Or, w, a, and), a);
+                assert_eq!(evaluate_binary(BinaryOp::And, w, a, or), a);
+            }
+        }
+    }
+
+    #[test]
+    fn simplify_collapses_xor_or_mba() {
+        // `a ^ (a | b)` -> `~a & b`, the pattern that dominates Ultra output.
+        let a = Expr::register(BitWidth::W32, "a");
+        let b = Expr::register(BitWidth::W32, "b");
+        let expr = Expr::binary(
+            BinaryOp::Xor,
+            a.clone(),
+            Expr::binary(BinaryOp::Or, a.clone(), b.clone()).unwrap(),
+        )
+        .unwrap();
+        let expected =
+            Expr::binary(BinaryOp::And, Expr::unary(UnaryOp::Not, a), b).unwrap();
+        assert_eq!(expr.simplify(), expected.simplify());
+    }
 
     #[test]
     fn flag_intrinsics_fold_with_symbolic_operands() {
