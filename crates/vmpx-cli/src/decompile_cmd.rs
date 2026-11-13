@@ -128,7 +128,8 @@ fn go(o: &Options) -> Result<()> {
     let mapped = crate::equiv_gate::load_pe(&bytes)?;
     let pe = PeImage::parse(&mapped).context("image failed reparse")?;
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
-    let mut targets: Vec<(String, u32)> = Vec::new();
+    // (full symbol, short C-identifier name, stub rva)
+    let mut targets: Vec<(String, String, u32)> = Vec::new();
     for sym in symbols {
         let Some(name) = sym.name.clone() else {
             continue;
@@ -137,21 +138,84 @@ fn go(o: &Options) -> Result<()> {
             continue;
         }
         match crate::diff_original::resolve_stub(&pe, &mapped, sym.rva.0) {
-            Ok(stub) => targets.push((name, stub)),
+            Ok(stub) => {
+                let short = short_name(&name);
+                targets.push((name, short, stub));
+            }
             Err(why) => println!("// {name}: not a virtualized user function ({why})"),
         }
     }
     for rva in &o.rvas {
-        targets.push((format!("vm_{rva:x}"), *rva));
+        targets.push((format!("vm_{rva:x}"), format!("vm_{rva:x}"), *rva));
     }
-    for (name, stub) in targets {
-        println!("// ==== {name} [{stub:#x}]");
-        match vm_one(o, &pe, &name, stub) {
+    for (full, short, stub) in targets {
+        // Keep the full mangled symbol in a comment; use the short readable name
+        // as the function identifier.
+        if full == short {
+            println!("// ==== {short} [{stub:#x}]");
+        } else {
+            println!("// ==== {short} [{stub:#x}]  ({full})");
+        }
+        match vm_one(o, &pe, &short, stub) {
             Ok(()) => {}
-            Err(e) => println!("// {name}: {e}\n"),
+            Err(e) => println!("// {short}: {e}\n"),
         }
     }
     Ok(())
+}
+
+/// A short, readable, C-identifier-safe name from a Rust v0 mangled symbol
+/// (`_R...`): the first few length-prefixed identifiers joined with `_`, skipping
+/// crate-hash disambiguators. Non-Rust names are sanitized to identifier chars.
+fn short_name(mangled: &str) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .take(60)
+            .collect()
+    };
+    if !mangled.starts_with("_R") {
+        return sanitize(mangled);
+    }
+    let b = mangled.as_bytes();
+    let mut i = 0;
+    let mut idents: Vec<&str> = Vec::new();
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        let mut len = 0usize;
+        while j < b.len() && b[j].is_ascii_digit() {
+            len = len.saturating_mul(10).saturating_add((b[j] - b'0') as usize);
+            j += 1;
+        }
+        if (2..=40).contains(&len)
+            && j + len <= b.len()
+            && mangled[j..j + len]
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            let ident = &mangled[j..j + len];
+            // Crate-hash disambiguators look like `ioKvcERoOwE`: long, mixed case,
+            // no underscore. Keep real identifiers, skip those.
+            let is_hash = ident.len() >= 10
+                && !ident.contains('_')
+                && ident.bytes().any(|c| c.is_ascii_uppercase())
+                && ident.bytes().any(|c| c.is_ascii_lowercase());
+            if !is_hash {
+                idents.push(ident);
+            }
+            i = j + len;
+        } else {
+            i = j;
+        }
+    }
+    if idents.is_empty() {
+        return sanitize(mangled.get(..20).unwrap_or(mangled));
+    }
+    idents.into_iter().take(4).collect::<Vec<_>>().join("_")
 }
 
 fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::Result<(), String> {
