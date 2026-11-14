@@ -1,3 +1,9 @@
 .claude/worktrees/
 out/
+out*/
 target/
+target_*/
+autoout*/
+tgt_*/
+tmp_*/
+dumps/
