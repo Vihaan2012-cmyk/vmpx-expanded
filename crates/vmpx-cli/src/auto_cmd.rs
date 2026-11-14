@@ -833,7 +833,11 @@ pub fn run(o: Options) -> Result<(), String> {
     // CFG, and escalate PER GUARD only where that falls short (the retry ladder
     // in `devirt_guards`). A larger blanket budget only slows the easy guards;
     // adapting where needed is both faster and "best" in the sense asked for.
-    let instruction_limit = 2048_usize;
+    let instruction_limit = std::env::var("VMPX_AUTO_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(2048_usize);
     log.step(
         "instruction limit",
         &format!("{instruction_limit}, escalating per guard as needed"),
@@ -1794,21 +1798,28 @@ fn devirt_guards(
                     }))
                     .unwrap_or_else(|_| Err("guard build panicked".to_owned()))
                 };
+                let t0 = std::time::Instant::now();
                 let mut result = build(instruction_limit);
                 let mut used = instruction_limit;
                 while let Err(reason) = &result {
-                    let budget_bound =
-                        reason.contains("limit hit: Some") || reason.contains("budget exhausted");
+                    // Only a TotalInstructions limit is relieved by more
+                    // instruction budget. Memory / WallClock / Visits / Blocks
+                    // re-fail at a higher budget -- sooner, and a WallClock retry
+                    // burns the whole wall budget again -- so escalating them is
+                    // pure wasted wall-clock with no coverage to gain.
+                    let budget_bound = reason.contains("Some(TotalInstructions)")
+                        || reason.contains("budget exhausted");
                     if !budget_bound || used >= 65536 {
                         break;
                     }
                     used *= 2;
                     result = build(used);
                 }
+                let ms = t0.elapsed().as_millis();
                 match &result {
-                    Ok(_) => eprintln!("[guard {}/{}] {rva:#x} built", index + 1, guards.len()),
+                    Ok(_) => eprintln!("[guard {}/{}] {rva:#x} built {ms}ms used={used}", index + 1, guards.len()),
                     Err(reason) => eprintln!(
-                        "[guard {}/{}] {rva:#x} fail: {}",
+                        "[guard {}/{}] {rva:#x} fail {ms}ms used={used}: {}",
                         index + 1,
                         guards.len(),
                         reason.lines().next().unwrap_or(reason)
