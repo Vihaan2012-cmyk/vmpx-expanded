@@ -1694,6 +1694,17 @@ fn repoint(
 /// Devirtualize each guard and retarget its `.text` transfer.
 /// Returns the devirtualized image and the RVAs of guards that could not be
 /// lifted (the residuals a later neutralization stage handles).
+/// Code alignment for a packed guard.
+const GUARD_CODE_ALIGN: u32 = 16;
+/// Reserved slack per guard: absorbs the worst-case `rel32 -> movabs` tail-jump
+/// growth (7 bytes) between the sizing compile and the final compile.
+const GUARD_JUMP_HEADROOM: u32 = 16;
+
+/// A built guard function with the byte length of its sizing compile.
+type SizedGuard = (usize, u32, Result<(vmpx_recompile::Function, u32), String>);
+/// A placed guard: original rva, packed rva, reserved slot size, compiled bytes.
+type CompiledGuard = (u32, u32, u32, Result<Vec<u8>, String>);
+
 fn devirt_guards(
     log: &Log,
     intact: &PeImage<'_>,
@@ -1816,12 +1827,8 @@ fn devirt_guards(
     // then recompile each at the VA it actually lands on. A guard that grows past
     // its reserved headroom (it never should: one absolute jump, +7 at most) is
     // dropped rather than allowed to overlap its neighbour.
-    const CODE_ALIGN: u32 = 16;
-    // Absorbs the worst-case rel32 -> movabs growth (7 bytes) between the sizing
-    // compile and the final compile.
-    const JUMP_HEADROOM: u32 = 16;
     let sizing_va = base + u64::from(section_rva);
-    let sized: Vec<(usize, u32, Result<(vmpx_recompile::Function, u32), String>)> =
+    let sized: Vec<SizedGuard> =
         pool.install(|| {
             functions
                 .into_par_iter()
@@ -1842,9 +1849,9 @@ fn devirt_guards(
         match outcome {
             Ok((function, len)) => {
                 let reserved = len
-                    .saturating_add(JUMP_HEADROOM)
-                    .div_ceil(CODE_ALIGN)
-                    .saturating_mul(CODE_ALIGN);
+                    .saturating_add(GUARD_JUMP_HEADROOM)
+                    .div_ceil(GUARD_CODE_ALIGN)
+                    .saturating_mul(GUARD_CODE_ALIGN);
                 by_index.push((index, rva, function, reserved));
             }
             Err(reason) => {
@@ -1863,7 +1870,7 @@ fn devirt_guards(
         running = running.saturating_add(reserved);
     }
     // Recompile each survivor at its final VA, in parallel.
-    let compiled: Vec<(u32, u32, u32, Result<Vec<u8>, String>)> = pool.install(|| {
+    let compiled: Vec<CompiledGuard> = pool.install(|| {
         layout
             .into_par_iter()
             .map(|(rva, new_rva, function, reserved)| {
