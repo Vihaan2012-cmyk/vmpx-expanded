@@ -71,6 +71,9 @@ fn is_protector_section(name: &str) -> bool {
         ".text", ".data", ".rdata", ".idata", ".edata", ".pdata", ".xdata",
         ".bss", ".tls", ".reloc", ".rsrc", ".eh_fram", ".crt", ".gfids",
         ".giats", ".00cfg", ".sxdata", ".debug", ".ndata", ".didat", ".drectve",
+        // MSVC read-only data (e.g. jump/function tables under /Gy); not a dot
+        // section, so it would otherwise be mistaken for a protector section.
+        "_RDATA",
     ];
     if name.starts_with(".vmp") {
         return true;
@@ -95,7 +98,16 @@ struct Targets {
 /// The opaque protector sections -- VM runtime, bytecode, the rebuilt IAT -- are
 /// not pure code and stay removable.
 fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
-    const PURE_CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    // Pure executable code: CODE | EXECUTE | READ set, and crucially neither
+    // writable nor INITIALIZED_DATA -- the opaque protector sections (VM runtime,
+    // bytecode) carry the data bit or are writable, while a renamed `.text` does
+    // not. Matched by mask, not exact equality: VMProtect copies the real `.text`
+    // characteristics verbatim, which on some binaries carry extra flags (e.g.
+    // NOT_PAGED, 0x0800_0000) that an exact `0x6000_0020` test rejected -- which is
+    // how A380's `.IG(` (exactly `0x6000_0020`) was retained but win.xpl's `.K9-`
+    // (`0x6800_0020`, 15 MiB, 921 `.pdata` entries) was not.
+    const CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    const NON_CODE: u32 = 0x8000_0040; // MEM_WRITE | CNT_INITIALIZED_DATA
     const DENSE: usize = 64;
     let mut pdata: BTreeMap<usize, usize> = BTreeMap::new();
     for function in &pe.report().exception_functions {
@@ -107,12 +119,28 @@ fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
             *pdata.entry(section.index).or_default() += 1;
         }
     }
+    // A small, read-only, non-executable protector section is application
+    // read-only data left in place (a jump table, or the string table the app's
+    // `lea`s point at); the application references it where it sits, so removing
+    // it only strands those references. The multi-MB VM runtime is executable and
+    // so excluded, and writable sections (live VM state) are too.
+    const READ: u32 = 0x4000_0000;
+    const EXECUTE: u32 = 0x2000_0000;
+    const WRITE: u32 = 0x8000_0000;
+    const SMALL_DATA: u32 = 0x1_0000;
     pe.sections
         .iter()
         .filter(|s| {
-            is_protector_section(s.name.as_str())
-                && s.characteristics == PURE_CODE
-                && pdata.get(&s.index).copied().unwrap_or(0) >= DENSE
+            if !is_protector_section(s.name.as_str()) {
+                return false;
+            }
+            let code = (s.characteristics & CODE) == CODE
+                && (s.characteristics & NON_CODE) == 0
+                && pdata.get(&s.index).copied().unwrap_or(0) >= DENSE;
+            let ro_data = (s.characteristics & READ) != 0
+                && (s.characteristics & (EXECUTE | WRITE)) == 0
+                && s.virtual_size <= SMALL_DATA;
+            code || ro_data
         })
         .map(|s| s.name.as_str().to_owned())
         .collect()
@@ -1317,7 +1345,14 @@ fn count_dangling(image: &[u8]) -> usize {
     };
     let base = pe.optional.image_base.0;
     let soi = pe.optional.size_of_image;
-    let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+    // The PE headers [0, size_of_headers) are mapped by the loader even though no
+    // section covers them, so a `lea reg, [rip-disp]` that computes the image base
+    // (RVA 0, ubiquitous in position-independent / mutated code) reaches mapped
+    // memory. Counting it as dangling was a false positive -- 810 of them on
+    // win.xpl alone.
+    let soh = pe.optional.size_of_headers;
+    let mapped =
+        |rva: u32| rva < soh || pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
     let mut count = 0;
     // `.pdata` bodies AND executable gaps -- a branch into removed space that
     // lives in a gap (outside any `.pdata` record) must be counted, or the
