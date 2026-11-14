@@ -942,8 +942,30 @@ pub fn run(o: Options) -> Result<(), String> {
         .iter()
         .map(|name| vmpx_pe::SectionSelector::Name(name.clone()))
         .collect();
-    let (stripped, summary) = crate::strip_wiring::strip_and_validate(&dir_bytes, &selectors, &[])
-        .map_err(|e| format!("strip refused: {e}"))?;
+    // A directory the relocator does not rebuild can sit inside a protector
+    // section VMProtect placed it in (e.g. load_config on a mutation-only binary).
+    // It is in removed protector space and is non-essential to execution, so drop
+    // each one the strip refuses over and retry. Essential directories (export,
+    // import, iat, exception, tls, basereloc) are relocated out already and
+    // app-data ones (resource, security) are not in this set, so a refusal over
+    // anything else still surfaces instead of silently dropping it.
+    // Indices: 6 debug, 7 architecture, 8 globalptr, 10 load_config, 11 bound_import.
+    const DROPPABLE_DIRS: [usize; 5] = [6, 7, 8, 10, 11];
+    let mut drop_dirs: Vec<usize> = Vec::new();
+    let (stripped, summary) = loop {
+        match crate::strip_wiring::strip_and_validate(&dir_bytes, &selectors, &drop_dirs) {
+            Ok(result) => break result,
+            Err(crate::strip_wiring::StripFailure::Refused(
+                vmpx_pe::StripError::DirectoryInRemoved { index, name, section },
+            )) if DROPPABLE_DIRS.contains(&index) && !drop_dirs.contains(&index) => {
+                log.warn(&format!(
+                    "{name} directory is in removed section {section}; dropping it (non-essential)"
+                ));
+                drop_dirs.push(index);
+            }
+            Err(e) => return Err(format!("strip refused: {e}")),
+        }
+    };
     log.step(
         "protector sections removed",
         &format!(
@@ -1509,7 +1531,10 @@ fn relocate_natives(
                 }
                 if !ok {
                     slot.copy_from_slice(&saved);
-                    return Err(format!("cannot rebase {start:#x}+{cursor}"));
+                    return Err(format!(
+                        "cannot rebase {start:#x}+{cursor} ({:?} size {size} target moved to {nt:#x}, out of range for this encoding)",
+                        ins.mnemonic()
+                    ));
                 }
             }
             cursor += size;
