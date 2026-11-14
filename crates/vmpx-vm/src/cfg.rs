@@ -172,7 +172,12 @@ impl Default for VmCfgLimits {
             max_targets: 16,
             // 8 refused 37 entries on systems.xpl once the earlier blockers
             // cleared, 3 of them blocked by nothing else; 4x is worth +3 N1.
-            max_nested_entries: 32,
+            // A380's nested-virtualized functions reach far more distinct nested
+            // sites; VMPX_MAX_NESTED overrides for measurement.
+            max_nested_entries: std::env::var("VMPX_MAX_NESTED")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32),
             // Counts DISTINCT transition sites (see `transition_sites`), so this
             // bounds how many profile regions one entry may reach, not how often
             // it re-enters them. 32 still refused entries at that bound; 8x is
