@@ -1733,10 +1733,6 @@ fn devirt_guards(
     let guards = guards.as_slice();
     let base = intact.optional.image_base.0;
     let section_rva = next_section_rva(&image).map_err(|e| e.to_string())?.0;
-    // Each guard gets a fixed-stride slot so its final VA -- which the emitted
-    // bytes depend on -- is known before building, which is what lets the builds
-    // run independently. A body that overflows its slot is left residual.
-    const SLOT_STRIDE: u32 = 0x1_0000;
     // Guard recovery recurses deeply (the serial path ran it on a 1 GiB stack),
     // so the worker threads need a big stack too or they overflow and the process
     // faults -- and each guard can hold up to ~1.5 GiB of symbolic state, so the
@@ -1758,19 +1754,19 @@ fn devirt_guards(
     log.step(
         "building",
         &format!(
-            "{} guard(s) across {thread_count} thread(s), fixed 64 KiB slots",
+            "{} guard(s) across {thread_count} thread(s), compact placement",
             guards.len()
         ),
     );
-    // Recover and emit every guard in parallel: VM CFG recovery is independent
-    // per guard and is the whole cost, so this scales across the machine.
-    let built: Vec<(usize, u32, Result<Vec<u8>, String>)> = pool.install(|| {
+    // Recover each guard's VA-independent native `Function` in parallel. VM CFG
+    // recovery is independent per guard and is the whole cost, so this scales
+    // across the machine. The cheap, VA-dependent compile is split out (below)
+    // so guards are packed end-to-end with no fixed slot and no size ceiling.
+    let functions: Vec<(usize, u32, Result<vmpx_recompile::Function, String>)> = pool.install(|| {
         guards
             .par_iter()
             .enumerate()
             .map(|(index, &rva)| {
-                let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
-                let va = base + u64::from(new_rva);
                 // Per-guard progress to stderr (flushed), so a crash names the
                 // guard it died on -- run with VMPX_GUARD_THREADS=1 to make the
                 // last line the exact culprit.
@@ -1778,14 +1774,12 @@ fn devirt_guards(
                 // Escalate a guard's budget only when more budget can actually
                 // help (CFG building exhausted its budget); a structural stall
                 // returns the same result at any budget, so retrying only burns
-                // time.
-                // A single guard must not take the whole batch down. A panic
-                // (e.g. an internal overflow) is caught and turned into a
-                // residual; an allocation abort still cannot be caught, which is
-                // why the per-guard budgets below bound memory.
+                // time. A single guard must not take the whole batch down: a
+                // panic is caught and turned into a residual; an allocation abort
+                // still cannot be caught, which is why the budgets bound memory.
                 let build = |limit| {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::devirt_cmd::build_one(intact, rva, limit, va)
+                        crate::devirt_cmd::build_one_function(intact, rva, limit)
                     }))
                     .unwrap_or_else(|_| Err("guard build panicked".to_owned()))
                 };
@@ -1801,7 +1795,7 @@ fn devirt_guards(
                     result = build(used);
                 }
                 match &result {
-                    Ok(bytes) => eprintln!("[guard {}/{}] {rva:#x} ok {} bytes", index + 1, guards.len(), bytes.len()),
+                    Ok(_) => eprintln!("[guard {}/{}] {rva:#x} built", index + 1, guards.len()),
                     Err(reason) => eprintln!(
                         "[guard {}/{}] {rva:#x} fail: {}",
                         index + 1,
@@ -1814,17 +1808,80 @@ fn devirt_guards(
             .collect()
     });
 
+    // Compact placement. A guard compiled at its final VA may be a few bytes
+    // longer or shorter than one compiled elsewhere (an absolute tail jump is 5
+    // bytes within rel32 range, 12 otherwise), so a fixed stride either wastes
+    // space or drops a body. Instead: compile once near the section base to size
+    // each guard, pack the surviving guards end-to-end with a little headroom,
+    // then recompile each at the VA it actually lands on. A guard that grows past
+    // its reserved headroom (it never should: one absolute jump, +7 at most) is
+    // dropped rather than allowed to overlap its neighbour.
+    const CODE_ALIGN: u32 = 16;
+    // Absorbs the worst-case rel32 -> movabs growth (7 bytes) between the sizing
+    // compile and the final compile.
+    const JUMP_HEADROOM: u32 = 16;
+    let sizing_va = base + u64::from(section_rva);
+    let sized: Vec<(usize, u32, Result<(vmpx_recompile::Function, u32), String>)> =
+        pool.install(|| {
+            functions
+                .into_par_iter()
+                .map(|(index, rva, result)| {
+                    let outcome = result.and_then(|function| {
+                        crate::devirt_cmd::compile_one(&function, sizing_va)
+                            .map(|bytes| (function, u32::try_from(bytes.len()).unwrap_or(u32::MAX)))
+                    });
+                    (index, rva, outcome)
+                })
+                .collect()
+        });
+
+    let mut residual: Vec<u32> = Vec::new();
+    // Survivors in original guard order, each with its reserved slot size.
+    let mut by_index: Vec<(usize, u32, vmpx_recompile::Function, u32)> = Vec::new();
+    for (index, rva, outcome) in sized {
+        match outcome {
+            Ok((function, len)) => {
+                let reserved = len
+                    .saturating_add(JUMP_HEADROOM)
+                    .div_ceil(CODE_ALIGN)
+                    .saturating_mul(CODE_ALIGN);
+                by_index.push((index, rva, function, reserved));
+            }
+            Err(reason) => {
+                residual.push(rva);
+                log.warn(&format!("{rva:#x}: {}", reason.lines().next().unwrap_or(&reason)));
+            }
+        }
+    }
+    by_index.sort_by_key(|(index, ..)| *index);
+    // Assign each survivor its packed RVA from the running offset.
+    let mut running = 0_u32;
+    let mut layout: Vec<(u32, u32, vmpx_recompile::Function, u32)> = Vec::new();
+    for (_, rva, function, reserved) in by_index {
+        let new_rva = section_rva + running;
+        layout.push((rva, new_rva, function, reserved));
+        running = running.saturating_add(reserved);
+    }
+    // Recompile each survivor at its final VA, in parallel.
+    let compiled: Vec<(u32, u32, u32, Result<Vec<u8>, String>)> = pool.install(|| {
+        layout
+            .into_par_iter()
+            .map(|(rva, new_rva, function, reserved)| {
+                let bytes = crate::devirt_cmd::compile_one(&function, base + u64::from(new_rva));
+                (rva, new_rva, reserved, bytes)
+            })
+            .collect()
+    });
+
     let mut payload: Vec<u8> = Vec::new();
     let mut mapping: BTreeMap<u32, u32> = BTreeMap::new();
     // (original rva, reconstructed rva, byte length) per devirtualized guard.
     let mut placements: Vec<(u32, u32, u32)> = Vec::new();
     let mut ok = 0_usize;
-    let mut residual: Vec<u32> = Vec::new();
-    for (index, rva, result) in built {
-        let new_rva = section_rva + u32::try_from(index).unwrap_or(0) * SLOT_STRIDE;
+    for (rva, new_rva, reserved, result) in compiled {
         let slot_start = usize::try_from(new_rva - section_rva).unwrap_or(0);
         match result {
-            Ok(bytes) if u32::try_from(bytes.len()).unwrap_or(u32::MAX) <= SLOT_STRIDE => {
+            Ok(bytes) if u32::try_from(bytes.len()).unwrap_or(u32::MAX) <= reserved => {
                 log.step(&format!("{rva:#x} devirtualized"), &format!("{} byte(s)", bytes.len()));
                 if payload.len() < slot_start {
                     payload.resize(slot_start, 0xCC);
@@ -1835,9 +1892,11 @@ fn devirt_guards(
                 ok += 1;
             }
             Ok(bytes) => {
+                // Final compile outgrew its reserved headroom -- drop rather than
+                // overlap the next guard. This should not happen in practice.
                 residual.push(rva);
                 log.warn(&format!(
-                    "{rva:#x}: {} byte body exceeds the {SLOT_STRIDE:#x} slot",
+                    "{rva:#x}: {} byte body outgrew its {reserved:#x} reserved slot",
                     bytes.len()
                 ));
             }

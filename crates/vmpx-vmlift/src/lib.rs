@@ -68,7 +68,7 @@ pub use replacement::{
 /// The VM-model symbol for the entry condition state, which a replacement
 /// captures for itself. Exported so the closedness check can admit it.
 pub use replacement::NATIVE_RFLAGS_INITIAL as ENTRY_FLAGS_SYMBOL;
-pub use loop_replacement::build_control_flow_replacement;
+pub use loop_replacement::{build_control_flow_function, build_control_flow_replacement};
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -406,12 +406,11 @@ fn collect_tree_symbols(node: &RNode, out: &mut std::collections::BTreeSet<Strin
 ///
 /// Fails when the tree uses a construct this emitter does not yet cover (region
 /// exits, nested loops) or when an expression cannot be lowered.
-pub fn build_control_flow_replacement(
+pub fn build_control_flow_function(
     root: &RNode,
     config: &ReplacementConfig,
-    address: CodeAddress,
     fold: &dyn Fn(&Expr) -> Result<Expr, String>,
-) -> Result<Vec<u8>, String> {
+) -> Result<vmpx_recompile::Function, String> {
     // Peel any leading pre-loop stores. The remainder is either a loop or, for a
     // branchy non-loop function, the body itself (no phis, no back edge).
     let mut leading: Vec<&RStore> = Vec::new();
@@ -632,6 +631,23 @@ pub fn build_control_flow_replacement(
         assignments: ctx.assignments,
         frame,
     };
+    Ok(function)
+}
+
+/// Build and compile a control-flow replacement at `address`. The Function is
+/// position-independent; the compile is the only VA-dependent step, so compact
+/// placement builds the Function once and compiles it at the packed offset.
+///
+/// # Errors
+///
+/// Fails when [`build_control_flow_function`] fails or the compile fails.
+pub fn build_control_flow_replacement(
+    root: &RNode,
+    config: &ReplacementConfig,
+    address: CodeAddress,
+    fold: &dyn Fn(&Expr) -> Result<Expr, String>,
+) -> Result<Vec<u8>, String> {
+    let function = build_control_flow_function(root, config, fold)?;
     let compiled = compile(&function, address).map_err(|error| format!("compile: {error}"))?;
     Ok(compiled.bytes)
 }

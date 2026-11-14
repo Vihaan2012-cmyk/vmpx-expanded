@@ -279,12 +279,46 @@ fn try_fold_loop_to_constant(
 }
 
 /// Native bytes for one devirtualized guard, built at its final VA.
+/// Compile a prebuilt, VA-independent [`Function`] at `va`. The recovery work
+/// lives in [`build_one_function`]; this is the cheap VA-dependent step, split
+/// out so compact placement can build every guard in parallel and then compile
+/// each one at its packed offset.
+///
+/// [`Function`]: vmpx_recompile::Function
+///
+/// # Errors
+///
+/// Fails when the compile fails.
+pub(crate) fn compile_one(function: &vmpx_recompile::Function, va: u64) -> Result<Vec<u8>, String> {
+    vmpx_recompile::compile(function, CodeAddress(va))
+        .map(|compiled| compiled.bytes)
+        .map_err(|error| format!("compile: {error}"))
+}
+
 pub(crate) fn build_one(
     intact: &PeImage<'_>,
     rva: u32,
     instruction_limit: usize,
     va: u64,
 ) -> Result<Vec<u8>, String> {
+    let function = build_one_function(intact, rva, instruction_limit)?;
+    compile_one(&function, va)
+}
+
+/// Recover a guard's VA-independent native [`Function`] (everything but the
+/// final compile): roll the CFG, fold the checksum, lower the tree. The returned
+/// `Function` can be compiled at any address with [`compile_one`].
+///
+/// [`Function`]: vmpx_recompile::Function
+///
+/// # Errors
+///
+/// Fails when the CFG has no exit path or the lift cannot lower the tree.
+pub(crate) fn build_one_function(
+    intact: &PeImage<'_>,
+    rva: u32,
+    instruction_limit: usize,
+) -> Result<vmpx_recompile::Function, String> {
     let rolled =
         crate::decoded_splice::with_entry_input(intact, Rva(rva), instruction_limit, |input| {
             let resolver = vmpx_vmlift::PeNestedEntries {
@@ -353,8 +387,8 @@ pub(crate) fn build_one(
                 rflags: None,
                 symbol_rewrites: BTreeMap::new(),
             };
-            return build_replacement(&registers, &config, CodeAddress(va))
-                .map(|replacement| replacement.compiled.bytes)
+            return build_replacement(&registers, &config, CodeAddress(0))
+                .map(|replacement| replacement.function)
                 .map_err(|error| format!("build: {error}"));
         }
         let config = ReplacementConfig {
@@ -368,12 +402,7 @@ pub(crate) fn build_one(
             rflags: None,
             symbol_rewrites: BTreeMap::new(),
         };
-        return vmpx_vmlift::build_control_flow_replacement(
-            &rolled.root,
-            &config,
-            CodeAddress(va),
-            &loop_fold,
-        );
+        return vmpx_vmlift::build_control_flow_function(&rolled.root, &config, &loop_fold);
     }
 
     let mut folded = 0_usize;
@@ -521,12 +550,7 @@ pub(crate) fn build_one(
             rflags: None,
             symbol_rewrites: BTreeMap::new(),
         };
-        return vmpx_vmlift::build_control_flow_replacement(
-            &rolled.root,
-            &config,
-            CodeAddress(va),
-            &cf_fold,
-        );
+        return vmpx_vmlift::build_control_flow_function(&rolled.root, &config, &cf_fold);
     }
     let (registers, effects) = (first.registers.clone(), first.effects.clone());
     // A region exit emits a `Computed` continuation: the replacement stages the
@@ -547,9 +571,9 @@ pub(crate) fn build_one(
         rflags: None,
         symbol_rewrites: BTreeMap::new(),
     };
-    let replacement = build_replacement(&registers, &config, CodeAddress(va))
-        .map_err(|error| format!("build: {error}"))?;
-    Ok(replacement.compiled.bytes)
+    build_replacement(&registers, &config, CodeAddress(0))
+        .map(|replacement| replacement.function)
+        .map_err(|error| format!("build: {error}"))
 }
 
 /// Retarget every direct `.text` transfer into `old` so it reaches `new`,
