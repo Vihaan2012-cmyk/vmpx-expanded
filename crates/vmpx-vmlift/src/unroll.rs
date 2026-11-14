@@ -311,7 +311,7 @@ impl Walker<'_, '_> {
                         key = to;
                         continue;
                     }
-                    let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset)
+                    let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset, crate::decoded_lift::RegionStaging::Full)
                         .map_err(|e| e.to_string())?;
                     let mut region_target = None;
                     let (exit, region_exit) = match recovered {

@@ -720,7 +720,7 @@ impl Walker<'_, '_> {
                         key = to;
                         continue;
                     }
-                    let recovered = recover_exit(&report, layout, self.input.frame.len(), self.input.top_offset)
+                    let recovered = recover_exit(&report, layout, self.input.frame.len(), self.input.top_offset, crate::decoded_lift::RegionStaging::TargetOnly)
                         .map_err(|e| e.to_string())?;
                     let (registers, region, continuation) = match recovered {
                         RecoveredExit::Callee(e) => (e.registers, false, None),

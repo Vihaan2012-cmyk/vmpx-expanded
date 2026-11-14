@@ -1200,6 +1200,7 @@ impl Builder<'_> {
                         layout,
                         input.frame.len(),
                         input.top_offset,
+                        crate::decoded_lift::RegionStaging::Full,
                     )
                     .map_err(|error| DecodedLiftError::Cfg {
                         block: key,

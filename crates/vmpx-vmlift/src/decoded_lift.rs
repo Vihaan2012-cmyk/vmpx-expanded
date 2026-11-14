@@ -268,7 +268,7 @@ pub fn recover_stub_exit(
     frame_cells: usize,
     top_offset: u64,
 ) -> Result<StubExit, DecodedLiftError> {
-    match recover_exit(symbolic, exit, frame_cells, top_offset)? {
+    match recover_exit(symbolic, exit, frame_cells, top_offset, RegionStaging::Full)? {
         RecoveredExit::Callee(exit) => Ok(exit),
         RecoveredExit::Region(_) => Err(DecodedLiftError::NotCalleeReturn(
             "the return address was written by the VM, not read from caller stack".to_owned(),
@@ -301,11 +301,24 @@ pub fn recover_stub_exit(
 /// Refuses a return through a VM-written slot outside the entry frame that is
 /// not the proven caller return, an untracked staged word, or an inconsistent
 /// layout.
+/// How a region (staged-continuation) exit is recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionStaging {
+    /// Stage every word in `[return_slot, entry_sp)`, failing closed if any is
+    /// untracked. For a consumer that reproduces the staged frame on the stack.
+    Full,
+    /// Require only word zero (the continuation target). For a consumer that
+    /// transfers through the target with a caller-level RSP and never reproduces
+    /// the staged scratch below the entry SP (the rolled tail-transfer emitter).
+    TargetOnly,
+}
+
 pub fn recover_exit(
     symbolic: &vmpx_vm::SymbolicVmExecutionReport,
     exit: &VmExitReport,
     frame_cells: usize,
     top_offset: u64,
+    region_staging: RegionStaging,
 ) -> Result<RecoveredExit, DecodedLiftError> {
     let fail = |message: String| DecodedLiftError::NativeExit(message);
     if exit.status != vmpx_vm::RecoveryStatus::Recovered {
@@ -421,8 +434,21 @@ pub fn recover_exit(
         // inside the captured entry frame or below the captured VSP (the VM built
         // a fresh exit frame there); either way every staged word must be a
         // tracked value or the lift fails closed.
-        Ok(_) if return_slot < entry_sp && return_slot % 8 == 0 => {
+        Ok(target_value) if return_slot < entry_sp && return_slot % 8 == 0 => {
             let staged_words = entry_sp.checked_sub(return_slot).map_or(0, |span| span / 8);
+            // A consumer that transfers through the target with a caller-level RSP
+            // (the rolled emitter) uses only word zero; the words above it are the
+            // VM's own scratch below the entry SP, which the emission never
+            // reproduces. Requiring them tracked fails the exit closed for nothing.
+            // A consumer that reproduces the staged frame asks for `Full`.
+            if region_staging == RegionStaging::TargetOnly {
+                return Ok(RecoveredExit::Region(RegionExit {
+                    registers,
+                    rflags,
+                    staged: vec![target_value],
+                    slot_offset: return_slot,
+                }));
+            }
             if staged_words > MAX_STAGED_CONTINUATION_WORDS {
                 return Err(fail(format!(
                     "region continuation stages {staged_words} words, over the {MAX_STAGED_CONTINUATION_WORDS} limit"
@@ -830,7 +856,7 @@ mod tests {
         let (symbolic, exit) = report(&target);
         // 12 cells, top_offset 0x28: entry stack pointer at 0x28 + 96 = 136 > 128.
         assert!(matches!(
-            recover_exit(&symbolic, &exit, 12, 0x28),
+            recover_exit(&symbolic, &exit, 12, 0x28, RegionStaging::Full),
             Ok(RecoveredExit::Region(_))
         ));
         // What `top_offset` is load-bearing for is the REGION classification:
@@ -839,7 +865,7 @@ mod tests {
         // staged. It used to refuse outright; now the same misplacement comes
         // back as a trampoline, so assert on what the offset actually decides.
         assert!(!matches!(
-            recover_exit(&symbolic, &exit, 12, 0),
+            recover_exit(&symbolic, &exit, 12, 0, RegionStaging::Full),
             Ok(RecoveredExit::Region(_))
         ));
     }
@@ -852,7 +878,7 @@ mod tests {
         let return_address = Expr::register(BitWidth::W64, "native_return_address_initial");
         let (symbolic, exit) = report(&return_address);
         // 16 cells, top_offset 0: entry stack pointer at 128 == return slot.
-        match recover_exit(&symbolic, &exit, 16, 0) {
+        match recover_exit(&symbolic, &exit, 16, 0, RegionStaging::Full) {
             Ok(RecoveredExit::Callee(stub)) => assert_eq!(stub.return_pop, 0),
             other => panic!("expected a clean callee return, got {other:?}"),
         }
@@ -869,7 +895,7 @@ mod tests {
     fn a_written_slot_with_a_computed_non_return_target_is_a_trampoline() {
         let computed = Expr::constant(BitWidth::W64, 0x1_8002_A700);
         let (symbolic, exit) = report(&computed);
-        match recover_exit(&symbolic, &exit, 16, 0) {
+        match recover_exit(&symbolic, &exit, 16, 0, RegionStaging::Full) {
             Ok(RecoveredExit::Trampoline(trampoline)) => {
                 assert_eq!(trampoline.target, computed);
                 // Exactly at the entry stack pointer, which is the case the
@@ -933,7 +959,7 @@ mod tests {
             resolved_image_bytes: 0,
         };
         let (_, exit) = report(&Expr::constant(BitWidth::W64, 0));
-        match recover_exit(&symbolic, &exit, 17, 0) {
+        match recover_exit(&symbolic, &exit, 17, 0, RegionStaging::Full) {
             Ok(RecoveredExit::Region(region)) => {
                 assert_eq!(region.slot_offset, -104);
                 // staged spans the return slot up to the entry stack pointer.
