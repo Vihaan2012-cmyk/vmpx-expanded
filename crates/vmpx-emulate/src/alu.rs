@@ -420,6 +420,88 @@ mod tests {
         assert_eq!(f.undef & CF, 0, "CF defined past width");
     }
 
+    // Audit of the exact shift/rotate forms VMProtect's mutator emits in the
+    // win.xpl decryption chain. These pin the SDM-defined behaviour (count
+    // masking to 5/6 bits; CF/ZF/SF/PF defined; rotates never touch SF/ZF/PF;
+    // OF defined only for a 1-bit count) that the detonation relies on.
+    #[test]
+    fn shift_count_masking_5bit() {
+        // `sar r11w,0x4Ch`: a word shift's count is masked to 5 bits (0x4C -> 12),
+        // NOT to the operand width. Masked and pre-masked forms must agree.
+        for a in [0x8001u64, 0x1234, 0xFFFF, 0x4000] {
+            assert_eq!(shift(Shift::Sar, a, 0x4C, 2), shift(Shift::Sar, a, 12, 2));
+        }
+        // SAR word by 12: CF is the last bit shifted out (bit 11 of the operand);
+        // SF/ZF/PF are defined from the result. 0x8801 has bit 11 set -> CF=1.
+        let (r, f) = shift(Shift::Sar, 0x8801, 12, 2).unwrap();
+        assert_eq!(r, 0xFFF8, "sign bits shifted in");
+        assert_eq!(f.def & (CF | SF | ZF | PF), CF | SF | ZF | PF);
+        assert_eq!(f.val & CF, CF, "bit 11 of 0x8801 is 1");
+        assert_eq!(f.val & SF, SF, "result is negative");
+        // bit 11 clear -> CF=0 (0x8001).
+        let (_, f) = shift(Shift::Sar, 0x8001, 12, 2).unwrap();
+        assert_eq!(f.val & CF, 0, "bit 11 of 0x8001 is 0");
+    }
+
+    #[test]
+    fn shift_count_zero_is_noop() {
+        // A masked count of 0 (0x20 on a dword -> 0) touches neither register
+        // nor flags.
+        assert!(shift(Shift::Shl, 0x1234_5678, 0x20, 4).is_none());
+        assert!(shift(Shift::Shr, 0x1234_5678, 0x40, 4).is_none());
+    }
+
+    #[test]
+    fn rotate_count_masking() {
+        // `ror r11b,0A6h` (0xA6 & 0x1F = 6) and `ror r10w,0CCh` (0xCC & 0x1F = 12).
+        for a in [0x81u64, 0x12, 0xFF, 0x3C] {
+            assert_eq!(rotate(Rotate::Ror, a, 0xA6, false, 1), rotate(Rotate::Ror, a, 6, false, 1));
+        }
+        for a in [0x8001u64, 0x1234, 0xABCD] {
+            assert_eq!(rotate(Rotate::Ror, a, 0xCC, false, 2), rotate(Rotate::Ror, a, 12, false, 2));
+        }
+        // Qword rotate masks to 6 bits: `rol rcx,5` and a 0x45 (& 0x3F = 5) agree.
+        for a in [0x1234_5678_9abc_def0u64, 1, u64::MAX] {
+            assert_eq!(rotate(Rotate::Rol, a, 5, false, 8), rotate(Rotate::Rol, a, 0x45, false, 8));
+        }
+    }
+
+    #[test]
+    fn rotate_never_touches_szp() {
+        // SDM: ROL/ROR/RCL/RCR affect only CF (and OF for a 1-bit count); SF, ZF,
+        // PF, AF are preserved. A mis-modelled rotate that cleared ZF/PF would
+        // corrupt a following `seta`/`jp`/`jcc` -- the suspected divergence class.
+        let cases = [
+            (Rotate::Rol, 0x1234_5678u64, 5u64, 8u32),
+            (Rotate::Ror, 0x81, 6, 1),
+            (Rotate::Ror, 0xABCD, 12, 2),
+            (Rotate::Rcl, 0xDEAD_BEEF, 7, 4),
+            (Rotate::Rcr, 0xFF, 3, 1),
+        ];
+        for (k, a, c, bytes) in cases {
+            let (_, f) = rotate(k, a, c, true, bytes).unwrap();
+            assert_eq!(f.def & (SF | ZF | PF | AF), 0, "rotate must not define SF/ZF/PF/AF");
+            assert_eq!(f.undef & (SF | ZF | PF | AF), 0, "rotate must not disturb SF/ZF/PF/AF");
+            assert_eq!(f.def & CF, CF, "rotate always defines CF");
+        }
+        // Multi-bit rotate leaves OF undefined; 1-bit defines it.
+        let (_, f) = rotate(Rotate::Rol, 0x8000_0000, 1, false, 4).unwrap();
+        assert_eq!(f.def & OF, OF);
+        let (_, f) = rotate(Rotate::Rol, 0x8000_0000, 5, false, 4).unwrap();
+        assert_eq!(f.undef & OF, OF);
+    }
+
+    #[test]
+    fn rotate_cf_matches_result_bit() {
+        // ROL CF = LSB of result; ROR CF = MSB of result (SDM).
+        for a in [0x81u64, 0x12, 0xC3, 0x7E] {
+            let (r, f) = rotate(Rotate::Rol, a, 3, false, 1).unwrap();
+            assert_eq!((f.val & CF != 0) as u64, r & 1, "ROL CF = result bit 0");
+            let (r, f) = rotate(Rotate::Ror, a, 3, false, 1).unwrap();
+            assert_eq!((f.val & CF != 0) as u64, bit(r, 7), "ROR CF = result MSB");
+        }
+    }
+
     #[test]
     fn adc_sbb_with_carry() {
         // 0xff + 0 + 1 = 0x100 -> byte 0, carry out.

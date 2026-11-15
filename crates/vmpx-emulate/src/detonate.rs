@@ -500,7 +500,11 @@ fn detonate_with(
     // in-model run; it never affects sound static output.
     emu.resolve_undefined_flags = opts.resolve_undefined_flags;
     // Only the retired count is consumed; skip the per-step trace allocation.
-    emu.record_trace = false;
+    // Under VMPX_FAULT_DUMP keep a per-step trace so a fault can show the
+    // executed instruction stream (real boundaries) leading up to it.
+    let fault_dump = std::env::var_os("VMPX_FAULT_DUMP").is_some();
+    emu.record_trace = fault_dump;
+    emu.observe.detail = fault_dump;
     // Run the protector byte-at-a-time integrity and copy loops natively. The
     // detonation is Observed tier by construction and these folds are gated on
     // reaching the same state the interpreter would (see `checksum_loop` and
@@ -550,6 +554,79 @@ fn detonate_with(
             ),
             1,
         );
+        if std::env::var_os("VMPX_FAULT_DUMP").is_some() {
+            let names = [
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                "r12", "r13", "r14", "r15",
+            ];
+            eprintln!("--- VMPX_FAULT_DUMP: {access:?} {addr:#x} at rip={rip:#x} ---");
+            for (i, n) in names.iter().enumerate() {
+                let v = emu.cpu.regs[i];
+                let mut tag = String::new();
+                if v == *addr {
+                    tag = "  <== holds fault addr".into();
+                } else if v & 0x7fff_ffff == *addr & 0x7fff_ffff && v != *addr {
+                    tag = "  <== low31 matches fault addr (bit-31 differs)".into();
+                } else if v & 0xffff_ffff == *addr & 0xffff_ffff {
+                    tag = "  <== low32 matches fault addr".into();
+                }
+                eprintln!("  {n:<3} = {v:#018x}{tag}");
+            }
+            // Decode the instruction at rip (code bytes, tolerating a short read).
+            let mut code = Vec::new();
+            for off in 0..16u64 {
+                match emu.mem.read_uint(rip + off, 1) {
+                    Ok(b) => code.push(b as u8),
+                    Err(_) => break,
+                }
+            }
+            eprintln!("  bytes@rip = {}", code.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            let mut dec = iced_x86::Decoder::with_ip(64, &code, *rip, iced_x86::DecoderOptions::NONE);
+            if dec.can_decode() {
+                use iced_x86::Formatter;
+                let insn = dec.decode();
+                let mut txt = String::new();
+                iced_x86::NasmFormatter::new().format(&insn, &mut txt);
+                eprintln!("  insn@rip  = {txt}");
+            }
+            // Tail of the executed stream (real boundaries), live-decoded. Flags
+            // any step whose destination's full register is RBX or R9 -- the
+            // registers holding the truncated fault address.
+            let n = emu.trace.len();
+            let want = std::env::var("VMPX_FAULT_TRACE_N")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(32);
+            let tail = emu.trace.iter().skip(n.saturating_sub(want));
+            eprintln!("  --- last {} executed instructions ---", n.min(want));
+            for te in tail {
+                let mut cb = Vec::new();
+                for off in 0..16u64 {
+                    match emu.mem.read_uint(te.rip + off, 1) {
+                        Ok(b) => cb.push(b as u8),
+                        Err(_) => break,
+                    }
+                }
+                let mut d = iced_x86::Decoder::with_ip(64, &cb, te.rip, iced_x86::DecoderOptions::NONE);
+                let (mut txt, mut writes_target) = (String::new(), false);
+                if d.can_decode() {
+                    use iced_x86::Formatter;
+                    let insn = d.decode();
+                    iced_x86::NasmFormatter::new().format(&insn, &mut txt);
+                    if insn.op_count() > 0 && insn.op0_kind() == iced_x86::OpKind::Register {
+                        let full = insn.op0_register().full_register();
+                        writes_target = full == iced_x86::Register::RBX || full == iced_x86::Register::R9;
+                    }
+                }
+                let ea = te.ea.map(|e| format!(" ea={e:#x}")).unwrap_or_default();
+                let val = te.value.map(|v| format!(" val={v:#x}")).unwrap_or_default();
+                eprintln!(
+                    "  {}{:#010x}  {txt}{ea}{val}",
+                    if writes_target { "* " } else { "  " },
+                    te.rip
+                );
+            }
+        }
     }
     let lifecycle = opts.lifecycle.as_ref().map(|lc| {
         let env = LifecycleEnv {
