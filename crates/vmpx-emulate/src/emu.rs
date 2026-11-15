@@ -453,6 +453,15 @@ pub struct Emulator {
     /// Set once the env check for `lzma_cap` found nothing, so the hot fold path
     /// does not re-query the environment every call.
     lzma_cap_off: bool,
+    /// Last stream start (`input_end`) seen, to detect a new stream for the
+    /// VMPX_LZMA_STREAMS register-sequencing dump.
+    lzma_last_end: u64,
+    /// New-stream register dumps emitted so far (VMPX_LZMA_STREAMS).
+    lzma_streams: u32,
+    /// VMPX_LZMA_STATEDUMP: first stream start seen, and how many mid-stream
+    /// state dumps have been emitted (locates the guest's state/reps/dicPos).
+    lzma_sd_end: u64,
+    lzma_sd_done: u32,
     /// Addresses known to hold no shape of any kind, one word each.
     ///
     /// The three caches above each answer "is there a shape at this rip", and
@@ -765,6 +774,10 @@ impl Emulator {
             lzma_probed: 0,
             lzma_cap: None,
             lzma_cap_off: false,
+            lzma_last_end: 0,
+            lzma_streams: 0,
+            lzma_sd_end: 0,
+            lzma_sd_done: 0,
             absent: vec![0u64; ABSENT_SLOTS].into_boxed_slice(),
         }
     }
@@ -1224,6 +1237,12 @@ impl Emulator {
         ) else {
             return 0;
         };
+        if self.lzma_sd_done == 0 && std::env::var_os("VMPX_LZMA_TRACE").is_some() {
+            eprintln!(
+                "[lzma-fold] FIRST fold entry: rip={:#x} input={input:#x} input_end={input_end:#x} r15={:#x} probs={probs:#x} range={range:#x} code={code:#x}",
+                self.cpu.rip, self.cpu.regs[15]
+            );
+        }
         if self.lzma_probed < 60 && std::env::var_os("VMPX_LZMA_PROBE").is_some() {
             self.lzma_probe(input, input_end);
         }
@@ -1231,6 +1250,48 @@ impl Emulator {
             match std::env::var_os("VMPX_LZMA_CAPTURE") {
                 Some(dir) => self.lzma_capture_begin(std::path::PathBuf::from(dir), input_end),
                 None => self.lzma_cap_off = true,
+            }
+        }
+        if self.lzma_streams < 12
+            && input_end != self.lzma_last_end
+            && std::env::var_os("VMPX_LZMA_STREAMS").is_some()
+        {
+            self.lzma_last_end = input_end;
+            self.lzma_streams += 1;
+            let names = [
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                "r12", "r13", "r14", "r15",
+            ];
+            let regs: Vec<String> = (0..16)
+                .map(|i| format!("{}={:#x}", names[i], self.cpu.regs[i]))
+                .collect();
+            let sp = self.cpu.regs[4];
+            let stack: Vec<String> = (0..8)
+                .map(|i| {
+                    self.mem
+                        .read_uint(sp + i * 8, 8)
+                        .map(|v| format!("[rsp+{:#x}]={v:#x}", i * 8))
+                        .unwrap_or_default()
+                })
+                .collect();
+            eprintln!(
+                "[stream {}] start={input_end:#x} rip={:#x} {}\n    stack: {}",
+                self.lzma_streams,
+                self.cpu.rip,
+                regs.join(" "),
+                stack.join(" ")
+            );
+        }
+        if self.lzma_sd_done < 3 {
+            if let Some(dir) = std::env::var_os("VMPX_LZMA_STATEDUMP") {
+                self.lzma_statedump(
+                    std::path::PathBuf::from(dir),
+                    input,
+                    input_end,
+                    probs,
+                    range,
+                    code,
+                );
             }
         }
         let mut symbol = symbol as u32;
@@ -1293,6 +1354,79 @@ impl Emulator {
         self.prof.literals_folded += 1;
         self.prof.literal_bits += done;
         done
+    }
+
+    /// VMPX_LZMA_STATEDUMP read-only capture: at three increasing offsets inside
+    /// the first LZMA stream, dump the guest's prob block (`r15`), the stack and
+    /// registers. Comparing these against a native decode replayed to the same
+    /// input offset locates where the guest keeps `state`/`reps`/`dicPos` and
+    /// confirms the stock prob layout end to end. No guest state is modified.
+    fn lzma_statedump(&mut self, dir: std::path::PathBuf, input: u64, input_end: u64, probs: u64, range: u64, code: u64) {
+        if self.lzma_sd_end == 0 {
+            self.lzma_sd_end = input_end;
+        }
+        if input_end != self.lzma_sd_end {
+            return; // only the first stream, so offsets correlate to one replay
+        }
+        let offset = input.wrapping_sub(input_end);
+        let thresholds = [0x8000u64, 0x20000, 0x40000];
+        let idx = self.lzma_sd_done as usize;
+        if offset < thresholds[idx] {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let r15 = self.cpu.regs[15];
+        // Dump the compressed stream once (for the offline native replay).
+        if idx == 0 {
+            let mut stream = Vec::with_capacity(8 << 20);
+            let mut a = input_end;
+            while a < input_end.saturating_add(8 << 20) {
+                match self.mem.read_uint(a, 1) {
+                    Ok(b) => stream.push(b as u8),
+                    Err(_) => break,
+                }
+                a += 1;
+            }
+            let _ = std::fs::write(dir.join("stream.bin"), &stream);
+        }
+        let sp = self.cpu.regs[4];
+        let read_region = |base: u64, len: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len as u64 {
+                match self.mem.read_uint(base + i, 1) {
+                    Ok(b) => v.push(b as u8),
+                    Err(_) => break,
+                }
+            }
+            v
+        };
+        let r15_blob = read_region(r15, 0x4200);
+        let stack_blob = read_region(sp, 0x100);
+        let _ = std::fs::write(dir.join(format!("state{idx}_r15.bin")), &r15_blob);
+        let _ = std::fs::write(dir.join(format!("state{idx}_stack.bin")), &stack_blob);
+        let names = [
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+            "r13", "r14", "r15",
+        ];
+        let regs: Vec<String> = (0..16)
+            .map(|i| format!("{}={:#x}", names[i], self.cpu.regs[i]))
+            .collect();
+        let meta = format!(
+            "dump={idx}\nstream_start={input_end:#x}\ninput={input:#x}\noffset={offset:#x}\nprobs={probs:#x}\nrange={range:#x}\ncode={code:#x}\nr15={r15:#x}\nrip={:#x}\nregs={}\nr15_blob_len={}\n",
+            self.cpu.rip,
+            regs.join(" "),
+            r15_blob.len(),
+        );
+        let _ = std::fs::write(dir.join(format!("state{idx}_meta.txt")), &meta);
+        eprintln!(
+            "[statedump {idx}] offset={offset:#x} input={input:#x} r15={r15:#x} probs={probs:#x} range={range:#x} code={code:#x} r15_len={}",
+            r15_blob.len()
+        );
+        self.lzma_sd_done += 1;
+        if self.lzma_sd_done >= 3 && std::env::var_os("VMPX_LZMA_STATEDUMP_EXIT").is_some() {
+            eprintln!("[statedump] 3 dumps written, exiting early");
+            std::process::exit(7);
+        }
     }
 
     /// VMPX_LZMA_PROBE one-shot: prove the compressed stream at the current fold

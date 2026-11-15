@@ -631,6 +631,35 @@ pub fn decode_lzma1_snapshot(
     Ok((out, dec.pos, snap))
 }
 
+/// Like `decode_lzma1_snapshot`, but the snapshot is taken at the top of the
+/// first symbol whose range-coder input cursor has reached `input_off` bytes.
+/// (The guest's state dumps are keyed by input offset, not symbol index.)
+pub fn decode_lzma1_snapshot_at_input(
+    input: &[u8],
+    cap: usize,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    input_off: usize,
+) -> Result<(Vec<u8>, usize, Option<LzmaState>), &'static str> {
+    let Some(mut dec) = RangeDecoder::new(input) else {
+        return Err("stream too short");
+    };
+    let mut d = StreamDecoder::new(lc, lp, pb);
+    let mut out: Vec<u8> = Vec::new();
+    let mut snap = None;
+    while out.len() < cap {
+        if snap.is_none() && dec.pos >= input_off {
+            snap = Some(d.export(&dec, out.len()));
+        }
+        match d.step(&mut dec, &mut out)? {
+            Step::Byte => {}
+            Step::Eos => return Ok((out, dec.pos, snap)),
+        }
+    }
+    Ok((out, dec.pos, snap))
+}
+
 /// Resume a decode from an exported state, appending to `out` (which must hold
 /// the already-decoded prefix, since matches reference it). Returns the input
 /// bytes consumed, relative to the resume position.

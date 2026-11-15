@@ -61,7 +61,9 @@ mod iat_fill;
 mod hostmodel;
 mod loader;
 mod lzma_decode;
-pub use lzma_decode::{LzmaState, decode_lzma1, decode_lzma1_snapshot, resume_lzma1};
+pub use lzma_decode::{
+    LzmaState, decode_lzma1, decode_lzma1_snapshot, decode_lzma1_snapshot_at_input, resume_lzma1,
+};
 mod lzma_literal;
 mod memory;
 mod replay;
