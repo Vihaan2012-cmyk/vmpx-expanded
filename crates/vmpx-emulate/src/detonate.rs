@@ -395,6 +395,64 @@ pub fn detonate(pe: &PeImage, opts: &DetonateOptions) -> Result<DetonationResult
     Ok(res)
 }
 
+/// Ground-truth lockstep dump: single-step the emulator (loop folding OFF so one
+/// `step()` is exactly one instruction) and write, per step, the executed rip +
+/// the 16 GP regs + rflags (18 LE u64) to `<dir>/vmpx_trace.bin`, plus the
+/// start-of-run state to `<dir>/start.snap`. A Unicorn harness replays the
+/// snapshot and emits the same layout; diffing the two finds the first diverging
+/// instruction. Gated by the `VMPX_UNICORN=<dir>` env var.
+fn unicorn_lockstep_dump(
+    emu: &mut crate::Emulator,
+    sentinel: u64,
+    dir: &std::path::Path,
+    max_steps: u64,
+) -> Stop {
+    std::fs::create_dir_all(dir).ok();
+    emu.accelerate_checksums = false;
+    emu.accelerate_literals = false;
+    emu.record_trace = false;
+    emu.observe.detail = false;
+    if let Err(e) = crate::snapshot::save(&emu.cpu, &emu.mem, &dir.join("start.snap")) {
+        eprintln!("VMPX_UNICORN: snapshot save failed: {e:?}");
+        return Stop::StepLimit;
+    }
+    let cap = std::env::var("VMPX_UNICORN_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300_000)
+        .min(max_steps);
+    let mut buf: Vec<u8> = Vec::with_capacity(cap as usize * 18 * 8);
+    let mut rec = |rip: u64, c: &crate::cpu::Cpu| {
+        buf.extend_from_slice(&rip.to_le_bytes());
+        for r in c.regs {
+            buf.extend_from_slice(&r.to_le_bytes());
+        }
+        buf.extend_from_slice(&c.rflags.to_le_bytes());
+    };
+    let mut stop = Stop::StepLimit;
+    for _ in 0..cap {
+        let exec_rip = emu.cpu.rip;
+        if exec_rip == sentinel {
+            stop = Stop::Reached;
+            break;
+        }
+        match emu.step() {
+            Ok(()) => rec(exec_rip, &emu.cpu),
+            Err(s) => {
+                rec(exec_rip, &emu.cpu);
+                stop = s;
+                break;
+            }
+        }
+    }
+    let n = buf.len() / (18 * 8);
+    if let Err(e) = std::fs::write(dir.join("vmpx_trace.bin"), &buf) {
+        eprintln!("VMPX_UNICORN: trace write failed: {e:?}");
+    }
+    eprintln!("VMPX_UNICORN: dumped {n} steps to {}, stop={stop:?}", dir.display());
+    stop
+}
+
 fn detonate_with(
     pe: &PeImage,
     opts: &DetonateOptions,
@@ -542,6 +600,8 @@ fn detonate_with(
         } else {
             Stop::Reached
         }
+    } else if let Some(dir) = std::env::var_os("VMPX_UNICORN") {
+        unicorn_lockstep_dump(&mut emu, sentinel, std::path::Path::new(&dir), opts.max_steps)
     } else {
         emu.run_until(sentinel, opts.max_steps)
     };

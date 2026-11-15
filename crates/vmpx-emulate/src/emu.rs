@@ -2280,6 +2280,12 @@ impl Emulator {
                 let v = self.rd(&p.b)?;
                 if taken {
                     self.wreg(&p.a, v);
+                } else if p.a.bytes == 4 {
+                    // Intel 64: a 32-bit CMOVcc always writes its destination, so
+                    // even a not-taken move clears the upper 32 bits. Re-write the
+                    // low dword through the zero-extending 32-bit path.
+                    let cur = self.rreg(&p.a);
+                    self.wreg(&p.a, cur);
                 }
             }
             K::Clc => {
@@ -2791,6 +2797,11 @@ impl Emulator {
                     let v = self.read_op(ins, 1, n)?;
                     if taken {
                         self.write_op(ins, 0, n, v)?;
+                    } else if n == 4 {
+                        // Intel 64: a 32-bit CMOVcc always writes its destination,
+                        // so a not-taken move still clears the upper 32 bits.
+                        let cur = self.read_op(ins, 0, n)?;
+                        self.write_op(ins, 0, n, cur)?;
                     }
                 }
             }
@@ -3401,6 +3412,41 @@ mod tests {
         emu.cpu.rip = ADDR;
         emu.step().unwrap();
         assert_eq!(emu.cpu.reg(Register::RAX), Some(2), "cache served stale decode");
+    }
+
+    /// Intel 64: a 32-bit `CMOVcc` always writes its destination, so even a
+    /// not-taken move clears the upper 32 bits. A 64-bit `CMOVcc` leaves the
+    /// destination untouched when not taken. (Ground-truth-confirmed vs Unicorn;
+    /// the win.xpl detonation diverged on exactly this: a not-taken `cmovae
+    /// r11d,edx` left bit 32 set, poisoning a pointer decryption chain.)
+    #[test]
+    fn cmov32_not_taken_zero_extends_dest() {
+        let run = |code: &[u8], r11: u64, rdx: u64, cf_set: bool| {
+            let mut mem = Memory::new();
+            mem.map(ADDR, PAGE_SIZE, Perm::RWX).unwrap();
+            mem.poke(ADDR, code).unwrap();
+            let mut emu = Emulator::new(Cpu::new(ADDR), mem);
+            emu.cpu.regs[11] = r11;
+            emu.cpu.regs[2] = rdx;
+            emu.cpu.rflags = if cf_set { 0x3 } else { 0x2 }; // CF -> AE (0f43) false
+            emu.step().unwrap();
+            emu.cpu.regs[11]
+        };
+        // cmovae r11d, edx (32-bit), not taken (CF=1): upper dword cleared.
+        assert_eq!(
+            run(&[0x44, 0x0F, 0x43, 0xDA], 0x0000_0001_dc40_cd10, 0xdead_beef, true),
+            0x0000_0000_dc40_cd10
+        );
+        // taken (CF=0): writes zero-extended src.
+        assert_eq!(
+            run(&[0x44, 0x0F, 0x43, 0xDA], 0xffff_ffff_ffff_ffff, 0xdead_beef, false),
+            0x0000_0000_dead_beef
+        );
+        // cmovae r11, rdx (64-bit), not taken: destination fully preserved.
+        assert_eq!(
+            run(&[0x4C, 0x0F, 0x43, 0xDA], 0x0000_0001_dc40_cd10, 0xdead_beef, true),
+            0x0000_0001_dc40_cd10
+        );
     }
 
     /// The 8-byte-load fast compare must agree with a plain slice compare for
