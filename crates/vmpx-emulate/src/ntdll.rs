@@ -46,6 +46,7 @@ const PAGE_EXECUTE_READWRITE: u64 = 0x40;
 const MEM_COMMIT: u64 = 0x0000_1000;
 const MEM_FREE: u64 = 0x0001_0000;
 const MEM_PRIVATE: u64 = 0x0002_0000;
+const MEM_IMAGE: u64 = 0x0100_0000;
 
 const PAGE: u64 = 0x1000;
 
@@ -701,7 +702,11 @@ fn basic_memory_info(mem: &Memory, addr: u64) -> [u8; 48] {
         b[24..32].copy_from_slice(&(hi - lo).to_le_bytes()); // RegionSize
         b[32..36].copy_from_slice(&(MEM_COMMIT as u32).to_le_bytes()); // State
         b[36..40].copy_from_slice(&(protect as u32).to_le_bytes()); // Protect
-        b[40..44].copy_from_slice(&(MEM_PRIVATE as u32).to_le_bytes()); // Type
+        // HYPOTHESIS TEST: the loaded image (lowest region, ~0x36x-0x37x) is a mapped
+        // module → MEM_IMAGE on real Windows; VirtualAlloc heaps (0x50../0x70..) stay
+        // MEM_PRIVATE. VMProtect checks its own code region is MEM_IMAGE.
+        let ty = if (0x3_6000_0000..0x3_8000_0000).contains(&lo) { MEM_IMAGE } else { MEM_PRIVATE };
+        b[40..44].copy_from_slice(&(ty as u32).to_le_bytes()); // Type
     } else {
         // Free region: bound it by the next mapped page above (best-effort).
         let next = mem.pages().map(|(base, _, _)| base).find(|&base| base > page);

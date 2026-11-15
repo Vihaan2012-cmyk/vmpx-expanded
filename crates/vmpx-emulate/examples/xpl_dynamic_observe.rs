@@ -30,6 +30,8 @@ fn main() {
 
     let opts = DetonateOptions {
         start_from_snapshot: Some(snap),
+        force_return_stack_mb: std::env::var("XPL_FORCE_RETURN_MB").ok().and_then(|v| v.parse().ok()),
+        max_steps: std::env::var("XPL_FORCE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000_000_000),
         lifecycle: Some(LifecycleOptions { max_steps: budget, ..Default::default() }),
         xplm: true,
         vm_discover: true,

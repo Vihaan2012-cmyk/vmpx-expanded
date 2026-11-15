@@ -98,6 +98,12 @@ pub struct DetonateOptions {
     /// Restore CPU+memory from this snapshot instead of running the entry/init
     /// (skips the ~27B-step `.xpl` startup); init is then treated as `Reached`.
     pub start_from_snapshot: Option<std::path::PathBuf>,
+    /// After restoring a snapshot, continue the entry (DllMain) but force it to
+    /// return TRUE once it has driven the stack more than this many MiB below the
+    /// snapshot's rsp — an escape hatch for a divergent init recursion that never
+    /// reaches a base case in-model. Observed what-if tier: the resulting post-init
+    /// state is used only to drive the lifecycle, and is validated downstream.
+    pub force_return_stack_mb: Option<u64>,
 }
 
 /// Bounds for the in-model plugin lifecycle (all offline, step-capped).
@@ -140,6 +146,7 @@ impl Default for DetonateOptions {
             iat_region: IatRegion::Auto,
             lifecycle: None,
             start_from_snapshot: None,
+            force_return_stack_mb: None,
         }
     }
 }
@@ -460,7 +467,32 @@ fn detonate_with(
         let (c, m) = crate::snapshot::load(snap).map_err(|e| DetonateError::Snapshot(e.kind()))?;
         emu.cpu = c;
         emu.mem = m;
-        Stop::Reached
+        if let Some(mb) = opts.force_return_stack_mb {
+            // Continue DllMain, but if it drives the stack past the threshold it is
+            // the divergent init recursion: force a TRUE return so the lifecycle runs.
+            let threshold = emu.cpu.regs[4].saturating_sub(mb << 20);
+            const CHUNK: u64 = 200_000_000;
+            let mut st = Stop::StepLimit;
+            while emu.steps() < opts.max_steps {
+                match emu.run_until(sentinel, CHUNK) {
+                    Stop::StepLimit => {
+                        if emu.cpu.regs[4] <= threshold {
+                            emu.cpu.regs[0] = 1; // RAX = TRUE
+                            emu.cpu.rip = sentinel;
+                            st = Stop::Reached;
+                            break;
+                        }
+                    }
+                    other => {
+                        st = other;
+                        break;
+                    }
+                }
+            }
+            st
+        } else {
+            Stop::Reached
+        }
     } else {
         emu.run_until(sentinel, opts.max_steps)
     };

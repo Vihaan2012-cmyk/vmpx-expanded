@@ -1362,7 +1362,11 @@ impl WinApiHook {
                 Dispatch::Ret(1)
             }
             (_, "FlushInstructionCache") => Dispatch::Ret(1),
-            (_, "GetCurrentProcess") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFF),
+            (_, "GetCurrentProcess") => Dispatch::Ret(
+                std::env::var("XPL_GCP_RET").ok().and_then(|v| {
+                    v.strip_prefix("0x").map_or_else(|| v.parse::<u64>().ok(), |h| u64::from_str_radix(h, 16).ok())
+                }).unwrap_or(0xFFFF_FFFF_FFFF_FFFF),
+            ),
             (_, "GetCurrentThread") => Dispatch::Ret(0xFFFF_FFFF_FFFF_FFFE),
             (_, "GetCurrentProcessId") => Dispatch::Ret(crate::ntdll::FAKE_PID),
             (_, "GetCurrentThreadId") => Dispatch::Ret(crate::ntdll::FAKE_TID),
