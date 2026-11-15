@@ -1260,6 +1260,7 @@ fn detonate_imports(
         export_reference,
         max_steps,
         xplm,
+        discover_iat: true,
         save_snapshot: save_snapshot.map(std::path::Path::to_path_buf),
         ..vmpx_emulate::DetonateOptions::default()
     };
@@ -1279,19 +1280,36 @@ fn detonate_imports(
             &format!("{} (reuse with --snapshot to skip detonation)", path.display()),
         );
     }
-    let slots = result
-        .observed
-        .imports
+    // Bind from the observed IAT fill: each watched slot whose final value is an
+    // exact known import address (slot_rva -> module!name). This is the
+    // authoritative slot mapping (the import ADDRESS table the protector filled),
+    // unlike `observed.imports`, which carries the export-stub VA, not the slot.
+    let _ = base;
+    let fill = &result.iat_fill;
+    log.step(
+        "iat fill",
+        &format!(
+            "declared-region={:?} resolved={} unresolved={} untouched={} | discovered={}",
+            fill.region,
+            fill.resolved.len(),
+            fill.unresolved.len(),
+            fill.untouched,
+            result.iat_discovered.len()
+        ),
+    );
+    // Prefer the auto-discovered custom IAT (where the protector actually wrote
+    // resolved pointers); fall back to the declared-region fill.
+    let source = if result.iat_discovered.is_empty() {
+        &fill.resolved
+    } else {
+        &result.iat_discovered
+    };
+    let mut slots: Vec<(u32, String, String)> = source
         .iter()
-        .filter_map(|import| {
-            let rva = u32::try_from(import.stub_va_or_slot.checked_sub(base)?).ok()?;
-            let symbol = match &import.symbol {
-                vmpx_emulate::SymbolOrOrdinal::Name(name) => name.clone(),
-                vmpx_emulate::SymbolOrOrdinal::Ordinal(ordinal) => format!("#{ordinal}"),
-            };
-            Some((rva, import.module.clone(), symbol))
-        })
+        .map(|imp| (imp.slot_rva as u32, imp.module.clone(), imp.name.clone()))
         .collect();
+    slots.sort();
+    slots.dedup();
     Ok(slots)
 }
 

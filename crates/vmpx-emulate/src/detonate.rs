@@ -111,6 +111,11 @@ pub struct DetonateOptions {
     pub accelerate_protector_loops: bool,
     /// Region watched for import-slot fills (see [`DetonationResult::iat_fill`]).
     pub iat_region: IatRegion,
+    /// Also auto-discover the import-address table: log every in-image write of a
+    /// known import address and bind the persistent ones. Finds a custom IAT the
+    /// protector fills outside the declared directory (see
+    /// [`DetonationResult::iat_discovered`]). Adds whole-run write watching.
+    pub discover_iat: bool,
     /// After the entry returns, drive the X-Plane plugin lifecycle in the same emulator
     /// (see [`LifecycleOptions`]). Implies `xplm`, and an OEP no longer stops the run.
     pub lifecycle: Option<LifecycleOptions>,
@@ -168,6 +173,7 @@ impl Default for DetonateOptions {
             resolve_undefined_flags: true,
             accelerate_protector_loops: true,
             iat_region: IatRegion::Auto,
+            discover_iat: false,
             lifecycle: None,
             start_from_snapshot: None,
             force_return_stack_mb: None,
@@ -260,6 +266,11 @@ pub struct DetonationResult {
     /// Import-slot fills observed in `opts.iat_region`, mapped to `module!name`
     /// only on an exact known-address match.
     pub iat_fill: IatFill,
+    /// Import slots auto-discovered when `opts.discover_iat` is set: in-image
+    /// addresses the guest wrote a known import address to (finding a custom
+    /// import-address table wherever the protector puts it, not just the
+    /// declared IAT), whose final value is still an exact known import.
+    pub iat_discovered: Vec<iat_fill::IatSlotImport>,
     /// What the plugin-lifecycle driver did, when `opts.lifecycle` was set.
     pub lifecycle: Option<LifecycleReport>,
     /// Anti-analysis / unmodeled-API audit from the API model: probe or stop -> count.
@@ -284,25 +295,57 @@ fn iat_range(pe: &PeImage, image_base: u64, region: IatRegion) -> Option<(u64, u
         IatRegion::Off => return None,
         IatRegion::Rva { rva, len } => (rva, len),
         IatRegion::Auto => {
-            let import_rva = report
-                .directories
-                .iter()
-                .find(|d| d.index == 1 && d.size != 0)
-                .map(|d| d.address);
-            let sec = report
-                .sections
-                .iter()
-                .find(|s| s.name.eq_ignore_ascii_case(".idata"))
-                .or_else(|| {
-                    import_rva.and_then(|r| {
-                        report.sections.iter().find(|s| s.contains_mapped_rva(vmpx_pe::Rva(r)))
-                    })
-                })?;
-            (u64::from(sec.virtual_address.0), u64::from(sec.mapped_span()))
+            // The import ADDRESS table (data directory 12) is exactly where a
+            // loader/protector writes resolved function pointers, so prefer it.
+            let dir = |i: usize| report.directories.iter().find(|d| d.index == i && d.size != 0);
+            if let Some(iat) = dir(12) {
+                (u64::from(iat.address), u64::from(iat.size))
+            } else {
+                // Fall back to the import directory's section / `.idata`.
+                let import_rva = dir(1).map(|d| d.address);
+                let sec = report
+                    .sections
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(".idata"))
+                    .or_else(|| {
+                        import_rva.and_then(|r| {
+                            report.sections.iter().find(|s| s.contains_mapped_rva(vmpx_pe::Rva(r)))
+                        })
+                    })?;
+                (u64::from(sec.virtual_address.0), u64::from(sec.mapped_span()))
+            }
         }
     };
     let len = len & !7;
     (len != 0 && len <= iat_fill::MAX_REGION).then(|| (image_base + rva, image_base + rva + len))
+}
+
+/// Diagnostic (VMPX_IAT_PROBE): logs where the guest writes a value that is a
+/// known import address, revealing the real import-address table wherever the
+/// protector puts it. Captures the first N distinct target addresses.
+struct IatProbeHook {
+    book: crate::iat_fill::AddressBook,
+    seen: Rc<RefCell<std::collections::BTreeMap<u64, u64>>>,
+}
+
+impl Hook for IatProbeHook {
+    fn interest(&self) -> Interest {
+        Interest { write_all: true, ..Interest::NONE }
+    }
+    fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
+        if ev.access == crate::memory::Access::Write {
+            if let Some(v) = ev.value {
+                if v != 0 && self.book.borrow().contains_key(&v) {
+                    let mut s = self.seen.borrow_mut();
+                    let key = ev.addr & !7;
+                    if s.len() < 100_000 || s.contains_key(&key) {
+                        s.insert(key, v); // keep the latest value written to this slot
+                    }
+                }
+            }
+        }
+        HookAction::Continue
+    }
 }
 
 /// A hook that fans every event out to several inner hooks. `Stop` from any
@@ -553,6 +596,17 @@ fn detonate_with(
         None => hook,
     };
 
+    // Discover the real import-address table by logging where the guest writes
+    // known import addresses (opts.discover_iat; VMPX_IAT_PROBE also prints it).
+    let iat_probe = (opts.discover_iat || std::env::var_os("VMPX_IAT_PROBE").is_some())
+        .then(|| Rc::new(RefCell::new(std::collections::BTreeMap::<u64, u64>::new())));
+    let hook: Box<dyn Hook> = match &iat_probe {
+        Some(seen) => Box::new(MultiHook {
+            hooks: vec![hook, Box::new(IatProbeHook { book: Rc::clone(&book), seen: Rc::clone(seen) })],
+        }),
+        None => hook,
+    };
+
     // Stop cleanly when the entry returns to the synthetic sentinel: for a DLL
     // whose DllMain simply returns (no write-then-execute OEP handoff), this is
     // a legitimate terminus (`Stop::Reached`) rather than an exec fault on the
@@ -712,6 +766,42 @@ fn detonate_with(
     });
     let steps = emu.steps() as usize;
 
+    let mut iat_discovered: Vec<iat_fill::IatSlotImport> = Vec::new();
+    if let Some(seen) = &iat_probe {
+        let s = seen.borrow();
+        let ab = book.borrow();
+        let image_end =
+            image_base.saturating_add(u64::from(pe.report().optional.size_of_image));
+        // A discovered slot: an in-image address whose FINAL value is still an
+        // exact known import (the soundness rule from `iat_fill`). Transient
+        // writes to the stack / scratch allocations are excluded by the in-image
+        // test and the final-value check.
+        for &target in s.keys() {
+            if target < image_base || target >= image_end {
+                continue;
+            }
+            let Ok(value) = emu.mem.read_uint(target, 8) else { continue };
+            if let Some(k) = ab.get(&value) {
+                iat_discovered.push(iat_fill::IatSlotImport {
+                    slot_rva: target - image_base,
+                    value,
+                    module: k.module.clone(),
+                    name: k.name.clone(),
+                    source: k.source,
+                    writes: 1,
+                    changed: true,
+                });
+            }
+        }
+        if std::env::var_os("VMPX_IAT_PROBE").is_some() {
+            eprintln!(
+                "--- VMPX_IAT_PROBE: {} write targets, {} in-image slots bound ---",
+                s.len(),
+                iat_discovered.len()
+            );
+        }
+    }
+
     // Persist the post-init state as a reusable VMPXSNP1 so a later run can
     // `--snapshot` it and skip this ~billions-of-steps init.
     if let Some(path) = &opts.save_snapshot {
@@ -763,6 +853,7 @@ fn detonate_with(
         xplm,
         discovered: Vec::new(),
         iat_fill,
+        iat_discovered,
         lifecycle,
         audit: audit.borrow().clone(),
     })
