@@ -374,6 +374,18 @@ enum HookOutcome {
     Redirect,
 }
 
+/// VMPX_LZMA_CAPTURE state: the compressed input stream and the decompressed
+/// output region, captured so a native decoder can be verified against the
+/// emulated depack.
+struct LzmaCap {
+    dir: std::path::PathBuf,
+    input_done: bool,
+    /// Output write cursor span, from the match-copy fold's `destination`.
+    out_lo: u64,
+    out_hi: u64,
+    done: bool,
+}
+
 pub struct Emulator {
     /// CPU-fingerprint / timing instructions the guest has executed (audit only).
     pub audit: InsnAudit,
@@ -431,6 +443,16 @@ pub struct Emulator {
     cpyc: Box<[Option<(u64, u64, Option<crate::copy_loop::Shape>)>]>,
     /// Recognizer cache for the LZMA literal decoder, same scheme as `csum`.
     lzmc: Box<[Option<(u64, u64, Option<crate::lzma_literal::Shape>)>]>,
+    /// Call counter for the VMPX_LZMA_PROBE native-decode feasibility probe.
+    lzma_probed: u32,
+    /// VMPX_LZMA_CAPTURE reference capture: dumps the compressed input stream and
+    /// a chunk of the decompressed output so a native decoder can be developed and
+    /// verified against ground truth. `None` until the first LZMA fold checks the
+    /// env; `Some(_)` while capturing; `done` once dumped.
+    lzma_cap: Option<LzmaCap>,
+    /// Set once the env check for `lzma_cap` found nothing, so the hot fold path
+    /// does not re-query the environment every call.
+    lzma_cap_off: bool,
     /// Addresses known to hold no shape of any kind, one word each.
     ///
     /// The three caches above each answer "is there a shape at this rip", and
@@ -740,6 +762,9 @@ impl Emulator {
             csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
             cpyc: vec![None; CSUM_SLOTS].into_boxed_slice(),
             lzmc: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            lzma_probed: 0,
+            lzma_cap: None,
+            lzma_cap_off: false,
             absent: vec![0u64; ABSENT_SLOTS].into_boxed_slice(),
         }
     }
@@ -1073,6 +1098,24 @@ impl Emulator {
         self.cpu.set_reg(shape.counter, counter - done);
         self.prof.copies_folded += 1;
         self.prof.copied_bytes += done;
+        // Reference capture: the match-copy destination is the depack output
+        // cursor; track its span so a chunk of decompressed output can be dumped.
+        let finish = if let Some(cap) = self.lzma_cap.as_mut() {
+            if cap.done {
+                false
+            } else {
+                let a0 = shape.store_address(destination.wrapping_add(1), other);
+                let a1 = shape.store_address(destination.wrapping_add(done + 1), other);
+                cap.out_lo = cap.out_lo.min(a0.min(a1));
+                cap.out_hi = cap.out_hi.max(a0.max(a1).wrapping_add(1));
+                cap.out_hi.saturating_sub(cap.out_lo) >= (256 << 10)
+            }
+        } else {
+            false
+        };
+        if finish {
+            self.lzma_capture_finish();
+        }
         done
     }
 
@@ -1181,6 +1224,15 @@ impl Emulator {
         ) else {
             return 0;
         };
+        if self.lzma_probed < 60 && std::env::var_os("VMPX_LZMA_PROBE").is_some() {
+            self.lzma_probe(input, input_end);
+        }
+        if !self.lzma_cap_off && self.lzma_cap.is_none() {
+            match std::env::var_os("VMPX_LZMA_CAPTURE") {
+                Some(dir) => self.lzma_capture_begin(std::path::PathBuf::from(dir), input_end),
+                None => self.lzma_cap_off = true,
+            }
+        }
         let mut symbol = symbol as u32;
         let mut range = range as u32;
         let mut code = code as u32;
@@ -1241,6 +1293,145 @@ impl Emulator {
         self.prof.literals_folded += 1;
         self.prof.literal_bits += done;
         done
+    }
+
+    /// VMPX_LZMA_PROBE one-shot: prove the compressed stream at the current fold
+    /// decodes with the native `lzma-rs` decoder, and measure it. Read-only / no
+    /// state change, so it validates the whole native-decode approach (and the
+    /// potential speedup) before any risky emulator splice is built.
+    fn lzma_probe(&mut self, input: u64, input_end: u64) {
+        self.lzma_probed = u32::MAX; // once
+        // `input_end` is actually the stream START (a fixed lower bound below the
+        // advancing `input`); the compressed stream runs forward from it.
+        let start = input_end;
+        const VMP_PROPS: [u8; 5] = [0x5D, 0x00, 0x00, 0x00, 0x04];
+        const CAP: u64 = 256 << 20;
+        let mut payload: Vec<u8> = Vec::new();
+        let mut a = start;
+        let mut chunk = [0u8; 4096];
+        while a < start.saturating_add(CAP) {
+            let n = chunk.len();
+            if self.mem.read(a, &mut chunk).is_err() {
+                // Read byte-by-byte to the first unmapped address, then stop.
+                while let Ok(b) = self.mem.read_uint(a, 1) {
+                    payload.push(b as u8);
+                    a += 1;
+                }
+                break;
+            }
+            payload.extend_from_slice(&chunk);
+            a += n as u64;
+        }
+        let _ = VMP_PROPS;
+        let head: Vec<String> = payload.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "--- VMPX_LZMA_PROBE: stream start={start:#x} (input now {input:#x}) readable={} bytes; head={} ---",
+            payload.len(),
+            head.join(" ")
+        );
+        // Brute-force LZMA properties (lc/lp/pb) and a couple start offsets to
+        // find the runtime's parameters; the fold's range coder is standard, so a
+        // correct (props, offset) decodes the whole stream.
+        let mut best = (0u8, 0usize, 0usize); // (props, offset, out_len)
+        for off in 0..2usize {
+            for pb in 0..3u8 {
+                for lp in 0..3u8 {
+                    for lc in 0..5u8 {
+                        let props = lc + lp * 9 + pb * 45;
+                        let mut src: Vec<u8> = Vec::with_capacity(13 + payload.len() - off);
+                        src.push(props);
+                        src.extend_from_slice(&0x0400_0000u32.to_le_bytes()); // 64 MiB dict
+                        src.extend_from_slice(&u64::MAX.to_le_bytes());
+                        src.extend_from_slice(&payload[off..]);
+                        let mut rd = std::io::Cursor::new(src);
+                        let mut out = Vec::new();
+                        let opts = lzma_rs::decompress::Options {
+                            unpacked_size: lzma_rs::decompress::UnpackedSize::ReadFromHeader,
+                            memlimit: Some(1 << 30),
+                            allow_incomplete: true,
+                        };
+                        let _ = lzma_rs::lzma_decompress_with_options(&mut rd, &mut out, &opts);
+                        if out.len() > best.2 {
+                            best = (props, off, out.len());
+                            if out.len() > 100_000 {
+                                eprintln!(
+                                    "  props={props:#04x} (lc={lc} lp={lp} pb={pb}) off={off}: decoded {} bytes",
+                                    out.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (props, off, len) = best;
+        eprintln!(
+            "  BEST: props={props:#04x} offset={off} -> {len} bytes (of ~253 MB expected){}",
+            if len < 100_000 { "  [likely a custom/non-LZMA1 coder]" } else { "" }
+        );
+    }
+
+    /// Start a VMPX_LZMA_CAPTURE: dump the compressed input stream (forward from
+    /// its start) and arm the output-span tracking in the copy fold.
+    fn lzma_capture_begin(&mut self, dir: std::path::PathBuf, stream_start: u64) {
+        let _ = std::fs::create_dir_all(&dir);
+        const CAP: u64 = 32 << 20;
+        let mut input: Vec<u8> = Vec::new();
+        let mut a = stream_start;
+        let mut chunk = [0u8; 4096];
+        while a < stream_start.saturating_add(CAP) {
+            if self.mem.read(a, &mut chunk).is_err() {
+                while let Ok(b) = self.mem.read_uint(a, 1) {
+                    input.push(b as u8);
+                    a += 1;
+                }
+                break;
+            }
+            input.extend_from_slice(&chunk);
+            a += chunk.len() as u64;
+        }
+        let _ = std::fs::write(dir.join("input.bin"), &input);
+        eprintln!(
+            "--- VMPX_LZMA_CAPTURE: wrote input.bin ({} bytes) from stream start {stream_start:#x} ---",
+            input.len()
+        );
+        self.lzma_cap = Some(LzmaCap {
+            dir,
+            input_done: true,
+            out_lo: u64::MAX,
+            out_hi: 0,
+            done: false,
+        });
+    }
+
+    /// Finish a VMPX_LZMA_CAPTURE: dump the contiguous decompressed output span.
+    fn lzma_capture_finish(&mut self) {
+        let Some(cap) = self.lzma_cap.as_ref() else { return };
+        if cap.done || !cap.input_done || cap.out_hi <= cap.out_lo {
+            return;
+        }
+        let (lo, hi, dir) = (cap.out_lo, cap.out_hi, cap.dir.clone());
+        let mut out: Vec<u8> = Vec::with_capacity((hi - lo) as usize);
+        let mut a = lo;
+        while a < hi {
+            match self.mem.read_uint(a, 1) {
+                Ok(b) => out.push(b as u8),
+                Err(_) => break,
+            }
+            a += 1;
+        }
+        let _ = std::fs::write(dir.join("output.bin"), &out);
+        let _ = std::fs::write(
+            dir.join("meta.txt"),
+            format!("output_lo={lo:#x}\noutput_hi={hi:#x}\noutput_len={}\n", out.len()),
+        );
+        eprintln!(
+            "--- VMPX_LZMA_CAPTURE: wrote output.bin ({} bytes) from [{lo:#x},{hi:#x}) ---",
+            out.len()
+        );
+        if let Some(cap) = self.lzma_cap.as_mut() {
+            cap.done = true;
+        }
     }
 
     /// As [`Emulator::fold_elides_wanted_event`], for the literal decoder.
