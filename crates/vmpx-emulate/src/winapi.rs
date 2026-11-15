@@ -566,6 +566,71 @@ impl WinApiHook {
         h
     }
 
+    /// Pre-populate the guest `PEB_LDR_DATA` module lists so a protector that
+    /// walks `PEB->Ldr` directly (a classic anti-hook that avoids
+    /// `GetModuleHandle`) finds real module bases and parseable export tables.
+    /// Each module is minted via [`Self::module_handle`] (image + fake export
+    /// table from the export reference); a `LDR_DATA_TABLE_ENTRY` is built per
+    /// module and linked into the InLoadOrder / InMemoryOrder /
+    /// InInitializationOrder circular lists. `gs_base` is the TEB base
+    /// (`PEB = gs:[0x60]`, `Ldr = PEB+0x18`). No-op if the PEB/Ldr are unreadable.
+    pub fn preload_ldr(&mut self, mem: &mut Memory, gs_base: u64, modules: &[String]) {
+        const LDR_ENTRIES: u64 = 0x0000_0048_0000_0000;
+        const STRIDE: u64 = 0x200; // entry struct (<=0x80) + wide name buffer
+        let Ok(peb) = mem.read_uint(gs_base + 0x60, 8) else { return };
+        let Ok(ldr) = mem.read_uint(peb + 0x18, 8) else { return };
+
+        let mut seen = BTreeSet::new();
+        let mut mods: Vec<(u64, String)> = Vec::new();
+        for name in modules {
+            let key = name.to_lowercase();
+            if !seen.insert(key.clone()) || is_analysis_artifact_module(&key) {
+                continue;
+            }
+            let base = self.module_handle(mem, &key);
+            if base != 0 {
+                mods.push((base, key));
+            }
+        }
+        if mods.is_empty() {
+            return;
+        }
+        let region = round_up(STRIDE * mods.len() as u64);
+        if mem.map(LDR_ENTRIES, region, Perm::RW).is_err() {
+            return;
+        }
+        let entry = |i: usize| LDR_ENTRIES + i as u64 * STRIDE;
+        for (i, (base, name)) in mods.iter().enumerate() {
+            let e = entry(i);
+            let _ = mem.write_uint(e + 0x30, 8, *base); // DllBase
+            let _ = mem.write_uint(e + 0x40, 8, MODULE_IMAGE_SIZE); // SizeOfImage
+            let name_buf = e + 0x100;
+            let wide: Vec<u8> =
+                name.encode_utf16().flat_map(u16::to_le_bytes).chain([0, 0]).collect();
+            let _ = mem.poke(name_buf, &wide);
+            let blen = (name.encode_utf16().count() * 2) as u64;
+            for base_off in [0x48u64, 0x58] {
+                // FullDllName, BaseDllName UNICODE_STRING { Length, MaxLength, _, Buffer }.
+                let _ = mem.write_uint(e + base_off, 2, blen);
+                let _ = mem.write_uint(e + base_off + 2, 2, blen + 2);
+                let _ = mem.write_uint(e + base_off + 8, 8, name_buf);
+            }
+        }
+        let n = mods.len();
+        for (head_off, link_off) in [(0x10u64, 0x00u64), (0x20, 0x10), (0x30, 0x20)] {
+            let head = ldr + head_off;
+            let node = |i: usize| entry(i) + link_off;
+            let _ = mem.write_uint(head, 8, node(0));
+            let _ = mem.write_uint(head + 8, 8, node(n - 1));
+            for i in 0..n {
+                let flink = if i + 1 < n { node(i + 1) } else { head };
+                let blink = if i > 0 { node(i - 1) } else { head };
+                let _ = mem.write_uint(node(i), 8, flink);
+                let _ = mem.write_uint(node(i) + 8, 8, blink);
+            }
+        }
+    }
+
     fn fail(&mut self, err: u64) -> Dispatch {
         self.last_error = err;
         Dispatch::Ret(0)

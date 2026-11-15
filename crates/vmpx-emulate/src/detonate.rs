@@ -498,6 +498,18 @@ fn detonate_with(
             }
         }
     }
+    // Pre-populate PEB->Ldr so a protector that resolves imports by walking the
+    // loaded-module list directly (not via GetModuleHandle) finds real module
+    // bases + export tables instead of an empty list (-> a null in its pointer
+    // table -> `call 0`). Modules: the default loader set plus the input's own
+    // imports. `VMPX_NO_LDR` disables it.
+    if std::env::var_os("VMPX_NO_LDR").is_none() {
+        let mut modules: Vec<String> =
+            crate::DEFAULT_SYSTEM_MODULES.iter().map(|m| (*m).to_owned()).collect();
+        modules.extend(pe.report().imports.iter().map(|m| m.name.to_lowercase()));
+        winapi.preload_ldr(&mut img.memory, img.gs_base, &modules);
+    }
+
     let facts = winapi.facts();
     let book = winapi.address_book();
     let audit = winapi.audit();
