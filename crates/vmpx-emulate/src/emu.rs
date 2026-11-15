@@ -3168,7 +3168,35 @@ impl Emulator {
     /// times itself). The value fits comfortably in EAX across the step budget,
     /// so EDX reads back 0.
     fn tsc(&self) -> u64 {
-        self.steps * TSC_STRIDE
+        // VMPX_TSC_STRIDE overrides the per-instruction TSC rate. The default 64
+        // makes a timed region's delta ~64x a real CPU's, which trips VMProtect's
+        // rdtsc anti-emulation check (the win.xpl detonation blocker); a smaller
+        // stride presents a realistic/fast delta so the check passes.
+        use std::sync::OnceLock;
+        static STRIDE: OnceLock<u64> = OnceLock::new();
+        static BASE: OnceLock<u64> = OnceLock::new();
+        let stride = *STRIDE.get_or_init(|| {
+            std::env::var("VMPX_TSC_STRIDE")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(TSC_STRIDE)
+        });
+        let base = *BASE.get_or_init(|| {
+            std::env::var("VMPX_TSC_BASE")
+                .ok()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+        });
+        // VMPX_TSC_REAL=1: non-deterministic real-entropy timestamp (diagnostic
+        // only) to test whether a real clock defeats the anti-emulation check.
+        static REAL: OnceLock<bool> = OnceLock::new();
+        if *REAL.get_or_init(|| std::env::var_os("VMPX_TSC_REAL").is_some()) {
+            return std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+        }
+        base.wrapping_add(self.steps * stride)
     }
 
     #[inline(always)]

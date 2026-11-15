@@ -253,6 +253,19 @@ impl Memory {
     /// # Errors
     /// Faults if any byte is unmapped or not writable; nothing is written then.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), MemFault> {
+        {
+            use std::sync::OnceLock;
+            static W: OnceLock<u64> = OnceLock::new();
+            let wa = *W.get_or_init(|| {
+                std::env::var("VMPX_WATCH_WRITE")
+                    .ok()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0)
+            });
+            if wa != 0 && addr <= wa && wa < addr + data.len() as u64 {
+                eprintln!("[watch] write {wa:#x}: [{addr:#x}+{}] = {data:02x?}", data.len());
+            }
+        }
         let off = (addr & PAGE_MASK) as usize;
         if !data.is_empty() && off + data.len() <= PAGE_SIZE as usize {
             return match self.page_mut(addr & !PAGE_MASK) {
@@ -372,6 +385,19 @@ impl Memory {
     /// Faults like [`Memory::write`].
     #[inline(always)]
     pub fn write_uint(&mut self, addr: u64, bytes: usize, val: u64) -> Result<(), MemFault> {
+        {
+            use std::sync::OnceLock;
+            static W: OnceLock<u64> = OnceLock::new();
+            let wa = *W.get_or_init(|| {
+                std::env::var("VMPX_WATCH_WRITE")
+                    .ok()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0)
+            });
+            if wa != 0 && addr <= wa && wa < addr + bytes as u64 {
+                eprintln!("[watch] write_uint {wa:#x}: [{addr:#x}+{bytes}] = {val:#x}");
+            }
+        }
         let off = (addr & PAGE_MASK) as usize;
         // Hit: read-modify-write of one 8-byte window of a writable page.
         if off + 8 <= PAGE_SIZE as usize && matches!(bytes, 1 | 2 | 4 | 8) {
