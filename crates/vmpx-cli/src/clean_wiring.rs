@@ -142,7 +142,12 @@ const OBSERVED_IAT_BASE: u32 = 0x1000;
 ///   feeds the sound blocker gate.
 pub(crate) fn derive_referenced_slots(observed: Option<&[ObservedImport]>) -> BTreeSet<Rva> {
     observed
-        .map(|imports| observed_slot_bindings(imports).iter().map(|b| b.slot).collect())
+        .map(|imports| {
+            observed_slot_bindings(imports)
+                .iter()
+                .map(|b| b.slot)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -161,7 +166,12 @@ fn observed_slot_bindings(imports: &[ObservedImport]) -> Vec<SlotBinding> {
         }
         let index = u32::try_from(out.len()).unwrap_or(u32::MAX);
         let slot = Rva(OBSERVED_IAT_BASE + index * 8);
-        out.push(SlotBinding { slot, module: imp.module.clone(), symbol: Some(symbol), hint: None });
+        out.push(SlotBinding {
+            slot,
+            module: imp.module.clone(),
+            symbol: Some(symbol),
+            hint: None,
+        });
     }
     out
 }
@@ -479,7 +489,10 @@ mod tests {
         assert!(recon.proof.complete, "all observed bindings proven");
         assert_eq!(recon.proof.proven_symbols, 2);
         assert_eq!(recon.proof.proven_modules, 2);
-        assert!(recon.directory_bytes.is_some_and(|n| n > 0), "directory produced");
+        assert!(
+            recon.directory_bytes.is_some_and(|n| n > 0),
+            "directory produced"
+        );
     }
 
     #[test]
@@ -496,7 +509,11 @@ mod tests {
         .into_iter()
         .collect();
         let (matched, total) = import_fidelity(&recon.proven, &known);
-        assert_eq!((matched, total), (2, 2), "reconstructed set matches known imports");
+        assert_eq!(
+            (matched, total),
+            (2, 2),
+            "reconstructed set matches known imports"
+        );
     }
 
     #[test]

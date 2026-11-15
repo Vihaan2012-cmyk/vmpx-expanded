@@ -7,7 +7,7 @@
 //! Anything unresolved stops that path and is reported; no edge is invented.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use iced_x86::{FlowControl, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, 
 use serde::Serialize;
 use thiserror::Error;
 use vmpx_disasm::{DirectJumpTraceLimits, trace_direct_jump_fragments};
-use vmpx_pe::{PeImage, Va};
+use vmpx_pe::{PeImage, Rva, Va};
 
 use crate::env_gate::{
     EnvironmentGateRoute, has_environment_source, record_environment_fork,
@@ -46,12 +46,41 @@ use crate::{
     recover_modulo_image_targets, recover_native_exit_state, value_range, ImageTableBranchLimits,
 };
 
+/// Distinct nodes one `shift_ancestor_onto_reentry` may decompose before it
+/// gives up. Each node costs an `affine_vsp_parts` decomposition of its whole
+/// subtree, which allocates a map of its terms, so the work is quadratic in the
+/// expression while the node COUNT -- the only thing the walker charges --
+/// stays flat. That is why a state that passes every size check can still take
+/// resident memory past 13 GB.
+///
+/// Exhausting the budget abandons the shift, so the fold simply does not
+/// happen: the entry falls back to the ordinary path and, failing that, stalls.
+/// Incomplete, never unsound.
+const SHIFT_NODE_BUDGET: usize = 200_000;
+
 /// 1.5 GiB per entry: far above any entry that completes, yet small enough that
 /// several concurrent entries stay well inside a 10 GB machine.
 const DEFAULT_MAX_MEMORY_BYTES: usize = 1536 * 1024 * 1024;
 
-/// Default per-entry wall-clock budget; bounds stragglers, never a finished entry.
-pub const DEFAULT_MAX_WALL_TIME: Duration = Duration::from_secs(60);
+/// Default per-entry wall-clock budget. This is a safety net for a pathological
+/// entry, not an exploration cap — but at 60s it was acting as one. Measured on
+/// systems.xpl (814 entries, `--all --serve-ro`, 24 threads), varying ONLY this:
+///
+/// | budget | N1 | WallClock stops | sweep |
+/// |--------|-----|-----|-------|
+/// | 60s    | 448 | 62  | 430s  |
+/// | 150s   | 452 | 22  | 661s  |
+/// | 400s   | 460 | 0   | 684s  |
+///
+/// So 60s was refusing 12 entries that do finish, and at 400s no entry is
+/// time-bound at all: the net has stopped deciding anything, which is where a
+/// timeout belongs. The sweep cost only 1.6x (not 6.7x) because the extra time
+/// is spent by a handful of entries. A lower budget only ever stops an entry
+/// sooner, recorded as `WallClock`, i.e. incomplete — so this is
+/// soundness-neutral in both directions. `VMPX_WALL_SECS` overrides it.
+/// N2 is unaffected: on the sound path every incomplete entry stops at a stall,
+/// none at the clock.
+pub const DEFAULT_MAX_WALL_TIME: Duration = Duration::from_secs(400);
 
 /// Over-estimate of the bytes one distinct hash-consed `Expr` node costs: the
 /// node, its `Arc` header, the interner's weak slot and bucket, and allocator
@@ -113,6 +142,14 @@ pub struct VmCfgLimits {
     /// stops the walk and records [`CfgLimitHit::WallClock`] (never complete).
     /// `None` is unbounded. A single block visit is not interrupted.
     pub max_wall_time: Option<Duration>,
+    /// EXPERIMENTAL. When true, a computed branch target that leaves the entry's
+    /// proven bytecode section but lands in ANOTHER EXECUTABLE image section is
+    /// followed as bytecode (labeled
+    /// [`VmCfgAssumption::AssumesCrossVmSectionContinuation`]) instead of failing
+    /// closed. The carried rolling-key decode at the target is the guard: a
+    /// non-continuation target decodes to an invalid dispatch and still stalls.
+    /// Default false: the sound path is byte-for-byte unchanged.
+    pub follow_cross_vm_section: bool,
 }
 
 impl Default for VmCfgLimits {
@@ -123,16 +160,50 @@ impl Default for VmCfgLimits {
             domain: SymbolicDomainLimits::default(),
             max_blocks: 512,
             max_visits: 4_096,
+            // Do NOT raise. Unlike the transition and nesting caps, this one is
+            // load-bearing: `visited` already counts DISTINCT states (an exact
+            // repeat returns early), so a larger bound buys real exploration at
+            // real cost. Measured 16 -> 64: sweep 254s -> 627s, WallClock stops
+            // 12 -> 28, and N1 FELL 449 -> 442 as entries timed out against the
+            // per-entry wall clock. 16 converges via `generalize_across` sooner
+            // and wins.
             max_visits_per_block: 16,
             max_total_instructions: 200_000,
             max_targets: 16,
-            max_nested_entries: 8,
-            max_profile_transitions: 8,
-            max_transition_visits: 64,
-            max_transition_instructions: 6_000,
+            // 8 refused 37 entries on systems.xpl (4x -> 32 was +3 N1). A380's
+            // nested-virtualized functions reach far more distinct nested sites,
+            // so 32 stalled ~23 of them as "exceeds the nesting limit" with no
+            // other blocker; 128 recovers them. Raising this only spends budget on
+            // guards that were ALREADY failing here (a non-nested guard never
+            // reaches the cap), and the per-entry memory/wall caps still bound
+            // runaway, so the cost is productive. VMPX_MAX_NESTED tunes it down
+            // (e.g. for speed) or further up.
+            max_nested_entries: std::env::var("VMPX_MAX_NESTED")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(128),
+            // Counts DISTINCT transition sites (see `transition_sites`), so this
+            // bounds how many profile regions one entry may reach, not how often
+            // it re-enters them. 32 still refused entries at that bound; 8x is
+            // worth a further +2 and is bounded by the per-region budget above
+            // plus the entry-global and memory caps.
+            max_profile_transitions: 256,
+            // Per-region allowances (see `transition_budget_exhausted`). These were
+            // 64 / 6000 when the budget was one flat grant for the whole walk; at
+            // that size they refused 238 entries on systems.xpl and measured +3 N1
+            // when scaled 8x, so the old values were simply too tight for a region
+            // rather than load-bearing. Memory is bounded by `max_memory_bytes`,
+            // not by these, and every one of them fails closed.
+            // Raised again (8x) for a further +2: with the per-region scaling the
+            // entry-global `max_visits` / `max_total_instructions` and the hard
+            // `max_memory_bytes` cap bind before this sub-budget does, so it was
+            // constraining exploration without being the thing bounding memory.
+            max_transition_visits: 4_096,
+            max_transition_instructions: 384_000,
             max_loop_unrolls: 4,
             max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
             max_wall_time: Some(DEFAULT_MAX_WALL_TIME),
+            follow_cross_vm_section: false,
         }
     }
 }
@@ -267,6 +338,88 @@ pub enum VmCfgAssumption {
     /// it). Image-source reads remain withheld, so the narrowing only recovers
     /// the VM-stack-rooted VIP; it does not otherwise trust the store.
     AssumesExternalStoresDisjointFromVmStack,
+    /// An external store to an opaque address was narrowed to preserve the
+    /// tracked cells rooted at an allocation THIS FRAME made, as well as the
+    /// VM-stack-rooted ones, under the assumption that external stores do not
+    /// alias those allocations either.
+    ///
+    /// Separate from `AssumesExternalStoresDisjointFromVmStack` because it is a
+    /// separate concession with a different discharge condition, and because
+    /// the VM-stack one IS discharged for a provably private frame -- which
+    /// says nothing about an allocation whose pointer the frame may well have
+    /// handed out. Nothing discharges this one yet, so an entry carrying it
+    /// reaches N1 and never N2.
+    ///
+    /// Why it is worth taking: the discarded allocation cells are where the
+    /// `memory_load_epoch` cascade starts. A read of a discarded cell returns an
+    /// opaque value, that value lands in the next store's address, the address
+    /// has no provable range, and that store havocs again. Keeping the cells
+    /// that a frame-local allocation roots stops the first link rather than
+    /// trying to bound an address that is already opaque.
+    AssumesExternalStoresDisjointFromFreshAllocations,
+    /// A block whose VM memory-load handler performs a proven null read was
+    /// closed as a VM exit, because every proven external read site in that
+    /// handler is covered by a language handler and the recovered continuation
+    /// is the zero-seed unwind back to the caller.
+    ///
+    /// Labeled rather than proven for one reason: the unwind's own reconstruction
+    /// is a structural recovery of a stack sled, not a proof that the process
+    /// reaches the caller. The fault itself IS certain -- a 1-byte read of
+    /// address 0 always raises -- and so is the SEH coverage, which comes from
+    /// the image's own exception directory.
+    AssumesNullReadFaultExitsViaSeh,
+    /// A handler's specification was recovered by walking ONE arm of a
+    /// conditional branch inside the handler (an opcode sub-dispatch), because
+    /// the two arms did not agree.
+    ///
+    /// Where both arms recover the same specification the walk carries NO
+    /// assumption: the two paths are the only paths through a single
+    /// conditional, so agreement is a proof. This label marks the other case --
+    /// the specification holds on the arm that was taken, and the walk assumes
+    /// that arm is the one the protector actually runs.
+    AssumesHandlerConditionalArm,
+    /// The walk resolved a branch whose block had HAVOCED memory, because the
+    /// target resolved anyway. Nothing about this target rests on the discarded
+    /// cells -- a load the havoc touched returns an opaque intrinsic and the
+    /// target would not have resolved -- but the successor state carries the
+    /// loss, so every block after it is reached with less memory than it would
+    /// otherwise have had.
+    AssumesTaintedBranchStateSufficient,
+    /// A store with no upper bound was placed by its LOWER bound alone: an
+    /// indexed VM-stack write, `vsp + k + (index << s)`, whose unsigned index
+    /// is at least zero. Cells below the bound are genuinely disjoint; what
+    /// cannot be proven is that the index does not WRAP the address space back
+    /// to a low address, which is what this labels.
+    AssumesIndexedStoreInBounds,
+    /// A block that STALLED was closed as a VM exit anyway, because
+    /// `VMPX_ASSUME_STALLED_BLOCKS_EXIT` was set.
+    ///
+    /// Deliberately unsound, and named so that no report can show it without
+    /// saying so. It exists to measure the N1 ceiling and to put a counted
+    /// label on every blocker that remains, so the work of discharging them has
+    /// a denominator. An entry carrying this has an unresolved branch, an
+    /// unrecovered handler or an unproven continuation that was simply declared
+    /// to be an exit.
+    ///
+    /// It can never reach N2: any assumption excludes an entry from the proven
+    /// tier, so the sound number is unaffected by construction. And it converts
+    /// a stall into a labeled exit rather than inventing an edge, a value or a
+    /// handler specification, so nothing downstream consumes a fabricated fact
+    /// -- the graph is honestly incomplete, just no longer counted as such.
+    AssumesStalledBlockExits,
+    /// Generalizing or closing a loop conceded that nothing outside the VM
+    /// aliases the VM stack frame. A widened state, or one re-expressed at a
+    /// moved stack base, describes the same concrete memory only under that
+    /// concession.
+    ///
+    /// Recorded SEPARATELY from `AssumesExternalStoresDisjointFromVmStack`,
+    /// which is inserted only when the symbolic executor actually narrowed an
+    /// external store. `frame_not_private` blocks discharging that one, so for a
+    /// long time the concession was recorded only on entries that happened to
+    /// have taken it — an entry that closed a strided loop without ever
+    /// narrowing a store carried no label at all and counted as PROVEN. The
+    /// concession is load-bearing either way, so it gets its own name.
+    AssumesVmStackFramePrivate,
     /// A constant read of a read-only, file-backed image page was served from
     /// the file after an external store suppressed image reads, assuming the
     /// page protection never changes at runtime (the binary imports
@@ -314,6 +467,17 @@ pub enum VmCfgAssumption {
     /// proven complete. Always present whenever an observed branch target was
     /// followed; marks the result experimental-tier.
     AssumesDynamicBranchTargetsComplete,
+    /// A computed VM branch target that left the entry's proven bytecode section
+    /// was followed into a DIFFERENT EXECUTABLE image section, under the premise
+    /// that a coherent key-driven dispatch decode at that address is a genuine
+    /// continuation of this VM's bytecode (VMProtect splits one function's
+    /// bytecode across executable protector sections such as `.vmp2`/`.vmp3`).
+    /// The follow is taken only when the target lands in an executable section and
+    /// the carried rolling key decodes a well-formed dispatch there; a wrong target
+    /// decodes to garbage and still fails closed. EXPERIMENTAL and unproven:
+    /// present only when `VmCfgLimits::follow_cross_vm_section` is enabled, and it
+    /// keeps the entry off the proven (N2) tier.
+    AssumesCrossVmSectionContinuation,
 }
 
 /// Observed back-edge trip counts per loop head, captured on ONE detonation: a
@@ -398,6 +562,15 @@ pub struct VmCfg {
     pub frame_note: Option<String>,
     /// Labeled assumptions relied on during recovery.
     pub assumptions: BTreeSet<VmCfgAssumption>,
+    /// Why the VM-stack assumption could not be discharged, when it could not.
+    /// Diagnostic only. Such an entry is CFG-complete but not proven, so this
+    /// names the condition standing between it and the proven tier.
+    pub discharge_refusal: Option<String>,
+    /// For each block that exits into a nested VM entry, the stub RVA the walk
+    /// resolved its return address to. The CFG walk concretizes the image reads
+    /// the return address depends on; a later lift that re-derives it from a less
+    /// concretized state would not, so it reuses this resolution instead.
+    pub nested_entry_stubs: BTreeMap<Va, Rva>,
 }
 
 impl VmCfg {
@@ -522,8 +695,32 @@ fn vsp_capture_top_offset(instruction: &iced_x86::Instruction, vsp: Register) ->
 /// based on it. Plain loads and stores through RSP do not expose the address.
 fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
     let is_rsp = |register: Register| register.full_register() == Register::RSP;
+    // A 16-bit (or narrower) read of RSP as a source operand yields no usable
+    // frame address: user-mode addresses below 64K are never mapped. VMProtect
+    // emits junk like `bsr ax,sp` after the VSP capture, and counting that as
+    // exposure made the frame extension bail and left the image-base relocation
+    // delta cell unknown, which made the whole address chain unresolvable.
+    // A write to SP, a 32-bit ESP read, `lea` and `push rsp` all still expose.
+    let narrow_read = |operand: u32| {
+        // `cmp`/`test` write no register, so operand 0 is a READ too: a 16-bit
+        // `cmp sp,r15w` only sets flags and yields no address. Every other
+        // mnemonic here writes operand 0, so only its sources are exempt.
+        let reads_operand_zero = matches!(instruction.mnemonic(), Mnemonic::Cmp | Mnemonic::Test);
+        (operand >= 1 || reads_operand_zero)
+            && instruction.op_register(operand).size() <= 2
+            && matches!(
+                instruction.mnemonic(),
+                Mnemonic::Bsr
+                    | Mnemonic::Bsf
+                    | Mnemonic::Mov
+                    | Mnemonic::Movzx
+                    | Mnemonic::Movsx
+                    | Mnemonic::Cmp
+                    | Mnemonic::Test
+            )
+    };
     (0..instruction.op_count()).any(|operand| match instruction.op_kind(operand) {
-        OpKind::Register => is_rsp(instruction.op_register(operand)),
+        OpKind::Register => is_rsp(instruction.op_register(operand)) && !narrow_read(operand),
         OpKind::Memory => {
             instruction.mnemonic() == Mnemonic::Lea
                 && (is_rsp(instruction.memory_base()) || is_rsp(instruction.memory_index()))
@@ -532,19 +729,43 @@ fn exposes_stack_pointer(instruction: &iced_x86::Instruction) -> bool {
     })
 }
 
+/// The VM entry a nested VM exit returns into at `target`: the stub itself, or
+/// the stub behind the entry flag-save (`pushfq`, then `push imm; call`). Returns
+/// the RVA frame recovery must start from (the flag-save included) and the
+/// candidate at the `push imm`.
+#[must_use]
+pub fn nested_entry_stub(pe: &PeImage<'_>, target: Rva) -> Option<(Rva, VmEntryCandidate)> {
+    if let Some(candidate) = analyze_vm_entry_at(pe, target, VmDiscoveryLimits::default())
+        .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)
+    {
+        return Some((target, candidate));
+    }
+    let first = vmpx_disasm::decode_one(pe, target).ok()?;
+    if first.instruction.mnemonic() != Mnemonic::Pushfq || std::env::var_os("VMPX_NO_PUSHFQ_NESTED").is_some() {
+        return None;
+    }
+    let candidate = analyze_vm_entry_at(pe, first.next_rva()?, VmDiscoveryLimits::default())
+        .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)?;
+    Some((target, candidate))
+}
+
 /// Proven contents of the VM stack at VM start, top first, recovered by
 /// stepping the native entry up to the VSP capture. Returns the cells, the
 /// byte offset from VSP to the top cell (nonzero when a `lea` capture places VSP
 /// off the frame top), and whether any pre-capture instruction exposed the
 /// stack pointer to a register or memory. Fails closed on anything it cannot
 /// model (nested calls, unknown stack writes, stack-pointer arithmetic).
-fn recover_entry_frame(
+///
+/// # Errors
+///
+/// Returns a note describing the first thing the stub does that is not modelled.
+pub fn recover_entry_frame(
     pe: &PeImage<'_>,
-    entry: &VmEntryCandidate,
+    entry: Rva,
     vsp: Register,
     limits: DirectJumpTraceLimits,
 ) -> Result<(Vec<NativeFrameSource>, u64, bool), String> {
-    let caller = trace_direct_jump_fragments(pe, entry.rva, limits).map_err(|e| e.to_string())?;
+    let caller = trace_direct_jump_fragments(pe, entry, limits).map_err(|e| e.to_string())?;
     let caller_instructions = caller.instructions().collect::<Vec<_>>();
     let (call_index, call) = caller_instructions
         .iter()
@@ -557,17 +778,31 @@ fn recover_entry_frame(
     // Bottom-first model of the native stack.
     let mut stack: Vec<NativeFrameSource> = Vec::new();
     let mut exposed = false;
+    let mut flags_clean = true;
     for decoded in caller_instructions.iter().copied().take(call_index) {
         let instruction = &decoded.instruction;
         exposed |= exposes_stack_pointer(instruction);
         if instruction.mnemonic() == Mnemonic::Push {
             let ordinal = u32::try_from(stack.len()).unwrap_or(u32::MAX);
             stack.push(caller_push_source(decoded, ordinal));
+        } else if instruction.mnemonic() == Mnemonic::Pushfq {
+            // The entry flag-save: the word is the flags the stub was entered with
+            // (`native_rflags_initial`), provided nothing before it set them.
+            stack.push(if flags_clean {
+                NativeFrameSource::Rflags
+            } else {
+                NativeFrameSource::Unknown {
+                    description: format!("RFLAGS modified before PUSHFQ at {}", decoded.rva),
+                }
+            });
         } else if instruction.stack_pointer_increment() != 0 {
             return Err(format!(
                 "unproven pre-call stack mutation at {}",
                 decoded.rva
             ));
+        }
+        if defines_flags(instruction) {
+            flags_clean = false;
         }
     }
     stack.push(NativeFrameSource::ReturnAddress {
@@ -576,32 +811,100 @@ fn recover_entry_frame(
     });
 
     let target = trace_direct_jump_fragments(pe, call_target, limits).map_err(|e| e.to_string())?;
-    let mut provenance = initial_provenance();
-    let mut original_flags = true;
-    let mut factory = InstructionInfoFactory::new();
-    for decoded in target.instructions() {
+    let relocations = relocation_slots(pe);
+    let mut state = StubState {
+        stack,
+        provenance: initial_provenance(),
+        original_flags: flags_clean,
+        factory: InstructionInfoFactory::new(),
+    };
+    let mut remaining = target.instructions();
+    let mut capture = None;
+    for decoded in remaining.by_ref() {
         let instruction = &decoded.instruction;
         if let Some(top_offset) = vsp_capture_top_offset(instruction, vsp) {
-            stack.reverse();
-            return Ok((stack, top_offset, exposed));
+            capture = Some(top_offset);
+            update_provenance(&mut state.factory, instruction, &mut state.provenance);
+            break;
         }
         exposed |= exposes_stack_pointer(instruction);
+        state.step(decoded, false)?;
+        state.track_relocated(decoded, relocations.as_ref());
+    }
+    let top_offset = capture.ok_or("no VSP capture reached")?;
+    let mut captured = state.stack.clone();
+    captured.reverse();
+    // The stub keeps pushing below the captured VSP before the VM starts, so
+    // those cells hold stub-written values. Any failure to model them keeps the
+    // captured-frame result unchanged.
+    let (cells, top_offset) =
+        extend_below_capture(&mut state, remaining, relocations.as_ref(), vsp, top_offset)
+            .unwrap_or((captured, top_offset));
+    Ok((cells, top_offset, exposed))
+}
+
+/// Native-stub state while stepping its pushes and RSP-relative stores.
+struct StubState {
+    /// Bottom-first model of the native stack.
+    stack: Vec<NativeFrameSource>,
+    provenance: BTreeMap<Register, Provenance>,
+    original_flags: bool,
+    factory: InstructionInfoFactory,
+}
+
+impl StubState {
+    /// Applies one stub instruction to the stack and register provenance.
+    /// `keep_relocated` keeps a relocated immediate as the relocation delta
+    /// instead of its on-disk constant.
+    fn step(
+        &mut self,
+        decoded: &vmpx_disasm::DecodedInstruction,
+        keep_relocated: bool,
+    ) -> Result<(), String> {
+        let instruction = &decoded.instruction;
         match instruction.flow_control() {
             FlowControl::Next | FlowControl::UnconditionalBranch => {}
             _ => return Err(format!("unsupported control flow at {}", decoded.rva)),
         }
+        let relocated = |operand: u32| {
+            (keep_relocated
+                && instruction.op_kind(operand) == OpKind::Register
+                && instruction.op_register(operand).size() == 8)
+                .then(|| self.provenance.get(&canonical(instruction.op_register(operand))))
+                .flatten()
+                .and_then(|known| match known {
+                    Provenance::RelocatedConstant(value) => {
+                        Some(NativeFrameSource::RelocatedConstant { value: *value })
+                    }
+                    _ => None,
+                })
+        };
+        let plain: BTreeMap<Register, Provenance> = self
+            .provenance
+            .iter()
+            .map(|(register, known)| match known {
+                Provenance::RelocatedConstant(value) => (*register, Provenance::Constant(*value)),
+                other => (*register, other.clone()),
+            })
+            .collect();
         if matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq) {
-            let observed = observe_target_push(decoded, &provenance, original_flags)
-                .ok_or_else(|| format!("unsupported push at {}", decoded.rva))?;
+            let source = if instruction.mnemonic() == Mnemonic::Push && let Some(source) = relocated(0) {
+                source
+            } else {
+                observe_target_push(decoded, &plain, self.original_flags)
+                    .ok_or_else(|| format!("unsupported push at {}", decoded.rva))?
+                    .source
+            };
             if instruction.stack_pointer_increment() != -8 {
                 return Err(format!("non-qword push at {}", decoded.rva));
             }
-            stack.push(observed.source);
+            self.stack.push(source);
         } else {
             if instruction.stack_pointer_increment() != 0 {
                 return Err(format!("unproven stack mutation at {}", decoded.rva));
             }
-            let writes: Vec<_> = factory
+            let writes: Vec<_> = self
+                .factory
                 .info(instruction)
                 .used_memory()
                 .iter()
@@ -623,25 +926,171 @@ fn recover_entry_frame(
                     && instruction.mnemonic() == Mnemonic::Mov
                     && instruction.op0_kind() == OpKind::Memory
                     && displacement % 8 == 0)
-                    .then(|| stored_value(instruction, &provenance))
+                    .then(|| relocated(1).or_else(|| stored_value(instruction, &plain)))
                     .flatten()
                     .ok_or_else(|| format!("unproven memory write at {}", decoded.rva))?;
                 let from_top = usize::try_from(displacement / 8)
                     .map_err(|_| format!("stack write offset at {}", decoded.rva))?;
-                let position = stack
+                let position = self
+                    .stack
                     .len()
                     .checked_sub(1)
                     .and_then(|top| top.checked_sub(from_top))
                     .ok_or_else(|| format!("stack write outside the frame at {}", decoded.rva))?;
-                stack[position] = stored;
+                self.stack[position] = stored;
             }
         }
-        update_provenance(&mut factory, instruction, &mut provenance);
+        update_provenance(&mut self.factory, instruction, &mut self.provenance);
         if defines_flags(instruction) {
-            original_flags = false;
+            self.original_flags = false;
+        }
+        Ok(())
+    }
+
+    /// Marks the destination of a `mov r64, imm64` whose immediate a base
+    /// relocation covers: its runtime value is the immediate plus the delta.
+    /// With no parsed relocation table every such immediate is treated so.
+    fn track_relocated(
+        &mut self,
+        decoded: &vmpx_disasm::DecodedInstruction,
+        relocations: Option<&BTreeMap<u32, u32>>,
+    ) {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() != Mnemonic::Mov
+            || instruction.op0_kind() != OpKind::Register
+            || instruction.op1_kind() != OpKind::Immediate64
+        {
+            return;
+        }
+        let start = decoded.rva.0;
+        let end = start.saturating_add(u32::try_from(decoded.bytes.len()).unwrap_or(u32::MAX));
+        let covered = relocations.is_none_or(|slots| {
+            slots
+                .range(start.saturating_sub(7)..end)
+                .any(|(slot, size)| *slot < end && start < slot.saturating_add(*size))
+        });
+        if covered {
+            self.provenance.insert(
+                canonical(instruction.op0_register()),
+                Provenance::RelocatedConstant(instruction.immediate64()),
+            );
         }
     }
-    Err("no VSP capture reached".to_owned())
+}
+
+/// Base-relocation slots as `rva -> width`, or `None` when the table cannot be
+/// parsed.
+fn relocation_slots(pe: &PeImage<'_>) -> Option<BTreeMap<u32, u32>> {
+    let blocks = pe.parse_relocations().ok()?;
+    let mut slots = BTreeMap::new();
+    for block in &blocks {
+        for entry in block.entries.iter().filter(|entry| entry.kind != 0) {
+            let size = if entry.kind == 10 { 8 } else { 4 };
+            slots.insert(block.page_rva.0 + u32::from(entry.offset), size);
+        }
+    }
+    Some(slots)
+}
+
+/// Continues the stub past the VSP capture to the `mov rsp, reg` that moves the
+/// native stack below VSP, returning the full frame (top first) and the
+/// VSP-to-top offset. `None` (keep the captured frame) when anything in between
+/// is not modelled, the pushes would place the top cell below VSP, the new stack
+/// is not proven to lie at or below VSP, or the stub then writes any other memory.
+fn extend_below_capture<'a>(
+    state: &mut StubState,
+    remaining: impl Iterator<Item = &'a vmpx_disasm::DecodedInstruction>,
+    relocations: Option<&BTreeMap<u32, u32>>,
+    vsp: Register,
+    top_offset: u64,
+) -> Option<(Vec<NativeFrameSource>, u64)> {
+    let vsp = canonical(vsp);
+    let before = state.stack.len();
+    let mut at_or_below_vsp: BTreeSet<Register> = BTreeSet::new();
+    let mut result = None;
+    for decoded in remaining {
+        let instruction = &decoded.instruction;
+        let mut writes_memory = || {
+            state
+                .factory
+                .info(instruction)
+                .used_memory()
+                .iter()
+                .any(|memory| {
+                    matches!(
+                        memory.access(),
+                        OpAccess::Write
+                            | OpAccess::CondWrite
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                    )
+                })
+        };
+        if result.is_some() {
+            // Past the redirect every write lands at or below the new stack
+            // pointer, hence below the frame; nothing else may write memory.
+            let push = matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq);
+            let flow = matches!(
+                instruction.flow_control(),
+                FlowControl::Next | FlowControl::UnconditionalBranch | FlowControl::Return
+            );
+            if !flow || (!push && writes_memory()) {
+                return None;
+            }
+            continue;
+        }
+        if instruction.mnemonic() == Mnemonic::Mov
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op1_kind() == OpKind::Register
+            && instruction.op0_register() == Register::RSP
+            && instruction.op1_register().size() == 8
+        {
+            if !at_or_below_vsp.contains(&canonical(instruction.op1_register())) {
+                return None;
+            }
+            let pushed = u64::try_from(state.stack.len() - before).ok()?;
+            let new_top = top_offset.checked_sub(pushed.checked_mul(8)?)?;
+            let mut cells = state.stack.clone();
+            cells.reverse();
+            result = Some((cells, new_top));
+            continue;
+        }
+        if exposes_stack_pointer(instruction) {
+            return None;
+        }
+        let writes = |state: &mut StubState, register: Register| {
+            crate::dispatch_extract::writes_register(&mut state.factory, instruction, register)
+        };
+        if !matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pushfq)
+            && writes(state, Register::RSP)
+        {
+            return None;
+        }
+        if writes(state, vsp) {
+            return None;
+        }
+        // `and reg, imm` never increases the unsigned value, so an address at or
+        // below VSP stays so (stack alignment).
+        let narrowing_and = instruction.mnemonic() == Mnemonic::And
+            && instruction.op0_kind() == OpKind::Register
+            && crate::dispatch_extract::signed_immediate(instruction, 1).is_some();
+        at_or_below_vsp.retain(|register| {
+            (narrowing_and && canonical(instruction.op0_register()) == *register)
+                || !writes(state, *register)
+        });
+        if instruction.mnemonic() == Mnemonic::Lea
+            && instruction.op0_kind() == OpKind::Register
+            && instruction.op0_register().size() == 8
+            && canonical(instruction.memory_base()) == vsp
+            && instruction.memory_index() == Register::None
+            && instruction.memory_displacement64().cast_signed() <= 0
+        {
+            at_or_below_vsp.insert(canonical(instruction.op0_register()));
+        }
+        state.step(decoded, true).ok()?;
+        state.track_relocated(decoded, relocations);
+    }
+    result
 }
 
 fn stored_value(
@@ -654,7 +1103,9 @@ fn stored_value(
                 Provenance::Native(register) => Some(NativeFrameSource::Register {
                     register: *register,
                 }),
-                Provenance::Constant(value) => Some(NativeFrameSource::Constant { value: *value }),
+                Provenance::Constant(value) | Provenance::RelocatedConstant(value) => {
+                    Some(NativeFrameSource::Constant { value: *value })
+                }
                 Provenance::Unknown => Some(NativeFrameSource::Unknown {
                     description: "stored register of unproven value".to_owned(),
                 }),
@@ -697,7 +1148,11 @@ fn frame_initial_state(
 }
 
 struct DecodedBlock {
-    instructions: Vec<DecodedVmInstruction>,
+    /// Shared, not owned: `visit` needs the decoded buffer while it mutates the
+    /// walker, and it took a full copy of it on EVERY re-visit of the block to
+    /// release the borrow. Up to `max_visits_per_block` copies of a buffer that
+    /// can hold `instruction_limit` instructions, per block, for nothing.
+    instructions: Rc<[DecodedVmInstruction]>,
     final_state: RelativeDispatchState,
     stop: LinearDecodeStop,
     boundary: Option<VmHandlerSemantic>,
@@ -868,8 +1323,22 @@ fn generalize(
         return Ok(a.cloned());
     }
     let width = match (a, r) {
+        // Differing widths are not a reason to refuse. Take the NARROWER: the
+        // cell becomes a fresh unconstrained value of that width, and the bytes
+        // beyond it are simply absent -- which in this model means unknown, so
+        // the wider side is covered too.
+        //
+        // The wider width is what cannot be used, and the probe says why: this
+        // memory is byte-addressed with non-overlapping cells, so a cell grown
+        // past its neighbour produces "initial memory contains overlapping
+        // addresses" on the next resume. That invariant is what the refusal was
+        // really protecting.
         (Some(a), Some(r)) if a.width != r.width => {
-            return Err("a loop-carried cell changes width".to_owned());
+            if a.width.bits() <= r.width.bits() {
+                a.width
+            } else {
+                r.width
+            }
         }
         (Some(cell), _) | (None, Some(cell)) => cell.width,
         (None, None) => return Ok(None),
@@ -908,12 +1377,113 @@ fn cell_token(address: &str) -> String {
     format!("m{:x}", hasher.finish())
 }
 
-fn memory_by_address(state: &SymbolicVmInitialState) -> BTreeMap<String, &(Expr, Expr)> {
-    state
-        .memory_values
-        .iter()
-        .map(|entry| (format!("{:?}", entry.0), entry))
-        .collect()
+/// Whether a proven null read may be closed as an SEH-covered VM exit.
+///
+/// On by default; `VMPX_NO_NULL_READ_SEH_EXIT=1` restores the stall. The switch
+/// is here so the change can be measured against itself in one build.
+fn null_read_seh_exit_enabled() -> bool {
+    static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_NULL_READ_SEH_EXIT").is_none())
+}
+
+/// Whether a stalled block is closed as a labeled exit instead of stalling.
+///
+/// Off unless `VMPX_ASSUME_STALLED_BLOCKS_EXIT=1`. See
+/// [`VmCfgAssumption::AssumesStalledBlockExits`] for why this is safe to have
+/// and not safe to trust.
+fn assume_stalled_blocks_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VMPX_ASSUME_STALLED_BLOCKS_EXIT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// Short class of a symbolic-execution failure, so the stall histogram separates
+/// the distinct underlying errors the one stall prefix would otherwise merge.
+fn symbolic_failure_class(message: &str) -> &'static str {
+    if message.contains("null memory read") {
+        "null-read"
+    } else if message.contains("exceed") {
+        "resource-limit"
+    } else if message.contains("not implemented") || message.contains("not modelled") {
+        "unmodelled"
+    } else {
+        "other"
+    }
+}
+
+/// A memory site's identity: its address text, or its structural hash once the
+/// text of a heavily shared address DAG outgrows `SITE_KEY_BYTES`.
+fn site_key(address: &Expr) -> String {
+    use std::hash::BuildHasher;
+    // MEASURED: lowering this to 8 KiB changed peak RSS not at all (12.26 GB vs
+    // 11.29 GB on entry 0xc43d80e at an 8192 instruction limit), so the key
+    // RENDERING is not what holds the memory -- `bounded_debug` already streams
+    // into a bounded writer and stops. Left at 4 MiB rather than carrying a
+    // behaviour change (more hash collisions merging sites) that bought nothing.
+    const SITE_KEY_BYTES: usize = 4 << 20;
+    crate::semantic_exec::bounded_debug(address, SITE_KEY_BYTES)
+        .unwrap_or_else(|| format!("#{:016x}", crate::expr::FxBuild::default().hash_one(address)))
+}
+
+/// One memory site of a widened pair: indices of its cell in `a` and `r` (the
+/// last cell wins on a repeated address) and the site's canonical-unknown token.
+type MemorySite = (Option<usize>, Option<usize>, String);
+
+/// The widened memory sites of `a` and `r` in rendered-address order. A site's
+/// identity is its address's `Debug` text, which for shared address DAGs runs to
+/// hundreds of KB, so the union is memoized on the two address sequences (the
+/// loop fixpoints re-widen the same sites over and over).
+fn memory_union(a: &SymbolicVmInitialState, r: &SymbolicVmInitialState) -> Rc<Vec<MemorySite>> {
+
+    type Entry = (Vec<Expr>, Vec<Expr>, Rc<Vec<MemorySite>>);
+    thread_local! {
+        static UNIONS: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    const CACHED_UNIONS: usize = 32;
+    let same = |cached: &[Expr], state: &SymbolicVmInitialState| {
+        cached.len() == state.memory_values.len()
+            && cached.iter().zip(&state.memory_values).all(|(c, (address, _))| c == address)
+    };
+    if let Some(hit) = UNIONS.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(ka, kr, _)| same(ka, a) && same(kr, r))
+            .map(|(_, _, union)| Rc::clone(union))
+    }) {
+        return hit;
+    }
+    let by_address = |state: &SymbolicVmInitialState| -> std::collections::HashMap<String, usize, crate::expr::FxBuild> {
+        state
+            .memory_values
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (site_key(&entry.0), index))
+            .collect()
+    };
+    let (a_memory, r_memory) = (by_address(a), by_address(r));
+    let mut addresses: Vec<&String> = a_memory.keys().chain(r_memory.keys()).collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let union = Rc::new(
+        addresses
+            .into_iter()
+            .map(|address| (a_memory.get(address).copied(), r_memory.get(address).copied(), cell_token(address)))
+            .collect::<Vec<_>>(),
+    );
+    UNIONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHED_UNIONS {
+            cache.remove(0);
+        }
+        cache.push((
+            a.memory_values.iter().map(|(address, _)| address.clone()).collect(),
+            r.memory_values.iter().map(|(address, _)| address.clone()).collect(),
+            Rc::clone(&union),
+        ));
+    });
+    union
 }
 
 /// The state covering both `a` and `r`, or `None` when `a` already covers `r`.
@@ -924,8 +1494,18 @@ fn widen_state(
     a: &SymbolicVmInitialState,
     r: &SymbolicVmInitialState,
 ) -> Result<Option<SymbolicVmInitialState>, String> {
-    if a.memory_tainted || r.memory_tainted {
-        return Err("loop follows an imprecise external-memory store".to_owned());
+    // Precision has to be loop-invariant, and that is a statement about the two
+    // states AGREEING, not about either being precise. Two states that both
+    // havoced have both discarded their tracked cells, so widening them is the
+    // ordinary case: differing cells become fresh unknowns, which is what the
+    // widening does anyway. Only a MIXED pair is refused, where the widened
+    // state would claim a precision one side does not have.
+    let mixed = a.memory_tainted != r.memory_tainted;
+    if (a.memory_tainted || r.memory_tainted) && (mixed || !taint_try_resolve()) {
+        return Err(format!(
+            "loop follows an imprecise external-memory store (tainted {} / {})",
+            a.memory_tainted, r.memory_tainted
+        ));
     }
     if a.vsp != r.vsp {
         return Err("loop changes the VM stack pointer".to_owned());
@@ -933,7 +1513,8 @@ fn widen_state(
     if a.fresh_allocations != r.fresh_allocations {
         return Err("loop changes the fresh allocations".to_owned());
     }
-    let mut changed = false;
+    let mut changed = (r.image_reads_suppressed && !a.image_reads_suppressed)
+        || (r.protection_may_have_changed && !a.protection_may_have_changed);
     let flags = generalize(Some(&a.flags), Some(&r.flags), key, "f", &mut changed)?
         .unwrap_or_else(|| a.flags.clone());
     let mut context_values = BTreeMap::new();
@@ -955,20 +1536,55 @@ fn widen_state(
             context_values.insert(offset, cell);
         }
     }
-    let (a_memory, r_memory) = (memory_by_address(a), memory_by_address(r));
     let mut memory_values = Vec::new();
-    for address in a_memory
-        .keys()
-        .chain(r_memory.keys())
-        .collect::<BTreeSet<_>>()
-    {
-        let (a_entry, r_entry) = (a_memory.get(address), r_memory.get(address));
+    for (a_index, r_index, token) in memory_union(a, r).iter() {
+        let a_entry = a_index.map(|index| &a.memory_values[index]);
+        let r_entry = r_index.map(|index| &r.memory_values[index]);
+        // A cell the re-entry tracks and the enclosing state does not: DROPPING
+        // it is a widening, not a loss of soundness. An untracked, symbolically
+        // addressed byte reads back as a fresh `memory_load_epoch_*` unknown
+        // (`load_memory`'s symbolic miss path), and an unconstrained byte covers
+        // every concrete value the re-entry's cell could hold, so the enclosing
+        // state's denotation is the larger one — which is exactly what coverage
+        // asks.
+        //
+        // This is what lets such a loop reach a fixpoint at all. Measured on
+        // systems.xpl it is the largest single family of incomplete entries: a
+        // loop that pushes one 8-byte word per iteration and never pops it. The
+        // shift translates the whole tracked frame, but the frame's DEEP end is
+        // anchored at `vsp_initial` and does not move, so the re-entry always
+        // holds 8 byte-cells the shifted ancestor lacks ("memory cell count 352
+        // vs 360") and a per-cell model never converges. Summarizing just that
+        // anchored tail leaves a frame of FIXED size, and the loop closes in one
+        // step.
+        //
+        // NOT for a concrete address: there the miss path consults the static
+        // image BEFORE minting an unknown, so an untracked concrete byte is
+        // pinned to the image value rather than unconstrained. Dropping one
+        // would claim coverage of a cell we would then re-read as a stale
+        // constant. The reverse direction (tracked here, untracked in the
+        // re-entry) is never dropped either: there it is the RE-ENTRY whose
+        // denotation is larger, so coverage genuinely has to widen.
+        //
+        // NOT for a cell holding a FRAME-POINTER value. Dropping one hides it:
+        // the state no longer holds that pointer anywhere, an untracked load
+        // could later produce it, and frame privacy would have to be conceded --
+        // which is exactly what `fold_hid_frame_pointer` is for. A drop that
+        // leaves `changed` clear reports `Ok(None)`, "already covered", and that
+        // check never runs, so such a cell is widened the ordinary way instead.
+        if a_entry.is_none()
+            && let Some((address, value)) = r_entry
+            && !matches!(address.kind, ExprKind::Const { .. })
+            && !crate::semantic_exec::is_frame_pointer_value(value)
+        {
+            continue;
+        }
         let location = a_entry.or(r_entry).map(|entry| entry.0.clone());
         let cell = generalize(
             a_entry.map(|entry| &entry.1),
             r_entry.map(|entry| &entry.1),
             key,
-            &cell_token(address),
+            token,
             &mut changed,
         )?;
         if let (Some(location), Some(cell)) = (location, cell) {
@@ -986,9 +1602,115 @@ fn widen_state(
         memory_epoch: a.memory_epoch.max(r.memory_epoch),
         memory_tainted: false,
         image_reads_suppressed: a.image_reads_suppressed || r.image_reads_suppressed,
+        protection_may_have_changed: a.protection_may_have_changed
+            || r.protection_may_have_changed,
         next_native_call_epoch: a.next_native_call_epoch.max(r.next_native_call_epoch),
         fresh_allocations: a.fresh_allocations.clone(),
     }))
+}
+
+/// `expr` rebuilt in a canonical affine form: its non-constant terms in a stable
+/// order, each with its coefficient, then one folded constant.
+///
+/// `VMProtect` writes the same stack address as `((base + a) - b) + c` in one
+/// block and `base + c'` in another. Those are semantically identical and
+/// structurally different, and `simplify` does not reassociate them —
+/// [`affine_vsp_parts`] exists precisely because it does not. Every state
+/// comparison in this module is structural (`Expr` is hash-consed, so `==` is a
+/// pointer test), so without this the same address in two forms reads as two
+/// different addresses and no fold, widen or back edge can see through it.
+///
+/// Semantics are preserved exactly: the result is the same wrapping sum of the
+/// same terms at the same width, just written one way. Anything that is not a
+/// pure Add/Sub/Neg/Const chain stays an opaque term with coefficient +-1, so a
+/// non-affine expression is returned unchanged rather than approximated. Any
+/// rebuild failure also returns the original.
+fn canonical_affine(expr: &Expr) -> Expr {
+    fn collect(expr: &Expr, positive: bool, terms: &mut Vec<(Expr, i64)>, constant: &mut u64) {
+        match &expr.kind {
+            ExprKind::Binary { op: BinaryOp::Add, left, right } => {
+                collect(left, positive, terms, constant);
+                collect(right, positive, terms, constant);
+            }
+            ExprKind::Binary { op: BinaryOp::Sub, left, right } => {
+                collect(left, positive, terms, constant);
+                collect(right, !positive, terms, constant);
+            }
+            ExprKind::Unary { op: UnaryOp::Neg, value } => collect(value, !positive, terms, constant),
+            ExprKind::Const { value } => {
+                *constant = if positive {
+                    constant.wrapping_add(*value)
+                } else {
+                    constant.wrapping_sub(*value)
+                };
+            }
+            _ => {
+                let step = if positive { 1 } else { -1 };
+                match terms.iter_mut().find(|(held, _)| held == expr) {
+                    Some((_, coefficient)) => *coefficient += step,
+                    None => terms.push((expr.clone(), step)),
+                }
+            }
+        }
+    }
+
+    let width = expr.width;
+    let mut terms: Vec<(Expr, i64)> = Vec::new();
+    let mut constant = 0_u64;
+    collect(&expr.simplify(), true, &mut terms, &mut constant);
+    terms.retain(|(_, coefficient)| *coefficient != 0);
+    // A stable order independent of how the expression was written, keyed on the
+    // interned structural hash.
+    //
+    // This was `format!("{term:?}")`. `Debug` prints a shared DAG as a TREE, so
+    // one term renders to megabytes, and `canonical_affine` runs over every
+    // memory cell of every canonicalized state: measured on entry 0xc43d80e at a
+    // 2048 instruction limit, `canonicalized` was 237s of a 255s walk with this
+    // line inside it. An earlier note here recorded hash ordering as "+0" -- that
+    // was +0 on the N1 COUNT, which is the thing it must not change; it was never
+    // measured against time, which is the thing it fixes.
+    //
+    // Unlike the sort in `canonicalized`, this order IS the canonical form, so a
+    // hash collision would leave two terms in input order and could cost a fold.
+    // At 64 bits that is negligible, and it is a precision risk only: the rebuilt
+    // sum is the same terms at the same width whatever their order.
+    terms.sort_by_cached_key(|(term, _)| {
+        use std::hash::BuildHasher;
+        crate::expr::FxBuild::default().hash_one(term)
+    });
+
+    let mut accumulated: Option<Expr> = None;
+    for (term, coefficient) in terms {
+        let scaled = match coefficient {
+            1 => term,
+            -1 => Expr::unary(UnaryOp::Neg, term),
+            other => {
+                let Ok(scaled) = Expr::binary(
+                    BinaryOp::Mul,
+                    term,
+                    Expr::constant(width, other as u64),
+                ) else {
+                    return expr.clone();
+                };
+                scaled
+            }
+        };
+        accumulated = Some(match accumulated {
+            None => scaled,
+            Some(sum) => {
+                let Ok(sum) = Expr::binary(BinaryOp::Add, sum, scaled) else {
+                    return expr.clone();
+                };
+                sum
+            }
+        });
+    }
+    match (accumulated, constant) {
+        (None, constant) => Expr::constant(width, constant),
+        (Some(sum), 0) => sum,
+        (Some(sum), constant) => Expr::binary(BinaryOp::Add, sum, Expr::constant(width, constant))
+            .unwrap_or_else(|_| expr.clone()),
+    }
 }
 
 /// Flattens an affine VSP expression into its non-constant terms (keyed by
@@ -998,8 +1720,18 @@ fn widen_state(
 /// single constant — the reduction `simplify` alone does not perform on `Sub`.
 /// Any other node (a multiply, a load, a flag intrinsic) stays an opaque term,
 /// so a non-affine VSP step cannot be mistaken for a constant adjustment.
-fn affine_vsp_parts(expr: &Expr) -> (BTreeMap<String, i64>, u64) {
-    fn collect(expr: &Expr, positive: bool, terms: &mut BTreeMap<String, i64>, constant: &mut u64) {
+/// Decomposes a VSP expression into non-constant terms and a constant offset.
+///
+/// Terms are keyed by the EXPRESSION, not by its rendered Debug text. `Expr`
+/// hashes and compares through interned `ExprRef`s, both O(1), so this keys on
+/// node identity instead of building a String per term — and `VMProtect` builds
+/// the VSP out of an opaque `Add(Not(Or(..)), k)`, so those Strings were large.
+/// The relation is the same either way (Debug rendering is faithful), so this is
+/// semantics-preserving. It did NOT turn out to be the cost on the entry that
+/// motivated it — 50 s per `generalize_across` call and 13 GB of transient heap
+/// survive it, and that cost is still unlocated.
+fn affine_vsp_parts(expr: &Expr) -> (HashMap<Expr, i64>, u64) {
+    fn collect(expr: &Expr, positive: bool, terms: &mut HashMap<Expr, i64>, constant: &mut u64) {
         match &expr.kind {
             ExprKind::Binary {
                 op: BinaryOp::Add,
@@ -1031,12 +1763,12 @@ fn affine_vsp_parts(expr: &Expr) -> (BTreeMap<String, i64>, u64) {
                 };
             }
             _ => {
-                let coefficient = terms.entry(format!("{expr:?}")).or_insert(0);
+                let coefficient = terms.entry(expr.clone()).or_insert(0);
                 *coefficient += if positive { 1 } else { -1 };
             }
         }
     }
-    let mut terms = BTreeMap::new();
+    let mut terms = HashMap::new();
     let mut constant = 0_u64;
     collect(&expr.simplify(), true, &mut terms, &mut constant);
     terms.retain(|_, coefficient| *coefficient != 0);
@@ -1066,12 +1798,20 @@ fn proven_constant_vsp_delta(
     reentry: &SymbolicVmInitialState,
 ) -> Option<u64> {
     // Oldest -> newest: reverse the nearest-first ancestors, then the re-entry.
-    let chain: Vec<&Expr> = ancestors
+    // Consecutive repeats are dropped: several iterations at one VM stack depth
+    // are not a stride violation, and keeping them mixed a step of 0 into the
+    // chain so a clean one-cell push-down read as non-constant.
+    let mut chain: Vec<&Expr> = Vec::new();
+    for vsp in ancestors
         .iter()
         .rev()
         .map(|state| &state.vsp)
         .chain(std::iter::once(&reentry.vsp))
-        .collect();
+    {
+        if chain.last() != Some(&vsp) {
+            chain.push(vsp);
+        }
+    }
     let mut delta: Option<u64> = None;
     for pair in chain.windows(2) {
         let step = constant_vsp_delta(pair[0], pair[1])?;
@@ -1088,6 +1828,24 @@ fn proven_constant_vsp_delta(
 enum LoopStep {
     /// An enclosing entry state covers the re-entry state: a back edge.
     Close,
+    /// An enclosing entry state IS the re-entry state with the VM stack base
+    /// shifted by one constant, so the back edge closes — but the VM stack grows
+    /// per level without a bound this walk can see, so the walker must concede
+    /// frame privacy. Every bound it measured on the frame extent came from the
+    /// finitely many stores it happened to observe, and an unbounded push-down
+    /// writes below all of them; letting the proven tier discharge the
+    /// external-store assumption on such an entry is exactly the error this
+    /// variant exists to prevent. See [`closes_under_vm_stack_shift`].
+    CloseShifted,
+    /// The shifted enclosing state does NOT yet cover the re-entry, so continue
+    /// from this generalization of the two. [`LoopStep::CloseShifted`] is a
+    /// one-shot coverage test, which left a VSP-striding loop with no widening
+    /// iteration at all: whatever failed to be covered on the first try — in the
+    /// measured cases the flag word — refused the whole entry, even though the
+    /// very next round would have carried a TOP that covers it. This is to
+    /// `CloseShifted` what [`LoopStep::Widen`] is to [`LoopStep::Close`], and it
+    /// concedes frame privacy for exactly the same reason `CloseShifted` does.
+    WidenShifted(SymbolicVmInitialState),
     /// Still within the exact-unroll budget.
     Unroll,
     /// Continue from this generalization of every enclosing entry at once.
@@ -1142,13 +1900,25 @@ fn widen_to_fixpoint(
 /// single enclosing path), which converges a block re-reached through sibling
 /// paths. `Err` when the states cannot be generalized (stack/allocation/taint
 /// drift), which fails the re-entry closed.
-fn fold_states(
+fn fold_states<'s>(
     key: Va,
-    states: &[SymbolicVmInitialState],
+    states: impl IntoIterator<Item = &'s SymbolicVmInitialState>,
     incoming: &SymbolicVmInitialState,
+    deadline: Option<Instant>,
 ) -> Result<SymbolicVmInitialState, String> {
     let mut acc = incoming.clone();
     for state in states {
+        // The walk's own deadline bounds the gaps BETWEEN worklist items, not
+        // the work inside one, and this fold is inside one. Measured on
+        // systems.xpl at an 8192 instruction limit: a single `generalize_across`
+        // ran 43s and took resident memory from 550MB to 13GB while every
+        // counter the walker charges stayed flat (states 336->337,
+        // interner_live 1542->1551, charged 249MB->250MB). Unbounded here is
+        // what made raising the instruction limit an out-of-memory risk rather
+        // than a slower sweep.
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return Err("generalization exceeded the per-entry wall-clock budget".to_owned());
+        }
         if let Some(widened) = widen_state(key, &acc, state)? {
             acc = widened;
         }
@@ -1156,14 +1926,384 @@ fn fold_states(
     Ok(acc)
 }
 
+/// True when the fold HID a frame pointer: some pre-fold cell held a
+/// frame-pointer value that the folded state no longer holds at that address.
+/// Such a pointer could later be produced by an untracked load, so frame privacy
+/// really is conceded. When no frame-pointer cell was altered, privacy survives
+/// the fold and the VM-stack assumption can still be discharged — conceding it
+/// unconditionally kept 115 CFG-complete entries out of the proven tier.
+fn fold_hid_frame_pointer<'s>(
+    before: impl Iterator<Item = &'s SymbolicVmInitialState>,
+    after: &SymbolicVmInitialState,
+) -> bool {
+    before.into_iter().any(|state| {
+        state.memory_values.iter().any(|(address, value)| {
+            crate::semantic_exec::is_frame_pointer_value(value)
+                && !after
+                    .memory_values
+                    .iter()
+                    .any(|(kept, held)| kept == address && held == value)
+        })
+    })
+}
+
+/// Outcome of scanning a block's phases shifted onto one re-entry's depth.
+enum ShiftedPhases {
+    /// Nothing here shifts, or the fold refused: the ordinary same-depth fold
+    /// still gets to decide.
+    None,
+    /// A shifted phase already covers the re-entry, so the back edge closes.
+    Covered,
+    /// Not covered yet; carry on from this broadened state.
+    Folded(SymbolicVmInitialState),
+}
+
 /// Outcome of generalizing a re-entry against a block's accumulated states.
+#[derive(Debug, Eq, PartialEq)]
 enum GeneralizeAcross {
     /// The running over-approximation already covers this re-entry: it closes.
     Closed,
-    /// Continue exploring from this broadened state.
-    Continue(SymbolicVmInitialState),
-    /// The states cannot be generalized soundly: fail closed.
-    Stall,
+    /// Continue exploring from this broadened state. `hid_frame_pointer` says
+    /// whether the fold discarded a frame-pointer-bearing cell.
+    Continue {
+        state: SymbolicVmInitialState,
+        hid_frame_pointer: bool,
+    },
+    /// The states cannot be generalized soundly: fail closed, carrying the
+    /// refusal reason so the census can tell a drifting VM stack pointer apart
+    /// from every other reason a fold is refused.
+    Stall(String),
+}
+
+/// True when `reentry` is exactly `ancestor` with the VM stack base shifted by
+/// one constant: the same abstract state, re-reached some cells deeper.
+///
+/// A recursion that `VMProtect` inlines re-enters its loop head at a new VM stack
+/// depth every level, and `widen_state` refuses any pair whose VSPs differ, so
+/// the loop never closed and 110+ systems.xpl entries stopped here. But a state
+/// that is EXACTLY the enclosing one under the uniform renaming
+/// `vsp_initial := vsp_initial + delta` is bisimilar to it: a block's identity is
+/// a code address, which the renaming does not touch, so both re-entries reach
+/// the same blocks by the same edges, and an unresolved target stalls in both.
+/// That lets the back edge close, which is all CFG completeness asks for — a back
+/// edge is a path to an exit, and no trip count is involved. The VM stack still
+/// grows per level at runtime; a loop in the recovered graph is the correct
+/// description of that, not an approximation of it.
+///
+/// Deliberately an EQUALITY test and not a widening seed. Widening a shifted
+/// state against an unshifted one would have to cover both, and any part of the
+/// state that does NOT move with the stack would make the renamed state wrong
+/// rather than conservative. Equality needs no such judgement: either every part
+/// shifted by the same delta — in which case the renaming is the other state, not
+/// an approximation of it — or this returns false and the refusal stands. It is
+/// self-validating for the same reason: if the VSP is not rooted at
+/// `vsp_initial`, the substitution leaves it alone and the equality simply fails.
+fn closes_under_vm_stack_shift(
+    key: Va,
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> bool {
+    // Coverage, not equality, and by the SAME test the non-shifted case at the
+    // top of `loop_step` uses: `widen_state(..) == Ok(None)` is this module's own
+    // "the enclosing state already covers this re-entry". Equality was too
+    // strict — measured, the shifted ancestor's flags are often already a
+    // `loop_havoc_*` TOP from an earlier generalization while the re-entry
+    // carries a precise value, and TOP covers precise. Everything new here is
+    // the shift; the soundness notion is unchanged.
+    shift_ancestor_onto_reentry(ancestor, reentry).is_some_and(|shifted| {
+        matches!(
+            widen_state(key, &canonicalized(&shifted), &canonicalized(reentry)),
+            Ok(None)
+        )
+    })
+}
+
+/// Every expression in `state` put through [`canonical_affine`]. Substituting the
+/// stack base for `base + delta` leaves nested sums like `((base + delta) + c)`
+/// that are semantically the re-entry's `base + c'` but not structurally equal to
+/// it, and structural equality is all `==` on a state can do. Memory cells are
+/// also sorted, because two states holding the same cells in a different order
+/// are the same state. Interning makes the canonical forms share, so comparing
+/// them is still a pointer test.
+fn canonicalized(state: &SymbolicVmInitialState) -> SymbolicVmInitialState {
+    let mut memory_values: Vec<(Expr, Expr)> = state
+        .memory_values
+        .iter()
+        .map(|(address, value)| (canonical_affine(address), canonical_affine(value)))
+        .collect();
+    // The interned structural hash, not rendered address text. `Debug` prints a
+    // shared DAG as a TREE, so an address renders to megabytes; bounding that
+    // render (`site_key`) fixed the resulting 13GB of resident memory but left
+    // the cost of producing it. Measured on entry 0xc43d80e at a 2048
+    // instruction limit, this one line was 225s of a 244s walk.
+    //
+    // Every node caches its structural hash at intern time and `ExprRef`'s
+    // `Hash` writes that one u64, so hashing an `Expr` composes its children's
+    // cached hashes: a full structural key, O(1) and allocation-free.
+    //
+    // This is only a SORT key -- `memory_union` builds its own site identity --
+    // so a collision leaves two cells in input order. That costs a missed fold,
+    // never correctness.
+    memory_values.sort_by_cached_key(|(address, _)| {
+        use std::hash::BuildHasher;
+        crate::expr::FxBuild::default().hash_one(address)
+    });
+    SymbolicVmInitialState {
+        vsp: canonical_affine(&state.vsp),
+        flags: canonical_affine(&state.flags),
+        context_values: state
+            .context_values
+            .iter()
+            .map(|(slot, value)| (*slot, canonical_affine(value)))
+            .collect(),
+        memory_values,
+        fresh_allocations: state
+            .fresh_allocations
+            .iter()
+            .map(|allocation| crate::semantic_exec::SymbolicFreshAllocation {
+                allocation: canonical_affine(&allocation.allocation),
+                size: canonical_affine(&allocation.size),
+                zero_initialized: allocation.zero_initialized,
+            })
+            .collect(),
+        ..state.clone()
+    }
+}
+
+/// Adds `delta` to every stack-relative expression in `expr`: any subexpression
+/// whose affine decomposition carries exactly `base_terms` as its non-constant
+/// part is `base + k`, so it becomes `base + k + delta`.
+///
+/// The shift CANNOT be done by substituting the base register. `VMProtect` builds
+/// the VM stack pointer out of obfuscated bitwise arithmetic — measured on these
+/// entries it is `Add(Not(Or(..)), k)` — so the base is one opaque term with the
+/// register buried inside it. Substituting the register rewrites the inside of
+/// that term and produces a term the re-entry never had; the whole opaque term
+/// has to move as a unit instead.
+///
+/// Top-down deliberately: a node that matches has its constant shifted and is
+/// NOT descended into, because its own base term must stay byte-identical.
+/// Descending as well would shift the base inside it and then shift the sum
+/// again, for 2*delta. Nodes that do not match are rebuilt from shifted
+/// children, so a stack address nested inside a load still moves.
+/// Shared across every cell of one state: `Expr` hashes and compares through
+/// interned `ExprRef`s, both O(1), so keying on the expression is keying on node
+/// identity.
+type ShiftMemo = std::collections::HashMap<Expr, Expr>;
+
+/// Memoized on node identity. Expressions here are a hash-consed DAG, and the
+/// unmemoized walk descended into every *edge*, so a subterm shared k ways was
+/// rebuilt k times — the DAG expanded into its tree. Measured on one entry's
+/// `generalize_across`: eight calls of 60-80 s each holding 11 GB of transient
+/// nodes, against a per-entry cap that never fired because none of it is
+/// retained. The memo makes it linear in distinct nodes.
+fn shift_stack_relative_memo(
+    expr: &Expr,
+    base_terms: &HashMap<Expr, i64>,
+    delta: u64,
+    memo: &mut ShiftMemo,
+    budget: &std::cell::Cell<usize>,
+) -> Expr {
+    if let Some(done) = memo.get(expr) {
+        return done.clone();
+    }
+    // Out of budget: hand back the node untouched and let the caller abandon
+    // the whole shift. Returning a partially shifted state would be wrong, so
+    // the exhausted flag (budget stuck at zero) is what the caller checks.
+    if budget.get() == 0 {
+        return expr.clone();
+    }
+    budget.set(budget.get() - 1);
+    let result = shift_stack_relative_uncached(expr, base_terms, delta, memo, budget);
+    memo.insert(expr.clone(), result.clone());
+    result
+}
+
+fn shift_stack_relative_uncached(
+    expr: &Expr,
+    base_terms: &HashMap<Expr, i64>,
+    delta: u64,
+    memo: &mut ShiftMemo,
+    budget: &std::cell::Cell<usize>,
+) -> Expr {
+    let (terms, constant) = affine_vsp_parts(expr);
+    if !terms.is_empty() && terms == *base_terms {
+        let shifted = constant.wrapping_add(delta);
+        // Rebuild as (expr - constant) + shifted, which is the same sum with one
+        // different constant, without touching the opaque base term.
+        let base = Expr::binary(
+            BinaryOp::Sub,
+            expr.clone(),
+            Expr::constant(expr.width, constant),
+        );
+        if let Ok(base) = base
+            && let Ok(result) = Expr::binary(
+                BinaryOp::Add,
+                base,
+                Expr::constant(expr.width, shifted),
+            )
+        {
+            return result;
+        }
+        return expr.clone();
+    }
+    let rebuilt = match &expr.kind {
+        ExprKind::Binary { op, left, right } => Expr::binary(
+            *op,
+            shift_stack_relative_memo(left, base_terms, delta, memo, budget),
+            shift_stack_relative_memo(right, base_terms, delta, memo, budget),
+        )
+        .ok(),
+        ExprKind::Unary { op, value } => {
+            Some(Expr::unary(*op, shift_stack_relative_memo(value, base_terms, delta, memo, budget)))
+        }
+        ExprKind::Load { address } => Some(Expr::load(
+            expr.width,
+            shift_stack_relative_memo(address, base_terms, delta, memo, budget),
+        )),
+        ExprKind::Intrinsic { name, arguments } => Some(Expr::intrinsic(
+            expr.width,
+            name.clone(),
+            arguments
+                .iter()
+                .map(|argument| shift_stack_relative_memo(argument, base_terms, delta, memo, budget))
+                .collect::<Vec<_>>(),
+        )),
+        _ => None,
+    };
+    rebuilt.unwrap_or_else(|| expr.clone())
+}
+
+/// `ancestor` with its whole VM stack advanced by the constant stride that
+/// separates it from `reentry`, or `None` when there is no such stride.
+fn shift_ancestor_onto_reentry(
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> Option<SymbolicVmInitialState> {
+    let delta = constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0)?;
+    let (base_terms, _) = affine_vsp_parts(&ancestor.vsp);
+    if base_terms.is_empty() {
+        return None;
+    }
+    // One memo for the whole state: its cells share subterms heavily, so a
+    // per-expression memo would rebuild the same DAG once per cell.
+    let memo = std::cell::RefCell::new(ShiftMemo::new());
+    let budget = std::cell::Cell::new(SHIFT_NODE_BUDGET);
+    let shift = |expr: &Expr| {
+        shift_stack_relative_memo(expr, &base_terms, delta, &mut memo.borrow_mut(), &budget)
+    };
+    let shifted = SymbolicVmInitialState {
+        vsp: shift(&ancestor.vsp),
+        flags: shift(&ancestor.flags),
+        context_values: ancestor
+            .context_values
+            .iter()
+            .map(|(slot, value)| (*slot, shift(value)))
+            .collect(),
+        memory_values: ancestor
+            .memory_values
+            .iter()
+            .map(|(address, value)| (shift(address), shift(value)))
+            .collect(),
+        fresh_allocations: ancestor
+            .fresh_allocations
+            .iter()
+            .map(|allocation| crate::semantic_exec::SymbolicFreshAllocation {
+                allocation: shift(&allocation.allocation),
+                size: shift(&allocation.size),
+                zero_initialized: allocation.zero_initialized,
+            })
+            .collect(),
+        ..ancestor.clone()
+    };
+    // A shift that ran out of budget is partial, and a partially shifted state
+    // is not a sound over-approximation of the ancestor, so it is discarded
+    // rather than folded against.
+    (budget.get() > 0).then_some(shifted)
+}
+
+/// Diagnostic: the first field in which `ancestor` shifted by its constant VM
+/// stack delta still differs from `reentry`. Names WHY a push-down level is not
+/// the renaming of the enclosing one, which is the only thing that stands
+/// between this stall family and a closed back edge.
+fn vm_stack_shift_mismatch(
+    ancestor: &SymbolicVmInitialState,
+    reentry: &SymbolicVmInitialState,
+) -> String {
+    if constant_vsp_delta(&ancestor.vsp, &reentry.vsp).filter(|d| *d != 0).is_none() {
+        return "no constant stride".to_owned();
+    }
+    let (base_terms, _) = affine_vsp_parts(&ancestor.vsp);
+    if base_terms.is_empty() {
+        return "vsp has no non-constant base term".to_owned();
+    }
+    let Some(a) = shift_ancestor_onto_reentry(ancestor, reentry).map(|s| canonicalized(&s)) else {
+        return "substitution failed".to_owned();
+    };
+    let r = &canonicalized(reentry);
+    // Report what the CLOSURE test decided, not a stricter one: an exact-equality
+    // walk below names a field that coverage may well tolerate.
+    match widen_state(Va(0), &a, r) {
+        Ok(None) => return "nothing (the shift covers it)".to_owned(),
+        Err(reason) => return format!("widen refuses: {reason}"),
+        Ok(Some(_)) => {}
+    }
+    if a.vsp != r.vsp {
+        let shown = |e: &Expr| crate::semantic_exec::debug_prefix(e, 150);
+        return format!(
+            "shifted vsp still differs: shifted {} vs reentry {}",
+            shown(&a.vsp),
+            shown(&r.vsp)
+        );
+    }
+    if !covers(Some(&a.flags), Some(&r.flags)) {
+        let shown = |e: &Expr| crate::semantic_exec::debug_prefix(e, 100);
+        return format!("flags: shifted {} vs reentry {}", shown(&a.flags), shown(&r.flags));
+    }
+    // NOT compared: `widen_state` folds the epoch with `max` and never counts it
+    // as a change, so reporting it here only buried the field that actually
+    // blocks the fold. It cost two rounds of chasing the wrong thing.
+    if a.next_native_call_epoch != r.next_native_call_epoch {
+        return "native_call_epoch".to_owned();
+    }
+    if a.memory_tainted != r.memory_tainted
+        || a.image_reads_suppressed != r.image_reads_suppressed
+        || a.protection_may_have_changed != r.protection_may_have_changed
+    {
+        return "a precision flag".to_owned();
+    }
+    if a.fresh_allocations != r.fresh_allocations {
+        return "fresh_allocations".to_owned();
+    }
+    if a.context_values.len() != r.context_values.len() {
+        return format!(
+            "context cell count {} vs {}",
+            a.context_values.len(),
+            r.context_values.len()
+        );
+    }
+    if let Some(slot) = a
+        .context_values
+        .iter()
+        .find(|(slot, value)| !covers(Some(value), r.context_values.get(slot)))
+        .map(|(slot, _)| *slot)
+    {
+        return format!("context cell {slot:#x} not covered");
+    }
+    // NOT a count comparison. `widen_state` drops a symbolically addressed cell
+    // the re-entry holds and this state does not -- that drop IS the widening --
+    // so a differing count is no longer what blocks the fold, and reporting it
+    // would bury the field that is, exactly as the epoch did before it. Only the
+    // cells this state actually holds have to be covered.
+    if let Some((address, _)) = a.memory_values.iter().find(|(address, value)| {
+        !r.memory_values
+            .iter()
+            .any(|(held, got)| held == address && covers(Some(value), Some(got)))
+    }) {
+        let shown = crate::semantic_exec::debug_prefix(address, 90);
+        return format!("memory cell not covered at {shown}");
+    }
+    "nothing (would have closed)".to_owned()
 }
 
 /// Decides how a block re-entered while already on the path proceeds.
@@ -1186,10 +2326,80 @@ fn loop_step(
     if ancestors.len() < unrolls {
         return LoopStep::Unroll;
     }
-    match widen_to_fixpoint(key, ancestors, reentry) {
+    // Widen only within the re-entry's own VM-stack phase. The VSP is part of a
+    // state's identity, not a dimension to join over: `widen_state` refuses any
+    // pair whose VSPs differ, so one enclosing iteration sitting at a different
+    // VM stack depth failed the whole re-entry closed even when the phase itself
+    // converges. Measured across eight such entries: every refusal showed a
+    // SINGLETON stride set of one cell (-8 or +8), never a growing
+    // {8, 16, 24, ...}, so the VM stack oscillates between a bounded number of
+    // depths rather than drifting. With no same-phase ancestor this is unchanged.
+    let phase: Vec<&SymbolicVmInitialState> = ancestors
+        .iter()
+        .copied()
+        .filter(|a| a.vsp == reentry.vsp)
+        .collect();
+    if phase.is_empty() {
+        // No enclosing iteration sits at this VM stack depth, so there is nothing
+        // to widen against and widening across depths only reproduces the VSP
+        // refusal. Explore ONE more depth exactly instead, which assumes nothing
+        // (an unroll is plain exploration) and still fails closed right after.
+        //
+        // Two distinct depths is the whole point: it is the least that lets
+        // `proven_constant_vsp_delta` see a stride at all, and a loop that merely
+        // oscillates would already have closed at the top of this function
+        // against the ancestor it returned to. So reaching the refusal with two
+        // depths and a constant stride is itself the proof that the VM stack
+        // grows per iteration. Measured on eight such entries: the strides read
+        // {-0x8, -0x10, -0x18, -0x20} from one re-entry, a clean one-cell
+        // push-down recursion, which no sound widening closes without a trip
+        // count — only the observed-depth bridge below can.
+        let mut depths: Vec<&Expr> = Vec::new();
+        for state in ancestors {
+            if !depths.contains(&&state.vsp) {
+                depths.push(&state.vsp);
+            }
+        }
+        if depths.len() < 2 {
+            return LoopStep::Unroll;
+        }
+    }
+    let enclosing = if phase.is_empty() { ancestors } else { &phase };
+    match widen_to_fixpoint(key, enclosing, reentry) {
         Ok(Some(widened)) => LoopStep::Widen(widened),
         Ok(None) => LoopStep::Close,
-        Err(reason) => bounded_unroll_or_refuse(ancestors, reentry, observed_depth, reason),
+        Err(reason) => bounded_unroll_or_refuse(key, ancestors, reentry, observed_depth, reason),
+    }
+}
+
+/// Diagnostic: appends the per-iteration VM-stack strides a refused loop shows,
+/// and whether the stride is a PROVEN constant. A proven constant stride is the
+/// only shape a sound stride summarization could ever close; an unproven or
+/// mixed stride set cannot be closed without an assumption.
+fn vsp_stride_note(
+    ancestors: &[&SymbolicVmInitialState],
+    reentry: &SymbolicVmInitialState,
+    reason: String,
+) -> String {
+    let strides: BTreeSet<i64> = ancestors
+        .iter()
+        .filter(|a| a.vsp != reentry.vsp)
+        .map(|a| constant_vsp_delta(&a.vsp, &reentry.vsp).map_or(i64::MIN, |d| d as i64))
+        .collect();
+    if strides.is_empty() {
+        return reason;
+    }
+    let proven = proven_constant_vsp_delta(ancestors, reentry).is_some();
+    // Why the nearest shifted ancestor is not the re-entry: see
+    // `vm_stack_shift_mismatch`.
+    let blocker = ancestors
+        .iter()
+        .find(|a| a.vsp != reentry.vsp)
+        .map_or_else(|| "none".to_owned(), |a| vm_stack_shift_mismatch(a, reentry));
+    if strides.contains(&i64::MIN) {
+        format!("{reason} (vsp strides non-constant, proven={proven}, shift blocked by {blocker})")
+    } else {
+        format!("{reason} (vsp strides {strides:#x?}, proven={proven}, shift blocked by {blocker})")
     }
 }
 
@@ -1201,16 +2411,46 @@ fn loop_step(
 /// constant, it stays the existing fail-closed refusal — no depth is ever
 /// guessed, and the sound path (no observed depth) is never reached here.
 fn bounded_unroll_or_refuse(
+    key: Va,
     ancestors: &[&SymbolicVmInitialState],
     reentry: &SymbolicVmInitialState,
     observed_depth: Option<u64>,
     reason: String,
 ) -> LoopStep {
+    // Checked only where the walk would otherwise refuse, and only AFTER the
+    // observed bridge below has had its chance: an exact unroll to an observed
+    // depth is strictly more precise output than a loop, so it must keep winning
+    // where a depth exists.
+    let refuse = |reason: String| -> LoopStep {
+        if ancestors
+            .iter()
+            .any(|ancestor| closes_under_vm_stack_shift(key, ancestor, reentry))
+        {
+            return LoopStep::CloseShifted;
+        }
+        // The shift did not cover outright. Widen the shifted ancestor against
+        // the re-entry and continue from that, rather than refusing: it is the
+        // same generalization the non-striding path takes, and the shifted
+        // ancestor sits at the re-entry's own depth by construction, so the
+        // widened state does too. Converges because `generalize` goes to a
+        // site-keyed TOP rather than growing a bound per revisit, so the next
+        // round's coverage test sees TOP and closes; the visit, instruction and
+        // wall-clock caps remain the backstop.
+        for ancestor in ancestors {
+            if let Some(shifted) = shift_ancestor_onto_reentry(ancestor, reentry)
+                && let Ok(Some(widened)) =
+                    widen_state(key, &canonicalized(&shifted), &canonicalized(reentry))
+            {
+                return LoopStep::WidenShifted(widened);
+            }
+        }
+        LoopStep::Refuse(vsp_stride_note(ancestors, reentry, reason))
+    };
     let Some(depth) = observed_depth else {
-        return LoopStep::Refuse(reason);
+        return refuse(reason);
     };
     if proven_constant_vsp_delta(ancestors, reentry).is_none() {
-        return LoopStep::Refuse(reason);
+        return refuse(reason);
     }
     // `ancestors.len()` counts the enclosing iterations already on the path; one
     // more exact unroll per remaining level up to the observed depth.
@@ -1240,7 +2480,21 @@ struct Walker<'a, 'p> {
     config: crate::HandlerCodecRecoveryConfig,
     global_table: Option<crate::GlobalTableBase>,
     profile: crate::VmProfile,
+    /// Total nested entries followed. Load-bearing for soundness, NOT just the
+    /// cap: `discharge_vm_stack_assumption` only drops the external-store
+    /// assumption when this is 0, so it must keep counting every following.
+    /// Why `follow_cross_profile_transition` last refused, for the
+    /// `MissingHandlerSpec` stall text. Each of its exits returns a bare
+    /// `false`, so without this the biggest sound-mode stall family names a
+    /// handler but never says which gate gave way.
+    transition_refusal: Option<String>,
     nested_followed: usize,
+    /// DISTINCT nested entry stubs followed. The cap bounds these rather than
+    /// the total, because sibling paths and loop unrolls re-enter the SAME stub
+    /// and were spending the budget on repeated work instead of on reaching new
+    /// nested entries. Bounded as before by the entry-global visit/instruction
+    /// caps and the hard per-entry memory cap, each of which fails closed.
+    nested_sites: BTreeSet<Rva>,
     current: Option<Rc<PathNode>>,
     direction: crate::BytecodeDirection,
     section: Option<usize>,
@@ -1252,6 +2506,11 @@ struct Walker<'a, 'p> {
     /// Proven cross-profile transitions followed so far this entry; capped by
     /// `limits.max_profile_transitions` to bound exploration/memory.
     profile_transitions: usize,
+    /// DISTINCT blocks a cross-profile transition was followed from; the cap bounds
+    /// these rather than total followings, which unrolls and sibling paths burn on
+    /// repeated work. Still bounded by post-transition visits, per-block visits and
+    /// the hard per-entry memory cap, each of which fails closed.
+    transition_sites: BTreeSet<Va>,
     /// `(total_instructions, visits)` captured when the FIRST cross-profile
     /// transition fired. `None` until then (and forever on the sound path).
     /// The post-transition budget is measured as growth beyond this baseline.
@@ -1259,16 +2518,25 @@ struct Walker<'a, 'p> {
     cache: LinearDecodeCache,
     decoded: BTreeMap<Va, DecodedBlock>,
     explored: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
+    /// Stalls a ceiling run closed as labeled exits, kept so the run still
+    /// reports WHICH blocker each assumption stood in for.
+    assumed_exits: Vec<CfgStall>,
     /// Per-block running over-approximation used once a block has hit the
     /// `max_visits_per_block` cap with distinct states that no path-local loop
     /// generalizes (blocks re-reached through many sibling paths, whose only drift
     /// is fresh-name bookkeeping). Incoming states fold into it so the block
     /// converges to a sound fixpoint instead of stalling at the cap.
-    widened: BTreeMap<Va, SymbolicVmInitialState>,
+    /// One canonical over-approximation PER VM-STACK PHASE per block. Keeping a
+    /// single canonical made a re-entry at another VM stack depth hit the VSP
+    /// refusal in `widen_state` and fail closed; phases converge separately.
+    widened: BTreeMap<Va, Vec<SymbolicVmInitialState>>,
     cfg: VmCfg,
     total_instructions: usize,
     /// Running over-estimate of live walker bytes; see `VmCfgLimits::max_memory_bytes`.
     live_bytes: usize,
+    /// Per-entry wall-clock deadline, so the generalization loops inside a
+    /// single worklist item are bounded too (see `fold_states`).
+    deadline: Option<Instant>,
     /// Observed runtime memory seed for the experimental tier (empty on the
     /// sound path). Consulted only to resolve provably-null image reads.
     observed: &'a crate::ObservedMemory,
@@ -1289,9 +2557,20 @@ struct Walker<'a, 'p> {
     private_frame_hi: Option<i64>,
     /// Set once a report may leak the frame address or write outside the frame,
     /// or a loop widening may have hidden such a pointer.
+    /// OBSERVED: the VM stack frame really did escape — an address of it was
+    /// exposed, or a store landed past its proven extent. A fact.
     frame_not_private: bool,
+    /// CONCEDED: privacy was ASSUMED, to generalize or close a loop. Not the
+    /// same claim as the field above, and keeping both in one flag denied the
+    /// taint retry to every entry that closed a strided loop — the retry wants
+    /// privacy to HOLD, and a concession is "not proven", not "false".
+    frame_privacy_conceded: bool,
     /// Some report let a value derived from the frame (possibly mere data) leave it.
     frame_derived_escape: bool,
+    /// Diagnostic: a report reported the frame ADDRESS escaping.
+    frame_escape_seen: bool,
+    /// Diagnostic: (frame_hi, written) of a store above the proven frame bound.
+    frame_store_past: Option<(i64, i64)>,
     /// Some report discarded tracked memory holding a frame-pointer value.
     frame_pointer_lost: bool,
 }
@@ -1299,6 +2578,98 @@ struct Walker<'a, 'p> {
 /// Builds the memory source for a symbolic call: the sound read-only image
 /// overlaid with the observed seed (which is empty on the sound path, so the
 /// overlay is then behaviourally identical to a bare [`ReadOnlyImage`]).
+/// Opt-in: offer the labeled disjointness retry to EVERY tainted block, not
+/// only one ending in an unconditional branch.
+///
+/// The restriction was never about soundness -- the retry's result carries the
+/// same unproven `AssumesExternalStoresDisjointFromVmStack` label whatever the
+/// boundary -- so widening it trades nothing but the number of entries that get
+/// the chance.
+///
+/// MEASURED on systems.xpl with `--serve-ro`: +0. N1 stays at 658/814 and the
+/// incomplete set stays at 154 (`BlockVisits` 5, stall 149), identical with the
+/// knob on and off. The 20 remaining "branch target follows an imprecise
+/// external-memory store" stalls are not reached by this retry, so widening the
+/// boundary was not what held them back. Left off by default and kept only so
+/// the next attempt starts from the measurement rather than the hypothesis.
+/// `VMPX_RETRY_FRAME_LOST`: let the labeled disjointness retry run even after a
+/// frame pointer has been LOST somewhere in this entry.
+///
+/// The gate's own comment says "only the OBSERVED escape bars this retry", but
+/// the code also bars `frame_pointer_lost`, which is accumulated over the whole
+/// entry rather than established for the block being retried. Measured on
+/// systems.xpl, that one gate is true in 100% of the imprecise-store stalls
+/// (45 of 45 occurrences) while the observed escape is false in 38 of them, so
+/// it alone blocks all 31 entries this cause leaves incomplete.
+///
+/// Relaxing it is a real relaxation, not a bookkeeping fix: a frame pointer that
+/// reached untracked memory earlier can come back from an opaque read later,
+/// where `is_frame_pointer_value` cannot recognise it. The per-BLOCK check
+/// inside the executor (`vm_stack_pointer_lost`) still applies, so this only
+/// widens the entry-accumulated gate. Anything it recovers carries
+/// `AssumesExternalStoresDisjointFromVmStack` and never reaches N2.
+/// Multiplier on the transition-prefix cap, from `VMPX_TRANSITION_PREFIX`.
+fn transition_prefix_scale() -> usize {
+    static SCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VMPX_TRANSITION_PREFIX")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|scale| *scale >= 1)
+            // Default 4, not 1. The comment at the cap already says hitting it
+            // is a symptom of recovering MORE -- the linear VM stream runs
+            // further before meeting an unrecovered handler, so the prefix
+            // grows -- and deciding more opaque predicates pushes it further
+            // still. Measured: 14 occurrences over 8 entries refused on this
+            // cap alone, so it is a cap doing the refusing, not a missing
+            // capability.
+            .unwrap_or(4)
+    })
+}
+
+/// Whether an observed frame escape -- and only that -- bars the tainted-block
+/// retry.
+///
+/// `VMPX_NO_WIDER_TAINT_RETRY=1` restores the older, stricter pair of gates
+/// (`frame_not_private` here and a default-off lost-pointer retry), so the
+/// change can be measured against itself in one build.
+fn wider_taint_retry_disabled_by_escape(walker: &Walker<'_, '_>) -> bool {
+    if wider_taint_retry_disabled() {
+        return walker.frame_not_private;
+    }
+    walker.frame_escape_seen
+}
+
+fn wider_taint_retry_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("VMPX_NO_WIDER_TAINT_RETRY").is_some())
+}
+
+/// Whether a lost frame pointer still allows the tainted-block retry.
+///
+/// This defaulted OFF, and every one of the 124 measured occurrences of the
+/// imprecise-external-store stall has `frame_pointer_lost` set -- so the gate
+/// above could be loosened to exactly its documented intent and still refuse
+/// every one of them. A lost frame pointer means a cell holding one was
+/// discarded by a havoc, so a later loaded-data address COULD be that pointer;
+/// the retry's result is labeled `AssumesExternalStoresDisjointFromVmStack`
+/// either way and never reaches N2, which is what makes conceding it here an
+/// N1 question rather than a soundness one.
+fn retry_when_frame_pointer_lost() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if wider_taint_retry_disabled() {
+            return std::env::var_os("VMPX_RETRY_FRAME_LOST").is_some();
+        }
+        std::env::var_os("VMPX_NO_RETRY_FRAME_LOST").is_none()
+    })
+}
+
+fn retry_every_tainted_block() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_RETRY_TAINTED_ALL").is_ok_and(|v| v == "1"))
+}
+
 fn observed_source<'a, 'p>(
     walker: &Walker<'a, 'p>,
 ) -> crate::ObservedImage<'a, 'p> {
@@ -1404,10 +2775,91 @@ pub(crate) fn bind_preferred_base_registers_except(
 /// Distinct flag bits the ordinary flag-fork fallback enumerates.
 const DEFAULT_MAX_FLAGS: usize = 2;
 
+/// Node evaluations one branch-target enumeration may cost (combinations x
+/// expression nodes). See the refusal in [`resolve_over_inputs_capped`].
+const MAX_ENUMERATION_WORK: usize = 4_000_000;
+
+/// `MAX_ENUMERATION_WORK` scaled by `VMPX_ENUMERATION_WORK` (integer multiplier,
+/// default 1). Still a deterministic work budget, so the same input gives the
+/// same answer on every run; a larger one only lets a cross-product finish.
+fn max_enumeration_work() -> usize {
+    static WORK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORK.get_or_init(|| {
+        let scale = std::env::var("VMPX_ENUMERATION_WORK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1);
+        MAX_ENUMERATION_WORK.saturating_mul(scale)
+    })
+}
+
 /// Targets a branch can take: the constant it simplifies to, or its image over
 /// a proven-exhaustive input domain (`true` when guarded by inputs).
+/// Diagnostic: with `VMPX_MEM_TRACE=1`, names any single call that ran longer
+/// than five seconds. The walker-level trace samples between worklist items, so
+/// it cannot fire while the walk is inside one call -- which is where the 11.7 GB
+/// transient on entry 0xdb9023d lives.
+/// Unconditional phase marker, enabled by `VMPX_TRACE_PHASES`.
+///
+/// `note_slow` prints only once a call RETURNS and only past a floor, so a call
+/// that never returns prints nothing -- indistinguishable from one that was
+/// fast. That ambiguity is what made a hung entry hard to locate. These markers
+/// pair with the `note_slow` line that follows the same call, so the last
+/// `enter` with no matching timing line names exactly where a walk is stuck.
+fn phase(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VMPX_TRACE_PHASES").is_some()) {
+        return;
+    }
+    eprintln!("[enter] {label}");
+}
+
+/// `note_slow` for the decode, which lives in another module.
+pub(crate) fn note_decode_slow(label: &str, start: std::time::Instant) {
+    note_slow(label, start);
+}
+
+fn note_slow(label: &str, start: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VMPX_MEM_TRACE").is_some()) {
+        return;
+    }
+    let ms = start.elapsed().as_millis();
+    // `VMPX_SLOW_MS` lowers the threshold: a 43s call made of many short ones
+    // prints nothing at 5s, which hides exactly the distribution that matters.
+    static FLOOR: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("VMPX_SLOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5_000)
+    });
+    if ms >= floor {
+        let (live, dead) = crate::expr::interner_census();
+        // stderr, not stdout: Rust BLOCK-buffers stdout when it is redirected to
+        // a file, so probe lines sit unflushed and a hung process looks silent --
+        // which reads exactly like "still inside the call that never returned".
+        // stderr is unbuffered, so these appear as they happen.
+        eprintln!("[slow] {label} {ms} ms  interner_live={live} dead={dead}");
+    }
+}
+
+/// Whether a branch in a block with havoced memory is attempted rather than
+/// vetoed on the flag alone.
+fn taint_try_resolve() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_TAINT_TRY_RESOLVE").is_ok_and(|v| v == "1"))
+}
+
 fn resolve_targets(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    let at = std::time::Instant::now();
+    let out = resolve_targets_inner(target, limits);
+    note_slow("resolve_targets", at);
+    out
+}
+
+fn resolve_targets_inner(target: &Expr, limits: VmCfgLimits) -> Result<(Vec<u64>, bool), String> {
+    phase("rt/simplify");
     let simplified = target.simplify();
+    phase("rt/simplified");
     if let ExprKind::Const { value } = simplified.kind {
         return Ok((vec![value], false));
     }
@@ -1429,6 +2881,7 @@ pub(crate) fn resolve_over_inputs_capped(
     limits: VmCfgLimits,
     max_flags: usize,
 ) -> Result<(Vec<u64>, bool), String> {
+    phase("rt/infer_branch_input_domains");
     let inferred = match infer_branch_input_domains(simplified, limits.input_domain) {
         Ok(inferred) => inferred,
         Err(refusal) => {
@@ -1436,6 +2889,7 @@ pub(crate) fn resolve_over_inputs_capped(
             // of flag bits the affine-domain path cannot characterize still
             // forks exactly when every input reaches the target through a
             // boolean, by enumerating that boolean over {0, 1}.
+            phase("rt/flagfork(after infer refusal)");
             return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!(
@@ -1451,7 +2905,41 @@ pub(crate) fn resolve_over_inputs_capped(
             .max(limits.input_domain.max_values_per_variable),
         ..limits.domain
     };
-    let report = match enumerate_symbolic_value(simplified, &inferred.domains, domain) {
+    // Bound the enumeration's WORK, not just its two factors.
+    //
+    // `enumerate_symbolic_value` evaluates the target once per input combination,
+    // so its cost is combinations x nodes. `max_combinations` (4096) bounds one
+    // factor and `max_expression_nodes` (200_000) the other, and nothing bounded
+    // the product: a single branch could cost ~8e8 node evaluations with no
+    // wall-clock check inside it. Measured on entry 0xc48d670, one call did not
+    // return in 540s against a 120s budget.
+    //
+    // This is the spin recorded at `ReportOptions::new`: "one entry spins
+    // indefinitely (observed 62 minutes with no progress, around entry index
+    // 385-388, rva ~0xc82b466) and the per-entry wall-clock limit does not bound
+    // it". It is why the default instruction limit is pinned at 512.
+    //
+    // A deterministic work budget rather than a deadline: the same input must
+    // give the same answer on every run, which a clock cannot promise. Refusing
+    // takes the flag-fork fallback already used when the cross-product is
+    // infeasible, and failing that the branch stalls -- incomplete, never unsound.
+    let combinations = inferred
+        .domains
+        .values()
+        .try_fold(1_usize, |acc, values| acc.checked_mul(values.len().max(1)))
+        .unwrap_or(usize::MAX);
+    let nodes = simplified.node_count_bounded(domain.max_expression_nodes);
+    let work = combinations.saturating_mul(nodes);
+    phase("rt/enumerate");
+    let enumerated = if work > max_enumeration_work() {
+        Err(format!(
+            "enumeration would cost {combinations} combinations x {nodes} nodes"
+        ))
+    } else {
+        enumerate_symbolic_value(simplified, &inferred.domains, domain)
+            .map_err(|error| format!("{error}"))
+    };
+    let report = match enumerated {
         Ok(report) => report,
         Err(error) => {
             // The full input cross-product is infeasible (too many independent
@@ -1460,6 +2948,7 @@ pub(crate) fn resolve_over_inputs_capped(
             // real target set is tiny. Enumerate those flags over {0, 1} instead.
             // Sound: each substituted flag is proven single-bit, and any residual
             // input dependence fails the branch closed rather than guessing.
+            phase("rt/flagfork(after enumerate refusal)");
             return match flag_fork_analysis(simplified, limits, max_flags) {
                 Ok(targets) => Ok((targets, true)),
                 Err(why) => Err(format!("target enumeration failed: {error} [flagfork={why}]")),
@@ -1766,6 +3255,18 @@ fn flag_fork_targets(target: &Expr, limits: VmCfgLimits) -> Option<Vec<u64>> {
     flag_fork_analysis(target, limits, DEFAULT_MAX_FLAGS).ok()
 }
 
+/// Whether a computed branch target leaving the entry's bytecode section may be
+/// followed. Section executability is NOT a criterion: the VM dispatcher reads
+/// bytecode as data, and this sample hides bytecode in sections marked
+/// non-executable (`.pdata` here carries 0 valid RUNTIME_FUNCTION entries in
+/// 66688 and is high-entropy throughout, so it is not real unwind data). An
+/// UNMAPPED target is still never followed, the lever is still off by default,
+/// and the carried rolling-key decode at the target remains the real guard: a
+/// wrong target decodes to garbage and stalls.
+fn cross_section_followable(follow: bool, target_characteristics: Option<u32>) -> bool {
+    follow && target_characteristics.is_some()
+}
+
 /// `flag_fork_targets` with the refusal reason retained.
 fn flag_fork_analysis(
     target: &Expr,
@@ -1804,8 +3305,27 @@ fn flag_fork_analysis(
     if flags.len() > max_flags {
         return Err(FlagForkRefusal::TooManyFlags(flags.len()));
     }
+    // A flag the range analysis proves constant must not be forked over {0, 1}:
+    // the other value is infeasible and seeds a spurious branch target (observed
+    // as VIP+-1 around the real target, which then decodes to a garbage handler).
+    // This only drops assignments `value_range` already proves cannot occur, so
+    // the over-approximation shrinks without any new assumption.
+    let ranges: Vec<(u64, u64)> = flags
+        .iter()
+        .map(|flag| {
+            let range = value_range(flag);
+            (range.min(), range.max())
+        })
+        .collect();
     let mut targets = BTreeSet::new();
     for combination in 0_u32..(1_u32 << flags.len()) {
+        let in_range = ranges.iter().enumerate().all(|(index, (lo, hi))| {
+            let bit = u64::from((combination >> index) & 1);
+            bit >= *lo && bit <= *hi
+        });
+        if !in_range {
+            continue;
+        }
         let assignment: Vec<(&Expr, u64)> = flags
             .iter()
             .enumerate()
@@ -1830,7 +3350,237 @@ fn flag_fork_analysis(
 }
 
 impl Walker<'_, '_> {
+    /// Closes a block whose only obstacle is a proven null read, when the fault
+    /// is provably caught and provably leaves the VM.
+    ///
+    /// VMProtect reads address 0 deliberately. A 1-byte read of 0 always
+    /// faults, the access violation reaches a registered language handler, and
+    /// the zero-seed path unwinds back through the original native frame to the
+    /// caller's saved return address. From the VM's point of view that is an
+    /// exit, so the block is one -- and the walk stalling there is what leaves
+    /// the CFG incomplete.
+    ///
+    /// Nothing here is assumed. Each step is required:
+    ///
+    /// 1. the failure really is the proven-null-read one, in a handler proven
+    ///    to implement a VM memory load;
+    /// 2. EVERY proven external read site in that handler lies inside a
+    ///    function with a language handler, so the fault is caught rather than
+    ///    crashing the process;
+    /// 3. a continuation resolved, and its source is the zero-seed unwind --
+    ///    the case with no dispatch address, where control reaches the caller.
+    ///
+    /// A continuation that dispatches somewhere instead is NOT closed here: it
+    /// re-enters code this walk would have to follow, and guessing it would
+    /// invent control flow. Those keep stalling, with the source named.
+    ///
+    /// MEASURED, AND CURRENTLY UNREACHABLE. Step 3 cannot be satisfied today:
+    /// `resolve_stack_sled_continuation` has exactly two exits, `Failed` and
+    /// `PartiallyRecovered`, and no variant of `ExceptionContinuationSource` is
+    /// constructed anywhere in the crate -- so `source` is always `None`. On a
+    /// 60-entry sample every refusal here reads "no zero-seed-unwind
+    /// continuation", with resolutions of `Failed/None` and
+    /// `PartiallyRecovered/None`.
+    ///
+    /// Steps 1 and 2 DO pass, which is the part worth keeping: the fault sites
+    /// come from the handler's own trace -- the recovery's `effects` list is
+    /// empty for exactly these handlers, since their recovery is what failed --
+    /// and SEH coverage over them is proven from the image's own exception
+    /// directory. The fault is therefore known to be CAUGHT; only where control
+    /// resumes is unknown.
+    ///
+    /// Closing the block anyway would overclaim. `BlockExit::VmExit` asserts
+    /// the VM was left, and if the handler resumes inside the VM that is a false
+    /// statement about control flow. A labeled tier makes a concession explicit;
+    /// it does not license an untrue one.
+    ///
+    /// What unblocks it: the handler reads its seed and cursor from native stack
+    /// slots (`CONTEXT.Rsp + 0xC0` and `+ 0xC8`), and
+    /// `analyze_vm_memory_exception_coverage_with_state` already takes a
+    /// `_symbolic` report that it never uses. Reading those two slots from the
+    /// pre-fault state is the missing piece, and a ZERO seed is precisely the
+    /// unwind-to-caller case this gate is waiting for.
+    ///
+    /// Returns the evidence on success. The caller only needs to know whether
+    /// the block closed; the evidence is returned so a future diagnostic can
+    /// carry it without re-running the analysis.
+    fn close_null_read_as_seh_exit(
+        &mut self,
+        key: Va,
+        error: &crate::SymbolicExecutionError,
+        instructions: &[DecodedVmInstruction],
+        symbolic_in: &crate::SymbolicVmInitialState,
+    ) -> Result<String, String> {
+        if !null_read_seh_exit_enabled() {
+            return Err("disabled".to_owned());
+        }
+        if symbolic_failure_class(&error.message) != "null-read" {
+            return Err("not a null read".to_owned());
+        }
+        if error.semantic != VmHandlerSemantic::MemoryLoad {
+            return Err(format!("handler semantic is {:?}, not a memory load", error.semantic));
+        }
+        let handler = instructions
+            .get(error.instruction_index)
+            .ok_or_else(|| {
+                format!("instruction {} is outside the block", error.instruction_index)
+            })?
+            .state_before
+            .handler;
+        let handler_rva = self
+            .pe
+            .optional
+            .image_base
+            .checked_rva_of(handler)
+            .ok_or_else(|| format!("handler {handler} is outside the image"))?;
+        // Locate the faulting reads in the handler itself.
+        //
+        // Deriving them from the recovery's `effects` list cannot work here: it
+        // is empty precisely for the handlers whose recovery failed, and those
+        // are the ones that stall. The handler's trace has the instructions, so
+        // every memory-reading one in it becomes a fault site. Requiring ALL of
+        // them to be covered is stronger than covering whichever one faults,
+        // and it does not need to know which that is.
+        let trace = trace_direct_jump_fragments(
+            self.pe,
+            handler_rva,
+            DirectJumpTraceLimits::default(),
+        )
+        .map_err(|error| format!("handler trace failed: {error}"))?;
+        // Only the EXTERNAL data read can fault on a null address. A memory-load
+        // handler also reads the bytecode through the VIP, the operand stack
+        // through the VSP and native spills through RSP/RBP, and taking all of
+        // them measured 5 sites over SIX language handlers for one handler --
+        // five of which fail to classify, while `continuation_recovered`
+        // requires every resolution to be recovered. That over-broad set was
+        // itself the refusal.
+        let roles = self.active.as_ref().map_or(&self.config, |context| &context.config);
+        let role_registers = [
+            roles.roles.vip,
+            roles.roles.rolling_key,
+            roles.roles.handler,
+            iced_x86::Register::RSP,
+            iced_x86::Register::RBP,
+        ];
+        let mut fault_sites: Vec<Rva> = trace
+            .instructions()
+            .filter(|decoded| {
+                let instruction = &decoded.instruction;
+                if instruction.mnemonic() == iced_x86::Mnemonic::Lea {
+                    return false;
+                }
+                let reads_memory = (0..instruction.op_count())
+                    .any(|operand| instruction.op_kind(operand) == iced_x86::OpKind::Memory);
+                if !reads_memory {
+                    return false;
+                }
+                let base = instruction.memory_base();
+                if base == iced_x86::Register::None {
+                    // An absolute address is not a null-dereference candidate.
+                    return false;
+                }
+                let full = base.full_register();
+                !role_registers
+                    .iter()
+                    .any(|role| role.full_register() == full)
+            })
+            .map(|decoded| decoded.rva)
+            .collect();
+        fault_sites.sort_unstable();
+        fault_sites.dedup();
+        if fault_sites.is_empty() {
+            return Err("handler trace has no external memory read".to_owned());
+        }
+        let site_count = fault_sites.len();
+        // The seed the language handler reads at `CONTEXT.Rsp + 0xC0` is a VM
+        // context slot, because this protector addresses its context off rsp
+        // (`entry_profile.rs` sets `context_base: Register::RSP` in both
+        // production recoveries) and the fault is the handler's FIRST
+        // instruction, so `CONTEXT.Rsp` IS that rsp. The equality is passed
+        // down rather than assumed, so a profile with another context base
+        // cannot inherit it.
+        let context_base_is_rsp =
+            self.ctx_profile().effect_roles.context_base.full_register() == iced_x86::Register::RSP;
+        let coverage = crate::analyze_fault_site_exception_coverage_with_context(
+            self.pe,
+            handler_rva,
+            fault_sites,
+            Some(crate::VmContextSeedSource {
+                context_values: &symbolic_in.context_values,
+                context_base_is_rsp,
+            }),
+        )
+        .map_err(|error| format!("exception metadata unreadable: {error}"))?;
+        if !coverage.all_fault_sites_have_language_handler {
+            return Err(format!(
+                "not every fault site is SEH-covered ({site_count} site(s), {} covered): {}",
+                coverage.coverage.len(),
+                coverage.diagnostics.iter().take(3).cloned().collect::<Vec<_>>().join("; "),
+            ));
+        }
+        let unwound = coverage
+            .continuation_resolutions
+            .iter()
+            .find(|resolution| {
+                resolution.status == RecoveryStatus::Recovered
+                    && resolution.source
+                        == Some(crate::ExceptionContinuationSource::ZeroSeedUnwind)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no zero-seed-unwind continuation for handler {handler_rva} ({} resolution(s): {})",
+                    coverage.continuation_resolutions.len(),
+                    coverage
+                        .continuation_resolutions
+                        .iter()
+                        .take(3)
+                        .map(|r| format!("{:?}/{:?}", r.status, r.source))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            })?;
+        let sled = unwound.handler;
+        // The block is already inserted as `Stalled`; the fault turns it into an
+        // exit. No `vm_exit` layout is attached, because none was recovered --
+        // the exit is through an unwind, not through a VM exit handler whose
+        // restore layout could be read off.
+        self.cfg
+            .blocks
+            .get_mut(&key)
+            .ok_or_else(|| "the faulting block is not in the graph".to_owned())?
+            .exit = BlockExit::VmExit;
+        self.cfg
+            .assumptions
+            .insert(VmCfgAssumption::AssumesNullReadFaultExitsViaSeh);
+        Ok(format!(
+            "handler {handler:?} fault sites all SEH-covered ({} site(s), {} covered), \
+             zero-seed unwind via sled handler {sled:?}",
+            coverage.fault_sites.len(),
+            coverage.coverage.len(),
+        ))
+    }
+
     fn stall(&mut self, block: Va, vip: Va, reason: impl Into<String>) {
+        if assume_stalled_blocks_exit() {
+            // Record what was given up, then close the block. The reason is
+            // kept as a note so the ceiling run still says WHICH blocker each
+            // assumption stood in for; it just no longer counts as a stall.
+            self.assumed_exits.push(CfgStall {
+                block,
+                vip,
+                reason: reason.into(),
+            });
+            if let Some(existing) = self.cfg.blocks.get_mut(&block) {
+                existing.exit = BlockExit::VmExit;
+            }
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesStalledBlockExits);
+            // A ceiling run must also drop the limit, or `is_complete` still
+            // refuses on `BlockVisits`.
+            self.cfg.limit_hit = None;
+            return;
+        }
         self.cfg.stalls.push(CfgStall {
             block,
             vip,
@@ -1872,9 +3622,28 @@ impl Walker<'_, '_> {
     /// tight node/instruction budget — not the loose entry-global caps — keeps a
     /// pathological entry from allocating without limit.
     fn transition_budget_exhausted(&self) -> bool {
+        // The allowance is PER DISTINCT TRANSITION SITE, not one flat grant for
+        // the whole remaining walk. Measured from the first transition only, an
+        // entry that legitimately follows 30 transitions got the same 64 visits
+        // and 6000 instructions as one following a single transition, so the
+        // budget ran out on the NUMBER of regions rather than on any one region
+        // being pathological. Per-region removes that refusal class entirely
+        // (TransitionBudget stops went 238 -> 0).
+        //
+        // Still bounded, and every bound still fails closed: at most
+        // `max_profile_transitions` distinct sites, so this tops out at that
+        // multiple of the per-region allowance, with the entry-global
+        // `max_visits` / `max_total_instructions` and the hard per-entry
+        // `max_memory_bytes` cap all continuing to apply above it.
+        let regions = self.transition_sites.len().max(1);
+        let visit_budget = self.limits.max_transition_visits.saturating_mul(regions);
+        let insn_budget = self
+            .limits
+            .max_transition_instructions
+            .saturating_mul(regions);
         self.transition_budget_base.is_some_and(|(i0, v0)| {
-            self.total_instructions.saturating_sub(i0) >= self.limits.max_transition_instructions
-                || self.cfg.visits.saturating_sub(v0) >= self.limits.max_transition_visits
+            self.total_instructions.saturating_sub(i0) >= insn_budget
+                || self.cfg.visits.saturating_sub(v0) >= visit_budget
         })
     }
 
@@ -1907,6 +3676,47 @@ impl Walker<'_, '_> {
             .saturating_add(root_count.saturating_mul(STATE_ROOT_BYTES))
     }
 
+    /// Diagnostic: with `VMPX_MEM_TRACE=1`, prints the walker's own containers
+    /// every two seconds. The per-entry cap counts the symbolic state the walker
+    /// holds; an entry reached 12 GB resident against a 1.5 GB cap that never
+    /// fired, so something it does not count holds the rest. Correlate these
+    /// against an external RSS sample: whichever column tracks RSS is the site.
+    fn mem_trace(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VMPX_MEM_TRACE").is_some()) {
+            return;
+        }
+        let start = START.get_or_init(std::time::Instant::now);
+        let secs = start.elapsed().as_secs();
+        if secs < LAST.load(Ordering::Relaxed) + 2 {
+            return;
+        }
+        LAST.store(secs, Ordering::Relaxed);
+        let states: usize = self.explored.values().map(Vec::len).sum();
+        let canon: usize = self.widened.values().map(Vec::len).sum();
+        let instrs: usize = self.decoded.values().map(|b| b.instructions.len()).sum();
+        let (live, dead) = crate::expr::interner_census();
+        println!(
+            "[mem {secs:>4}s] charged={:>6}MB blocks={:<5} states={:<6} canon={:<5} decoded={:<5} \
+             decoded_instrs={:<8} cfg_blocks={:<5} visits={:<6} interner_live={:<9} \
+             interner_dead={:<8} interner_live_MB={:>6}",
+            self.live_bytes / (1024 * 1024),
+            self.explored.len(),
+            states,
+            canon,
+            self.decoded.len(),
+            instrs,
+            self.cfg.blocks.len(),
+            self.cfg.visits,
+            live,
+            dead,
+            live.saturating_mul(EXPR_NODE_BYTES) / (1024 * 1024),
+        );
+    }
+
     /// Adds `bytes` to the live estimate; on exceeding the cap records
     /// `CfgLimitHit::Memory` and a stall, and returns false (fail closed).
     fn charge(&mut self, bytes: usize, key: Va, vip: Va) -> bool {
@@ -1922,7 +3732,9 @@ impl Walker<'_, '_> {
     /// Charges the symbolic state each newly queued successor carries.
     fn account_pending(&mut self, items: &mut [Item]) -> bool {
         for item in items {
+            let sb_at = std::time::Instant::now();
             let bytes = self.state_bytes(&item.symbolic);
+            note_slow("account/state_bytes", sb_at);
             item.bytes = bytes;
             let vip = item.start.vip;
             if !self.charge(bytes, vip, vip) {
@@ -1962,6 +3774,7 @@ impl Walker<'_, '_> {
             self.limits.entry.instruction_limit.min(remaining),
             global_table,
             &mut self.cache,
+            self.deadline,
         ) {
             Ok(report) => {
                 let decode = report.decode;
@@ -1971,7 +3784,7 @@ impl Walker<'_, '_> {
                     .and_then(|recovery| recovery.handler_analysis.as_ref())
                     .map(|analysis| analysis.semantic);
                 DecodedBlock {
-                    instructions: decode.instructions,
+                    instructions: decode.instructions.into(),
                     final_state: decode.final_state,
                     stop: decode.stop_reason,
                     boundary,
@@ -1981,7 +3794,7 @@ impl Walker<'_, '_> {
             Err(error) => {
                 let partial = error.partial_report().decode.clone();
                 DecodedBlock {
-                    instructions: partial.instructions,
+                    instructions: partial.instructions.into(),
                     final_state: partial.final_state,
                     stop: partial.stop_reason,
                     boundary: None,
@@ -1989,14 +3802,28 @@ impl Walker<'_, '_> {
                 }
             }
         };
+        // A handler recovered on one arm of its own conditional makes every
+        // block decoded through it conditional on that arm. Cached recoveries
+        // count too, so this reads the cache rather than the new recoveries.
+        let arm_recovered = block.instructions.iter().any(|instruction| {
+            self.cache
+                .recoveries
+                .get(&instruction.state_before.handler)
+                .is_some_and(|recovery| !recovery.conditional_arms.is_empty())
+        });
+        if arm_recovered {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesHandlerConditionalArm);
+        }
         self.total_instructions += block.instructions.len();
-        // Decoded buffers live in `decoded`, in `cfg.blocks`, and as a transient
-        // clone in `visit`.
+        // Decoded buffers live in `decoded` and in `cfg.blocks`. `visit` used to
+        // hold a third, transient copy; it now shares the one in `decoded`.
         let decoded_bytes = block
             .instructions
             .len()
             .saturating_mul(DECODED_INSTRUCTION_BYTES)
-            .saturating_mul(3);
+            .saturating_mul(2);
         if !self.charge(decoded_bytes, key, item.start.vip) {
             return false;
         }
@@ -2020,7 +3847,7 @@ impl Walker<'_, '_> {
             VmBasicBlock {
                 start: item.start,
                 address: item.address,
-                instructions: block.instructions.clone(),
+                instructions: block.instructions.to_vec(),
                 exit,
                 boundary_handler,
                 native_call: None,
@@ -2058,7 +3885,26 @@ impl Walker<'_, '_> {
             }
             LoopStep::Unroll => Some(item.symbolic.clone()),
             LoopStep::Widen(widened) => {
-                self.frame_not_private = true;
+                self.concede_frame_privacy();
+                Some(widened)
+            }
+            // The back edge closes, but the VM stack grows a constant amount per
+            // level with no bound this walk can see. Concede frame privacy for
+            // the same reason `Widen` does, and more sharply: every bound on the
+            // frame extent came from the finitely many stores observed, and an
+            // unbounded push-down writes below all of them. The entry can reach
+            // N1 on the strength of a closed graph; it must not reach the proven
+            // tier on the strength of a frame bound that does not hold.
+            LoopStep::CloseShifted => {
+                self.concede_frame_privacy();
+                self.record_loop_back(item, key);
+                None
+            }
+            // Same frame-privacy concession as `CloseShifted`, and the same
+            // continuation as `Widen`: the loop has not closed yet, it carries on
+            // from the generalization.
+            LoopStep::WidenShifted(widened) => {
+                self.concede_frame_privacy();
                 Some(widened)
             }
             LoopStep::Refuse(reason) => {
@@ -2095,6 +3941,16 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// Replaces the canonical for `state`'s VM-stack phase at `key`, leaving the
+    /// other phases' canonicals in place.
+    fn record_canonical(&mut self, key: Va, state: SymbolicVmInitialState) {
+        let phases = self.widened.entry(key).or_default();
+        match phases.iter_mut().find(|held| held.vsp == state.vsp) {
+            Some(slot) => *slot = state,
+            None => phases.push(state),
+        }
+    }
+
     /// Generalizes a re-entry at a saturated block against its running
     /// over-approximation (seeded from every state recorded there). A cell the
     /// generalization already holds at TOP is covered, so once the varying cells
@@ -2105,31 +3961,202 @@ impl Walker<'_, '_> {
         key: Va,
         incoming: &SymbolicVmInitialState,
     ) -> GeneralizeAcross {
-        if let Some(canonical) = self.widened.get(&key) {
-            return match widen_state(key, canonical, incoming) {
-                Ok(None) => GeneralizeAcross::Closed,
+        // Phase-local, for the reason recorded on `Walker::widened`: fold and widen
+        // only against states at the re-entry's VM stack depth. Both lookups borrow
+        // in place and hold only the owned outcome across the mutation, so a
+        // saturated block no longer clones its whole recorded state set on every
+        // re-entry — the cost that matters now that partitioning lets the walk
+        // explore much deeper.
+        let canonical = self
+            .widened
+            .get(&key)
+            .and_then(|phases| phases.iter().find(|c| c.vsp == incoming.vsp));
+        if let Some(canonical) = canonical {
+            let folded = match widen_state(key, canonical, incoming) {
+                Ok(None) => return GeneralizeAcross::Closed,
                 Ok(Some(widened)) => {
-                    let bytes = self.state_bytes(&widened);
-                    self.charge(bytes, key, key);
-                    self.widened.insert(key, widened.clone());
-                    GeneralizeAcross::Continue(widened)
+                    let hid_frame_pointer =
+                        fold_hid_frame_pointer([canonical, incoming].into_iter(), &widened);
+                    Ok((widened, hid_frame_pointer))
                 }
-                Err(_) => GeneralizeAcross::Stall,
+                Err(reason) => Err(reason),
             };
+            return self.continue_from(key, folded);
         }
-        let states = self.explored.get(&key).cloned().unwrap_or_default();
-        match fold_states(key, &states, incoming) {
+        // Counted under its own borrow so the shift below can take `&mut self`.
+        let at_this_depth = self
+            .explored
+            .get(&key)
+            .map_or(0, |states| states.iter().filter(|s| s.vsp == incoming.vsp).count());
+        if at_this_depth == 0 {
+            // Phase-local folding has nothing to fold against: every state
+            // recorded here sits at a different VM stack depth. That is exactly
+            // what a strided loop BODY looks like, and `visited` counts states
+            // across all depths, so such a block piles up one state per phase and
+            // dies at the ceiling without the fold ever engaging. Shift the
+            // recorded phases onto this re-entry's depth — the same substitution
+            // the loop HEAD already uses to close a strided back edge — and fold
+            // against those instead.
+            let shifted_at = std::time::Instant::now();
+            let shifted = self.fold_shifted_phases(key, incoming);
+            note_slow("generalize/fold_shifted_phases", shifted_at);
+            if let Some(folded) = shifted {
+                return folded;
+            }
+        }
+        let states: Vec<&SymbolicVmInitialState> = self
+            .explored
+            .get(&key)
+            .map(|states| {
+                states
+                    .iter()
+                    .filter(|state| state.vsp == incoming.vsp)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let folded = match fold_states(key, states.iter().copied(), incoming, self.deadline) {
             Ok(widened) => {
+                let hid_frame_pointer =
+                    fold_hid_frame_pointer(states.iter().copied().chain([incoming]), &widened);
+                Ok((widened, hid_frame_pointer))
+            }
+            Err(reason) => Err(reason),
+        };
+        self.continue_from(key, folded)
+    }
+
+    /// Folds this re-entry against the block's other phases, each re-expressed at
+    /// the re-entry's VM stack depth. `None` when nothing here shifts, leaving the
+    /// ordinary (empty) fold to decide.
+    ///
+    /// The shift re-expresses an ancestor's cells relative to a moved stack base,
+    /// so it describes the same concrete memory only if nothing outside the VM
+    /// aliases the frame. That is a concession, not a proof, so every result here
+    /// sets `frame_not_private`: it can reach N1 and never N2.
+    fn fold_shifted_phases(
+        &mut self,
+        key: Va,
+        incoming: &SymbolicVmInitialState,
+    ) -> Option<GeneralizeAcross> {
+        match self.scan_shifted_phases(key, incoming) {
+            ShiftedPhases::None => None,
+            ShiftedPhases::Covered => {
+                self.concede_frame_privacy();
+                Some(GeneralizeAcross::Closed)
+            }
+            ShiftedPhases::Folded(folded) => {
+                self.concede_frame_privacy();
+                // `false`, not a computed fold-hid test: this path concedes frame
+                // privacy outright above, so the flag the caller ORs in is already
+                // set and a test of what the fold dropped would decide nothing.
+                Some(self.continue_from(key, Ok((folded, false))))
+            }
+        }
+    }
+
+    /// Walks the block's other phases, each re-expressed at the re-entry's VM
+    /// stack depth, holding ONE shifted copy at a time.
+    ///
+    /// Materializing them all was measured at 171 s and 11.7 GB transient in a
+    /// single call: `shift_ancestor_onto_reentry` substitutes over every cell of
+    /// a state, so a vector of N shifted phases is N full copies of the state's
+    /// expressions alive at once. Nothing the walker retains grows during that
+    /// spike, which is why the per-entry cap never saw it -- the peak is this
+    /// scan's own working set, and bounding it is the whole fix.
+    fn scan_shifted_phases(&self, key: Va, incoming: &SymbolicVmInitialState) -> ShiftedPhases {
+        let reentry_at = std::time::Instant::now();
+        let reentry = canonicalized(incoming);
+        note_slow("scan/canonicalized(incoming)", reentry_at);
+        let empty: &[SymbolicVmInitialState] = &[];
+        let canonicals = self.widened.get(&key).map_or(empty, Vec::as_slice);
+        // A recorded canonical is already a fold of many states, so it is both
+        // tighter and cheaper to shift than the raw history; fall back to the
+        // history only when no phase has converged yet.
+        let sources = if canonicals.is_empty() {
+            self.explored.get(&key).map_or(empty, Vec::as_slice)
+        } else {
+            canonicals
+        };
+        // OLDEST first, and at most `max_visits_per_block` of them. Order is not
+        // a detail here: folding oldest-first reaches a stable over-approximation
+        // in a few steps, while newest-first re-widens against ever more
+        // different states and the accumulator grows. Measured on one entry,
+        // same budget, only the order reversed: 0.55 GB flat against 13.4 GB.
+        // The bound then caps the per-call cost, since shifting one phase
+        // substitutes over every cell of a state.
+        let budget = self.limits.max_visits_per_block;
+        let mut acc: Option<SymbolicVmInitialState> = None;
+        for phase in sources.iter().take(budget) {
+            // Bounded for the same reason as `fold_states`: this runs inside one
+            // worklist item, where the walk's own deadline does not reach.
+            if self.deadline.is_some_and(|at| Instant::now() >= at) {
+                return ShiftedPhases::None;
+            }
+            let Some(shifted) = shift_ancestor_onto_reentry(phase, incoming) else {
+                continue;
+            };
+            // Closing is the whole point. Folding alone does not converge a
+            // strided block: the fold's result is recorded at THIS depth, the
+            // next re-entry arrives one stride deeper, finds no canonical of its
+            // own again, and the block still spends one state per phase until the
+            // ceiling. Only a shifted phase that already COVERS the re-entry
+            // subsumes the back edge.
+            if matches!(widen_state(key, &canonicalized(&shifted), &reentry), Ok(None)) {
+                return ShiftedPhases::Covered;
+            }
+            // Not covered yet: broaden so a later re-entry is.
+            let base = acc.unwrap_or_else(|| incoming.clone());
+            acc = Some(match widen_state(key, &base, &shifted) {
+                Ok(Some(widened)) => widened,
+                Ok(None) => base,
+                Err(_) => return ShiftedPhases::None,
+            });
+        }
+        acc.map_or(ShiftedPhases::None, ShiftedPhases::Folded)
+    }
+
+    /// Records the frame-privacy concession a generalization rests on: both the
+    /// flag that bars the discharge and the label that names it on the result.
+    /// See [`VmCfgAssumption::AssumesVmStackFramePrivate`] for why the flag alone
+    /// was not enough.
+    fn concede_frame_privacy(&mut self) {
+        self.frame_privacy_conceded = true;
+        self.cfg
+            .assumptions
+            .insert(VmCfgAssumption::AssumesVmStackFramePrivate);
+    }
+
+    /// Charges a generalization and records it as its phase's canonical. Split
+    /// out so the lookups above can borrow `explored`/`widened` in place and end
+    /// that borrow before this mutates.
+    fn continue_from(
+        &mut self,
+        key: Va,
+        folded: Result<(SymbolicVmInitialState, bool), String>,
+    ) -> GeneralizeAcross {
+        match folded {
+            Ok((widened, hid_frame_pointer)) => {
                 let bytes = self.state_bytes(&widened);
                 self.charge(bytes, key, key);
-                self.widened.insert(key, widened.clone());
-                GeneralizeAcross::Continue(widened)
+                self.record_canonical(key, widened.clone());
+                GeneralizeAcross::Continue {
+                    state: widened,
+                    hid_frame_pointer,
+                }
             }
-            Err(_) => GeneralizeAcross::Stall,
+            // Never a VM-stack drift any more: both paths above are restricted to
+            // the re-entry's own depth, so `widen_state` cannot refuse on the VSP
+            // here. Only the loop head still sees cross-depth re-entries, and it
+            // renders the strides itself.
+            Err(reason) => GeneralizeAcross::Stall(reason),
         }
     }
 
     fn visit(&mut self, item: &Item, pending: &mut Vec<Item>) {
+        phase("visit/mem_trace");
+        let mt_at = std::time::Instant::now();
+        self.mem_trace();
+        note_slow("visit/mem_trace", mt_at);
         // Walk this block (and the successors it queues) under its profile.
         // `None` is the base profile, so the sound path is unchanged.
         self.active.clone_from(&item.profile);
@@ -2146,10 +4173,18 @@ impl Walker<'_, '_> {
             self.cfg.limit_hit.get_or_insert(CfgLimitHit::Visits);
             return;
         }
-        let Some(mut symbolic_in) = self.enter_loop(item) else {
+        phase("enter_loop");
+        let at = std::time::Instant::now();
+        let entered = self.enter_loop(item);
+        note_slow("enter_loop", at);
+        let Some(mut symbolic_in) = entered else {
             return;
         };
-        if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
+        phase("visit/explored_contains");
+        let seen_at = std::time::Instant::now();
+        let already = self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in));
+        note_slow("visit/explored_contains", seen_at);
+        if already {
             return;
         }
         let visited = self.explored.get(&key).map_or(0, Vec::len);
@@ -2162,28 +4197,53 @@ impl Walker<'_, '_> {
             // even the generalization keeps broadening.
             if visited >= self.limits.max_visits_per_block.saturating_mul(2) {
                 self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
-                self.stall(key, key, "symbolic state keeps changing at this block");
+                self.stall(key, key, "symbolic state keeps changing at this block: ceiling");
                 return;
             }
-            match self.generalize_across(key, &symbolic_in) {
+            phase("generalize_across");
+            let at = std::time::Instant::now();
+            let across = self.generalize_across(key, &symbolic_in);
+            note_slow("generalize_across", at);
+            match across {
                 GeneralizeAcross::Closed => return,
-                GeneralizeAcross::Stall => {
+                GeneralizeAcross::Stall(reason) => {
                     self.cfg.limit_hit.get_or_insert(CfgLimitHit::BlockVisits);
-                    self.stall(key, key, "symbolic state keeps changing at this block");
+                    self.stall(
+                        key,
+                        key,
+                        format!("symbolic state keeps changing at this block: {reason}"),
+                    );
                     return;
                 }
-                GeneralizeAcross::Continue(widened) => {
-                    self.frame_not_private = true;
+                GeneralizeAcross::Continue {
+                    state: widened,
+                    hid_frame_pointer,
+                } => {
+                    // Concede frame privacy only when the fold actually hid a
+                    // frame-pointer-bearing cell. Conceding on every fold cost
+                    // 115 CFG-complete entries the proven tier even though no
+                    // frame pointer had been lost (ptr_lost=false in all of them).
+                    self.frame_privacy_conceded |= hid_frame_pointer;
                     symbolic_in = widened;
                 }
             }
-            if self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in)) {
+            let seen2_at = std::time::Instant::now();
+            let already2 =
+                self.explored.get(&key).is_some_and(|states| states.contains(&symbolic_in));
+            note_slow("visit/explored_contains2", seen2_at);
+            if already2 {
                 return;
             }
         }
         // Held in `explored` and the path node (which clones the containers).
+        phase("visit/state_bytes");
+        let sb_at = std::time::Instant::now();
         let held = self.state_bytes(&symbolic_in).saturating_mul(2);
-        if !self.charge(held, key, key) {
+        note_slow("visit/state_bytes", sb_at);
+        let charge_at = std::time::Instant::now();
+        let ok = self.charge(held, key, key);
+        note_slow("visit/charge", charge_at);
+        if !ok {
             return;
         }
         self.explored.entry(key).or_default().push(symbolic_in.clone());
@@ -2193,7 +4253,11 @@ impl Walker<'_, '_> {
             state: symbolic_in.clone(),
             parent: item.path.clone(),
         }));
-        if !self.decode_block(item) {
+        phase("decode_block");
+        let at = std::time::Instant::now();
+        let decoded_ok = self.decode_block(item);
+        note_slow("decode_block", at);
+        if !decoded_ok {
             return;
         }
         let (final_state, stop, boundary, error, instructions) = {
@@ -2203,7 +4267,7 @@ impl Walker<'_, '_> {
                 block.stop,
                 block.boundary,
                 block.error.clone(),
-                block.instructions.clone(),
+                Rc::clone(&block.instructions),
             )
         };
         if let Some(error) = error {
@@ -2231,17 +4295,34 @@ impl Walker<'_, '_> {
             let detail = match stop {
                 LinearDecodeStop::MissingHandlerSpec => {
                     let recovery = self.cache.recoveries.get(&final_state.handler);
+                    // Reaching here means follow_cross_profile_transition already
+                    // returned false, so record what the refusal had to work with:
+                    // the transition count against its cap (a saturated cap is a
+                    // budget refusal wearing a MissingHandlerSpec label), the roles
+                    // the codec recovery was given, and where the trace stopped.
+                    let roles = self.active.as_ref().map_or(&self.config, |c| &c.config);
                     format!(
-                        "undecodable opcode: handler {} has no recovered specification                          (status {:?}, semantic {:?}; {})",
+                        "undecodable opcode: handler {} has no recovered specification                          (status {:?}, semantic {:?}; \
+                         transitions {}/{}, vip {:?}, key {:?}, hreg {:?}, dir {:?}, \
+                         trace_stop {:?}, fragments {:?}; transition refused: {}; {})",
                         final_state.handler,
                         recovery.map(|r| r.status),
                         recovery
                             .and_then(|r| r.handler_analysis.as_ref())
                             .map(|a| a.semantic),
+                        self.profile_transitions,
+                        self.limits.max_profile_transitions,
+                        roles.roles.vip,
+                        roles.roles.rolling_key,
+                        roles.roles.handler,
+                        roles.bytecode_direction,
+                        recovery.map(|r| r.trace_stop.clone()),
+                        recovery.map(|r| r.trace_fragments),
+                        self.transition_refusal.as_deref().unwrap_or("not attempted"),
                         recovery.map_or(String::new(), |r| r
                             .diagnostics
                             .iter()
-                            .take(4)
+                            .take(8)
                             .cloned()
                             .collect::<Vec<_>>()
                             .join("; ")),
@@ -2262,12 +4343,67 @@ impl Walker<'_, '_> {
             &symbolic_in,
             Some(&observed_source(self)),
         ) {
+            Ok(report)
+                if report.memory_tainted
+                    && (boundary == Some(VmHandlerSemantic::UnconditionalBranch)
+                        || retry_every_tainted_block())
+                    // Only the OBSERVED escape bars this retry. A loop
+                    // generalization that conceded privacy has not shown the
+                    // frame is aliased, and the retry's own result is labeled
+                    // the same unproven tier, so denying it bought nothing and
+                    // cost every entry that closed a strided loop.
+                    //
+                    // That is what the condition now says. It used to say
+                    // `!frame_not_private`, which is
+                    // `vm_stack_address_escapes || past_frame` -- so a store
+                    // above the frame's high-water mark barred the retry too,
+                    // contradicting the sentence above it. Measured over the
+                    // imprecise-external-store class, that is the dominant
+                    // state: 82 of 124 occurrences have `frame_not_private`
+                    // set with `frame_escape_seen` CLEAR, i.e. refused for a
+                    // reason the comment says is not a reason. A store past
+                    // the frame bound says the VM wrote above the region this
+                    // analysis modelled; it does not say anything external
+                    // aliases the VM stack, which is what the retry concedes.
+                    && !wider_taint_retry_disabled_by_escape(self)
+                    && (!self.frame_pointer_lost || retry_when_frame_pointer_lost()) =>
+            {
+                // A tainted branch block stalls; retry it once with loaded-data
+                // store addresses under the labeled disjointness assumption.
+                let relaxed = crate::SymbolicExecutionLimits {
+                    assume_loaded_store_addresses_disjoint: true,
+                    ..self.limits.entry.symbolic
+                };
+                self.seeded.set(false);
+                match execute_symbolic_linear_block_with_initial_state(
+                    &instructions,
+                    symbolic_boundary,
+                    relaxed,
+                    &symbolic_in,
+                    Some(&observed_source(self)),
+                ) {
+                    Ok(retry) if !retry.memory_tainted => retry,
+                    _ => report,
+                }
+            }
             Ok(report) => report,
             Err(error) => {
+                // A proven null read is not necessarily a dead end: the
+                // protector reads address 0 on purpose and the fault carries
+                // control out of the VM. Try that before giving up.
+                let seh =
+                    self.close_null_read_as_seh_exit(key, &error, &instructions, &symbolic_in);
+                if seh.is_ok() {
+                    return;
+                }
+                let refusal = seh.unwrap_err();
                 self.stall(
                     key,
                     error.vip,
-                    format!("symbolic execution failed: {error}"),
+                    format!(
+                        "symbolic execution failed [{}]: {error} [seh-exit refused: {refusal}]",
+                        symbolic_failure_class(&error.message)
+                    ),
                 );
                 return;
             }
@@ -2278,6 +4414,16 @@ impl Walker<'_, '_> {
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
         }
+        if symbolic.assumed_indexed_store_in_bounds {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesIndexedStoreInBounds);
+        }
+        if symbolic.assumed_external_disjoint_from_fresh_allocations {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations);
+        }
         if symbolic.served_read_only_image {
             self.cfg
                 .assumptions
@@ -2286,15 +4432,23 @@ impl Walker<'_, '_> {
         if self.seeded.get() {
             self.cfg.assumptions.insert(VmCfgAssumption::ObservedGlobal);
         }
+        phase("boundary_dispatch");
+        let boundary_at = std::time::Instant::now();
         match boundary {
             Some(VmHandlerSemantic::VmExit) => {
+                phase("boundary/follow_nested_entry");
                 self.follow_nested_entry(key, final_state.vip, &symbolic, pending);
+                note_slow("follow_nested_entry", boundary_at);
             }
             Some(VmHandlerSemantic::UnconditionalBranch) => {
+                phase("boundary/follow_branch");
                 self.follow_branch(key, final_state, &symbolic, pending);
+                note_slow("follow_branch", boundary_at);
             }
             Some(VmHandlerSemantic::NativeCall) => {
+                phase("boundary/follow_native_call");
                 self.follow_native_call(key, final_state, &symbolic, pending);
+                note_slow("follow_native_call", boundary_at);
             }
             other => self.stall(
                 key,
@@ -2345,6 +4499,13 @@ impl Walker<'_, '_> {
     /// Resolves a computed branch whose next-VIP reads a read-only image
     /// jump/const table at a proven-finite index, returning the exact concrete
     /// targets or `None` when no sound read-only table recovery applies.
+    /// [`resolve_targets`] with the phase marker, so a walk stuck in the target
+    /// enumeration is identifiable from the trace alone.
+    fn resolve_branch_targets(&self, bound_target: &Expr) -> Result<(Vec<u64>, bool), String> {
+        phase("branch/resolve_targets");
+        resolve_targets(bound_target, self.limits)
+    }
+
     fn resolve_readonly_image_table(&self, bound_target: &Expr) -> Option<Vec<u64>> {
         let limits = ImageTableBranchLimits {
             input_domain: self.limits.input_domain,
@@ -2374,13 +4535,42 @@ impl Walker<'_, '_> {
             self.stall(key, vip, "branch has no symbolic target");
             return;
         };
-        if symbolic.memory_tainted {
+        if symbolic.memory_tainted && !taint_try_resolve() {
+            // Carry BOTH halves of the refusal into the stall text, because they
+            // are independent and each can block alone: the walker's gate on the
+            // labeled disjointness retry, and the executor's own per-block check
+            // that refuses even once the retry runs. Measured, the gate is
+            // `frame_pointer_lost` in 45 of 45 occurrences while the observed
+            // escape is false in 38 -- and widening it alone is +0, because the
+            // executor then refuses instead. Without the havoc cause here that
+            // second refusal is invisible: it lives in `memory_havocs`, which no
+            // dump reads.
+            let havoc = symbolic
+                .memory_havocs
+                .iter()
+                .rev()
+                .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                .map_or_else(
+                    || "no aliasing havoc recorded".to_owned(),
+                    |havoc| havoc.cause.clone(),
+                );
             self.stall(
                 key,
                 vip,
-                "branch target follows an imprecise external-memory store",
+                format!(
+                    "branch target follows an imprecise external-memory store                      (retry gates: frame_not_private={} frame_pointer_lost={}                      frame_escape_seen={} frame_privacy_conceded={}; havoc: {havoc})",
+                    self.frame_not_private,
+                    self.frame_pointer_lost,
+                    self.frame_escape_seen,
+                    self.frame_privacy_conceded,
+                ),
             );
             return;
+        }
+        if symbolic.memory_tainted {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesTaintedBranchStateSufficient);
         }
         let (dispatch, anchor) = match self.branch_dispatch(final_state.handler) {
             Ok(found) => found,
@@ -2401,7 +4591,7 @@ impl Walker<'_, '_> {
         let mut gate_route = None;
         let mut primary_resolved = false;
         let (targets, guarded, bound_registers, mut environment_gate) =
-            match resolve_targets(&bound_target, self.limits) {
+            match self.resolve_branch_targets(&bound_target) {
                 Ok((targets, guarded)) => {
                     primary_resolved = true;
                     if diagnostics_enabled() {
@@ -2413,12 +4603,16 @@ impl Walker<'_, '_> {
                     // A VMProtect CPUID / timestamp-counter anti-analysis gate
                     // stalls here because the environment value is statically
                     // unknown: resolve it by a sound both-target over-approximation.
+                    phase("branch/resolve_environment_gate");
                     if let Some((targets, guarded, gate_registers)) =
                         resolve_environment_gate(target, &is_image_va, self.limits)
                     {
                         gate_route = Some(EnvironmentGateRoute::LegacyGate);
                         (targets, guarded, gate_registers, true)
-                    } else if let Some(targets) = self.resolve_readonly_image_table(&bound_target) {
+                    } else if let Some(targets) = {
+                        phase("branch/resolve_readonly_image_table");
+                        self.resolve_readonly_image_table(&bound_target)
+                    } {
                         // A jump/const-table branch whose next-VIP reads a
                         // read-only image table at a proven-finite index: the
                         // table bytes are definitive, so enumerate the exact
@@ -2492,6 +4686,7 @@ impl Walker<'_, '_> {
         let mut observed_consulted = false;
         let mut observed_followed = false;
         let section = self.ctx_section();
+        phase(&format!("branch/targets_loop n={}", targets.len()));
         for value in targets {
             let target_va = Va(value);
             if section.is_none() || bytecode_section(self.pe, target_va) != section {
@@ -2517,6 +4712,22 @@ impl Walker<'_, '_> {
                             .find(|section| section.contains_mapped_rva(rva))
                     })
                     .map(|section| section.characteristics);
+                // EXPERIMENTAL cross-VM-section continuation (see
+                // `VmCfgLimits::follow_cross_vm_section`). Labeled, so the entry
+                // never reaches the proven tier.
+                if cross_section_followable(
+                    self.limits.follow_cross_vm_section,
+                    target_characteristics,
+                ) {
+                    if self.follow_bytecode_target(
+                        key, vip, target_va, value, &dispatch, anchor, guarded, symbolic, pending,
+                    ) {
+                        self.cfg
+                            .assumptions
+                            .insert(VmCfgAssumption::AssumesCrossVmSectionContinuation);
+                    }
+                    continue;
+                }
                 self.stall(
                     key,
                     vip,
@@ -2656,8 +4867,14 @@ impl Walker<'_, '_> {
         else {
             return;
         };
-        let Ok(exit) = recover_native_exit_state(symbolic, &layout) else {
-            return;
+        let exit = match recover_native_exit_state(symbolic, &layout) {
+            Ok(exit) => exit,
+            Err(error) => {
+                if std::env::var_os("VMPX_NESTED_TRACE").is_some() {
+                    eprintln!("[nested] {key}: exit state unrecovered: {error}");
+                }
+                return;
+            }
         };
         let simplified = exit.return_address.simplify();
         let target = if let ExprKind::Const { value } = simplified.kind {
@@ -2672,14 +4889,16 @@ impl Walker<'_, '_> {
             .filter(|report| report.complete && report.targets.len() == 1)
             .and_then(|report| report.targets[0].rva)
         };
-        let Some(candidate) = target
-            .and_then(|rva| analyze_vm_entry_at(self.pe, rva, VmDiscoveryLimits::default()))
-            .filter(|candidate| candidate.confidence >= NESTED_ENTRY_CONFIDENCE)
-        else {
+        let Some(target_rva) = target else {
+            return;
+        };
+        let Some((frame_entry, candidate)) = nested_entry_stub(self.pe, target_rva) else {
             return;
         };
         let at = candidate.rva;
-        if self.nested_followed >= self.limits.max_nested_entries {
+        if !self.nested_sites.contains(&at)
+            && self.nested_sites.len() >= self.limits.max_nested_entries
+        {
             self.stall(
                 key,
                 vip,
@@ -2725,7 +4944,7 @@ impl Walker<'_, '_> {
         };
         let (cells, top_offset, _) = match recover_entry_frame(
             self.pe,
-            &candidate,
+            frame_entry,
             setup.profile.effect_roles.vsp,
             self.limits.entry.trace,
         ) {
@@ -2763,6 +4982,10 @@ impl Walker<'_, '_> {
             }
         };
         self.nested_followed += 1;
+        self.nested_sites.insert(at);
+        // Record the resolution so a later lift reuses it rather than re-deriving
+        // the return address from a less concretized state (and failing).
+        self.cfg.nested_entry_stubs.insert(key, target_rva);
         self.add_edge(CfgEdge {
             from: key,
             to: setup.first_state.vip,
@@ -2786,15 +5009,45 @@ impl Walker<'_, '_> {
         // Data read from the frame is benign only if no cell holding a frame
         // pointer was discarded (an untracked load could otherwise return it).
         let derived_leak = self.frame_pointer_lost && self.frame_derived_escape;
+        // NOT relaxed to `frame_escape_seen`, though the measurement is
+        // tempting: 119 CFG-complete entries are refused on `past_frame` alone,
+        // and the narrowed havoc now discards out-of-frame cells, which makes
+        // the "every cell lies inside the frame" obligation hold directly.
+        //
+        // Left as-is because discharging moves an entry into N2 = PROVEN, and
+        // `vm_stack_assumption_discharges_only_when_the_frame_is_provably_private`
+        // asserts a write past the frame must block it. That test cannot observe
+        // the retention invariant (it drives the discharge with synthetic
+        // reports), so relaxing here would remove a guard with nothing checking
+        // the replacement.
         if self.private_frame_hi.is_some()
             && !self.frame_not_private
+            && !self.frame_privacy_conceded
             && !derived_leak
             && self.nested_followed == 0
         {
             self.cfg
                 .assumptions
                 .remove(&VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+            return;
         }
+        // Record WHICH condition refused the discharge. These entries are already
+        // CFG-complete, so each one is a candidate for the proven tier and the
+        // blocking condition is the lever: raising N2 means discharging here, not
+        // completing more CFGs.
+        self.cfg.discharge_refusal = Some(format!(
+            "no_private_frame={} frame_not_private={} conceded={} [addr_escape={} store_past={}] derived_leak={} (ptr_lost={} ptr_escape={}) nested={}",
+            self.private_frame_hi.is_none(),
+            self.frame_not_private,
+            self.frame_privacy_conceded,
+            self.frame_escape_seen,
+            self.frame_store_past
+                .map_or_else(|| "no".to_owned(), |(hi, w)| format!("hi={hi:#x}<written={w:#x}")),
+            derived_leak,
+            self.frame_pointer_lost,
+            self.frame_derived_escape,
+            self.nested_followed,
+        ));
     }
 
     fn note_frame_use(&mut self, report: &SymbolicVmExecutionReport) {
@@ -2802,6 +5055,14 @@ impl Walker<'_, '_> {
             .private_frame_hi
             .zip(report.vm_stack_store_hi)
             .is_some_and(|(frame_hi, written)| written > frame_hi);
+        // Which of the two reasons fired, for the discharge diagnostic.
+        self.frame_escape_seen |= report.vm_stack_address_escapes;
+        if past_frame {
+            self.frame_store_past = self
+                .private_frame_hi
+                .zip(report.vm_stack_store_hi)
+                .map(|(frame_hi, written)| (frame_hi, written));
+        }
         self.frame_not_private |= report.vm_stack_address_escapes || past_frame;
         self.frame_derived_escape |= report.vm_stack_derived_escapes;
         self.frame_pointer_lost |= report.vm_stack_pointer_lost;
@@ -2904,22 +5165,40 @@ impl Walker<'_, '_> {
         // allocates without limit. Beyond the budget, fail closed (the caller
         // stalls) instead of switching. Sound: a bounded walk that hits the cap
         // stalls — it never false-completes.
-        if self.profile_transitions >= self.limits.max_profile_transitions {
-            return false;
+        if !self.transition_sites.contains(&key)
+            && self.transition_sites.len() >= self.limits.max_profile_transitions
+        {
+            {
+                self.transition_refusal = Some("transition budget spent".to_owned());
+                return false;
+            }
         }
         // A genuine transition handler ends a short handler-stream block; a very
         // long prefix is not a clean transition and symbolic-executing it would
         // allocate a large state for nothing. Fail closed past a modest cap.
+        // `VMPX_TRANSITION_PREFIX` scales it. The cap became the binding one once
+        // the native trace stopped truncating at opaque predicates: handlers that
+        // used to have no specification now decode, so the linear VM stream runs
+        // further before meeting an unrecovered one and the prefix grows. Hitting
+        // this cap is therefore a symptom of recovering MORE, not of a longer
+        // handler.
         const MAX_TRANSITION_PREFIX: usize = 512;
-        if instructions.len() > MAX_TRANSITION_PREFIX {
-            return false;
+        let max_prefix = MAX_TRANSITION_PREFIX.saturating_mul(transition_prefix_scale());
+        if instructions.len() > max_prefix {
+            {
+                self.transition_refusal = Some("prefix too long for a clean transition".to_owned());
+                return false;
+            }
         }
         let profile = self.ctx_profile();
         let old_vsp = profile.effect_roles.vsp;
         let context_base = profile.effect_roles.context_base;
         let Some(entry_rva) = self.pe.optional.image_base.checked_rva_of(final_state.handler)
         else {
-            return false;
+            {
+                self.transition_refusal = Some("handler VA outside the image".to_owned());
+                return false;
+            }
         };
         // Prove the unresolved handler is a popped-target cross-profile transition.
         let Ok(transition) = analyze_vm_transition(
@@ -2929,10 +5208,16 @@ impl Walker<'_, '_> {
             context_base,
             self.limits.entry.trace,
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("transition analysis failed".to_owned());
+                return false;
+            }
         };
         let Some(recovered) = transition.recovered else {
-            return false;
+            {
+                self.transition_refusal = Some("no popped-target transition recovered".to_owned());
+                return false;
+            }
         };
         debug_assert!(recovered.report.state_effects_proven);
         // Symbolic state at the transition handler: the decoded prefix executed
@@ -2945,7 +5230,10 @@ impl Walker<'_, '_> {
             symbolic_in,
             Some(&observed_source(self)),
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("prefix symbolic execution failed".to_owned());
+                return false;
+            }
         };
         // Pop the concrete branch target off the VM stack.
         let Ok(pop) = execute_symbolic_linear_block_with_initial_state(
@@ -2955,14 +5243,29 @@ impl Walker<'_, '_> {
             &symbolic.continuation_state(),
             Some(&observed_source(self)),
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("pop of the branch target failed".to_owned());
+                return false;
+            }
         };
         let Some(Expr {
             kind: ExprKind::Const { value: target },
             ..
         }) = pop.branch_target
         else {
-            return false;
+            {
+                // The expression matters: if these are unresolved image reads
+                // then this stall family and the `memory_load_epoch` family are
+                // one cause, not two.
+                self.transition_refusal = Some(format!(
+                    "popped branch target is not a constant: {}",
+                    pop.branch_target.as_ref().map_or_else(
+                        || "none".to_owned(),
+                        |target| crate::semantic_exec::debug_prefix(target, 110),
+                    )
+                ));
+                return false;
+            }
         };
         // Decode the first dispatch at the target under the transition's proven
         // direction and handler anchor.
@@ -2975,7 +5278,10 @@ impl Walker<'_, '_> {
             },
             recovered.report.bytecode_direction,
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("first dispatch at the target did not decode".to_owned());
+                return false;
+            }
         };
         // Resolve the new register profile from the target's first handler.
         let Some(first_handler_rva) = self
@@ -2984,7 +5290,10 @@ impl Walker<'_, '_> {
             .image_base
             .checked_rva_of(first.state_after.handler)
         else {
-            return false;
+            {
+                self.transition_refusal = Some("target handler VA outside the image".to_owned());
+                return false;
+            }
         };
         let Ok(roles) = resolve_vm_profile_roles(
             self.pe,
@@ -2998,10 +5307,16 @@ impl Walker<'_, '_> {
                 proof_limits: self.limits.entry.dispatch_proof,
             },
         ) else {
-            return false;
+            {
+                self.transition_refusal = Some("role resolution at the target failed".to_owned());
+                return false;
+            }
         };
         let Some(resolved) = roles.recovered else {
-            return false;
+            {
+                self.transition_refusal = Some("no roles recovered at the target".to_owned());
+                return false;
+            }
         };
         // Proven switch: build the successor's per-block profile context. A new
         // profile recovers its own table anchors per handler, so none is threaded
@@ -3027,6 +5342,13 @@ impl Walker<'_, '_> {
                 .assumptions
                 .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
         }
+        if symbolic.assumed_external_disjoint_from_fresh_allocations
+            || pop.assumed_external_disjoint_from_fresh_allocations
+        {
+            self.cfg
+                .assumptions
+                .insert(VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations);
+        }
         if symbolic.served_read_only_image || pop.served_read_only_image {
             self.cfg
                 .assumptions
@@ -3040,6 +5362,7 @@ impl Walker<'_, '_> {
             self.transition_budget_base = Some((self.total_instructions, self.cfg.visits));
         }
         self.profile_transitions += 1;
+        self.transition_sites.insert(key);
         self.add_edge(CfgEdge {
             from: key,
             to: first.state_after.vip,
@@ -3126,23 +5449,46 @@ pub fn recover_vm_cfg_with_observed_memory(
 pub fn recover_vm_cfg_with_observed(
     pe: &PeImage<'_>,
     entry: &VmEntryCandidate,
-    limits: VmCfgLimits,
+    mut limits: VmCfgLimits,
     observed: &ObservedRun,
 ) -> Result<VmCfg, CfgError> {
+    // The per-entry wall has to cover ENTRY SETUP, not just the walk.
+    //
+    // The deadline used to be built after `prepare_entry_stream`, so that call's
+    // symbolic execution ran with `deadline: None` -- untimed. Measured on entry
+    // 0xc48d670: setup alone ran past 540s against a 120s budget, printing
+    // nothing and never returning. That is why a sweep plateaued near 800/814
+    // under BOTH a 20s and a 400s wall -- a handful of entries were stuck in a
+    // phase no budget reached, so they never finished and never reported
+    // WallClock either.
+    //
+    // A setup that runs out of budget fails closed as an entry error (there is no
+    // profile, so there is no CFG to return and report as incomplete). That is
+    // one honest error instead of a sweep that never ends.
+    let began = Instant::now();
+    if let Some(budget) = limits.max_wall_time {
+        limits.entry.symbolic.deadline = began.checked_add(budget);
+    }
+    let setup_at = began;
     let setup = prepare_entry_stream(pe, entry, limits.entry)?;
+    note_slow("setup/prepare_entry_stream", setup_at);
     let mut private_frame_hi = None;
-    let (initial, frame_cells_known, frame_note) = match recover_entry_frame(
+    let frame_at = Instant::now();
+    let frame = recover_entry_frame(
         pe,
-        entry,
+        entry.rva,
         setup.profile.effect_roles.vsp,
         limits.entry.trace,
-    ) {
+    );
+    note_slow("setup/recover_entry_frame", frame_at);
+    let (initial, frame_cells_known, frame_note) = match frame {
         Ok((cells, top_offset, exposed)) => {
             let (initial, known) = frame_initial_state(&cells, top_offset);
             let frame_hi = top_offset.wrapping_add((cells.len() as u64).wrapping_mul(8));
             DIAG_FRAME_HI.with(|hi| hi.set(Some(frame_hi)));
             if !exposed {
                 private_frame_hi = Some(frame_hi.cast_signed());
+                limits.entry.symbolic.private_frame_hi = private_frame_hi;
             }
             (initial, known, None)
         }
@@ -3159,16 +5505,20 @@ pub fn recover_vm_cfg_with_observed(
         config: entry_stream_config(&setup.profile, limits.entry),
         global_table: bootstrap_global_table(&setup.bootstrap),
         profile: setup.profile,
+        transition_refusal: None,
         nested_followed: 0,
+        nested_sites: BTreeSet::new(),
         current: None,
         direction: setup.profile.bytecode_direction,
         section: bytecode_section(pe, entry_address),
         active: None,
         profile_transitions: 0,
+        transition_sites: BTreeSet::new(),
         transition_budget_base: None,
         cache: LinearDecodeCache::default(),
         decoded: BTreeMap::new(),
         explored: BTreeMap::new(),
+        assumed_exits: Vec::new(),
         widened: BTreeMap::new(),
         cfg: VmCfg {
             entry: setup.first_state.vip,
@@ -3180,17 +5530,23 @@ pub fn recover_vm_cfg_with_observed(
             frame_cells_known,
             frame_note,
             assumptions: BTreeSet::new(),
+            discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
         },
         total_instructions: 0,
         live_bytes: 0,
+        deadline: None,
         observed: &observed.memory,
         seeded: &seeded,
         observed_depths: &observed.loop_depths,
         observed_branch_targets: &observed.branch_targets,
         private_frame_hi,
         frame_not_private: false,
+        frame_privacy_conceded: false,
         frame_derived_escape: false,
         frame_pointer_lost: false,
+        frame_escape_seen: false,
+        frame_store_past: None,
     };
     let mut pending = vec![Item {
         bytes: 0,
@@ -3200,7 +5556,13 @@ pub fn recover_vm_cfg_with_observed(
         path: None,
         profile: None,
     }];
-    let deadline = limits.max_wall_time.map(|budget| (Instant::now(), budget));
+    let deadline = limits.max_wall_time.map(|budget| (began, budget));
+    // Hand the same instant to the symbolic executor: the check below bounds the
+    // gaps between worklist items, not the work inside one.
+    if let Some((start, budget)) = deadline {
+        walker.limits.entry.symbolic.deadline = start.checked_add(budget);
+        walker.deadline = start.checked_add(budget);
+    }
     while let Some(item) = pending.pop() {
         if deadline.is_some_and(|(start, budget)| start.elapsed() >= budget) {
             walker.cfg.limit_hit.get_or_insert(CfgLimitHit::WallClock);
@@ -3213,8 +5575,15 @@ pub fn recover_vm_cfg_with_observed(
         }
         walker.live_bytes = walker.live_bytes.saturating_sub(item.bytes);
         let queued = pending.len();
+        phase("loop/visit");
+        let visit_at = Instant::now();
         walker.visit(&item, &mut pending);
+        note_slow("loop/visit", visit_at);
+        let ap_at = Instant::now();
+        let ap_n = pending.len().saturating_sub(queued);
+        phase("loop/account_pending");
         walker.account_pending(&mut pending[queued..]);
+        note_slow(&format!("loop/account_pending n={ap_n}"), ap_at);
         if walker
             .cfg
             .limit_hit
@@ -3223,7 +5592,9 @@ pub fn recover_vm_cfg_with_observed(
             break;
         }
     }
+    note_slow("walk/loop-total", began);
     walker.discharge_vm_stack_assumption();
+    note_slow("walk/pre-return", began);
     Ok(walker.cfg)
 }
 
@@ -3272,6 +5643,31 @@ mod tests {
         )
         .unwrap();
         Expr::binary(BinaryOp::Add, Expr::constant(BitWidth::W64, low), scaled).unwrap()
+    }
+
+    #[test]
+    fn symbolic_failures_are_classified() {
+        assert_eq!(
+            symbolic_failure_class("proven null memory read of 1 byte(s) requires exception-flow analysis"),
+            "null-read"
+        );
+        assert_eq!(symbolic_failure_class("instruction count exceeds limit 4096"), "resource-limit");
+        assert_eq!(symbolic_failure_class("control-flow boundary is not implemented"), "unmodelled");
+        assert_eq!(symbolic_failure_class("anything else"), "other");
+    }
+
+    #[test]
+    fn oversized_address_site_key_falls_back_to_the_structural_hash() {
+        let mut address = Expr::register(BitWidth::W64, "native_rax_initial");
+        for round in 0..48_u64 {
+            let mixed = Expr::binary(BinaryOp::Xor, address.clone(), Expr::constant(BitWidth::W64, round + 1)).unwrap();
+            address = Expr::binary(BinaryOp::Add, address, mixed).unwrap();
+        }
+        let key = site_key(&address);
+        assert!(key.starts_with('#') && key.len() < 32);
+        assert_eq!(key, site_key(&address));
+        let small = Expr::constant(BitWidth::W64, 7);
+        assert_eq!(site_key(&small), format!("{small:?}"));
     }
 
     #[test]
@@ -3368,19 +5764,24 @@ mod tests {
         Walker {
             pe,
             limits,
+            deadline: None,
             config: entry_stream_config(&base, limits.entry),
             global_table: None,
             profile: base,
+            transition_refusal: None,
             nested_followed: 0,
+            nested_sites: BTreeSet::new(),
             current: None,
             direction: base.bytecode_direction,
             section: Some(0),
             active: None,
             profile_transitions: 0,
+            transition_sites: BTreeSet::new(),
             transition_budget_base: None,
             cache: LinearDecodeCache::default(),
             decoded: BTreeMap::new(),
             explored: BTreeMap::new(),
+            assumed_exits: Vec::new(),
             widened: BTreeMap::new(),
             cfg: VmCfg {
                 entry: Va(crate::immutable_image::tests::RDATA_VA),
@@ -3392,6 +5793,8 @@ mod tests {
                 frame_cells_known: 0,
                 frame_note: None,
                 assumptions: BTreeSet::new(),
+            discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
             },
             total_instructions: 0,
             live_bytes: 0,
@@ -3401,8 +5804,11 @@ mod tests {
             observed_branch_targets: &observed.branch_targets,
             private_frame_hi: None,
             frame_not_private: false,
+            frame_privacy_conceded: false,
             frame_derived_escape: false,
             frame_pointer_lost: false,
+            frame_escape_seen: false,
+            frame_store_past: None,
         }
     }
 
@@ -3415,6 +5821,22 @@ mod tests {
         assert!(!exposes(&[0x48, 0x89, 0x04, 0x24])); // mov [rsp],rax
         assert!(!exposes(&[0x48, 0x8B, 0x44, 0x24, 0x08])); // mov rax,[rsp+8]
         assert!(!exposes(&[0x53])); // push rbx
+        // A 16-bit or narrower READ of SP yields no usable address: user-mode
+        // addresses below 64K are never mapped. VMProtect emits such junk after
+        // the VSP capture.
+        assert!(!exposes(&[0x66, 0x0F, 0xBD, 0xC4])); // bsr ax,sp
+        assert!(!exposes(&[0x66, 0x89, 0xE0])); // mov ax,sp
+        assert!(!exposes(&[0x40, 0x88, 0xE0])); // mov al,spl
+        // cmp/test write nothing, so operand 0 is a read as well: flags only.
+        // REX.R (0x44) extends the reg field, which is where r15 sits here;
+        // 0x41 is REX.B and would name r12d in r/m instead, touching no RSP.
+        assert!(!exposes(&[0x66, 0x44, 0x39, 0xFC])); // cmp sp,r15w
+        assert!(!exposes(&[0x66, 0x85, 0xE4])); // test sp,sp
+        // Still exposure: a WRITE to SP, any 32-bit read, and the full pointer.
+        assert!(exposes(&[0x66, 0x89, 0xC4])); // mov sp,ax rewrites RSP
+        assert!(exposes(&[0x89, 0xE0])); // mov eax,esp keeps 32 bits
+        assert!(exposes(&[0x44, 0x39, 0xFC])); // cmp esp,r15d keeps 32 bits
+        assert!(exposes(&[0x4C, 0x39, 0xFC])); // cmp rsp,r15 is the full pointer
     }
 
     /// The assumption is discharged only for a private, un-leaked, in-frame,
@@ -3636,7 +6058,7 @@ mod tests {
         );
         let mut walker = test_walker(&pe, base, &observed, &seeded);
         // Saturate the budget: the next transition must be refused outright.
-        walker.profile_transitions = walker.limits.max_profile_transitions;
+        walker.transition_sites = (0..walker.limits.max_profile_transitions).map(|i| Va(0x9000_0000 + i as u64)).collect();
         let final_state = RelativeDispatchState {
             vip: Va(RDATA_VA),
             rolling_key: RDATA_VA,
@@ -3670,6 +6092,48 @@ mod tests {
         assert_eq!(
             resolve_targets(&target, VmCfgLimits::default()),
             Ok((vec![0x1800_1000, 0x1800_2000], true))
+        );
+    }
+
+    #[test]
+    fn cross_section_follow_needs_the_lever_and_a_mapped_target_not_executability() {
+        const EXEC: u32 = 0x2000_0000;
+        const DATA: u32 = 0xC000_0040;
+        // A non-executable target is followable: VM bytecode is read as data.
+        assert!(cross_section_followable(true, Some(EXEC)));
+        assert!(cross_section_followable(true, Some(DATA)));
+        // Unmapped is never followed, and the lever still gates everything.
+        assert!(!cross_section_followable(true, None));
+        assert!(!cross_section_followable(false, Some(EXEC)));
+        assert!(!cross_section_followable(false, Some(DATA)));
+    }
+
+    #[test]
+    fn flag_fork_does_not_fork_a_flag_proven_constant() {
+        // Bit 6 of `(~L & C1) & (L & C2)` is zero (C1 has bit 6 clear), but the
+        // simplifier keeps the expression. Forking it over {0, 1} would add the
+        // infeasible `+0x10` targets; only the real ZF fork may remain.
+        let load = Expr::intrinsic(
+            BitWidth::W64,
+            "memory_load_epoch_1",
+            vec![Expr::constant(BitWidth::W64, 0x148)],
+        );
+        let and = |a: Expr, b: Expr| Expr::binary(BinaryOp::And, a, b).unwrap();
+        let c = |v: u64| Expr::constant(BitWidth::W64, v);
+        let not_load = Expr::unary(UnaryOp::Not, load.clone());
+        let inner = and(and(not_load, c(0x924a_712f)), and(load, c(0x6db5_8ed0)));
+        let dead = Expr::binary(BinaryOp::Shr, and(c(0x40), inner), c(6)).unwrap();
+        assert_eq!(value_range(&dead).max(), 0);
+        let sum = Expr::binary(
+            BinaryOp::Add,
+            select(zf_bit(opaque_operand()), 0x1800_1000, 0x1800_2000),
+            Expr::binary(BinaryOp::Mul, dead, c(0x10)).unwrap(),
+        )
+        .unwrap()
+        .simplify();
+        assert_eq!(
+            flag_fork_targets(&sum, VmCfgLimits::default()),
+            Some(vec![0x1800_1000, 0x1800_2000])
         );
     }
 
@@ -4091,6 +6555,8 @@ mod tests {
             frame_cells_known: 0,
             frame_note: None,
             assumptions: BTreeSet::new(),
+            discharge_refusal: None,
+            nested_entry_stubs: BTreeMap::new(),
         }
     }
 
@@ -4179,6 +6645,8 @@ mod tests {
         observed_unrolls: usize,
         /// The bounded unroll's observed-depth close fired.
         closed_observed: bool,
+        /// The VM-stack-shift close fired (sound, but concedes frame privacy).
+        closed_shifted: bool,
     }
 
     /// Walks one loop whose body runs `step` on the state; returns how it closed,
@@ -4196,6 +6664,7 @@ mod tests {
             widened: 0,
             observed_unrolls: 0,
             closed_observed: false,
+            closed_shifted: false,
         };
         for iteration in 1..=64 {
             let reentry = step(ancestors.last().expect("entry"));
@@ -4215,9 +6684,14 @@ mod tests {
                     walk.observed_unrolls += 1;
                     ancestors.push(reentry);
                 }
-                LoopStep::Widen(state) => {
+                LoopStep::Widen(state) | LoopStep::WidenShifted(state) => {
                     walk.widened += 1;
                     ancestors.push(state);
+                }
+                LoopStep::CloseShifted => {
+                    walk.iterations = iteration;
+                    walk.closed_shifted = true;
+                    return Ok(walk);
                 }
                 LoopStep::Refuse(reason) => return Err(reason),
             }
@@ -4257,6 +6731,50 @@ mod tests {
     }
 
     #[test]
+    fn folding_concedes_frame_privacy_only_when_it_hides_a_frame_pointer() {
+        let w = BitWidth::W64;
+        let addr = |n: u64| Expr::constant(w, n);
+        // A frame POINTER: vsp_initial occurs outside an untracked load's args.
+        let pointer = Expr::register(w, "vsp_initial");
+        // Frame DATA: vsp_initial occurs only inside the load's address.
+        let data = Expr::intrinsic(w, "memory_load_epoch_0", vec![pointer.clone()]);
+        assert!(crate::semantic_exec::is_frame_pointer_value(&pointer));
+        assert!(!crate::semantic_exec::is_frame_pointer_value(&data));
+
+        let state = |cells: Vec<(Expr, Expr)>| SymbolicVmInitialState {
+            memory_values: cells,
+            ..SymbolicVmInitialState::default()
+        };
+
+        // Pointer cell survives the fold unchanged: privacy is NOT conceded.
+        let before = state(vec![(addr(0x10), pointer.clone())]);
+        let after = state(vec![(addr(0x10), pointer.clone())]);
+        assert!(!fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell DROPPED by the fold: privacy IS conceded.
+        let after = state(vec![]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell BROADENED to an unknown: privacy IS conceded.
+        let after = state(vec![(addr(0x10), Expr::register(w, "havoc_1"))]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Pointer cell kept, but re-homed to another address: conceded.
+        let after = state(vec![(addr(0x18), pointer.clone())]);
+        assert!(fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // Only a NON-pointer cell is dropped: privacy survives.
+        let before = state(vec![(addr(0x10), data.clone()), (addr(0x18), pointer.clone())]);
+        let after = state(vec![(addr(0x18), pointer)]);
+        assert!(!fold_hid_frame_pointer([&before].into_iter(), &after));
+
+        // A pointer in ANY pre-fold state counts, not just the first.
+        let other = state(vec![(addr(0x20), Expr::register(w, "vsp_initial"))]);
+        let after = state(vec![]);
+        assert!(fold_hid_frame_pointer([&other].into_iter(), &after));
+    }
+
+    #[test]
     fn widened_loop_state_keeps_invariant_cells_exact() {
         let a = loop_state(0, w64(0));
         let r = loop_state(0, w64(1));
@@ -4267,6 +6785,23 @@ mod tests {
         assert!(is_havoc(&widened.context_values[&8]));
         assert_eq!(widened.vsp, a.vsp);
         assert!(matches!(widen_state(Va(0x1000), &widened, &r), Ok(None)));
+    }
+
+    #[test]
+    fn re_entry_that_lost_image_or_protection_proof_is_not_subsumed() {
+        let a = loop_state(0, w64(0));
+        for lose in [
+            |s: &mut SymbolicVmInitialState| s.image_reads_suppressed = true,
+            |s: &mut SymbolicVmInitialState| s.protection_may_have_changed = true,
+        ] {
+            let mut r = loop_state(0, w64(0));
+            lose(&mut r);
+            let widened = widen_state(Va(0x1000), &a, &r)
+                .expect("widens")
+                .expect("a state with weaker facts must be re-analysed");
+            assert!(widened.image_reads_suppressed || widened.protection_may_have_changed);
+            assert!(matches!(widen_state(Va(0x1000), &widened, &r), Ok(None)));
+        }
     }
 
     #[test]
@@ -4282,15 +6817,43 @@ mod tests {
     }
 
     #[test]
-    fn loop_that_moves_the_stack_pointer_is_refused() {
+    fn loop_that_only_moves_the_stack_pointer_closes_as_a_back_edge() {
+        // The VSP advances a constant 1 byte per iteration and NOTHING else
+        // changes, so each re-entry is the enclosing state under the uniform
+        // renaming of the stack base: bisimilar, and the back edge closes. It
+        // used to be refused, which cost 110+ systems.xpl entries for a loop the
+        // graph can describe exactly.
         let entry = loop_state(0, w64(0));
         let step = |state: &SymbolicVmInitialState| {
             let mut next = state.clone();
             next.vsp = increment(&state.vsp);
             next
         };
-        let reason = walk_loop(entry, step, 2).expect_err("never converges");
-        assert!(reason.contains("stack pointer"), "{reason}");
+        let walk = walk_loop_observed(entry, step, 2, None).expect("closes as a loop");
+        assert!(walk.closed_shifted, "closed through the stack-shift test");
+        assert_eq!(walk.widened, 0, "no widening is involved in an exact shift");
+    }
+
+    #[test]
+    fn stack_shift_close_concludes_nothing_about_a_cell_that_also_moves() {
+        // Same constant VSP stride, but a context cell drifts too, so the
+        // re-entry is NOT the renaming of the enclosing state. What this guards
+        // is that NOTHING is concluded from the shift about the drifting cell.
+        // It used to be a flat refusal; the drift is now generalized instead,
+        // which concludes strictly less about the cell rather than more. The
+        // pairing with `loop_that_only_moves_the_stack_pointer_...` is the whole
+        // point: a pure shift closes with NO widening, a shift with a drift
+        // cannot close until the drift has been widened away.
+        let step = |state: &SymbolicVmInitialState| {
+            let mut next = state.clone();
+            next.vsp = increment(&state.vsp);
+            next.context_values.insert(0, increment(&state.context_values[&0]));
+            next
+        };
+        let walk = walk_loop_observed(loop_state(0, w64(0)), step, 2, None)
+            .expect("the drift is widened away rather than refused");
+        assert!(walk.closed_shifted, "still closes through the stack-shift test");
+        assert!(walk.widened >= 1, "the drifting cell had to be generalized first");
     }
 
     /// A step that decrements VSP by a proven constant `delta` bytes each
@@ -4318,14 +6881,18 @@ mod tests {
     }
 
     #[test]
-    fn vsp_loop_without_observed_depth_still_fails_closed() {
-        // The same constant-delta VSP loop, but no observed depth: the sound path
-        // keeps the fail-closed stall. No depth is guessed.
+    fn vsp_loop_without_observed_depth_closes_as_a_loop_and_never_unrolls() {
+        // The same constant-delta VSP loop with no observed depth. The point this
+        // test has always guarded is that NO DEPTH IS GUESSED, and that still
+        // holds: the walk closes the back edge instead, which is depth-free, and
+        // takes neither of the observed-tier unroll paths.
         let entry = SymbolicVmInitialState::default();
         let minus_64 = (-64_i64) as u64;
-        let reason = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, None)
-            .expect_err("no depth means fail closed");
-        assert!(reason.contains("stack pointer"), "{reason}");
+        let walk = walk_loop_observed(entry, constant_vsp_shift(minus_64), 2, None)
+            .expect("closes as a loop");
+        assert!(walk.closed_shifted);
+        assert!(!walk.closed_observed, "no observed bridge without a depth");
+        assert_eq!(walk.observed_unrolls, 0, "no depth is ever guessed");
     }
 
     #[test]
@@ -4361,6 +6928,30 @@ mod tests {
         let reentry = s(shifted((-128_i64) as u64));
         assert_eq!(
             proven_constant_vsp_delta(&[&r1, &a], &reentry),
+            Some((-64_i64) as u64)
+        );
+        // A push-down level whose state is otherwise identical closes the back
+        // edge; one that differs in a cell does not, and the refusal stands.
+        let pushed = |offset: u64, cell: Expr| SymbolicVmInitialState {
+            vsp: shifted(offset),
+            memory_values: vec![(shifted(offset), cell)],
+            ..SymbolicVmInitialState::default()
+        };
+        let level1 = pushed((-8_i64) as u64, w64(7));
+        let level2 = pushed((-16_i64) as u64, w64(7));
+        assert!(closes_under_vm_stack_shift(Va(0x1000), &level1, &level2));
+        assert!(!closes_under_vm_stack_shift(
+            Va(0x1000),
+            &level1,
+            &pushed((-16_i64) as u64, w64(9))
+        ));
+        // Equal VSPs are the ordinary case, handled by `widen_state`, not here.
+        assert!(!closes_under_vm_stack_shift(Va(0x1000), &level1, &level1));
+
+        // Iterations that linger at one depth are not a stride violation: the
+        // same chain with a repeat still proves −64.
+        assert_eq!(
+            proven_constant_vsp_delta(&[&r1, &r1, &a, &a], &reentry),
             Some((-64_i64) as u64)
         );
         // A non-constant step (doubling) has no proven constant delta.
@@ -4443,7 +7034,7 @@ mod tests {
             loop_state(0, w64(2)),
         ];
         let incoming = loop_state(0, w64(3));
-        let canonical = fold_states(Va(0x1000), &states, &incoming).expect("folds");
+        let canonical = fold_states(Va(0x1000), &states, &incoming, None).expect("folds");
         assert!(is_havoc(&canonical.context_values[&8]));
         assert_eq!(canonical.context_values[&0], w64(7));
         assert!(matches!(
@@ -4452,13 +7043,83 @@ mod tests {
         ));
     }
 
+    /// The ceiling family: a block whose every recorded state sits at a
+    /// different VM stack depth. Phase-local folding has no sibling to fold
+    /// against, so before the shift such a block spent one state per phase and
+    /// died at `max_visits_per_block * 2` with "symbolic state keeps changing".
+    /// Shifting a recorded phase onto the re-entry's depth closes it instead —
+    /// and concedes frame privacy, so it can reach N1 and never N2.
+    #[test]
+    fn a_block_re_reached_only_at_new_stack_depths_closes_by_shifting_a_phase() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        let key = Va(RDATA_VA);
+        // Four phases, 8 bytes apart, identical but for the stack base.
+        for offset in [0, 8, 16, 24] {
+            walker.explored.entry(key).or_default().push(loop_state(offset, w64(7)));
+        }
+        let incoming = loop_state(32, w64(7));
+        assert!(
+            walker.explored[&key].iter().all(|s| s.vsp != incoming.vsp),
+            "the point of the fixture is that no recorded state shares the re-entry's depth"
+        );
+        assert_eq!(walker.generalize_across(key, &incoming), GeneralizeAcross::Closed);
+        assert!(
+            walker.frame_privacy_conceded,
+            "closing by shifting the stack base concedes frame privacy"
+        );
+        assert!(
+            !walker.frame_not_private,
+            "a concession is not an observed escape: conflating them denied the \
+             taint retry to every entry that closed a strided loop"
+        );
+    }
+
+    /// The shift must not rescue a block whose drift is not a pure stack stride:
+    /// a re-entry that also changes a tracked cell still fails closed, because
+    /// re-expressing the ancestor at the new depth does not cover it.
+    #[test]
+    fn shifting_a_phase_does_not_close_a_block_whose_cells_also_move() {
+        use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let observed = ObservedRun::default();
+        let seeded = Cell::new(false);
+        let base = profile(
+            roles(Register::R11, Register::R13, Register::RBP),
+            Register::R8,
+            crate::BytecodeDirection::Descending,
+        );
+        let mut walker = test_walker(&pe, base, &observed, &seeded);
+        let key = Va(RDATA_VA);
+        walker.explored.entry(key).or_default().push(loop_state(0, w64(7)));
+        let outcome = walker.generalize_across(key, &loop_state(8, w64(9)));
+        assert_ne!(outcome, GeneralizeAcross::Closed, "{outcome:?}");
+    }
+
     #[test]
     fn fold_states_refuses_a_stack_pointer_that_moves() {
         // Generalization is sound only when the stack pointer is loop-invariant;
         // a block whose re-entries move it cannot be folded and fails closed.
         let states = [loop_state(0, w64(0))];
         let incoming = loop_state(8, w64(0));
-        assert!(fold_states(Va(0x1000), &states, &incoming).is_err());
+        let refusal = fold_states(Va(0x1000), &states, &incoming, None).expect_err("moves the VSP");
+        assert!(refusal.contains("stack pointer"), "{refusal}");
+        // The census needs the drift itself, not just the refusal: a growing VM
+        // stack is a different lever from one that merely oscillates, and only
+        // the stride set tells them apart.
+        let noted = vsp_stride_note(&[&states[0]], &incoming, refusal);
+        assert!(noted.contains("0x8,"), "{noted}");
+        assert!(noted.contains("proven=true"), "{noted}");
     }
 
     fn byte_cell_state(cell: Expr) -> SymbolicVmInitialState {

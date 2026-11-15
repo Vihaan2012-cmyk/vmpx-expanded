@@ -63,7 +63,7 @@ pub use cfg::{
     BranchRefusalDiagnostic, set_branch_refusal_diagnostics, take_branch_refusal_diagnostics,
     BlockExit, CfgEdge, CfgEdgeKind, CfgError, CfgLimitHit, CfgStall, ObservedLoopDepths,
     ObservedRun, VmBasicBlock, VmCfg, VmCfgAssumption, VmCfgLimits, DEFAULT_MAX_WALL_TIME, recover_vm_cfg,
-    recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
+    nested_entry_stub, recover_entry_frame, recover_vm_cfg_with_observed, recover_vm_cfg_with_observed_memory,
 };
 pub use env_gate::{
     EnvironmentGateFork, EnvironmentGateRoute, EnvironmentSource, take_environment_gate_forks,
@@ -115,10 +115,13 @@ pub use entry_profile::{
 pub use exception_flow::{
     ExceptionContinuationResolution, ExceptionContinuationSource, ExceptionStackSledReport,
     VmFaultUnwindCoverage, VmMemoryExceptionCoverageReport, analyze_exception_stack_sled,
-    analyze_vm_memory_exception_coverage, analyze_vm_memory_exception_coverage_with_state,
+    VmContextSeedSource, analyze_fault_site_exception_coverage,
+    analyze_fault_site_exception_coverage_with_context, analyze_vm_memory_exception_coverage,
+    analyze_vm_memory_exception_coverage_with_state,
 };
 pub use expr::{
     BinaryOp, Expr, ExprError, ExprKind, ExprRef, ResizeOp, UnaryOp, distinct_node_count_bounded,
+    interner_census,
 };
 pub use handler_slice::{
     HandlerSliceConfig, NativeBackwardSlice, NativeInstructionDisposition, NativeSliceInstruction,
@@ -127,15 +130,21 @@ pub use handler_slice::{
 pub use image_concretize::{
     ImageConcretizationError, ImageConcretizationLimits, ImageConcretizationReport,
     ImageTableBranchError, ImageTableBranchLimits, ImageTableBranchReport, ModuloImageTargetError,
-    ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget,
-    concretize_with_immutable_image, recover_image_table_targets, recover_modulo_image_targets,
+    ModuloImageTargetLimits, ModuloImageTargetReport, RecoveredImageTarget, TimingLoadFoldReport,
+    concretize_with_immutable_image, fold_timing_invariant_loads, recover_image_table_targets,
+    recover_modulo_image_targets,
 };
-pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage};
-pub use input_closed::{is_expr_input_closed, is_input_closed};
+pub use immutable_image::{FAR_BRANCH_DELTA, ObservedBranchTargets,ObservedImage, ObservedMemory, ReadOnlyImage, set_trusted_mapped_image, set_volatile_image_pages, set_volatile_image_ranges};
+pub use input_closed::{
+    exit_closure_violation, input_closure_violation, input_closure_violation_allowing_loads,
+    is_expr_input_closed, is_input_closed, is_pure_intrinsic,
+};
 pub use input_domain::{
     AddFlagsObservation, DomainCertificate, InferredInputDomains, InputDomainLimits,
     InputDomainRefusal, RefusalCause, abstract_epoch_loads, add_flags_cover,
-    diagnose_branch_refusals, infer_branch_input_domains,
+    OPAQUE_STATE_PREFIX, abstract_opaque_intrinsics, diagnose_branch_refusals,
+    infer_branch_input_domains, materialize_epoch_loads_from, mentions_opaque_state,
+    substitute_opaque_intrinsics,
 };
 pub use model::{
     BytecodeDirection, EffectKnowledge, RecoveryStatus, StateValue, VmContextLayout, VmDecodeState,
@@ -167,7 +176,7 @@ pub use neutralize::{
     DetectedWhen, INTEGRITY_CHECKSUM_INTRINSIC, NeutralizeAction, NeutralizeConstruct,
     NeutralizeOptions, RecoveredGuard, TIMESTAMP_COUNTER_INTRINSIC_PREFIX, neutralize,
 };
-pub use oep::{OepDecision, decide_oep};
+pub use oep::{OepDecision, decide_oep, decide_oep_with_returns};
 pub use operand_extract::{
     KeyedOperandCodecCandidate, KeyedOperandCodecRejection, KeyedOperandCodecReport,
     extract_keyed_operand_codecs, extract_keyed_operand_codecs_direction,
@@ -192,7 +201,9 @@ pub use semantic_exec::{
     SymbolicMemoryWrite, SymbolicNativeCall, SymbolicVmExecutionReport, SymbolicVmInitialState,
     canonicalize_symbolic_pointer, execute_symbolic_linear_block,
     execute_symbolic_linear_block_with_initial_state,
-    execute_symbolic_native_call_boundary_with_initial_state, symbolic_pointer_offset,
+    execute_symbolic_native_call_boundary_with_initial_state, set_served_page_audit,
+    symbolic_pointer_offset, take_served_page_audit, SERVED_LABELED_SUPPRESSED,
+    SERVED_PROVEN_SUPPRESSED, SERVED_UNSUPPRESSED,
 };
 pub use symbolic_domain::{
     SymbolicConcreteAlternative, SymbolicDomainError, SymbolicDomainLimits, SymbolicDomainReport,
@@ -220,6 +231,10 @@ pub enum VmEntrySource {
     PeEntryPoint,
     TlsCallback,
     ExecutableScan,
+    /// An exported symbol: a virtualized exported function points at a VM entry
+    /// stub, so the export table seeds discovery of user-function virtualization
+    /// (which an executable scan from the entry region does not reach).
+    Export,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -466,6 +481,89 @@ fn add_evidence(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Follows a chain of unconditional direct jumps (export/import thunks VMProtect
+/// places in front of a VM entry) to the instruction they ultimately reach, so a
+/// root that lands on a `jmp stub` is analyzed at the stub. Bounded; a non-jump
+/// or an indirect/out-of-image target ends the chase and the last RVA is kept.
+fn follow_direct_thunk(pe: &PeImage<'_>, mut rva: Rva, max_hops: usize) -> Rva {
+    let mut seen = 0;
+    while seen < max_hops {
+        let Ok(decoded) = decode_one(pe, rva) else {
+            break;
+        };
+        if decoded.instruction.flow_control() != FlowControl::UnconditionalBranch {
+            break;
+        }
+        let Some(target) = decoded.direct_target_rva(pe) else {
+            break;
+        };
+        if target == rva {
+            break;
+        }
+        rva = target;
+        seen += 1;
+    }
+    rva
+}
+
+/// What the entry prologue reveals before it transfers into the VM bootstrap.
+struct Prologue {
+    /// The first immediate pushed before the bootstrap call: the VM seed.
+    seed: Option<u64>,
+    /// The target of the first direct call the prologue reaches: the bootstrap.
+    call_target: Option<Rva>,
+}
+
+/// Parse an entry prologue tolerant of mutation. A clean VMProtect entry is
+/// `push seed; call bootstrap`, but Ultra (mutate-then-virtualize) scatters junk
+/// across the entry, so the seed push and bootstrap call are no longer the first
+/// two instructions. Walk fall-through (and single direct jumps, the mutation
+/// trampolines) up to a bounded instruction count, take the first immediate push
+/// as the seed, and stop at the first direct call -- the bootstrap. Any other
+/// control-flow break (conditional branch, return, indirect transfer) ends the
+/// prologue. This keeps the clean case exact (seed at 0, call at 1) while
+/// recovering the same skeleton through intervening obfuscation.
+fn scan_prologue(pe: &PeImage<'_>, rva: Rva) -> Prologue {
+    const MAX_INSNS: usize = 64;
+    let mut cursor = rva;
+    let mut seed = None;
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_INSNS {
+        if !seen.insert(cursor) {
+            break;
+        }
+        let Ok(decoded) = decode_one(pe, cursor) else {
+            break;
+        };
+        if seed.is_none() && decoded.instruction.mnemonic() == Mnemonic::Push {
+            if let Some(value) = immediate(&decoded) {
+                seed = Some(value);
+            }
+        }
+        match decoded.instruction.flow_control() {
+            FlowControl::Call => {
+                return Prologue {
+                    seed,
+                    call_target: decoded.direct_target_rva(pe),
+                };
+            }
+            FlowControl::UnconditionalBranch => match decoded.direct_target_rva(pe) {
+                Some(target) => cursor = target,
+                None => break,
+            },
+            FlowControl::Next => match decoded.next_rva() {
+                Some(next) => cursor = next,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    Prologue {
+        seed,
+        call_target: None,
+    }
+}
+
 fn analyze_stub(
     pe: &PeImage<'_>,
     rva: Rva,
@@ -473,6 +571,9 @@ fn analyze_stub(
     limits: VmDiscoveryLimits,
     chain_cache: &mut HashMap<Rva, ChainFeatures>,
 ) -> Option<VmEntryCandidate> {
+    // An exported virtualized function is reached through a `jmp` thunk; resolve
+    // it to the VM entry stub so the push-seed/call shape below is seen.
+    let rva = follow_direct_thunk(pe, rva, 8);
     let first = decode_one(pe, rva).ok()?;
     let va = first.va;
     let mut candidate = VmEntryCandidate {
@@ -481,7 +582,7 @@ fn analyze_stub(
         source,
         reachability: if matches!(
             source,
-            VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback
+            VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback | VmEntrySource::Export
         ) {
             VmEntryReachability::LoaderReachable
         } else {
@@ -496,36 +597,30 @@ fn analyze_stub(
     let mut score = 0_u16;
     if matches!(
         source,
-        VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback
+        VmEntrySource::PeEntryPoint | VmEntrySource::TlsCallback | VmEntrySource::Export
     ) {
         add_evidence(&mut candidate, &mut score, 10, "loader-reachable root");
     }
-    if first.instruction.mnemonic() != Mnemonic::Push {
-        candidate.confidence = u8::try_from(score).unwrap_or(u8::MAX);
-        return Some(candidate);
-    }
-    candidate.seed = immediate(&first);
-    if candidate.seed.is_some() {
+    let prologue = scan_prologue(pe, rva);
+    candidate.seed = prologue.seed;
+    if prologue.seed.is_some() {
         add_evidence(
             &mut candidate,
             &mut score,
             15,
-            "entry begins by pushing an immediate seed",
+            "prologue pushes an immediate seed",
         );
     }
-    let second_rva = first.next_rva()?;
-    let second = decode_one(pe, second_rva).ok()?;
-    if second.instruction.flow_control() != FlowControl::Call {
+    let Some(target) = prologue.call_target else {
         candidate.confidence = u8::try_from(score).unwrap_or(u8::MAX);
         return Some(candidate);
-    }
-    let target = second.direct_target_rva(pe)?;
+    };
     candidate.call_target = Some(target);
     add_evidence(
         &mut candidate,
         &mut score,
         15,
-        format!("seed is followed by a direct call to executable RVA {target}"),
+        format!("prologue reaches a direct call to executable RVA {target}"),
     );
     let features = chain_cache
         .entry(target)
@@ -539,6 +634,20 @@ fn analyze_stub(
                 "downstream chain saves {} distinct registers",
                 features.pushed_registers.len()
             ),
+        );
+    }
+    // A near-full save of the general registers is the VM capturing the entire
+    // native state before it begins interpreting -- pushad-style, which compiled
+    // code never does. It is near-conclusive on its own, so it earns extra credit
+    // beyond the >= 8 band; without it a build whose bootstrap reserves its frame
+    // in a shape the stack/dispatch checks miss can save all 13 registers and
+    // still fall short of the VM-entry bar.
+    if features.pushed_registers.len() >= 12 {
+        add_evidence(
+            &mut candidate,
+            &mut score,
+            10,
+            "downstream chain captures nearly the full native register file",
         );
     }
     if features.pushes_flags {
@@ -760,6 +869,17 @@ pub fn discover_vm_entries(
             roots
                 .entry(callback_rva)
                 .or_insert(VmEntrySource::TlsCallback);
+        }
+    }
+    // Seed from the export table: a virtualized exported function is redirected
+    // to a VM entry stub, so each non-forwarder export is a discovery root. This
+    // reaches user-function virtualization (e.g. a protected library) that an
+    // executable scan rooted at the entry region never finds.
+    if let Some(exports) = &pe_report.exports {
+        for symbol in &exports.symbols {
+            if symbol.forwarder.is_none() {
+                roots.entry(symbol.rva).or_insert(VmEntrySource::Export);
+            }
         }
     }
     let (scan_roots, scanned_stub_candidates, resource_limited) = if limits.scan_executable_stubs {

@@ -530,13 +530,27 @@ pub fn analyze_native_call_handler(
             .then_some(*rva)
         })
         .collect::<Vec<_>>();
-    let [alias_copy] = alias_copies.as_slice() else {
-        return Ok(failed_report(
-            entry,
-            cfg.blocks.len(),
-            instruction_count,
-            vec!["call-frame base is not a uniquely proven VSP alias".to_owned()],
-        ));
+    // A register is an alias of itself: when the call target is loaded straight
+    // from `[vsp]` there is no copy to find, and the alias is live from the
+    // handler's entry. Everything downstream that uses this site then checks the
+    // whole prefix instead of a suffix, which is stricter.
+    let alias_copy = if vsp_alias == canonical(vsp) {
+        entry
+    } else {
+        let [alias_copy] = alias_copies.as_slice() else {
+            return Ok(failed_report(
+                entry,
+                cfg.blocks.len(),
+                instruction_count,
+                vec![format!(
+                    "call-frame base is not a uniquely proven VSP alias (alias {:?}, vsp {:?}, copies {})",
+                    vsp_alias,
+                    canonical(vsp),
+                    alias_copies.len()
+                )],
+            ));
+        };
+        *alias_copy
     };
     if !is_win64_nonvolatile(vsp_alias) {
         return Ok(failed_report(
@@ -548,13 +562,13 @@ pub fn analyze_native_call_handler(
             )],
         ));
     }
-    let between_alias_and_call = reachable(&graph, *alias_copy)
+    let between_alias_and_call = reachable(&graph, alias_copy)
         .intersection(&reverse_reachable(&graph, call_site))
         .copied()
         .collect::<BTreeSet<_>>();
     let mut factory = iced_x86::InstructionInfoFactory::new();
     if between_alias_and_call.iter().any(|rva| {
-        *rva != *alias_copy
+        *rva != alias_copy
             && writes_register(&mut factory, &instructions[rva].instruction, vsp_alias)
     }) {
         return Ok(failed_report(
@@ -583,7 +597,7 @@ pub fn analyze_native_call_handler(
             vec!["native RSP is not saved exactly once through the VSP alias".to_owned()],
         ));
     };
-    if !dominates(&graph, entry, *alias_copy, *rsp_save) {
+    if !dominates(&graph, entry, alias_copy, *rsp_save) {
         return Ok(failed_report(
             entry,
             cfg.blocks.len(),
@@ -660,13 +674,82 @@ pub fn analyze_native_call_handler(
             .then_some(*rva)
         })
         .collect::<Vec<_>>();
-    let [vsp_restore] = vsp_restores.as_slice() else {
-        return Ok(failed_report(
-            entry,
-            cfg.blocks.len(),
-            instruction_count,
-            vec!["post-call VM stack pointer is not restored on every path".to_owned()],
-        ));
+    // Two shapes. The VSP was parked in `vsp_alias` and moved back, or -- the
+    // measured one -- the handler COMPUTED the post-call VSP into a frame slot
+    // before the call and loads it back after. The second is the exact mirror of
+    // the native-RSP save/restore accepted above, and rests on the same
+    // obligation that pair already does: the callee runs on the switched native
+    // stack and does not write the VM's frame.
+    let vsp_restore = match vsp_restores.as_slice() {
+        [vsp_restore] => *vsp_restore,
+        _ => {
+            let slot_stores = instructions
+                .iter()
+                .filter_map(|(rva, decoded)| {
+                    let (base, displacement, _) = exact_store(&decoded.instruction)?;
+                    (base == vsp_alias
+                        && displacement != *rsp_displacement
+                        && dominates(&graph, entry, *rva, call_site))
+                    .then_some((*rva, displacement))
+                })
+                .collect::<Vec<_>>();
+            let [(slot_store, slot_displacement)] = slot_stores.as_slice() else {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec![format!(
+                        "post-call VM stack pointer is not restored on every path ({} alias move(s), {} frame slot store(s))",
+                        vsp_restores.len(),
+                        slot_stores.len()
+                    )],
+                ));
+            };
+            // Nothing may rewrite the slot between the store and the call, or the
+            // value loaded back is not the one that was computed.
+            let between = reachable(&graph, *slot_store)
+                .intersection(&reverse_reachable(&graph, call_site))
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if between.iter().any(|rva| {
+                *rva != *slot_store
+                    && exact_store(&instructions[rva].instruction).is_some_and(
+                        |(base, displacement, _)| {
+                            base == vsp_alias && displacement == *slot_displacement
+                        },
+                    )
+            }) {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec!["the saved VM stack pointer slot is rewritten before the call".to_owned()],
+                ));
+            }
+            let slot_loads = instructions
+                .iter()
+                .filter_map(|(rva, decoded)| {
+                    let (destination, base, displacement) = exact_load(&decoded.instruction)?;
+                    (destination == canonical(vsp)
+                        && base == vsp_alias
+                        && displacement == *slot_displacement
+                        && dominates(&graph, resume_rva, *rva, dispatch))
+                    .then_some(*rva)
+                })
+                .collect::<Vec<_>>();
+            let [slot_load] = slot_loads.as_slice() else {
+                return Ok(failed_report(
+                    entry,
+                    cfg.blocks.len(),
+                    instruction_count,
+                    vec![format!(
+                        "VM stack pointer slot is not loaded back on every dispatch path ({} load(s))",
+                        slot_loads.len()
+                    )],
+                ));
+            };
+            *slot_load
+        }
     };
 
     let mut saved = BTreeSet::new();
@@ -772,7 +855,7 @@ pub fn analyze_native_call_handler(
         native_rsp_save: Some(*rsp_save),
         native_rsp_restore: Some(*rsp_restore),
         return_store: Some(*return_store),
-        vsp_restore: Some(*vsp_restore),
+        vsp_restore: Some(vsp_restore),
         selector_register: Some(format!("{:?}", canonical(selector_register))),
         selector_completion: Some(selector_completion),
         dispatch_source: Some(*dispatch_source),
@@ -820,8 +903,9 @@ pub fn analyze_keyless_native_call_handler(
     selector_register: Register,
     operand_load: Rva,
     operand_bytes: i64,
+    direction: crate::BytecodeDirection,
     limits: CfgLimits,
-    resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Register), String>,
+    resolve_dispatch: impl FnOnce(Rva) -> Result<(Rva, Rva, Option<Register>), String>,
 ) -> Result<NativeCallAnalysis, DisasmError> {
     let cfg = recover_cfg(pe, entry, limits)?;
     let instruction_count = cfg
@@ -841,7 +925,11 @@ pub fn analyze_keyless_native_call_handler(
     if cfg.status != CfgStatus::Complete {
         return fail(format!("native-call CFG is incomplete: {:?}", cfg.status));
     }
-    if operand_load != entry {
+    let descending = direction == crate::BytecodeDirection::Descending;
+    // An ascending handler reads then advances, so its load IS the entry. A
+    // descending one advances first, so the load sits behind the advance and
+    // whatever junk the protector put between them.
+    if !descending && operand_load != entry {
         return fail("keyless operand is not the first handler instruction".to_owned());
     }
     let mut instructions = BTreeMap::new();
@@ -882,7 +970,11 @@ pub fn analyze_keyless_native_call_handler(
     let mut advance_factory = iced_x86::InstructionInfoFactory::new();
     let mut segment = Vec::new();
     let mut completion = None;
-    let mut cursor = Some(operand_load);
+    let mut reached_load = false;
+    // Descending walks `entry -> load`, ascending `load -> advance`. Either way
+    // this is a straight-line span and the first VIP write in it must be the
+    // exact advance for the operand's width.
+    let mut cursor = Some(if descending { entry } else { operand_load });
     while let Some(rva) = cursor
         && segment.len() < 64
         && let Some(decoded) = instructions.get(&rva)
@@ -890,18 +982,35 @@ pub fn analyze_keyless_native_call_handler(
     {
         let instruction = &decoded.instruction;
         segment.push(rva);
+        if descending && rva == operand_load {
+            reached_load = true;
+            break;
+        }
         if rva != operand_load && writes_register(&mut advance_factory, instruction, vip) {
-            let exact = instruction.mnemonic() == Mnemonic::Add
+            let advance = if descending { Mnemonic::Sub } else { Mnemonic::Add };
+            let exact = instruction.mnemonic() == advance
                 && instruction.op0_kind() == OpKind::Register
                 && instruction.op0_register() == vip
                 && signed_immediate(instruction, 1) == Some(operand_bytes);
-            completion = exact.then_some(rva);
-            break;
+            if !exact {
+                return fail(format!(
+                    "VIP is written at {rva} by something other than the operand advance"
+                ));
+            }
+            completion = Some(rva);
+            if !descending {
+                break;
+            }
         }
         cursor = decoded.next_rva();
     }
+    if descending && !reached_load {
+        return fail(
+            "the keyless operand load is not on the handler's straight-line prefix".to_owned(),
+        );
+    }
     let Some(completion) = completion else {
-        return fail("operand load is not followed by the exact VIP advance".to_owned());
+        return fail("the operand load is not paired with the exact VIP advance".to_owned());
     };
     let (dispatch_source, terminal_dispatch, table_register) = match resolve_dispatch(resume_rva) {
         Ok(resolved) => resolved,
@@ -912,18 +1021,26 @@ pub fn analyze_keyless_native_call_handler(
     {
         return fail("post-call dispatch source is not on the recovered return path".to_owned());
     }
-    let table_register = canonical(table_register);
-    if [vip, vsp_canonical, canonical(selector_register)].contains(&table_register) {
-        return fail("table register overlaps a VM role".to_owned());
-    }
-    if segment.iter().any(|rva| {
-        writes_register(
-            &mut advance_factory,
-            &instructions[rva].instruction,
-            table_register,
-        )
-    }) {
-        return fail("table register is written before the operand advance completes".to_owned());
+    // Only a TABLE dispatch has a base to keep alive; a relative one resumes by
+    // adding the decoded delta to the handler register and has nothing here to
+    // protect, so both obligations are vacuous and are skipped rather than
+    // faked.
+    let table_register = table_register.map(canonical);
+    if let Some(table_register) = table_register {
+        if [vip, vsp_canonical, canonical(selector_register)].contains(&table_register) {
+            return fail("table register overlaps a VM role".to_owned());
+        }
+        if segment.iter().any(|rva| {
+            writes_register(
+                &mut advance_factory,
+                &instructions[rva].instruction,
+                table_register,
+            )
+        }) {
+            return fail(
+                "table register is written before the operand advance completes".to_owned(),
+            );
+        }
     }
     let dispatch_region = reachable(&graph, dispatch_source);
     if instructions.iter().any(|(rva, decoded)| {
@@ -1015,10 +1132,19 @@ pub fn analyze_keyless_native_call_handler(
         call_site,
         dispatch_source,
         terminal_dispatch,
-        completion,
+        // Where the selector register provably holds the decoded byte. In an
+        // ASCENDING stream the advance follows the load, so the advance is that
+        // point. In a DESCENDING one the advance comes FIRST -- `sub vip,n`
+        // before `movzx r,[vip]` -- so seeding at the advance is overwritten by
+        // the load an instruction later, and every branch on the selector then
+        // reads an unknown. Seed at the load there.
+        if descending { operand_load } else { completion },
         selector_register,
         vsp,
-        &[roles.vip, table_register],
+        // The registers the outcome check must see preserved: the VIP always,
+        // and a table base only when there is one.
+        &table_register
+            .map_or_else(|| vec![roles.vip], |table| vec![roles.vip, table]),
         limits.max_instructions.max(1),
     ) {
         Ok(outcomes) => outcomes,

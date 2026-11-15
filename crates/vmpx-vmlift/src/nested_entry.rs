@@ -4,10 +4,9 @@
 //! not that entry's native frame, which composing its state needs. A resolver
 //! supplies it, and the lift cross-checks it against the CFG's nested block.
 
-use vmpx_pe::{PeImage, Va};
+use vmpx_pe::{PeImage, Rva, Va};
 use vmpx_vm::{
-    EntryProfileRecoveryLimits, ExprKind, NativeFrameSource, VmDiscoveryLimits,
-    analyze_vm_entry_at, recover_entry_stream,
+    EntryProfileRecoveryLimits, ExprKind, NativeFrameSource, nested_entry_stub, recover_entry_stream,
 };
 
 use crate::recover_entry_frame;
@@ -28,6 +27,12 @@ pub struct NestedEntry {
 pub trait NestedEntryResolver {
     /// The entry a VM exit returns into, proven from its return address.
     fn resolve(&self, return_address: &vmpx_vm::Expr) -> Option<NestedEntry>;
+
+    /// The entry whose stub is at `rva` -- a return address the CFG walk already
+    /// resolved. The lift uses this when the walk recorded the resolution, so it
+    /// does not have to re-derive it from a return address its own (less
+    /// concretized) state leaves symbolic.
+    fn resolve_by_rva(&self, rva: Rva) -> Option<NestedEntry>;
 }
 
 /// Resolves a constant return address that is a VM entry stub of the image.
@@ -38,19 +43,36 @@ pub struct PeNestedEntries<'a, 'b> {
 
 impl NestedEntryResolver for PeNestedEntries<'_, '_> {
     fn resolve(&self, return_address: &vmpx_vm::Expr) -> Option<NestedEntry> {
-        let ExprKind::Const { value } = return_address.simplify().kind else {
-            return None;
-        };
         let base = self.pe.optional.image_base;
-        let candidate = analyze_vm_entry_at(
-            self.pe,
-            base.checked_rva_of(Va(value))?,
-            VmDiscoveryLimits::default(),
-        )?;
+        // A nested entry's return address is the entry stub's VA, which the
+        // protector may emit as modulo-image arithmetic rather than a constant.
+        // Resolve the single proven image target exactly as the CFG's own
+        // nested-entry follow does, so a non-constant does not refuse the entry.
+        let simplified = return_address.simplify();
+        let rva = if let ExprKind::Const { value } = simplified.kind {
+            base.checked_rva_of(Va(value))?
+        } else {
+            let report = vmpx_vm::recover_modulo_image_targets(
+                self.pe,
+                return_address,
+                vmpx_vm::ModuloImageTargetLimits::default(),
+            )
+            .ok()?;
+            if !report.complete || report.targets.len() != 1 {
+                return None;
+            }
+            report.targets[0].rva?
+        };
+        self.resolve_by_rva(rva)
+    }
+
+    fn resolve_by_rva(&self, rva: Rva) -> Option<NestedEntry> {
+        let base = self.pe.optional.image_base;
+        let (frame_entry, candidate) = nested_entry_stub(self.pe, rva)?;
         let stream = recover_entry_stream(self.pe, &candidate, self.limits).ok()?;
         let (frame, top_offset) = recover_entry_frame(
             self.pe,
-            candidate.rva,
+            frame_entry,
             stream.profile.effect_roles.vsp,
             self.limits.trace,
         )

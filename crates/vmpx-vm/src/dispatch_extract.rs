@@ -594,6 +594,50 @@ fn attempt_candidate(
     let has_prior_source = previous_source_index.is_some();
     let local_prefix_start = previous_source_index.map_or(0, |index| index + 1);
     let mut vip_rebased_before_source = false;
+    // A full-width write to the VIP whose value does not come FROM the VIP
+    // supersedes every earlier write to it: whatever clobbered the VIP before
+    // cannot reach the fetch. `mov vip, reg64` was already treated this way, but
+    // only when it was the first VIP write seen -- the scan refused on the first
+    // UNMODELLED write without looking ahead for a rebase that makes it
+    // irrelevant. A `pop vip` is such a rebase too; its value comes off the
+    // native stack.
+    //
+    // Measured on systems.xpl, that is VMProtect's cpuid handler: `cpuid`
+    // legitimately clobbers EBX, which is this profile's VIP, the handler pushes
+    // its four results to the VM stack, and then `pop rbx` restores the VIP
+    // before `sub rbx, 4` and the opcode fetch. Refusing on the cpuid wrote off
+    // the whole handler over a register the handler itself puts back.
+    let is_vip_rebase = |instruction: &Instruction| -> bool {
+        if instruction.op0_kind() != OpKind::Register
+            || instruction.op0_register() != canonical(roles.vip)
+            || instruction.op0_register().size() != 8
+        {
+            return false;
+        }
+        match instruction.mnemonic() {
+            Mnemonic::Mov => instruction.op1_kind() == OpKind::Register
+                && instruction.op1_register().size() == 8,
+            Mnemonic::Pop => true,
+            _ => false,
+        }
+    };
+    let last_vip_rebase: Option<usize> = if has_prior_source {
+        None
+    } else {
+        decoded
+            .iter()
+            .take(source_index)
+            .enumerate()
+            .filter(|(_, decoded)| {
+                let disposition = dispositions
+                    .get(&decoded.rva)
+                    .copied()
+                    .unwrap_or(NativeInstructionDisposition::Dead);
+                is_active(disposition) && is_vip_rebase(&decoded.instruction)
+            })
+            .map(|(index, _)| index)
+            .next_back()
+    };
     let mut pre_source_handler_writes = Vec::new();
     let mut pre_source_key_writes = Vec::new();
     for (index, decoded) in decoded.iter().take(source_index).enumerate() {
@@ -619,14 +663,12 @@ fn attempt_candidate(
             && writes_register(&mut factory, &decoded.instruction, canonical(roles.vip))
         {
             let instruction = &decoded.instruction;
-            let exact_full_width_rebase = !vip_rebased_before_source
-                && !has_prior_source
-                && instruction.mnemonic() == Mnemonic::Mov
-                && instruction.op0_kind() == OpKind::Register
-                && instruction.op1_kind() == OpKind::Register
-                && instruction.op0_register() == canonical(roles.vip)
-                && instruction.op1_register().size() == 8;
-            if exact_full_width_rebase {
+            // Superseded by a later rebase, so it cannot affect the fetch. Also
+            // keeps its delta out of `vip_delta`, which is what the rebase means.
+            if last_vip_rebase.is_some_and(|rebase| index < rebase) {
+                continue;
+            }
+            if last_vip_rebase == Some(index) {
                 vip_rebased_before_source = true;
                 continue;
             }
@@ -797,7 +839,20 @@ fn attempt_candidate(
             canonical(roles.rolling_key),
         ) && !allowed_key_writes.contains(&decoded.rva)
     }) {
-        return Err("rolling-key register has an unmodelled write".to_owned());
+        // Name the write. "unmodelled" is the biggest single handler-spec
+        // diagnostic and says nothing about WHICH instruction to model.
+        let offender = active.iter().find(|decoded| {
+            writes_register(
+                &mut factory,
+                &decoded.instruction,
+                canonical(roles.rolling_key),
+            ) && !allowed_key_writes.contains(&decoded.rva)
+        });
+        return Err(format!(
+            "rolling-key register has an unmodelled write ({:?} at {:?})",
+            offender.map(|decoded| decoded.instruction.mnemonic()),
+            offender.map(|decoded| decoded.rva),
+        ));
     }
     let key_update_index = decoded
         .iter()
@@ -940,10 +995,30 @@ fn attempt_table_indexed_candidate(
     terminal_evidence: &str,
 ) -> Result<DispatchExtractionCandidate, String> {
     let source = decoded[source_index];
-    // The opcode must be zero-extended so the index register holds exactly the
-    // unsigned table index.
-    if source.instruction.mnemonic() != Mnemonic::Movzx {
-        return Err("table-indexed opcode load is not zero-extended".to_owned());
+    // The index register must end up holding EXACTLY the unsigned value loaded.
+    // `movzx` is the obvious form, but a plain `mov` into a 32-bit register is
+    // just as exactly zero-extended -- an x86-64 write to a 32-bit register
+    // clears the upper half by definition -- and a 64-bit load needs no
+    // extension at all. A 16- or 8-bit `mov` is NOT acceptable, because it
+    // preserves the rest of the register, and `movsx` is sign-extended.
+    //
+    // Measured on systems.xpl: both dispatch sources this rejected decode to
+    // `mov r12d, [rbx]` (44 8B 23), a zero-extended 4-byte opcode fetch from the
+    // recovered VIP register. Nothing else here assumes a byte opcode -- the VIP
+    // delta is `opcode_width.bytes()` and the width is read from the memory
+    // operand -- so only this gate had to change.
+    let zero_extended = match source.instruction.mnemonic() {
+        Mnemonic::Movzx => true,
+        // `op0_register()` is `None` (size 0) when the destination is memory, so
+        // a store cannot slip through this.
+        Mnemonic::Mov => matches!(source.instruction.op0_register().size(), 4 | 8),
+        _ => false,
+    };
+    if !zero_extended {
+        return Err(format!(
+            "table-indexed opcode load is not zero-extended ({:?})",
+            source.instruction.mnemonic()
+        ));
     }
     let opcode_width = source_load_width(&source.instruction)
         .ok_or_else(|| "unsupported opcode width".to_owned())?;
@@ -1335,7 +1410,17 @@ pub fn extract_relative_dispatch_codecs_with_stack_check(
                     postlude_proof: Some(proof),
                 });
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // "Not this shape" is the normal answer, but a trace that ends
+                // in a `ja` after a register compare looks exactly like the
+                // guard, so say which condition refused it.
+                if let Some(reason) = stack_check_refusal(trace, roles, check) {
+                    stack_check_rejection = Some(DispatchExtractionRejection {
+                        encoded_load: trace.stop.at,
+                        reason: format!("stack-check postlude unmatched: {reason}"),
+                    });
+                }
+            }
             Err(reason) => {
                 stack_check_rejection = Some(DispatchExtractionRejection {
                     encoded_load: trace.stop.at,
@@ -1395,6 +1480,114 @@ struct StackCheckShape {
 /// Matches the exact tail `lea tmp,[ctx+disp]; cmp vsp,tmp; ja head`. Only
 /// direct jumps may separate `cmp` from `ja` (they leave flags intact) and only
 /// direct jumps or carry-flag junk may precede `cmp` (it rewrites every flag).
+/// Why [`match_stack_check`] did not recognize a trace, for the diagnostic.
+///
+/// The matcher itself returns `Option` because "not this shape" is the normal
+/// answer for most handlers. But when a trace DOES end in a `ja` after a
+/// register compare -- which is what the guard looks like -- knowing which
+/// condition then refused is the difference between a lever and a guess.
+fn stack_check_refusal(
+    trace: &DirectJumpTrace,
+    roles: HandlerRegisterRoles,
+    check: StackCheckRoles,
+) -> Option<String> {
+    if trace.stop.kind != DirectJumpTraceStopKind::ConditionalBranch {
+        return None;
+    }
+    let instructions: Vec<_> = trace.instructions().collect();
+    let branch = instructions.last()?;
+    if !matches!(
+        branch.instruction.mnemonic(),
+        Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jb | Mnemonic::Jbe
+    ) {
+        return Some(format!(
+            "terminal branch is {:?}, not an unsigned stack-limit compare",
+            branch.instruction.mnemonic()
+        ));
+    }
+    if trace.stop.direct_target.is_none() {
+        return Some("the guard branch has no direct target".to_owned());
+    }
+    if trace.stop.fallthrough.is_none() {
+        return Some("the guard branch has no fall-through".to_owned());
+    }
+    let mut index = instructions.len() - 1;
+    let cmp_index = loop {
+        index = index.checked_sub(1)?;
+        if !is_direct_jump(&instructions[index].instruction) {
+            break index;
+        }
+    };
+    let cmp = &instructions[cmp_index].instruction;
+    if cmp.mnemonic() != Mnemonic::Cmp {
+        return Some(format!("the guard reads {:?}, not a `cmp`", cmp.mnemonic()));
+    }
+    if cmp.op0_kind() != OpKind::Register || cmp.op1_kind() != OpKind::Register {
+        return Some(format!(
+            "the guard compare is not register-to-register (op0 {:?} {:?}, op1 {:?} {:?}, mem base {:?} disp {:#x})",
+            cmp.op0_kind(),
+            cmp.op0_register(),
+            cmp.op1_kind(),
+            cmp.op1_register(),
+            cmp.memory_base(),
+            cmp.memory_displacement64(),
+        ));
+    }
+    if cmp.op0_register() != canonical(check.vsp) {
+        return Some(format!(
+            "the guard compares {:?}, but the resolved VSP is {:?}",
+            cmp.op0_register(),
+            canonical(check.vsp)
+        ));
+    }
+    if cmp.op0_register().size() != 8 || cmp.op1_register().size() != 8 {
+        return Some("the guard compare is not full width".to_owned());
+    }
+    let tmp = cmp.op1_register();
+    if tmp != canonical(tmp) {
+        return Some(format!("the guard scratch {tmp:?} is not a full register"));
+    }
+    if [check.vsp, roles.vip]
+        .into_iter()
+        .any(|register| canonical(register) == tmp)
+    {
+        return Some(format!(
+            "the guard scratch {tmp:?} aliases the VSP or the VIP"
+        ));
+    }
+    // Past here the shape held up to the `lea`, so the matcher's own result is
+    // the answer; a `None` from it now means the `lea` test refused.
+    if match_stack_check(trace, roles, check).is_none() {
+        return Some(format!(
+            "the `lea` establishing {tmp:?} from the context base {:?} was not found",
+            canonical(check.context_base)
+        ));
+    }
+    None
+}
+
+/// The guard's successors as (dispatch head, relocation path).
+///
+/// `cmp vsp,limit` is followed by either sense: `ja`/`jae` jump to the head when
+/// the VM stack is still inside its region, while `jb`/`jbe` jump to the
+/// overflow path and leave the head as the fall-through. The protector picks the
+/// polarity per handler; demanding `ja` refused 91 of 122 handler-spec stalls.
+///
+/// This only ORDERS the two successors. Which one is really the dispatch head is
+/// proven downstream (`terminal_dispatches_through` on the head, then
+/// `region_reaches_head` from the other), so a wrong polarity fails closed.
+fn stack_check_successors(
+    branch: Mnemonic,
+    direct_target: Rva,
+    fallthrough: Rva,
+) -> Option<(Rva, Rva)> {
+    match branch {
+        Mnemonic::Ja | Mnemonic::Jae => Some((direct_target, fallthrough)),
+        Mnemonic::Jb | Mnemonic::Jbe => Some((fallthrough, direct_target)),
+        _ => None,
+    }
+}
+
 fn match_stack_check(
     trace: &DirectJumpTrace,
     roles: HandlerRegisterRoles,
@@ -1405,11 +1598,14 @@ fn match_stack_check(
     }
     let instructions: Vec<_> = trace.instructions().collect();
     let branch = instructions.last()?;
-    if branch.rva != trace.stop.at || branch.instruction.mnemonic() != Mnemonic::Ja {
+    if branch.rva != trace.stop.at {
         return None;
     }
-    let head = trace.stop.direct_target?;
-    let fallthrough = trace.stop.fallthrough?;
+    let (head, fallthrough) = stack_check_successors(
+        branch.instruction.mnemonic(),
+        trace.stop.direct_target?,
+        trace.stop.fallthrough?,
+    )?;
     let mut index = instructions.len() - 1;
     let cmp_index = loop {
         index = index.checked_sub(1)?;
@@ -1685,10 +1881,10 @@ fn recognize_postlude_dispatch(
         branch: shape.branch,
         head: shape.head,
     });
-    candidate.evidence.push(
-        "handler ends in the shared stack-check postlude; ja targets the proven dispatch head"
-            .to_owned(),
-    );
+    candidate.evidence.push(format!(
+        "handler ends in the shared stack-check postlude; its guard branch at {} selects the proven dispatch head at {}",
+        shape.branch, shape.head
+    ));
     match anchor {
         Some((base, _)) => candidate.evidence.push(format!(
             "fall-through relocation path reaches the head without writing VIP, VSP, or the table register; table base {base} falls into the head"
@@ -1736,6 +1932,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::IndirectBranch,
                 at: terminal_rva,
@@ -1889,6 +2086,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::ConditionalBranch,
                 at: terminal_rva,
@@ -1922,6 +2120,57 @@ mod tests {
         let shape = match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
             .expect("stack-check shape recovered despite the junk cmp");
         assert_eq!(shape.head, Rva(0x2000));
+    }
+
+    #[test]
+    fn stack_check_accepts_the_inverted_guard_polarity() {
+        // `jbe` jumps to the OVERFLOW path, so the dispatch head is the
+        // fall-through. 91 of 122 handler-spec stalls were refused on this.
+        for (sense, target_is_head) in [("ja", true), ("jae", true), ("jb", false), ("jbe", false)]
+        {
+            let mut a = CodeAssembler::new(64).expect("x64 assembler");
+            a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+            a.cmp(rbp, rax).expect("vsp vs guard compare");
+            match sense {
+                "ja" => a.ja(0x1_4000_2000_u64),
+                "jae" => a.jae(0x1_4000_2000_u64),
+                "jb" => a.jb(0x1_4000_2000_u64),
+                _ => a.jbe(0x1_4000_2000_u64),
+            }
+            .expect("stack-check branch");
+            let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+            let trace = conditional_trace(&bytes);
+            let expected_head = if target_is_head {
+                trace.stop.direct_target.expect("target")
+            } else {
+                trace.stop.fallthrough.expect("fall-through")
+            };
+            let shape = match_stack_check(&trace, STACK_CHECK_ROLES, STACK_CHECK)
+                .unwrap_or_else(|| panic!("{sense} guard must match"));
+            assert_eq!(shape.head, expected_head, "{sense}");
+            assert_ne!(shape.fallthrough, shape.head, "{sense}");
+        }
+    }
+
+    /// A branch that is not an unsigned limit compare is still refused, so the
+    /// polarity widening did not become "any conditional branch".
+    #[test]
+    fn stack_check_still_rejects_an_unrelated_condition() {
+        for build in [0_u8, 1] {
+            let mut a = CodeAssembler::new(64).expect("x64 assembler");
+            a.lea(rax, qword_ptr(rsp + 0x180)).expect("stack-guard lea");
+            a.cmp(rbp, rax).expect("vsp vs guard compare");
+            if build == 0 {
+                a.jne(0x1_4000_2000_u64).expect("branch");
+            } else {
+                a.jg(0x1_4000_2000_u64).expect("branch");
+            }
+            let bytes = a.assemble(0x1_4000_1000).expect("assemble");
+            assert!(
+                match_stack_check(&conditional_trace(&bytes), STACK_CHECK_ROLES, STACK_CHECK)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

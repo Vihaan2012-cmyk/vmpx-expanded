@@ -4,11 +4,13 @@
 //! upgrades an eligible candidate to proven. [`equiv`] is the per-function
 //! end-to-end gate (PROVEN / REFUTED / TIMEOUT) over whole exit states.
 
+pub mod branch_paths;
 pub mod differential;
 pub mod equiv;
 pub mod fidelity;
 pub mod fp;
 pub mod input_testing;
+pub mod loops;
 pub mod smt;
 pub mod sweep;
 pub mod smtlib;

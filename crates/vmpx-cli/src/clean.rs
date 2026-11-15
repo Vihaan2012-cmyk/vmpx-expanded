@@ -12,8 +12,9 @@ use vmpx_vm::{
     NativeContinuationLimits, NativeContinuationReport, RecoveryStatus, VmDiscoveryLimits,
     VmEntrySource, VmMemoryExceptionCoverageReport, VmProfileChainStop, VmProfileExplorerLimits,
     analyze_native_continuation, analyze_vm_entry_at,
-    analyze_vm_memory_exception_coverage_with_state, continue_through_native_vm_entry, decide_oep,
-    discover_vm_entries, recover_entry_paths, recover_modulo_image_targets,
+    analyze_vm_memory_exception_coverage_with_state, continue_through_native_vm_entry,
+    decide_oep_with_returns, discover_vm_entries, recover_entry_paths,
+    recover_modulo_image_targets,
 };
 use vmpx_vmlift::audit_entry_effect_liveness;
 
@@ -345,6 +346,50 @@ pub(crate) fn export_dependency_report(pe: &PeImage<'_>) -> Vec<CleanExportRepor
     results
 }
 
+/// Global slots the detonation should capture, from `VMPX_DYNAMIC_CAPTURE` as
+/// `addr:len` pairs (`0x1a2b3c:8,0x1a2b44:4`), length in bytes.
+///
+/// These are the constant-addressed untracked reads a prior static pass could
+/// not resolve; feeding them back is what turns `observed globals=0` into a
+/// seed. A malformed pair is reported and skipped rather than failing the run,
+/// because this only ever feeds the experimental tier.
+fn dynamic_capture_requests(warnings: &mut Vec<String>) -> Vec<(u64, usize)> {
+    let Ok(spec) = std::env::var("VMPX_DYNAMIC_CAPTURE") else {
+        return Vec::new();
+    };
+    let mut requests = Vec::new();
+    for item in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (address, length) = match item.split_once(':') {
+            Some((address, length)) => (address, length),
+            None => (item, "8"),
+        };
+        let address = address.trim().trim_start_matches("0x");
+        match (
+            u64::from_str_radix(address, 16),
+            length.trim().parse::<usize>(),
+        ) {
+            (Ok(address), Ok(length)) if length > 0 && length <= 4096 => {
+                requests.push((address, length));
+            }
+            _ => warnings.push(format!(
+                "[dynamic][experimental] ignoring malformed VMPX_DYNAMIC_CAPTURE entry {item:?}; \
+                 expected <hex-address>[:<length-bytes>]"
+            )),
+        }
+    }
+    if !requests.is_empty() {
+        warnings.push(format!(
+            "[dynamic][experimental] capturing {} requested global slot(s)",
+            requests.len()
+        ));
+    }
+    requests
+}
+
 /// Unifies executable-stub discovery with the VM entries reachable from exports
 /// into one deduplicated list. Inventory only: nothing here is recovered.
 pub(crate) fn build_vm_inventory(
@@ -366,6 +411,7 @@ pub(crate) fn build_vm_inventory(
                 vmpx_vm::VmEntrySource::PeEntryPoint => "header",
                 vmpx_vm::VmEntrySource::TlsCallback => "tls",
                 vmpx_vm::VmEntrySource::ExecutableScan => "scan",
+                vmpx_vm::VmEntrySource::Export => "export",
             };
             (entry.rva, entry.confidence, label, false)
         })),
@@ -691,7 +737,10 @@ pub(crate) fn dynamic_export_reference(
     // export list). Offline, accurate (real local DLLs); missing => skipped.
     let db = vmpx_emulate::SysDllDb::new();
     let mut system_modules: std::collections::BTreeSet<String> =
-        vmpx_emulate::DEFAULT_SYSTEM_MODULES.iter().map(|m| (*m).to_owned()).collect();
+        vmpx_emulate::DEFAULT_SYSTEM_MODULES
+            .iter()
+            .map(|m| (*m).to_owned())
+            .collect();
     system_modules.extend(reference.keys().cloned());
     let mut auto_modules = 0usize;
     let mut auto_symbols = 0usize;
@@ -716,9 +765,11 @@ pub(crate) fn dynamic_export_reference(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            match std::fs::read(path).ok().and_then(|b| PeImage::parse(&b).ok().map(|pe| {
-                vmpx_emulate::export_reference_from_exports(&pe)
-            })) {
+            match std::fs::read(path).ok().and_then(|b| {
+                PeImage::parse(&b)
+                    .ok()
+                    .map(|pe| vmpx_emulate::export_reference_from_exports(&pe))
+            }) {
                 Some(names) => {
                     warnings.push(format!(
                         "[dynamic][experimental] export reference: {} export(s) for {key} from system-DLL reference {path}",
@@ -800,7 +851,12 @@ pub fn rebuild_dumped_pe(input_path: &str, input: &[u8]) -> Result<DumpPeOutcome
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(base.max_steps);
-    let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, dump: true, ..base };
+    let opts = vmpx_emulate::DetonateOptions {
+        export_reference,
+        max_steps,
+        dump: true,
+        ..base
+    };
     let result = vmpx_emulate::detonate(&pe, &opts)
         .map_err(|error| anyhow!("[dump-pe] detonation could not start: {error:?}"))?;
     let dump = result
@@ -883,6 +939,22 @@ pub fn analyze_clean_with_image(
         .iter()
         .map(|module| module.entries.len())
         .sum::<usize>();
+    // The executable stub scan is OFF here, and that is why `clean` sees 2 VM
+    // entries where `report --all` sees 814: every one of those comes from this
+    // scan, as `VmEntrySource::ExecutableScan` with
+    // `reachability=UnprovenExecutableCandidate`. They are byte-pattern
+    // CANDIDATES, so splicing native code over one is unsound in exactly the way
+    // the "entry path family is not proven safe for native replacement" blocker
+    // describes.
+    //
+    // Turning the scan ON was measured and changes NOTHING: `vm_entries` goes
+    // 2 -> 814 and `routines` stays 4. Replacement here is driven from the
+    // module entry point -- the DllMain reason family (`native_rdx_initial`
+    // 0..3) plus the nested entries its continuations reach -- not from a
+    // function inventory. So feeding arbitrary discovered entries in has nowhere
+    // to go, and raising N1 cannot produce more devirtualized output by itself.
+    // What that needs is a PROVEN function inventory (real call site, proven
+    // entry address, recovered calling convention) wired into `reintegrate`.
     let discovery = discover_vm_entries(
         &pe,
         VmDiscoveryLimits {
@@ -926,7 +998,39 @@ pub fn analyze_clean_with_image(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(base.max_steps);
-        let opts = vmpx_emulate::DetonateOptions { export_reference, max_steps, ..base };
+        // `capture_globals` is CALLER-DRIVEN: the emulator captures only the
+        // (address, length) pairs it is asked for. Passing the default empty list
+        // meant `observed globals=0` at every step budget, so the globals bridge
+        // looked ineffective when it had simply never been told what to watch.
+        //
+        // Only a read at a CONSTANT address is a global a later run can supply.
+        // Measured on systems.xpl, of 270 untracked reads that block replacement
+        // just 22 are constant-addressed; the other ~138 are rooted in a caller
+        // register (`native_rsi_initial` and friends), so they are caller data
+        // with a different address per call site and no observation can bind
+        // them. Sizing that first is why this is worth ~22 entries, not 143.
+        //
+        // Addresses come from a prior static pass, which is the honest order for
+        // an observed-tier assist: let static recovery say what it could not
+        // resolve, then watch exactly those slots. Within one invocation the
+        // detonation runs before any static recovery, so they arrive by knob.
+        let capture_globals = dynamic_capture_requests(&mut warnings);
+        let opts = vmpx_emulate::DetonateOptions {
+            export_reference,
+            max_steps,
+            capture_globals,
+            // The VM observer is caller-driven: with no dispatcher configured,
+            // `observed branch-target edges` and `observed loop depths` are
+            // structurally 0 no matter how far the run gets -- measured at a 20B
+            // step budget, with the run well past the protector LZMA init
+            // (rip-sample concentration 5.9%). `vm_discover` runs the structural
+            // survey pass first and builds the specs from it, which is what
+            // makes those two seed channels able to report anything at all. It
+            // costs a second detonation; Observed tier only, so the sound path
+            // and its blockers are untouched.
+            vm_discover: true,
+            ..base
+        };
         match vmpx_emulate::detonate(&input_pe, &opts) {
             Ok(result) => {
                 warnings.push(format!(
@@ -972,8 +1076,9 @@ pub fn analyze_clean_with_image(
                 result.observed.imports
             }
             Err(error) => {
-                warnings
-                    .push(format!("[dynamic][experimental] detonation could not start: {error:?}"));
+                warnings.push(format!(
+                    "[dynamic][experimental] detonation could not start: {error:?}"
+                ));
                 Vec::new()
             }
         }
@@ -1031,6 +1136,10 @@ pub fn analyze_clean_with_image(
     let mut header_entry_candidate: Option<vmpx_vm::VmEntryCandidate> = None;
     // Per header path: its single-resolved continuation RVA, or None.
     let mut oep_paths: Vec<Option<Rva>> = Vec::new();
+    // Positional against `oep_paths`: a path whose VM exit is a proven
+    // zero-seed exception unwind returns to its caller and never transfers into
+    // original native code, so it supplies no entry-point candidate.
+    let mut oep_path_returns: Vec<bool> = Vec::new();
     // Unknown counts as incomplete: a group only skips its dispatcher fallback
     // when its family was proven complete.
     let mut header_family_complete = false;
@@ -1070,6 +1179,33 @@ pub fn analyze_clean_with_image(
                             continuation_targets
                                 .as_ref()
                                 .and_then(single_continuation_rva),
+                        );
+                        // A path whose exit resolves to NO image target and
+                        // whose fault provably unwinds to the caller is a
+                        // RETURN, not an unresolved transfer.
+                        //
+                        // The test is the absent continuation target, not an
+                        // absent native exit: measured on this sample all four
+                        // paths report `native_exit_recovered = true`, and the
+                        // two unwinding ones differ by having no image target
+                        // for their return address -- which is the caller's,
+                        // and therefore not in this image at all.
+                        oep_path_returns.push(
+                            continuation_targets
+                                .as_ref()
+                                .and_then(single_continuation_rva)
+                                .is_none()
+                                && exception_coverage_for_chain(&pe, &path.chain).iter().any(
+                                    |coverage| {
+                                        coverage.continuation_resolutions.iter().any(|resolution| {
+                                            resolution.status == RecoveryStatus::Recovered
+                                                && resolution.source
+                                                    == Some(
+                                                        vmpx_vm::ExceptionContinuationSource::ZeroSeedUnwind,
+                                                    )
+                                        })
+                                    },
+                                ),
                         );
                         let mut issues = live.issues.clone();
                         if path.chain.stop_reason == VmProfileChainStop::SymbolicExecutionFailure {
@@ -1344,12 +1480,7 @@ pub fn analyze_clean_with_image(
                 .collect(),
         )]);
         let limits = EntryPathRecoveryLimits {
-            chain: VmProfileExplorerLimits {
-                max_segments: 32,
-                max_instructions_per_segment: 2_048,
-                max_total_instructions: 8_192,
-                ..VmProfileExplorerLimits::default()
-            },
+            chain: chain_limits(),
             ..EntryPathRecoveryLimits::default()
         };
         let report = match recover_entry_paths(&pe, entry, &domains, limits) {
@@ -1996,9 +2127,12 @@ pub fn analyze_clean_with_image(
     }
     let verified_noop = protection.verdict == DetectionVerdict::NoStrongEvidence
         && protection.image_layout == ImageLayout::ConventionalFile;
-    let oep_decision = decide_oep(&oep_paths, header_family_complete, |rva| {
-        is_native_continuation(&pe, rva)
-    });
+    let oep_decision = decide_oep_with_returns(
+        &oep_paths,
+        &oep_path_returns,
+        header_family_complete,
+        |rva| is_native_continuation(&pe, rva),
+    );
     if let (Some(bytes), Some(oep), false) = (
         reintegrated.as_mut(),
         oep_decision.recovered_entry,
@@ -2314,6 +2448,14 @@ pub(crate) fn replacement_config(
     // to the caller. Resolve that continuation so the replacement can
     // tail-jump into it after restoring the exit state, which is what makes
     // it a drop-in for the VM entry.
+    // Only the single-proven-target form is wired. Routing the proven-but-
+    // multi-target case through `ReplacementContinuation::Computed` was built and
+    // MEASURED on systems.xpl: +0, census byte-identical, `recovered` still 20,
+    // `.vmpx0` unchanged. The reason is structural rather than incidental --
+    // `replacement_config` is only reached by exits that already survived
+    // recovery, and those all resolve to one target; the refusals that would
+    // benefit never get this far. Reverted rather than left as dead code whose
+    // only live risk is emitting a transfer where an ordinary return belongs.
     let continuation = vmpx_vm::recover_modulo_image_targets(
         pe,
         &exit.return_address,
@@ -2322,7 +2464,7 @@ pub(crate) fn replacement_config(
     .ok()
     .filter(|report| report.complete && report.targets.len() == 1)
     .map(|report| report.targets[0].va)
-    .map(|va| va.0);
+    .map(|va| vmpx_vmlift::ReplacementContinuation::Address(va.0));
     vmpx_vmlift::ReplacementConfig {
         inputs: inputs.to_vec(),
         max_expression_nodes: 200_000,
@@ -2575,6 +2717,29 @@ fn layout_reintegration_payload(
 const NATIVE_RDX_DOMAIN: std::ops::RangeInclusive<u64> = 0..=3;
 
 /// Reason-domain assignments and limits used to recover a DLL entry's paths.
+/// Integer multiplier from `var`, default 1. Mirrors `report_cmd::env_scale`,
+/// which the CFG caps already use; the entry-path chain had no knob at all.
+pub(crate) fn chain_scale(var: &str) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+/// The chain caps for entry-path recovery, scaled by `VMPX_CHAIN_SEGMENTS` and
+/// `VMPX_CHAIN_INSTRUCTIONS`.
+pub(crate) fn chain_limits() -> VmProfileExplorerLimits {
+    let segments = chain_scale("VMPX_CHAIN_SEGMENTS");
+    let instructions = chain_scale("VMPX_CHAIN_INSTRUCTIONS");
+    VmProfileExplorerLimits {
+        max_segments: 32usize.saturating_mul(segments),
+        max_instructions_per_segment: 2_048usize.saturating_mul(instructions),
+        max_total_instructions: 8_192usize.saturating_mul(instructions),
+        ..VmProfileExplorerLimits::default()
+    }
+}
+
 pub(crate) fn dll_entry_recovery_inputs() -> (BTreeMap<String, Vec<Expr>>, EntryPathRecoveryLimits)
 {
     let domains = BTreeMap::from([(
@@ -2584,12 +2749,7 @@ pub(crate) fn dll_entry_recovery_inputs() -> (BTreeMap<String, Vec<Expr>>, Entry
             .collect(),
     )]);
     let limits = EntryPathRecoveryLimits {
-        chain: VmProfileExplorerLimits {
-            max_segments: 32,
-            max_instructions_per_segment: 2_048,
-            max_total_instructions: 8_192,
-            ..VmProfileExplorerLimits::default()
-        },
+        chain: chain_limits(),
         ..EntryPathRecoveryLimits::default()
     };
     (domains, limits)

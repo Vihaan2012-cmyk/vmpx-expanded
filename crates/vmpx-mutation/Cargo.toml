@@ -13,3 +13,7 @@ vmpx-vm = { path = "../vmpx-vm" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# examples only: the relocator writes a rebuilt image.
+vmpx-rebuild = { path = "../vmpx-rebuild" }

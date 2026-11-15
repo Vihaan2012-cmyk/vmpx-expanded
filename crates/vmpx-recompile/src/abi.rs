@@ -69,9 +69,13 @@ pub(crate) fn operation_register_accesses(
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        // Register-transparent: saves and restores every register it touches,
+        // so it reads and writes no virtual register.
+        | Operation::Rdtsc { .. }
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
+        | Operation::WideMultiply { .. }
         | Operation::ReturnPopping { .. }
         | Operation::ReturnRetaining { .. }
         | Operation::Return => {}
@@ -305,9 +309,11 @@ fn validate_operation_widths(operation: &Operation) -> Result<(), CompileError> 
         | Operation::JumpToAddress(_)
         | Operation::BranchIf { .. }
         | Operation::RestoreFlags { .. }
+        | Operation::Rdtsc { .. }
         | Operation::Cpuid { .. }
         | Operation::MultiplyFlags { .. }
         | Operation::UnsignedDivide { .. }
+        | Operation::WideMultiply { .. }
         | Operation::ReturnPopping { .. }
         | Operation::ReturnRetaining { .. }
         | Operation::Return => Ok(()),
@@ -418,6 +424,11 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
                 })?;
                 state.insert(*slot, stored_bytes);
             }
+            Operation::Rdtsc { out } => {
+                // Writes the whole qword; reads nothing.
+                let existing = state.get(out).copied().unwrap_or(0);
+                state.insert(*out, existing.max(8));
+            }
             Operation::Cpuid {
                 leaf,
                 subleaf,
@@ -464,6 +475,32 @@ fn validate_spill_initialization(function: &Function) -> Result<(), CompileError
                 }
                 let existing = state.get(out_flags).copied().unwrap_or(0);
                 state.insert(*out_flags, existing.max(8));
+            }
+            Operation::WideMultiply {
+                width,
+                left,
+                right,
+                out_low,
+                out_high,
+                ..
+            } => {
+                let operand_bytes = u8::try_from(width.bits() / 8)
+                    .map_err(|_| CompileError::UnsupportedWidth { width: *width })?;
+                for slot in [left, right] {
+                    let initialized_bytes = state.get(slot).copied().unwrap_or(0);
+                    if initialized_bytes < operand_bytes {
+                        return Err(CompileError::UninitializedSpill {
+                            operation_index: index,
+                            slot: *slot,
+                            initialized_bytes,
+                            required_bytes: operand_bytes,
+                        });
+                    }
+                }
+                for slot in [out_low, out_high] {
+                    let existing = state.get(slot).copied().unwrap_or(0);
+                    state.insert(*slot, existing.max(8));
+                }
             }
             Operation::UnsignedDivide {
                 width,
@@ -743,6 +780,9 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
             Operation::SpillLoad { slot, .. } | Operation::SpillStore { slot, .. } => {
                 let _ = spill_displacement(&function.frame, *slot)?;
             }
+            Operation::Rdtsc { out } => {
+                let _ = spill_displacement(&function.frame, *out)?;
+            }
             Operation::Cpuid {
                 leaf,
                 subleaf,
@@ -762,6 +802,17 @@ pub(crate) fn validate(function: &Function) -> Result<ValidatedFunction, Compile
                 ..
             } => {
                 for slot in [left, right, out_flags] {
+                    let _ = spill_displacement(&function.frame, *slot)?;
+                }
+            }
+            Operation::WideMultiply {
+                left,
+                right,
+                out_low,
+                out_high,
+                ..
+            } => {
+                for slot in [left, right, out_low, out_high] {
                     let _ = spill_displacement(&function.frame, *slot)?;
                 }
             }

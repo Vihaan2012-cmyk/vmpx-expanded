@@ -1,4 +1,4 @@
-// User-function devirt coverage: measures the EXPORTED virtualized functions
+﻿// User-function devirt coverage: measures the EXPORTED virtualized functions
 // (export -> [jmp ->] `push <seed>; call <wrapper>` stub), not the VMProtect
 // runtime scaffold that `discover_vm_entries` / `xpl_coverage` sweeps.
 // Static only. Per-entry wall-clock cap via XPL_ENTRY_TIMEOUT_SECS (default 60).
@@ -158,7 +158,15 @@ fn tier(a: &[VmCfgAssumption]) -> &'static str {
             | VmCfgAssumption::ObservedBranchTarget
             | VmCfgAssumption::AssumesDynamicBranchTargetsComplete => 3,
             VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack
-            | VmCfgAssumption::AssumesImageProtectionStable => 2,
+            | VmCfgAssumption::AssumesExternalStoresDisjointFromFreshAllocations
+            | VmCfgAssumption::AssumesStalledBlockExits
+            | VmCfgAssumption::AssumesNullReadFaultExitsViaSeh
+            | VmCfgAssumption::AssumesVmStackFramePrivate
+            | VmCfgAssumption::AssumesImageProtectionStable
+            | VmCfgAssumption::AssumesCrossVmSectionContinuation
+            | VmCfgAssumption::AssumesHandlerConditionalArm
+            | VmCfgAssumption::AssumesTaintedBranchStateSufficient
+            | VmCfgAssumption::AssumesIndexedStoreInBounds => 2,
             VmCfgAssumption::PreferredImageBase | VmCfgAssumption::OverApproximatedEnvironmentGate => 1,
         });
     }

@@ -794,7 +794,12 @@ impl<'a> PeImage<'a> {
         Ok(functions)
     }
 
-    fn parse_relocations(&self) -> Result<Vec<BaseRelocationBlock>, PeError> {
+    /// Parses the base-relocation directory (empty when absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a relocation block is malformed or unmapped.
+    pub fn parse_relocations(&self) -> Result<Vec<BaseRelocationBlock>, PeError> {
         let Some(directory) = self.directory(IMAGE_DIRECTORY_ENTRY_BASERELOC) else {
             return Ok(Vec::new());
         };

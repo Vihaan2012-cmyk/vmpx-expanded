@@ -127,6 +127,11 @@ pub(crate) enum K {
     Pushfq,
     Setcc,
     Cmov,
+    /// Two-operand `imul r, r` / `imul r, m`. The LZMA range decoder the
+    /// protector unpacks with runs one of these per decoded bit, which made
+    /// `Imul` 38% of all generic-path steps on systems.xpl.
+    ImulRR,
+    ImulRM,
 }
 
 /// Pre-resolved instruction: kind, up to two operands and a few scalars whose
@@ -149,6 +154,9 @@ pub(crate) struct Pre {
     /// The flags this op produces are overwritten, unobserved, by a later op in
     /// its block (set when placed in a block).
     pub nf: bool,
+    /// This `Jcc`'s flags come from the op immediately before it in the block,
+    /// so the pair could be evaluated as one.
+    pub pairable: bool,
     /// May write memory or run a hook (so guest code may have changed after it).
     pub chk: bool,
     pub a: Opnd,
@@ -170,6 +178,7 @@ impl Pre {
         flow: false,
         fj: false,
         nf: false,
+        pairable: false,
         chk: true,
         a: NONE,
         b: NONE,
@@ -346,6 +355,7 @@ pub(crate) fn resolve(ins: &Instruction) -> Pre {
                 | K::CmpRI
                 | K::TestRR
                 | K::TestRI
+                | K::ImulRR
                 | K::AdcSbbRR
                 | K::AdcSbbRI
         );
@@ -365,6 +375,24 @@ fn resolve_kind(ins: &Instruction, p: &mut Pre) -> Option<K> {
     let mn = ins.mnemonic();
     Some(match mn {
         M::Nop => K::Nop,
+        // Only the two-operand forms: one-operand `imul` writes RDX:RAX and the
+        // three-operand form needs a third slot, so both stay generic.
+        M::Imul if ins.op_count() == 2 => {
+            let n = op_bytes(ins, 0)?;
+            let a = opnd(ins, 0, n)?;
+            let b = opnd(ins, 1, n)?;
+            if a.tag != T_REG {
+                return None;
+            }
+            p.n = n;
+            p.a = a;
+            p.b = b;
+            match b.tag {
+                T_REG => K::ImulRR,
+                T_MEM => K::ImulRM,
+                _ => return None,
+            }
+        }
         M::Mov => {
             let n = op_bytes(ins, 0)?;
             let a = opnd(ins, 0, n)?;

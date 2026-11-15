@@ -32,6 +32,9 @@ fn slices_ida_verified_add_handler_without_byte_signatures() {
         &pe,
         entry,
         DirectJumpTraceLimits {
+            follow_conditional_fallthrough: false,
+            follow_conditional_target: false,
+            max_conditional_continuations: 1,
             max_fragments: 1_024,
             max_instructions: 50_000,
             max_instructions_per_fragment: 10_000,
@@ -147,6 +150,9 @@ fn slices_ida_verified_add_handler_without_byte_signatures() {
             &pe,
             handler_entry,
             DirectJumpTraceLimits {
+                follow_conditional_fallthrough: false,
+                follow_conditional_target: false,
+                max_conditional_continuations: 1,
                 max_fragments: 1_024,
                 max_instructions: 50_000,
                 max_instructions_per_fragment: 10_000,
@@ -285,6 +291,9 @@ fn slices_ida_verified_add_handler_without_byte_signatures() {
                 ],
                 live_out_rflags: 0,
                 trace_limits: DirectJumpTraceLimits {
+                    follow_conditional_fallthrough: false,
+                    follow_conditional_target: false,
+                    max_conditional_continuations: 1,
                     max_fragments: 1_024,
                     max_instructions: 50_000,
                     max_instructions_per_fragment: 10_000,

@@ -38,10 +38,19 @@ pub enum UnpackOutcome {
     Unsupported { kind: PackerKind, confidence: u8 },
     /// Detected + routed, reached OEP under the bound, and the memory dump was
     /// rebuilt into a (loader-valid) PE. OBSERVED artifact.
-    UnpackedToOep { kind: PackerKind, oep: u64, steps: usize, pe_bytes: Vec<u8> },
+    UnpackedToOep {
+        kind: PackerKind,
+        oep: u64,
+        steps: usize,
+        pe_bytes: Vec<u8>,
+    },
     /// Detected + routed, but OEP was not reached within the step bound. Fail
     /// closed: no output.
-    OepNotReached { kind: PackerKind, steps: usize, stop: Stop },
+    OepNotReached {
+        kind: PackerKind,
+        steps: usize,
+        stop: Stop,
+    },
     /// Detected + routed, but the detonation could not even start.
     NotStarted { kind: PackerKind, reason: String },
     /// Detected + routed + reached OEP, but the dump could not be rebuilt.
@@ -58,16 +67,26 @@ pub fn route_generic_unpack(pe: &PeImage<'_>, max_steps: u64) -> UnpackOutcome {
     match kind {
         PackerKind::None => return UnpackOutcome::NoPacker,
         k if !k.routes_to_generic_unpack() => {
-            return UnpackOutcome::Unsupported { kind, confidence: detected.confidence };
+            return UnpackOutcome::Unsupported {
+                kind,
+                confidence: detected.confidence,
+            };
         }
         _ => {}
     }
 
-    let opts = DetonateOptions { max_steps, dump: true, ..DetonateOptions::default() };
+    let opts = DetonateOptions {
+        max_steps,
+        dump: true,
+        ..DetonateOptions::default()
+    };
     let result = match detonate(pe, &opts) {
         Ok(result) => result,
         Err(error) => {
-            return UnpackOutcome::NotStarted { kind, reason: format!("{error:?}") };
+            return UnpackOutcome::NotStarted {
+                kind,
+                reason: format!("{error:?}"),
+            };
         }
     };
 
@@ -75,14 +94,24 @@ pub fn route_generic_unpack(pe: &PeImage<'_>, max_steps: u64) -> UnpackOutcome {
         (Some(oep), Some(dump)) => {
             let size_of_image = u64::from(pe.optional.size_of_image);
             match rebuild_module_pe(&dump, size_of_image) {
-                Ok(pe_bytes) => {
-                    UnpackOutcome::UnpackedToOep { kind, oep, steps: result.steps, pe_bytes }
-                }
-                Err(error) => UnpackOutcome::RebuildFailed { kind, reason: error.to_string() },
+                Ok(pe_bytes) => UnpackOutcome::UnpackedToOep {
+                    kind,
+                    oep,
+                    steps: result.steps,
+                    pe_bytes,
+                },
+                Err(error) => UnpackOutcome::RebuildFailed {
+                    kind,
+                    reason: error.to_string(),
+                },
             }
         }
         // No OEP observed within the bound (or no dump): fail closed.
-        _ => UnpackOutcome::OepNotReached { kind, steps: result.steps, stop: result.stop },
+        _ => UnpackOutcome::OepNotReached {
+            kind,
+            steps: result.steps,
+            stop: result.stop,
+        },
     }
 }
 
@@ -154,7 +183,12 @@ mod tests {
         let data = synth_packed_pe((b"UPX1", b"UPX0"), RX);
         let pe = PeImage::parse(&data).expect("parses");
         match route_generic_unpack(&pe, PACKER_UNPACK_MAX_STEPS) {
-            UnpackOutcome::UnpackedToOep { kind, oep, pe_bytes, .. } => {
+            UnpackOutcome::UnpackedToOep {
+                kind,
+                oep,
+                pe_bytes,
+                ..
+            } => {
                 assert_eq!(kind, PackerKind::Upx);
                 assert_eq!(oep, OEP_TARGET);
                 // Rebuilt bytes reparse as a PE (what the CLI verifies on disk).

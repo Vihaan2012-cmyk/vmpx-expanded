@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+title: "expanded: static deobfuscation of protected x64 Windows binaries"
+abstract: >-
+  A family of static, fail-closed deobfuscators for protected binaries. vmpx-expanded
+  strips VMProtect, recovers the entry point and encrypted import table, relocates
+  mutated native code, and devirtualizes the guards in one command, without ever
+  executing the protected sample. tigress-expanded (planned) targets the Tigress
+  C obfuscator.
+type: software
+authors:
+  - name: "Vihaan2012-cmyk"
+    # Replace with your real name if you prefer:
+    # family-names: ...
+    # given-names: ...
+license: MIT
+repository-code: "https://github.com/Vihaan2012-cmyk/vmpx-expanded"
+url: "https://github.com/Vihaan2012-cmyk/vmpx-expanded"
+keywords:
+  - reverse-engineering
+  - devirtualization
+  - deobfuscation
+  - vmprotect
+  - tigress
+  - static-analysis
+  - binary-analysis
+  - rust

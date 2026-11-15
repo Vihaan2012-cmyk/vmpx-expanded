@@ -69,17 +69,28 @@ pub fn semantic_lowering(semantic: VmHandlerSemantic) -> SemanticLowering {
         | S::RotateRight
         | S::MemoryLoad
         | S::MemoryStore => L::Computed,
-        S::Cpuid | S::GsRelativeLoad => L::Passthrough { boundary: true },
+        // rdtsc joins cpuid and the gs load: the executor cannot compute it, so it
+        // names it with an opaque intrinsic and the replacement re-emits the real
+        // instruction. Behaviour-preserving by identity, and a trusted
+        // environment boundary rather than a proven value.
+        S::Cpuid | S::GsRelativeLoad | S::ReadTimestampCounter => {
+            L::Passthrough { boundary: true }
+        }
         S::ShiftLeftDouble | S::ShiftRightDouble | S::PopFlags => {
             L::Passthrough { boundary: false }
         }
         S::VmExit => L::BlockExit,
-        S::ReadTimestampCounter => L::Refused("rdtsc has no lowering yet"),
         // Wide multiply and unsigned divide are symbolically executed to packed
         // double-width results and their flag words; `expr_codegen` lowers each by
         // re-emitting the real `mul`/`imul`/`div` (see those lowerings).
         S::Mul | S::SignedMultiply | S::UnsignedDivide => L::Computed,
-        S::TableChecksum => L::Refused("table checksum has no lowering"),
+        // The executor folds the checksum concretely when its pointer, length and
+        // table bytes are all constant (`execute_table_checksum`), which on a
+        // static image is the usual case — the result is then a plain constant
+        // the backend materializes. When any input byte is symbolic it yields the
+        // recurrence intrinsic instead, which the backend cannot compute, so that
+        // case still fails closed rather than inventing a value.
+        S::TableChecksum => L::Computed,
         S::ConditionalBranch | S::UnconditionalBranch | S::NativeCall => {
             L::Refused("control transfer needs the CFG lift")
         }
@@ -217,6 +228,28 @@ pub struct RegionExit {
 pub enum RecoveredExit {
     Callee(StubExit),
     Region(RegionExit),
+    /// The VM wrote a computed target into a return slot ABOVE the entry stack
+    /// pointer and transfers to it. Like [`RecoveredExit::Region`] this does not
+    /// return to the caller, but nothing is staged below the entry frame, so it
+    /// carries only the target. Kept separate from `Region` precisely because
+    /// `RegionExit::staged` drives how many bytes native reintegration retains,
+    /// and this case stages none.
+    Trampoline(TrampolineExit),
+}
+
+#[derive(Debug)]
+pub struct TrampolineExit {
+    pub registers: BTreeMap<X64NativeRegister, Expr>,
+    /// Computed exit flags; part of the trampoline-exit description, not yet read by a consumer.
+    #[allow(dead_code)]
+    pub rflags: Expr,
+    /// The computed address control transfers to.
+    pub target: Expr,
+    /// Signed byte offset of the `ret` slot from the initial VM stack pointer,
+    /// or `None` when the final VSP is not rooted at the entry frame at all and
+    /// the slot therefore has no position in those coordinates.
+    #[allow(dead_code)]
+    pub slot_offset: Option<i64>,
 }
 
 fn add_offset(base: &Expr, offset: u32) -> Result<Expr, DecodedLiftError> {
@@ -235,10 +268,13 @@ pub fn recover_stub_exit(
     frame_cells: usize,
     top_offset: u64,
 ) -> Result<StubExit, DecodedLiftError> {
-    match recover_exit(symbolic, exit, frame_cells, top_offset)? {
+    match recover_exit(symbolic, exit, frame_cells, top_offset, RegionStaging::Full)? {
         RecoveredExit::Callee(exit) => Ok(exit),
         RecoveredExit::Region(_) => Err(DecodedLiftError::NotCalleeReturn(
             "the return address was written by the VM, not read from caller stack".to_owned(),
+        )),
+        RecoveredExit::Trampoline(_) => Err(DecodedLiftError::NotCalleeReturn(
+            "the exit transfers to a computed continuation above the entry frame".to_owned(),
         )),
     }
 }
@@ -265,11 +301,24 @@ pub fn recover_stub_exit(
 /// Refuses a return through a VM-written slot outside the entry frame that is
 /// not the proven caller return, an untracked staged word, or an inconsistent
 /// layout.
+/// How a region (staged-continuation) exit is recovered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegionStaging {
+    /// Stage every word in `[return_slot, entry_sp)`, failing closed if any is
+    /// untracked. For a consumer that reproduces the staged frame on the stack.
+    Full,
+    /// Require only word zero (the continuation target). For a consumer that
+    /// transfers through the target with a caller-level RSP and never reproduces
+    /// the staged scratch below the entry SP (the rolled tail-transfer emitter).
+    TargetOnly,
+}
+
 pub fn recover_exit(
     symbolic: &vmpx_vm::SymbolicVmExecutionReport,
     exit: &VmExitReport,
     frame_cells: usize,
     top_offset: u64,
+    region_staging: RegionStaging,
 ) -> Result<RecoveredExit, DecodedLiftError> {
     let fail = |message: String| DecodedLiftError::NativeExit(message);
     if exit.status != vmpx_vm::RecoveryStatus::Recovered {
@@ -290,12 +339,56 @@ pub fn recover_exit(
     {
         return Err(fail("exit does not restore every register exactly once".to_owned()));
     }
-    let final_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial")
-        .ok_or_else(|| fail("final VSP is not an affine offset of the entry frame".to_owned()))?;
-    let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
+    // Only the entry-frame CLASSIFICATION needs this; every slot below is read
+    // through `final_vsp` itself and so does not care what it is rooted at.
+    let placed_offset = symbolic_pointer_offset(&symbolic.final_vsp, "vsp_initial");
+    // The RETURN slot is read strictly, and that distinction is load-bearing:
+    // an untracked return slot means the VM never wrote it, which is a CLEAN
+    // callee return (the arm below matches on exactly that error). Handing back
+    // an opaque load there turns every clean return into a trampoline.
+    let read_strict = |offset: u32| -> Result<Expr, DecodedLiftError> {
+        let address = add_offset(&symbolic.final_vsp, offset)?;
         symbolic
-            .read_tracked_memory(add_offset(&symbolic.final_vsp, offset)?, BitWidth::W64)
+            .read_tracked_memory(address, BitWidth::W64)
             .map_err(|error| fail(error.to_string()))
+    };
+    let read = |offset: u32| -> Result<Expr, DecodedLiftError> {
+        let address = add_offset(&symbolic.final_vsp, offset)?;
+        if restore_untracked_slots()
+            && symbolic
+                .read_tracked_memory(address.clone(), BitWidth::W64)
+                .is_err()
+        {
+            // The VM reads this address at exit and the value is unknown. The
+            // decompiler lowers a `memory_load_epoch_N` intrinsic to a real
+            // load, so this prints what actually happens instead of discarding
+            // the function.
+            return Ok(Expr::intrinsic(
+                BitWidth::W64,
+                format!("memory_load_epoch_{}", symbolic.memory_epoch),
+                vec![address],
+            ));
+        }
+        symbolic
+            .read_tracked_memory(address, BitWidth::W64)
+            .map_err(|error| {
+                // A restore slot is written by the entry stub, so a MISSING one
+                // means something discarded it rather than that it was never
+                // there. Say which havoc, or the message reads like a lift bug.
+                let havoc = symbolic
+                    .memory_havocs
+                    .iter()
+                    .rev()
+                    .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                    .map_or_else(
+                        || "no aliasing havoc recorded".to_owned(),
+                        |havoc| havoc.cause.clone(),
+                    );
+                fail(format!(
+                    "{error} [slot {offset:#x}, tainted={}, {havoc}]",
+                    symbolic.memory_tainted
+                ))
+            })
     };
     let mut registers = BTreeMap::new();
     for slot in &exit.restore_slots {
@@ -306,8 +399,33 @@ pub fn recover_exit(
     let entry_sp = i64::try_from(frame_cells * 8)
         .unwrap_or(i64::MAX)
         .saturating_add(top_offset.cast_signed());
+    let Some(final_offset) = placed_offset else {
+        // The final VSP is rooted somewhere other than the entry frame —
+        // measured on systems.xpl it is `native_rbp_initial` every time, an exit
+        // that restores RSP from the caller's frame pointer. Nothing can be
+        // placed against the entry frame, so no callee return can be claimed.
+        // The transfer itself is still fully recovered though: the registers and
+        // the slot's value are read through `final_vsp` directly. Hand that back
+        // as a trampoline when the value is not the caller's own return address,
+        // and keep refusing when it is, because then it IS a return and the
+        // unwind amount is exactly what could not be computed.
+        return match read_strict(return_offset) {
+            Ok(value) if !is_caller_return_address(&value) => {
+                Ok(RecoveredExit::Trampoline(TrampolineExit {
+                    registers,
+                    rflags,
+                    target: value,
+                    slot_offset: None,
+                }))
+            }
+            _ => Err(fail(format!(
+                "final VSP is not an affine offset of the entry frame (roots {:?})",
+                symbolic.final_vsp.dependencies()
+            ))),
+        };
+    };
     let return_slot = final_offset + i64::from(return_offset);
-    match read(return_offset) {
+    match read_strict(return_offset) {
         Err(DecodedLiftError::NativeExit(message)) if message.contains("no byte at address") => {}
         Err(error) => return Err(error),
         // The VM wrote the return slot below the entry stack pointer: the target
@@ -316,8 +434,21 @@ pub fn recover_exit(
         // inside the captured entry frame or below the captured VSP (the VM built
         // a fresh exit frame there); either way every staged word must be a
         // tracked value or the lift fails closed.
-        Ok(_) if return_slot < entry_sp && return_slot % 8 == 0 => {
+        Ok(target_value) if return_slot < entry_sp && return_slot % 8 == 0 => {
             let staged_words = entry_sp.checked_sub(return_slot).map_or(0, |span| span / 8);
+            // A consumer that transfers through the target with a caller-level RSP
+            // (the rolled emitter) uses only word zero; the words above it are the
+            // VM's own scratch below the entry SP, which the emission never
+            // reproduces. Requiring them tracked fails the exit closed for nothing.
+            // A consumer that reproduces the staged frame asks for `Full`.
+            if region_staging == RegionStaging::TargetOnly {
+                return Ok(RecoveredExit::Region(RegionExit {
+                    registers,
+                    rflags,
+                    staged: vec![target_value],
+                    slot_offset: return_slot,
+                }));
+            }
             if staged_words > MAX_STAGED_CONTINUATION_WORDS {
                 return Err(fail(format!(
                     "region continuation stages {staged_words} words, over the {MAX_STAGED_CONTINUATION_WORDS} limit"
@@ -331,6 +462,12 @@ pub fn recover_exit(
                     Expr::constant(BitWidth::W64, (slot - final_offset).cast_unsigned()),
                 )
                 .map_err(|error| fail(error.to_string()))?;
+                // Strictly tracked, deliberately. A staged word is CONTROL
+                // FLOW -- word zero of a region exit IS the continuation target
+                // -- so an unknown one cannot be lowered as a load the way a
+                // register-restore slot can. Letting one through made
+                // `an_unproven_computed_return_refuses` lift an unproven
+                // computed return, which is exactly what it guards.
                 staged.push(
                     symbolic
                         .read_tracked_memory(address, BitWidth::W64)
@@ -349,7 +486,37 @@ pub fn recover_exit(
         // stack. Popping it is byte-identical to popping the untouched caller
         // slot, so this is a clean callee return.
         Ok(value) if return_slot == entry_sp && is_caller_return_address(&value) => {}
-        Ok(_) => {
+        // At or above the entry stack pointer with a VM-written value: the VM
+        // computed where to go and will transfer there. Fully recovered -- the
+        // target, the registers and the flags are all in hand -- so it is handed
+        // back rather than refused, and each consumer decides whether it can use
+        // it.
+        //
+        // `==` belongs here as much as `>`. The arm above already took the case
+        // where the slot holds the caller's own return address; reaching this one
+        // AT the entry stack pointer means the VM overwrote that slot with a
+        // value it computed, and the `ret` will go there. Probed on
+        // vm_c446e48: slot 0x98 == entry_sp, value an arithmetic expression over
+        // `memory_load_epoch_1583`, which is a computed target and not a return
+        // address however it is read. Refusing it threw away a fully recovered
+        // exit on 12 entries.
+        Ok(value) if return_slot >= entry_sp && return_slot % 8 == 0 => {
+            return Ok(RecoveredExit::Trampoline(TrampolineExit {
+                registers,
+                rflags,
+                target: value,
+                slot_offset: Some(return_slot),
+            }));
+        }
+        Ok(value) => {
+            if std::env::var_os("VMPX_SEG_TRACE").is_some() {
+                let rendered = format!("{value:?}");
+                eprintln!(
+                    "[exit] return slot {return_slot} entry_sp {entry_sp} final {final_offset} deps {:?} value {}",
+                    value.dependencies(),
+                    &rendered[..rendered.len().min(400)]
+                );
+            }
             return Err(DecodedLiftError::NotCalleeReturn(
                 "the return address was written by the VM, not read from caller stack".to_owned(),
             ));
@@ -376,13 +543,46 @@ pub fn recover_exit(
 pub fn first_unliftable(
     instructions: &[DecodedVmInstruction],
 ) -> Option<(usize, VmHandlerSemantic, &'static str)> {
-    instructions
+    let found = instructions
         .iter()
         .enumerate()
         .find_map(|(index, instruction)| match semantic_lowering(instruction.semantic) {
             SemanticLowering::Refused(reason) => Some((index, instruction.semantic, reason)),
             _ => None,
-        })
+        });
+    if found.is_some() {
+        report_all_gaps(instructions);
+    }
+    found
+}
+
+/// Diagnostic: with `VMPX_LIFT_ALL_GAPS` set, reports EVERY distinct semantic in
+/// the stream that has no lowering, not just the first.
+///
+/// A refusal names one semantic, so fixing it and re-measuring is the only way
+/// to learn whether a second and a third sit behind it in the same block. That
+/// loop costs a build each time and has already been walked once here (rdtsc ->
+/// table checksum). This answers the depth in one run instead.
+fn report_all_gaps(instructions: &[DecodedVmInstruction]) {
+    if std::env::var_os("VMPX_LIFT_ALL_GAPS").is_none() {
+        return;
+    }
+    let mut gaps: BTreeMap<String, usize> = BTreeMap::new();
+    for instruction in instructions {
+        if let SemanticLowering::Refused(_) = semantic_lowering(instruction.semantic) {
+            *gaps.entry(format!("{:?}", instruction.semantic)).or_default() += 1;
+        }
+    }
+    let rendered: Vec<String> = gaps
+        .iter()
+        .map(|(semantic, count)| format!("{semantic}x{count}"))
+        .collect();
+    eprintln!(
+        "[liftgaps] instructions={} distinct_unliftable={} {}",
+        instructions.len(),
+        gaps.len(),
+        rendered.join(" ")
+    );
 }
 
 fn only_entry_registers(expression: &Expr, what: &str, uses_root: &mut bool) -> Result<(), DecodedLiftError> {
@@ -435,6 +635,12 @@ fn is_register(expression: &Expr, name: &str) -> bool {
 /// structural identity proves a VM-written return slot equals the standard
 /// callee return; a reconstructed address (e.g. relocation base plus a constant)
 /// is not accepted, so the lift fails closed on it.
+/// Whether an untracked register-restore slot is lowered as a load.
+fn restore_untracked_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
+}
+
 fn is_caller_return_address(expression: &Expr) -> bool {
     is_register(expression, "native_return_address_initial")
 }
@@ -590,7 +796,10 @@ mod tests {
             memory_tainted: false,
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
+            assumed_indexed_store_in_bounds: false,
             served_read_only_image: false,
+            protection_may_have_changed: false,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,
@@ -647,13 +856,17 @@ mod tests {
         let (symbolic, exit) = report(&target);
         // 12 cells, top_offset 0x28: entry stack pointer at 0x28 + 96 = 136 > 128.
         assert!(matches!(
-            recover_exit(&symbolic, &exit, 12, 0x28),
+            recover_exit(&symbolic, &exit, 12, 0x28, RegionStaging::Full),
             Ok(RecoveredExit::Region(_))
         ));
-        // Ignoring top_offset put the entry stack pointer at 96 < 128 and refused.
-        assert!(matches!(
-            recover_exit(&symbolic, &exit, 12, 0),
-            Err(DecodedLiftError::NotCalleeReturn(_))
+        // What `top_offset` is load-bearing for is the REGION classification:
+        // ignoring it puts the entry stack pointer at 96, below the slot at 128,
+        // so the slot reads as sitting in the caller's frame and nothing can be
+        // staged. It used to refuse outright; now the same misplacement comes
+        // back as a trampoline, so assert on what the offset actually decides.
+        assert!(!matches!(
+            recover_exit(&symbolic, &exit, 12, 0, RegionStaging::Full),
+            Ok(RecoveredExit::Region(_))
         ));
     }
 
@@ -665,22 +878,32 @@ mod tests {
         let return_address = Expr::register(BitWidth::W64, "native_return_address_initial");
         let (symbolic, exit) = report(&return_address);
         // 16 cells, top_offset 0: entry stack pointer at 128 == return slot.
-        match recover_exit(&symbolic, &exit, 16, 0) {
+        match recover_exit(&symbolic, &exit, 16, 0, RegionStaging::Full) {
             Ok(RecoveredExit::Callee(stub)) => assert_eq!(stub.return_pop, 0),
             other => panic!("expected a clean callee return, got {other:?}"),
         }
     }
 
-    // The same position, but the VM computed some other target: not provably the
-    // caller return, so it is refused (fail closed) rather than lifted as `ret`.
+    // The same position, but the VM computed some other target. This used to
+    // refuse, and the reason given was "rather than lifted as `ret`" -- the
+    // worry being that a computed target would be passed off as a clean return.
+    // A TRAMPOLINE does not do that: it carries the computed target explicitly,
+    // so the distinction the refusal was defending is kept while the exit stops
+    // being thrown away. The arm above still takes a provable caller return
+    // first, so a clean return can never arrive here.
     #[test]
-    fn a_written_slot_with_a_computed_non_return_target_is_refused() {
+    fn a_written_slot_with_a_computed_non_return_target_is_a_trampoline() {
         let computed = Expr::constant(BitWidth::W64, 0x1_8002_A700);
         let (symbolic, exit) = report(&computed);
-        assert!(matches!(
-            recover_exit(&symbolic, &exit, 16, 0),
-            Err(DecodedLiftError::NotCalleeReturn(_))
-        ));
+        match recover_exit(&symbolic, &exit, 16, 0, RegionStaging::Full) {
+            Ok(RecoveredExit::Trampoline(trampoline)) => {
+                assert_eq!(trampoline.target, computed);
+                // Exactly at the entry stack pointer, which is the case the
+                // `>` bound used to exclude.
+                assert_eq!(trampoline.slot_offset, Some(128));
+            }
+            other => panic!("expected a trampoline to the computed target, got {other:?}"),
+        }
     }
 
     // The VM built its exit frame below the captured VSP (`final_vsp` is negative
@@ -718,7 +941,10 @@ mod tests {
             memory_tainted: false,
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
+            assumed_indexed_store_in_bounds: false,
             served_read_only_image: false,
+            protection_may_have_changed: false,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,
@@ -733,7 +959,7 @@ mod tests {
             resolved_image_bytes: 0,
         };
         let (_, exit) = report(&Expr::constant(BitWidth::W64, 0));
-        match recover_exit(&symbolic, &exit, 17, 0) {
+        match recover_exit(&symbolic, &exit, 17, 0, RegionStaging::Full) {
             Ok(RecoveredExit::Region(region)) => {
                 assert_eq!(region.slot_offset, -104);
                 // staged spans the return slot up to the entry stack pointer.

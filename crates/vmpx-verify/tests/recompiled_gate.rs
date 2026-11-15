@@ -9,7 +9,7 @@ use vmpx_verify::equiv::{CellId, CellVerdict, EquivVerdict, Obligation, Verifier
 use vmpx_vm::{BinaryOp, BitWidth, Expr, NativeExitState, X64NativeRegister as R};
 use vmpx_vmlift::{
     CollectedEffects, CollectedStore, ExitSemantics, RecompiledPair, ReplacementConfig,
-    recompiled_pair,
+    ReplacementContinuation, recompiled_pair,
 };
 
 const W: BitWidth = BitWidth::W64;
@@ -77,6 +77,7 @@ fn with_store(mut vm: ExitSemantics) -> ExitSemantics {
         address: bin(BinaryOp::Add, reg(R::Rbx), k(8)),
         value: reg(R::Rsi),
         width: W,
+        epoch: 1,
     });
     vm
 }
@@ -90,7 +91,7 @@ fn config(vm: &ExitSemantics, restore_flags: bool) -> ReplacementConfig {
         max_expression_nodes: 10_000,
         max_spill_slots: 64,
         import_calls: BTreeMap::new(),
-        continuation: Some(CONTINUATION),
+        continuation: Some(ReplacementContinuation::Address(CONTINUATION)),
         effects: vm
             .effects
             .stores

@@ -291,6 +291,13 @@ pub enum Operation {
         destination: VirtualRegister,
         address: Address,
     },
+    /// `RDTSC` with the 64-bit counter written to a qword frame slot. It is
+    /// register-transparent in the same sense as [`Operation::Cpuid`]: `RAX` and
+    /// `RDX` carry the counter halves and are saved and restored around the
+    /// instruction.
+    Rdtsc {
+        out: SpillSlot,
+    },
     /// `CPUID` with the dword leaf and subleaf read from frame slots and the four
     /// dword results written to frame slots. It is register-transparent: every
     /// register it touches is saved and restored around the instruction.
@@ -329,6 +336,19 @@ pub enum Operation {
         out_quotient: SpillSlot,
         out_remainder: SpillSlot,
         out_flags: SpillSlot,
+    },
+    /// One-operand `MUL`/`IMUL` of two width-sized frame slots, writing the
+    /// double-width product's low and high halves (`RAX` and `RDX` after the
+    /// instruction) to two qword frame slots. Register-transparent: `RAX`/`RDX`
+    /// are saved and restored around it. The flags it leaves are discarded (a VM
+    /// that needs them emits a separate `MultiplyFlags`).
+    WideMultiply {
+        signed: bool,
+        width: Width,
+        left: SpillSlot,
+        right: SpillSlot,
+        out_low: SpillSlot,
+        out_high: SpillSlot,
     },
 }
 

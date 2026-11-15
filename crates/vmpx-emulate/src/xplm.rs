@@ -380,6 +380,9 @@ pub struct Xplm {
     features: BTreeSet<String>,
     next_tex: u32,
     sep_addr: Option<u64>,
+    /// Recorded sim/ dataref stream served on reads (observed tier). None on the
+    /// ordinary path, so behavior is unchanged when no recording is loaded.
+    replay: Option<crate::replay::Replay>,
 }
 
 impl Default for Xplm {
@@ -423,6 +426,7 @@ impl Xplm {
             features: BTreeSet::new(),
             next_tex: 1000,
             sep_addr: None,
+            replay: None,
         };
         for (name, h) in STUBS {
             x.register_stub("XPLM_64.dll", name, *h);
@@ -556,6 +560,25 @@ impl Xplm {
         let n = self.handle_names.get(&handle).cloned().unwrap_or_else(|| format!("?{handle:#x}"));
         *self.dataref_access.entry(n).or_insert(0) += 1;
     }
+
+    /// Loads a recorded sim/ dataref stream to serve on reads (observed tier).
+    pub fn set_replay(&mut self, r: crate::replay::Replay) {
+        self.replay = Some(r);
+    }
+
+    /// Recorded frame count (0 when no recording is loaded).
+    #[must_use]
+    pub fn replay_frames(&self) -> usize {
+        self.replay.as_ref().map_or(0, crate::replay::Replay::n_frames)
+    }
+
+    /// Advances the recording one frame, so the next dataref reads reflect the
+    /// next captured instant. No-op without a recording.
+    pub fn replay_advance(&mut self) {
+        if let Some(r) = self.replay.as_mut() {
+            r.advance();
+        }
+    }
 }
 
 // ---- handler helpers --------------------------------------------------------------------------
@@ -583,12 +606,34 @@ fn get_data(x: &mut Xplm, c: &mut Ctx) -> Ret {
     x.touch_dataref(c.a(0));
     Ret::int(0)
 }
+fn get_datai(x: &mut Xplm, c: &mut Ctx) -> Ret {
+    let h = c.a(0);
+    x.touch_dataref(h);
+    if let Some(name) = x.dataref_name(h).map(str::to_owned) {
+        if let Some(v) = x.replay.as_ref().and_then(|r| r.get_i32(&name)) {
+            return Ret::int(v);
+        }
+    }
+    Ret::int(0)
+}
 fn get_dataf(x: &mut Xplm, c: &mut Ctx) -> Ret {
-    x.touch_dataref(c.a(0));
+    let h = c.a(0);
+    x.touch_dataref(h);
+    if let Some(name) = x.dataref_name(h).map(str::to_owned) {
+        if let Some(v) = x.replay.as_ref().and_then(|r| r.get_f32(&name)) {
+            return Ret::f32(v);
+        }
+    }
     Ret::f32(0.0)
 }
 fn get_datad(x: &mut Xplm, c: &mut Ctx) -> Ret {
-    x.touch_dataref(c.a(0));
+    let h = c.a(0);
+    x.touch_dataref(h);
+    if let Some(name) = x.dataref_name(h).map(str::to_owned) {
+        if let Some(v) = x.replay.as_ref().and_then(|r| r.get_f64(&name)) {
+            return Ret::f64(v);
+        }
+    }
     Ret::f64(0.0)
 }
 fn set_data(x: &mut Xplm, c: &mut Ctx) -> Ret {
@@ -999,7 +1044,7 @@ const STUBS: &[(&str, Handler)] = &[
     ("XPLMFindDataRef", find_dataref),
     ("XPLMCanWriteDataRef", one),
     ("XPLMGetDataRefTypes", dataref_types),
-    ("XPLMGetDatai", get_data),
+    ("XPLMGetDatai", get_datai),
     ("XPLMGetDataf", get_dataf),
     ("XPLMGetDatad", get_datad),
     ("XPLMGetDatavi", get_data),

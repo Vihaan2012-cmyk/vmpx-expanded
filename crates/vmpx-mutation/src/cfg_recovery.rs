@@ -7,8 +7,8 @@ use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic,
 };
 use vmpx_disasm::{
-    Algebra, AlgebraError, BinOp, BlockSemantics, LiftError, LiftOptions, Resize, UnOp, Width,
-    lift_block_with, lift_bytes_with,
+    Algebra, AlgebraError, BinOp, BlockSemantics, Gpr, LiftError, LiftOptions, Resize, UnOp,
+    Width, lift_block_with, lift_bytes_with,
 };
 use vmpx_pe::{PeImage, Rva};
 use vmpx_vm::{BinaryOp, BitWidth, Expr, ExprKind, ResizeOp, UnaryOp};
@@ -116,6 +116,15 @@ pub struct CfgOptions {
     /// [`Terminator::Call`] (and continue at the next instruction) instead of
     /// refusing it. Only set it where the consumer models the call.
     pub model_calls: bool,
+    /// Record frame-versus-entry-pointer load/store pairs as
+    /// `BlockSemantics::deferred_alias` obligations instead of refusing the block.
+    /// Only for a consumer that discharges every obligation (the differential executor).
+    pub defer_frame_alias: bool,
+    /// Lift the function's entry block with
+    /// [`vmpx_disasm::LiftOptions::entry_args_disjoint_from_frame`] (only when
+    /// nothing branches back to the entry). Blocks that used it carry
+    /// [`NativeBlock::assumes_stack_disjoint`].
+    pub entry_args_disjoint: bool,
 }
 
 impl CfgOptions {
@@ -124,18 +133,35 @@ impl CfgOptions {
         assume_stack_disjoint: false,
         model_xmm: false,
         model_calls: false,
+        defer_frame_alias: false,
+        entry_args_disjoint: false,
     };
     /// [`Self::PROVEN`] plus the SSE scalar floating-point slice and call terminators.
     pub const PROVEN_FP: Self = Self {
         assume_stack_disjoint: false,
         model_xmm: true,
         model_calls: true,
+        defer_frame_alias: false,
+        entry_args_disjoint: false,
+    };
+    /// [`Self::PROVEN_FP`] plus deferred frame-alias obligations; the consumer must
+    /// discharge `BlockSemantics::deferred_alias` for every block it executes.
+    pub const DIFFERENTIAL: Self = Self {
+        defer_frame_alias: true,
+        ..Self::PROVEN_FP
+    };
+    /// [`Self::DIFFERENTIAL`] plus the labeled entry-argument-vs-own-frame relaxation.
+    pub const DIFFERENTIAL_ENTRY_ARGS: Self = Self {
+        entry_args_disjoint: true,
+        ..Self::DIFFERENTIAL
     };
     /// Stack-disjoint relaxation on (the default of the recovery entry points).
     pub const ASSUME_STACK_DISJOINT: Self = Self {
         assume_stack_disjoint: true,
         model_xmm: false,
         model_calls: false,
+        defer_frame_alias: false,
+        entry_args_disjoint: false,
     };
 }
 
@@ -150,6 +176,7 @@ impl From<CfgOptions> for LiftOptions {
         Self {
             assume_stack_disjoint: o.assume_stack_disjoint,
             model_xmm: o.model_xmm,
+            defer_frame_alias: o.defer_frame_alias,
             ..Self::default()
         }
     }
@@ -194,8 +221,13 @@ pub enum Terminator {
     /// A direct or import call (only with [`CfgOptions::model_calls`]); execution
     /// continues at `next`. The callee is not analysed.
     Call { target: CallTarget, next: u64 },
-    /// Indirect/computed branch, call, out-of-range target, undecodable bytes or a
-    /// body the lifter refuses. No successor edges are recorded.
+    /// `jmp` that leaves the function through a call target (only with
+    /// [`CfgOptions::model_calls`]): the callee returns straight to the caller, so
+    /// the block has no successors. Whether the stack is balanced is the consumer's
+    /// check.
+    TailCall { target: CallTarget },
+    /// Other indirect/computed branch or call, out-of-range target, undecodable
+    /// bytes or a body the lifter refuses. No successor edges are recorded.
     Unsupported(String),
 }
 
@@ -206,6 +238,23 @@ pub enum CallTarget {
     Direct(u64),
     /// `call qword ptr [rip+disp]` through the import slot at this virtual address.
     Import(u64),
+    /// A register or memory operand whose value the consumer must evaluate. The
+    /// CFG records no successor for it, so it is never a jump-table resolution.
+    Indirect(IndirectTarget),
+}
+
+/// The operand of an indirect `call`/`jmp` (64-bit, flat segment).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndirectTarget {
+    /// `call reg` / `jmp reg`.
+    Reg(Gpr),
+    /// `qword ptr [base + index*scale + disp]`. A RIP-relative operand has no
+    /// base and an absolute `disp`.
+    Mem {
+        base: Option<Gpr>,
+        index: Option<(Gpr, u8)>,
+        disp: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +272,10 @@ pub struct NativeBlock {
     pub end: u64,
     /// Lift of the straight-line body (terminator excluded); `None` if the lifter refused it.
     pub semantics: Option<BlockSemantics<Expr>>,
+    /// Why the body was refused, when `semantics` is `None`. Kept because the
+    /// terminator is recovered independently, so the refusal is no longer
+    /// visible as a `Terminator::Unsupported`.
+    pub body_refusal: Option<String>,
     pub terminator: Terminator,
     /// The lift relied on the stack-disjoint assumption (mirrors
     /// `semantics.assumes_stack_disjoint`; `false` when not lifted).
@@ -240,12 +293,22 @@ pub struct NativeCfg {
 }
 
 impl NativeCfg {
-    /// True when no block ended in [`Terminator::Unsupported`].
+    /// True when no block ended in [`Terminator::Unsupported`], i.e. control
+    /// flow is fully recovered. A block whose BODY the lifter refused still
+    /// counts as complete here, with [`NativeBlock::semantics`] `None`; use
+    /// [`Self::all_bodies_lifted`] when the consumer needs the semantics.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.blocks
             .values()
             .all(|b| !matches!(b.terminator, Terminator::Unsupported(_)))
+    }
+
+    /// True when every block's straight-line body was lifted, so the whole
+    /// function has semantics and not just a shape.
+    #[must_use]
+    pub fn all_bodies_lifted(&self) -> bool {
+        self.blocks.values().all(|b| b.semantics.is_some())
     }
 }
 
@@ -296,7 +359,64 @@ enum Flow {
     Jcc(String, u64, u64),
     Ret,
     Call(CallTarget, u64),
+    TailCall(CallTarget),
     Other(String),
+}
+
+fn gpr64(reg: iced_x86::Register) -> Option<Gpr> {
+    use iced_x86::Register as R;
+    Some(match reg {
+        R::RAX => Gpr::Rax,
+        R::RCX => Gpr::Rcx,
+        R::RDX => Gpr::Rdx,
+        R::RBX => Gpr::Rbx,
+        R::RSP => Gpr::Rsp,
+        R::RBP => Gpr::Rbp,
+        R::RSI => Gpr::Rsi,
+        R::RDI => Gpr::Rdi,
+        R::R8 => Gpr::R8,
+        R::R9 => Gpr::R9,
+        R::R10 => Gpr::R10,
+        R::R11 => Gpr::R11,
+        R::R12 => Gpr::R12,
+        R::R13 => Gpr::R13,
+        R::R14 => Gpr::R14,
+        R::R15 => Gpr::R15,
+        _ => return None,
+    })
+}
+
+/// The operand of a near indirect `call`/`jmp`, or `None` for anything but a
+/// 64-bit register or a flat 64-bit-addressed qword memory operand.
+fn indirect_target(ins: &Instruction) -> Option<IndirectTarget> {
+    match ins.op0_kind() {
+        iced_x86::OpKind::Register => gpr64(ins.op0_register()).map(IndirectTarget::Reg),
+        iced_x86::OpKind::Memory if ins.memory_size().size() == 8 => {
+            if matches!(ins.segment_prefix(), iced_x86::Register::FS | iced_x86::Register::GS) {
+                return None;
+            }
+            let base = match ins.memory_base() {
+                iced_x86::Register::None | iced_x86::Register::RIP => None,
+                b => Some(gpr64(b)?),
+            };
+            let index = match ins.memory_index() {
+                iced_x86::Register::None => None,
+                i => Some((gpr64(i)?, u8::try_from(ins.memory_index_scale()).ok()?)),
+            };
+            Some(IndirectTarget::Mem {
+                base,
+                index,
+                disp: ins.memory_displacement64().cast_signed(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_ip_rel_qword(ins: &Instruction) -> bool {
+    ins.op0_kind() == iced_x86::OpKind::Memory
+        && ins.is_ip_rel_memory_operand()
+        && ins.memory_size().size() == 8
 }
 
 fn classify(ins: &Instruction, model_calls: bool) -> Flow {
@@ -305,16 +425,32 @@ fn classify(ins: &Instruction, model_calls: bool) -> Flow {
             if ins.is_call_near() {
                 return Flow::Call(CallTarget::Direct(ins.near_branch_target()), ins.next_ip());
             }
-            if ins.is_call_near_indirect()
-                && ins.op0_kind() == iced_x86::OpKind::Memory
-                && ins.is_ip_rel_memory_operand()
-                && ins.memory_size().size() == 8
-            {
-                return Flow::Call(CallTarget::Import(ins.ip_rel_memory_address()), ins.next_ip());
+            if ins.is_call_near_indirect() {
+                if is_ip_rel_qword(ins) {
+                    return Flow::Call(CallTarget::Import(ins.ip_rel_memory_address()), ins.next_ip());
+                }
+                if let Some(t) = indirect_target(ins) {
+                    return Flow::Call(CallTarget::Indirect(t), ins.next_ip());
+                }
             }
             let mut text = String::new();
             IntelFormatter::new().format(ins, &mut text);
             Flow::Other(format!("Call `{text}`"))
+        }
+        FlowControl::IndirectBranch if model_calls && ins.is_jmp_near_indirect() => {
+            let target = if is_ip_rel_qword(ins) {
+                Some(CallTarget::Import(ins.ip_rel_memory_address()))
+            } else {
+                indirect_target(ins).map(CallTarget::Indirect)
+            };
+            target.map_or_else(
+                || {
+                    let mut text = String::new();
+                    IntelFormatter::new().format(ins, &mut text);
+                    Flow::Other(format!("IndirectBranch `{text}`"))
+                },
+                Flow::TailCall,
+            )
         }
         FlowControl::Next => Flow::Next,
         FlowControl::UnconditionalBranch if ins.is_jmp_short_or_near() => {
@@ -440,7 +576,7 @@ pub fn recover_native_cfg_opts(
                 Flow::Call(_, next) => targets[0] = Some(next),
                 Flow::Jmp(t) => targets[0] = Some(t),
                 Flow::Jcc(_, t, f) => targets = [Some(t), Some(f)],
-                Flow::Ret | Flow::Other(_) => {}
+                Flow::Ret | Flow::TailCall(_) | Flow::Other(_) => {}
             }
             for t in targets.into_iter().flatten() {
                 if in_range(t) && leaders.insert(t) {
@@ -454,6 +590,11 @@ pub fn recover_native_cfg_opts(
         }
     }
 
+    let entry_is_branch_target = instrs.values().any(|ins| match classify(ins, options.model_calls) {
+        Flow::Jmp(t) => t == entry,
+        Flow::Jcc(_, t, f) => t == entry || f == entry,
+        _ => false,
+    });
     let mut blocks = BTreeMap::new();
     let mut edges = Vec::new();
     for &start in &leaders {
@@ -496,6 +637,10 @@ pub fn recover_native_cfg_opts(
                     ip = ins.next_ip();
                     break Terminator::Return;
                 }
+                Flow::TailCall(target) => {
+                    ip = ins.next_ip();
+                    break Terminator::TailCall { target };
+                }
                 Flow::Jmp(_) | Flow::Jcc(..) => {
                     ip = ins.next_ip();
                     break Terminator::Unsupported("direct branch target outside code".to_owned());
@@ -506,13 +651,25 @@ pub fn recover_native_cfg_opts(
                 }
             }
         };
-        let semantics = match lift_block_with(&VmAlgebra, &body, options.into()) {
-            Ok(sem) => Some(sem),
-            Err(e) => {
-                terminator = Terminator::Unsupported(e.to_string());
-                None
-            }
+        let mut lift_options: LiftOptions = options.into();
+        lift_options.entry_args_disjoint_from_frame =
+            options.entry_args_disjoint && start == entry && !entry_is_branch_target;
+        // A body the lifter cannot model and a terminator we cannot find are
+        // DIFFERENT facts. Overwriting the terminator here conflated them and
+        // suppressed the block's outgoing edges, so one unmodelable instruction
+        // truncated the control-flow graph. `semantics: None` already records
+        // "the body was refused"; the recovered terminator is kept.
+        let (semantics, body_refusal) = match lift_block_with(&VmAlgebra, &body, lift_options) {
+            Ok(sem) => (Some(sem), None),
+            Err(e) => (None, Some(e.to_string())),
         };
+        if let Some(why) = &body_refusal
+            && matches!(terminator, Terminator::Unsupported(_))
+        {
+            // Nothing was recovered either way; keep the lift's reason, which is
+            // the more specific of the two.
+            terminator = Terminator::Unsupported(why.clone());
+        }
         match &terminator {
             Terminator::FallThrough(t) => edges.push((start, *t, EdgeKind::FallThrough)),
             Terminator::Jump(t) => edges.push((start, *t, EdgeKind::Jump)),
@@ -523,7 +680,7 @@ pub fn recover_native_cfg_opts(
                 edges.push((start, *not_taken, EdgeKind::NotTaken));
             }
             Terminator::Call { next, .. } => edges.push((start, *next, EdgeKind::FallThrough)),
-            Terminator::Return | Terminator::Unsupported(_) => {}
+            Terminator::Return | Terminator::TailCall { .. } | Terminator::Unsupported(_) => {}
         }
         blocks.insert(
             start,
@@ -534,6 +691,7 @@ pub fn recover_native_cfg_opts(
                     .as_ref()
                     .is_some_and(|s| s.assumes_stack_disjoint),
                 semantics,
+                body_refusal,
                 terminator,
             },
         );
@@ -767,7 +925,10 @@ mod tests {
         let cfg = recover_native_cfg_proven(FRAME, 0x1000, 0x1000).expect("cfg");
         let b = &cfg.blocks[&0x1000];
         assert!(b.semantics.is_none() && !b.assumes_stack_disjoint);
-        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+        // The BODY is refused; control flow is still recovered, and those are
+        // tracked separately now.
+        assert!(!cfg.assumes_stack_disjoint && !cfg.all_bodies_lifted());
+        assert!(cfg.is_complete());
 
         assert!(
             lift_native_block(&FRAME[..FRAME.len() - 1], 0x1000)
@@ -782,7 +943,7 @@ mod tests {
     fn genuine_alias_fails_closed_even_with_assumption() {
         let cfg = recover_native_cfg(ALIAS, 0x1000, 0x1000).expect("cfg");
         assert!(cfg.blocks[&0x1000].semantics.is_none());
-        assert!(!cfg.assumes_stack_disjoint && !cfg.is_complete());
+        assert!(!cfg.assumes_stack_disjoint && !cfg.all_bodies_lifted());
     }
 
     #[test]

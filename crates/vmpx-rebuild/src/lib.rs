@@ -1,3 +1,4 @@
+pub mod directory_relocate;
 mod import_reconstruct;
 mod import_table;
 mod layout;
@@ -20,7 +21,8 @@ pub use layout::{
     relayout_conventional, validate_for_loader,
 };
 pub use reintegrate::{
-    ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate, set_tls_callback,
+    ReintegrationReport, ReintegrationRequest, redirect_vm_stub, reintegrate,
+    retarget_direct_branch, retarget_rip_relative, set_tls_callback,
 };
 
 pub use unpacked::{
@@ -159,6 +161,17 @@ pub enum RebuildError {
 
     #[error("jmp from {stub:?} to {target:?} does not fit a rel32 displacement")]
     VmStubRel32Range { stub: Rva, target: Rva },
+
+    #[error("retarget site {rva:?} is not decodable, executable and file-backed")]
+    RetargetBadSite { rva: Rva },
+
+    #[error("retarget site {rva:?} is not a {want}: {found}")]
+    RetargetWrongShape { rva: Rva, want: &'static str, found: String },
+
+    #[error(
+        "no length-preserving rewrite at {site:?} reaches {target:?}: the field is out of range or          the re-decode did not match"
+    )]
+    RetargetUnreachable { site: Rva, target: Rva },
 }
 
 fn align_u32(value: u32, alignment: u32, what: &'static str) -> Result<u32, RebuildError> {
@@ -466,6 +479,17 @@ pub fn append_section(input: &[u8], request: AppendSection<'_>) -> Result<Rebuil
         .unwrap_or(FileOffset(u64::from(pe.optional.size_of_headers)));
     let header_capacity = FileOffset(first_raw.0.min(u64::from(pe.optional.size_of_headers)));
     if new_header_end > header_capacity {
+        // The section table has no room for another header. Grow the header
+        // region -- claiming padding between the headers and the first section,
+        // or, when there is none (a relaid-out image like a stripped protector),
+        // shifting every section's file offset down one alignment unit -- then
+        // retry on the enlarged image. One grow adds many 40-byte slots, so the
+        // retry fits; a grow that did not raise SizeOfHeaders stops the recursion.
+        if let Ok((grown, cap)) = directory_relocate::grow_header_capacity(input)
+            && cap.size_of_headers > pe.optional.size_of_headers
+        {
+            return append_section(&grown, request);
+        }
         return Err(RebuildError::HeaderCapacity {
             required_end: new_header_end,
             capacity_end: header_capacity,
@@ -887,9 +911,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_section_header_growth_that_overlaps_first_raw_section() {
-        let input = minimal_pe(0x1C0);
-        let error = append_section(
+    fn grows_header_capacity_when_the_section_table_is_full() {
+        // SizeOfHeaders ends right after the single existing header, so there is
+        // no room for a second one -- but padding up to the first raw section can
+        // be claimed. Appending must grow into it and succeed, not refuse.
+        let mut input = minimal_pe(0x200);
+        let tight = u32::try_from(SECTION_TABLE_OFFSET + 40).expect("small test offset");
+        put_u32(&mut input, OPTIONAL_OFFSET + 60, tight);
+        let before = PeImage::parse(&input).expect("input PE");
+        let rebuilt = append_section(
             &input,
             AppendSection {
                 name: *b".vmpx\0\0\0",
@@ -897,9 +927,16 @@ mod tests {
                 characteristics: 0x6000_0020,
             },
         )
-        .expect_err("new header must not overlap raw data");
-
-        assert!(matches!(error, RebuildError::HeaderCapacity { .. }));
+        .expect("append should grow the header region and succeed");
+        let after = PeImage::parse(&rebuilt.bytes).expect("grown image reparses");
+        assert!(
+            after.optional.size_of_headers > before.optional.size_of_headers,
+            "SizeOfHeaders must grow to fit the new header"
+        );
+        assert!(
+            after.sections.iter().any(|s| s.name.as_str().starts_with(".vmpx")),
+            "the appended section must be present"
+        );
     }
 
     #[test]

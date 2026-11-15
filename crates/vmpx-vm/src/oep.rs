@@ -21,6 +21,51 @@ pub fn decide_oep(
     family_complete: bool,
     is_native: impl Fn(Rva) -> bool,
 ) -> OepDecision {
+    decide_oep_with_returns(paths, &[], family_complete, is_native)
+}
+
+/// As [`decide_oep`], with the paths that RETURN to their caller marked.
+///
+/// A path whose VM exit is an exception unwind back through the original native
+/// frame never transfers into original code, so it contributes no entry-point
+/// candidate. Counting it as a path that failed to resolve one is a category
+/// error, and it is the reason this returned "unresolved" once every header
+/// path finally decoded: two of the four unwind, by design.
+///
+/// `returns_to_caller` is positional against `paths`; a shorter slice leaves the
+/// remaining paths treated as transfers. Everything else is unchanged -- the
+/// surviving paths must all agree on one RVA and it must be native -- so the
+/// failure mode is declining to recover an entry point, not inventing one.
+#[must_use]
+pub fn decide_oep_with_returns(
+    paths: &[Option<Rva>],
+    returns_to_caller: &[bool],
+    family_complete: bool,
+    is_native: impl Fn(Rva) -> bool,
+) -> OepDecision {
+    let returning = |index: usize| returns_to_caller.get(index).copied().unwrap_or(false);
+    let transfers: Vec<Option<Rva>> = paths
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !returning(*index))
+        .map(|(_, target)| *target)
+        .collect();
+    let returned = paths.len() - transfers.len();
+    if returned != 0 && !transfers.is_empty() {
+        let mut decision = decide_oep_inner(&transfers, family_complete, is_native);
+        decision.evidence.push(format!(
+            "{returned} path(s) unwind to the caller and supply no entry-point candidate"
+        ));
+        return decision;
+    }
+    decide_oep_inner(paths, family_complete, is_native)
+}
+
+fn decide_oep_inner(
+    paths: &[Option<Rva>],
+    family_complete: bool,
+    is_native: impl Fn(Rva) -> bool,
+) -> OepDecision {
     let unresolved = |mut evidence: Vec<String>, reason: String| {
         evidence.push(reason);
         OepDecision {

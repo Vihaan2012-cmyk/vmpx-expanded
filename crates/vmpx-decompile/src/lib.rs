@@ -3,13 +3,23 @@
 //! cannot prove falls back to labelled gotos, never to guessed structure.
 #![allow(clippy::pedantic, clippy::all, dead_code)]
 
+/// Smallest subtree worth a line of its own. Below this, naming a value
+/// costs more attention than the repetition it removes.
+const CSE_MIN_NODES: usize = 6;
+
+pub mod annotate;
+pub mod cse;
 pub mod ctext;
 pub mod exec;
 pub mod ir;
+pub mod mba;
 pub mod native;
 pub mod opt;
+pub mod readable;
 pub mod render;
 pub mod structure;
+pub mod symbols;
+pub mod tidy;
 pub mod vm;
 pub mod xu;
 
@@ -96,7 +106,10 @@ fn flat(blocks: &BTreeMap<NodeId, LBlock>, entry: NodeId) -> Vec<Stmt> {
                 }
             }
             Term::Branch { cond, then, els } => {
-                out.push(Stmt::IfGoto { cond: cond.clone(), target: *then });
+                out.push(Stmt::IfGoto {
+                    cond: cond.clone(),
+                    target: *then,
+                });
                 if Some(*els) != next {
                     out.push(Stmt::Goto(*els));
                 }
@@ -143,7 +156,8 @@ fn collect_decls(stmts: &[Stmt], out: &mut BTreeMap<String, BitWidth>) {
 }
 
 const REG_NAMES: [&str; 16] = [
-    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
 ];
 
 fn input_env(rng: &mut Rng, k: usize) -> Env {
@@ -162,7 +176,11 @@ fn input_env(rng: &mut Rng, k: usize) -> Env {
 
 /// Runs `f` and each `targets` expression (over register names / loads) on the
 /// same random register inputs; the return value must equal every target.
-pub fn linkage_vs_exprs(f: &Func, targets: &[vmpx_vm::Expr], vectors: usize) -> Result<usize, String> {
+pub fn linkage_vs_exprs(
+    f: &Func,
+    targets: &[vmpx_vm::Expr],
+    vectors: usize,
+) -> Result<usize, String> {
     let mut rng = Rng(0x0BAD_5EED_1234_5678);
     let mut f = f.clone();
     opt::cleanup_all(&mut f);
@@ -172,7 +190,9 @@ pub fn linkage_vs_exprs(f: &Func, targets: &[vmpx_vm::Expr], vectors: usize) -> 
         for (i, t) in targets.iter().enumerate() {
             let got = exec::eval(t, &env).map_err(|e| format!("target {i}: {e}"))?;
             if got != want {
-                return Err(format!("vector {k}: decompiled function returns {want:#x}, target {i} evaluates to {got:#x}"));
+                return Err(format!(
+                    "vector {k}: decompiled function returns {want:#x}, target {i} evaluates to {got:#x}"
+                ));
             }
         }
     }
@@ -208,7 +228,10 @@ pub fn dump_func(f: &Func, depth: u32) -> String {
             Term::Goto(t) => s.push_str(&format!("  goto {t:#x}\n")),
             Term::Branch { cond, then, els } => {
                 let c: Vec<String> = cond.exprs().into_iter().map(|e| p(e)).collect();
-                s.push_str(&format!("  branch {cond:?} [{}] then {then:#x} else {els:#x}\n", c.join(" ; ")));
+                s.push_str(&format!(
+                    "  branch {cond:?} [{}] then {then:#x} else {els:#x}\n",
+                    c.join(" ; ")
+                ));
             }
             Term::Return(v) => s.push_str(&format!("  return {}\n", p(&v[0].1))),
         }
@@ -218,6 +241,16 @@ pub fn dump_func(f: &Func, depth: u32) -> String {
 
 /// Runs the whole pipeline on `func` (consumed as the reference).
 pub fn decompile(func: &Func) -> Result<Decompiled, String> {
+    decompile_with(func, &symbols::Symbols::default())
+}
+
+/// As [`decompile`], with a symbol table so import slots are named and the
+/// facilities they reach are labelled.
+///
+/// # Errors
+///
+/// As [`decompile`].
+pub fn decompile_with(func: &Func, symbols: &symbols::Symbols) -> Result<Decompiled, String> {
     let reference = {
         let mut r = func.clone();
         opt::cleanup_all(&mut r);
@@ -233,7 +266,10 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     let all_zext = f.blocks.values().all(|b| match &b.term {
         Term::Return(v) => matches!(
             v[0].1.kind,
-            vmpx_vm::ExprKind::Resize { op: vmpx_vm::ResizeOp::ZeroExtend, .. }
+            vmpx_vm::ExprKind::Resize {
+                op: vmpx_vm::ResizeOp::ZeroExtend,
+                ..
+            }
         ),
         _ => true,
     });
@@ -264,7 +300,7 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         }
     }
 
-    let (body, structured, fallback_reason) =
+    let (mut body, structured, fallback_reason) =
         match structure::Structurer::new(&seqs, f.entry).run() {
             Ok(b) => (b, true, None),
             Err(why) => (flat(&seqs, f.entry), false, Some(why)),
@@ -279,7 +315,12 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
 
     // names
     let mut names: BTreeMap<String, String> = BTreeMap::new();
-    let var_w = |v: &str| -> BitWidth { decl.get(v).copied().or_else(|| widths.get(v).copied()).unwrap_or(BitWidth::W64) };
+    let var_w = |v: &str| -> BitWidth {
+        decl.get(v)
+            .copied()
+            .or_else(|| widths.get(v).copied())
+            .unwrap_or(BitWidth::W64)
+    };
     let mut all_vars: BTreeSet<String> = decl.keys().cloned().collect();
     all_vars.extend(live_in.iter().cloned());
     let mut prologue: Vec<Stmt> = Vec::new();
@@ -291,13 +332,18 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         if decl.contains_key(p) {
             let dn = display_name(p, w);
             names.insert(p.clone(), dn);
-            prologue.push(Stmt::Assign(p.clone(), vmpx_vm::Expr::register(w, format!("\u{1}{arg}"))));
+            prologue.push(Stmt::Assign(
+                p.clone(),
+                vmpx_vm::Expr::register(w, format!("\u{1}{arg}")),
+            ));
         } else {
             names.insert(p.clone(), arg);
         }
     }
     for v in &all_vars {
-        names.entry(v.clone()).or_insert_with(|| display_name(v, var_w(v)));
+        names
+            .entry(v.clone())
+            .or_insert_with(|| display_name(v, var_w(v)));
     }
     names.insert("\u{1}a0".into(), "a0".into());
     for i in 0..params.len() {
@@ -316,7 +362,9 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
                     ret_width(then, w);
                     ret_width(els, w);
                 }
-                Stmt::Loop(b) | Stmt::While { body: b, .. } | Stmt::DoWhile { body: b, .. } => ret_width(b, w),
+                Stmt::Loop(b) | Stmt::While { body: b, .. } | Stmt::DoWhile { body: b, .. } => {
+                    ret_width(b, w)
+                }
                 _ => {}
             }
         }
@@ -325,12 +373,64 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     ret_width(&body, &mut rw);
     let ret_ty = rw.map_or("void", ty);
 
-    let mut ctx = Ctx { r: Renderer { names: &names }, out: String::new(), log: Vec::new() };
+    // Collapse the MBA identities VMProtect rewrites plain arithmetic into, so
+    // the text says `a - 1` where the recovered IR says `~(~a + 1)`. Done BEFORE
+    // naming shared subtrees, so the names cover the simplified forms, and
+    // before the cross-check below, which replays the original function against
+    // these statements and so validates every rewrite made here.
+    {
+        let mut memo = std::collections::HashMap::new();
+        mba::simplify_stmts(&mut prologue, &mut memo);
+        mba::simplify_stmts(&mut body, &mut memo);
+    }
+    // Drop the branches that decide nothing. VMProtect fans one logical path out
+    // across many dispatch selectors, so the structurer produces nests whose arms
+    // are identical; naming shared subtrees below cannot help with duplication at
+    // the STATEMENT level. Before the cross-check, which replays the original
+    // function against these statements and so validates the rewrite.
+    tidy::tidy_stmts(&mut prologue);
+    tidy::tidy_stmts(&mut body);
+    // Give every subtree that is used more than once a name. The IR is a DAG
+    // and rendering flattens it, so without this a value computed once and used
+    // ten times is PRINTED ten times -- which is most of why the output reads as
+    // a wall rather than as code.
+    let taken: std::collections::HashSet<String> = names.values().cloned().collect();
+    let mut all_stmts: Vec<opt::Stmt> = prologue.clone();
+    all_stmts.extend(body.iter().cloned());
+    let temps = cse::extract_with(&all_stmts, 2, CSE_MIN_NODES, &taken, symbols);
+    // Labels for the protector machinery, so a reader can tell self-defence
+    // from work. `said` is threaded through the hoisted definitions first and
+    // the body second, so a tag lands on the line that earns it and is never
+    // repeated.
+    let mut said: Vec<annotate::Tag> = Vec::new();
+    // The exit components every return agrees on: reported once below instead of
+    // on each return line.
+    let exit_common = render::common_exit_components(&all_stmts);
+    let mut ctx = Ctx {
+        r: Renderer {
+            names: &names,
+            image_base: symbols.image_base(),
+            temps: &temps.map,
+            exit_common: &exit_common,
+        },
+        out: String::new(),
+        log: Vec::new(),
+    };
     let (mut loops, mut ifs, mut gotos) = (0, 0, 0);
     count(&body, &mut loops, &mut ifs, &mut gotos);
     let mut text = String::new();
     for n in f.notes.iter().chain(func.notes.iter()) {
         text.push_str(&format!("// {n}\n"));
+    }
+    // What every exit path agrees on, so the per-return notes carry only what the
+    // branch actually decided.
+    if !exit_common.is_empty() {
+        let same = exit_common
+            .iter()
+            .map(|(name, value)| format!("{name}={}", ctx.r.rx(value, true).0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!("// exit, same on every path: {same}\n"));
     }
     text.push_str(&format!("{ret_ty} {}({})\n{{\n", func.name, sig.join(", ")));
     let mut by_ty: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -340,12 +440,33 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
     for (t, vs) in by_ty {
         text.push_str(&format!("    {t} {};\n", vs.join(", ")));
     }
+    if !temps.is_empty() {
+        text.push('\n');
+        for (name, definition) in &temps.order {
+            // Smaller definitions come first, so a definition only ever
+            // references names already introduced above it.
+            for tag in annotate::tags_for_with(definition, symbols) {
+                if !said.contains(&tag) {
+                    said.push(tag);
+                    text.push_str(&format!("    /* {} */\n", tag.text()));
+                }
+            }
+            text.push_str(&format!(
+                "    {} {name} = {};\n",
+                ty(definition.width),
+                ctx.r.define(definition)
+            ));
+        }
+        text.push('\n');
+    }
+    annotate::annotate_with_symbols(&mut prologue, &mut said, symbols);
+    annotate::annotate_with_symbols(&mut body, &mut said, symbols);
     ctx.stmts(&prologue, 1, rw);
     ctx.stmts(&body, 1, rw);
     text.push_str(&ctx.out);
     text.push_str("}\n");
 
-    let text_check = check_text(&ctx.log, &names);
+    let text_check = check_text(&ctx.log, &names, symbols.image_base());
 
     // cross-check against the reference run
     let check = (|| -> Result<usize, String> {
@@ -353,9 +474,17 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         let mut full: Vec<Stmt> = prologue.clone();
         full.extend(body.clone());
         let mut n = 0;
+        // Unknowns the recovery left behind are inputs to the check too. Both
+        // sides are built from the same interned expressions, so each gets the
+        // same name and the same seeded value.
+        let mut unknowns = std::collections::BTreeSet::new();
+        intrinsic_inputs_of(&reference, &mut unknowns);
+        // And from the optimized side: narrowing can leave an unknown reachable
+        // there that the reference does not name identically.
+        intrinsic_inputs_of(&f, &mut unknowns);
         for k in 0..48 {
             let mut inputs = Env::new();
-            for v in &live_in {
+            for v in unknowns.iter().chain(live_in.iter()) {
                 let x = match k {
                     0 => 0,
                     1 => u64::MAX,
@@ -379,7 +508,10 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
             let got = run_structured(&full, &sinputs, &pw)?;
             let got_ret = got.ret;
             let mask = rw.map_or(u64::MAX, |w| w.mask());
-            if (want.ret & mask) != got_ret || (rw.is_some_and(|w| w.bits() < 64) && want.ret >> rw.unwrap().bits() != 0) || want.stores != got.stores {
+            if (want.ret & mask) != got_ret
+                || (rw.is_some_and(|w| w.bits() < 64) && want.ret >> rw.unwrap().bits() != 0)
+                || want.stores != got.stores
+            {
                 return Err(format!(
                     "MISMATCH on vector {k}: reference ret {:#x}, decompiled ret {:#x}",
                     want.ret, got_ret
@@ -390,7 +522,72 @@ pub fn decompile(func: &Func) -> Result<Decompiled, String> {
         Ok(n)
     })();
 
-    Ok(Decompiled { text, structured, fallback_reason, check, text_check, loops, ifs, gotos })
+    // Opt-in readable dialect (rust / c99 / c23 / cpp / pseudo): re-render the
+    // same recovered tree. The C cross-check above is unchanged and already ran.
+    if let Some(d) = readable::dialect()
+        .as_deref()
+        .and_then(readable::Dialect::parse)
+    {
+        text = readable::preamble(d)
+            + "\n"
+            + &readable::render_function(
+                &func.name,
+                &sig,
+                ret_ty,
+                &decl,
+                &temps.order,
+                &prologue,
+                &body,
+                &names,
+                &temps.map,
+                symbols,
+            );
+    }
+
+    Ok(Decompiled {
+        text,
+        structured,
+        fallback_reason,
+        check,
+        text_check,
+        loops,
+        ifs,
+        gotos,
+    })
+}
+
+/// Every intrinsic in `f`, named as a free input. These are seeded like the
+/// live-in registers but are NOT parameters: an unknown the recovery could not
+/// resolve is an input to the CHECK, not to the function's C signature.
+fn intrinsic_inputs_of(f: &Func, out: &mut std::collections::BTreeSet<String>) {
+    for block in f.blocks.values() {
+        for (_, e) in &block.assigns {
+            exec::intrinsic_inputs(e, out);
+        }
+        for store in &block.stores {
+            exec::intrinsic_inputs(&store.address, out);
+            exec::intrinsic_inputs(&store.value, out);
+        }
+        match &block.term {
+            Term::Goto(_) => {}
+            Term::Branch { cond, .. } => match cond {
+                ir::Cond::Cmp { a, b, .. } => {
+                    exec::intrinsic_inputs(a, out);
+                    exec::intrinsic_inputs(b, out);
+                }
+                ir::Cond::Opaque { args, .. } => {
+                    for a in args {
+                        exec::intrinsic_inputs(a, out);
+                    }
+                }
+            },
+            Term::Return(values) => {
+                for (_, e) in values {
+                    exec::intrinsic_inputs(e, out);
+                }
+            }
+        }
+    }
 }
 
 fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {
@@ -405,14 +602,21 @@ fn registers_of(e: &vmpx_vm::Expr, out: &mut BTreeMap<String, BitWidth>) {
 
 /// Re-evaluates every rendered expression/condition as C text (real C typing
 /// rules, UB detection) against the IR expression it came from.
-fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>) -> Result<(usize, usize), String> {
+fn check_text(
+    log: &[(render::Logged, String)],
+    names: &BTreeMap<String, String>,
+    image_base: u64,
+) -> Result<(usize, usize), String> {
     let mut rng = Rng(0xC0DE_C0DE_1357_9BDF);
     let (mut checked, mut skipped) = (0, 0);
     for (item, text) in log {
         let mut regs = BTreeMap::new();
         match item {
             render::Logged::E(e) => registers_of(e, &mut regs),
-            render::Logged::C(c) => c.exprs().into_iter().for_each(|e| registers_of(e, &mut regs)),
+            render::Logged::C(c) => c
+                .exprs()
+                .into_iter()
+                .for_each(|e| registers_of(e, &mut regs)),
         }
         if let render::Logged::C(ir::Cond::Opaque { .. }) = item {
             skipped += 1;
@@ -422,6 +626,9 @@ fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>
         for k in 0..24 {
             let mut env_ir = Env::new();
             let mut env_c = std::collections::HashMap::new();
+            if image_base != 0 {
+                env_c.insert("IMAGE_BASE".to_owned(), (image_base, 64));
+            }
             for (n, w) in &regs {
                 let x = w.truncate(match k {
                     0 => 0,
@@ -450,9 +657,15 @@ fn check_text(log: &[(render::Logged, String)], names: &BTreeMap<String, String>
             };
             match ctext::eval(text, &env_c) {
                 Ok(got) => {
-                    let got = if matches!(item, render::Logged::C(_)) { u64::from(got != 0) } else { got & width_mask };
+                    let got = if matches!(item, render::Logged::C(_)) {
+                        u64::from(got != 0)
+                    } else {
+                        got & width_mask
+                    };
                     if got != want {
-                        return Err(format!("rendered text `{text}` evaluates to {got:#x}, IR says {want:#x} (sample {k})"));
+                        return Err(format!(
+                            "rendered text `{text}` evaluates to {got:#x}, IR says {want:#x} (sample {k})"
+                        ));
                     }
                 }
                 Err(e) if e.contains("unsupported call") || e.contains("unknown identifier") => {

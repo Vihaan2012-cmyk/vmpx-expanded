@@ -6,7 +6,7 @@ use vmpx_disasm::{CfgLimits, decode_one, recover_cfg};
 use vmpx_pe::{PeError, PeImage, RuntimeFunction, Rva, UnwindInfo, Va};
 
 use crate::{
-    Expr, HandlerCodecRecoveryReport, HandlerMemoryRegion, RecoveryStatus,
+    Expr, ExprKind, HandlerCodecRecoveryReport, HandlerMemoryRegion, RecoveryStatus,
     SymbolicVmExecutionReport, VmHandlerSemantic,
 };
 
@@ -522,6 +522,111 @@ pub fn analyze_exception_stack_sled(pe: &PeImage<'_>, handler: Rva) -> Exception
     report
 }
 
+/// The VM context slots an exception continuation is read from, when the
+/// protector addresses its context off the native stack pointer.
+///
+/// `context_base == RSP` is what makes this sound, and it is passed in rather
+/// than assumed: a VM slot `k` is then the native address `rsp + k`, which is
+/// the same `CONTEXT.Rsp + k` the language handler reads. For any other context
+/// base the two are unrelated and no seed is resolved.
+#[derive(Clone, Copy, Debug)]
+pub struct VmContextSeedSource<'a> {
+    /// Context slot values at the faulting block's entry.
+    pub context_values: &'a BTreeMap<i64, Expr>,
+    /// Whether the VM profile addresses its context off `rsp`.
+    pub context_base_is_rsp: bool,
+}
+
+fn resolve_stack_sled_continuation_with_context(
+    sled: &ExceptionStackSledReport,
+    seed_source: Option<VmContextSeedSource<'_>>,
+) -> ExceptionContinuationResolution {
+    let mut resolution = ExceptionContinuationResolution {
+        schema_version: 2,
+        handler: sled.handler,
+        status: RecoveryStatus::Failed,
+        seed: None,
+        cursor: None,
+        continuation: None,
+        continuation_rva: None,
+        source: None,
+        diagnostics: Vec::new(),
+    };
+    if sled.status != RecoveryStatus::Recovered {
+        resolution.diagnostics.push(
+            "language handler was not fully classified, so no continuation was selected".to_owned(),
+        );
+        return resolution;
+    }
+    let Some(seed_source) = seed_source else {
+        resolution.diagnostics.push(
+            "no pre-fault VM context was supplied, so the seed field cannot be read".to_owned(),
+        );
+        resolution.status = RecoveryStatus::PartiallyRecovered;
+        return resolution;
+    };
+    if !seed_source.context_base_is_rsp {
+        // The refusal this replaces, kept for exactly the case it was right
+        // about: a context addressed off anything but rsp really is a different
+        // region from `CONTEXT.Rsp + k`.
+        resolution.diagnostics.push(
+            "the VM addresses its context off a register other than rsp, so a context slot is \
+             not the CONTEXT.Rsp-relative native slot the handler reads"
+                .to_owned(),
+        );
+        resolution.status = RecoveryStatus::PartiallyRecovered;
+        return resolution;
+    }
+    let Some(seed_offset) = sled.seed_context_offset else {
+        resolution.diagnostics.push("the sled has no classified seed field".to_owned());
+        resolution.status = RecoveryStatus::PartiallyRecovered;
+        return resolution;
+    };
+    let Some(seed) = seed_source.context_values.get(&seed_offset) else {
+        resolution.diagnostics.push(format!(
+            "context slot {seed_offset:#x} (the seed) is not tracked in the pre-fault state"
+        ));
+        resolution.status = RecoveryStatus::PartiallyRecovered;
+        return resolution;
+    };
+    resolution.seed = Some(seed.clone());
+    resolution.cursor = sled
+        .cursor_context_offset
+        .and_then(|offset| seed_source.context_values.get(&offset))
+        .cloned();
+    let ExprKind::Const { value } = seed.kind else {
+        resolution.diagnostics.push(
+            "the seed is symbolic at the fault, so which continuation the handler takes is not \
+             decided"
+                .to_owned(),
+        );
+        resolution.status = RecoveryStatus::PartiallyRecovered;
+        return resolution;
+    };
+    if value == 0 {
+        // The handler zero-tests the seed and only stores it when non-zero, so a
+        // zero seed leaves a pure RET sled: the unwind walks back through the
+        // original native frame and control reaches the caller's saved return
+        // address. There is no dispatch target, which is the whole point.
+        resolution.status = RecoveryStatus::Recovered;
+        resolution.source = Some(ExceptionContinuationSource::ZeroSeedUnwind);
+        resolution
+            .diagnostics
+            .push(format!("seed slot {seed_offset:#x} is a proven zero: the sled unwinds to the caller"));
+        return resolution;
+    }
+    resolution.status = RecoveryStatus::Recovered;
+    resolution.source = Some(ExceptionContinuationSource::NonZeroSeed);
+    resolution.continuation = Some(seed.clone());
+    resolution.continuation_rva = None;
+    resolution.diagnostics.push(format!(
+        "seed slot {seed_offset:#x} is a proven {value:#x}: the handler stores it and control \
+         continues there, which is NOT an exit"
+    ));
+    resolution
+}
+
+#[cfg(test)]
 fn resolve_stack_sled_continuation(
     sled: &ExceptionStackSledReport,
 ) -> ExceptionContinuationResolution {
@@ -569,7 +674,7 @@ fn resolve_stack_sled_continuation(
 pub fn analyze_vm_memory_exception_coverage_with_state(
     pe: &PeImage<'_>,
     handler: &HandlerCodecRecoveryReport,
-    _symbolic: Option<&SymbolicVmExecutionReport>,
+    symbolic: Option<&SymbolicVmExecutionReport>,
 ) -> Result<VmMemoryExceptionCoverageReport, PeError> {
     let mut diagnostics = Vec::new();
     if handler
@@ -592,6 +697,73 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
         diagnostics.push("no proven external native read site was recovered".to_owned());
     }
 
+    // The symbolic report finally earns its parameter. Its `context_cells` are
+    // keyed by VM context slot, and this protector addresses its context off
+    // rsp (`entry_profile.rs` sets `context_base: Register::RSP` in both
+    // production recoveries), so a slot IS the `CONTEXT.Rsp`-relative native
+    // slot the language handler reads its seed from.
+    //
+    // `context_base_is_rsp` is hard-coded true here only because this entry
+    // point has no profile to consult; the CFG walker, which does, passes the
+    // measured value. If a profile with another context base ever reaches this
+    // path, the seed it resolves would be a different slot -- so this is the
+    // one place in the chain carrying an assumption rather than a check, and it
+    // is recorded in the report's diagnostics.
+    let seed_source = symbolic.map(|report| VmContextSeedSource {
+        context_values: &report.context_cells,
+        context_base_is_rsp: true,
+    });
+    if seed_source.is_some() {
+        diagnostics.push(
+            "continuation seed read from VM context slots, assuming the profile's context base \
+             is rsp"
+                .to_owned(),
+        );
+    }
+    let mut report = analyze_fault_site_exception_coverage_with_context(
+        pe,
+        handler.entry,
+        fault_sites,
+        seed_source,
+    )?;
+    report.diagnostics.splice(0..0, diagnostics);
+    Ok(report)
+}
+
+/// Exception coverage for fault sites the CALLER located.
+///
+/// The entry point above reads its sites from a handler recovery's `effects`
+/// list, which is empty for exactly the handlers whose recovery failed -- and
+/// those are the ones that stall, so the report could never claim coverage for
+/// them. A caller that knows where the faulting reads are (from the handler's
+/// own trace, say) supplies them here instead.
+///
+/// # Errors
+///
+/// Propagates malformed or unmapped exception/unwind metadata errors.
+pub fn analyze_fault_site_exception_coverage(
+    pe: &PeImage<'_>,
+    vm_handler: Rva,
+    fault_sites: Vec<Rva>,
+) -> Result<VmMemoryExceptionCoverageReport, PeError> {
+    analyze_fault_site_exception_coverage_with_context(pe, vm_handler, fault_sites, None)
+}
+
+/// As above, resolving the continuation seed from the pre-fault VM context.
+///
+/// # Errors
+///
+/// Propagates malformed or unmapped exception/unwind metadata errors.
+pub fn analyze_fault_site_exception_coverage_with_context(
+    pe: &PeImage<'_>,
+    vm_handler: Rva,
+    fault_sites: Vec<Rva>,
+    seed_source: Option<VmContextSeedSource<'_>>,
+) -> Result<VmMemoryExceptionCoverageReport, PeError> {
+    let mut diagnostics = Vec::new();
+    if fault_sites.is_empty() {
+        diagnostics.push("no fault site was supplied".to_owned());
+    }
     let mut coverage = Vec::new();
     let mut language_handlers = BTreeSet::new();
     let mut all_fault_sites_have_language_handler = !fault_sites.is_empty();
@@ -630,7 +802,7 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
         .collect::<Vec<_>>();
     let continuation_resolutions = stack_sled_handlers
         .iter()
-        .map(resolve_stack_sled_continuation)
+        .map(|sled| resolve_stack_sled_continuation_with_context(sled, seed_source))
         .collect::<Vec<_>>();
     let continuation_recovered = !continuation_resolutions.is_empty()
         && continuation_resolutions
@@ -649,7 +821,7 @@ pub fn analyze_vm_memory_exception_coverage_with_state(
     }
     Ok(VmMemoryExceptionCoverageReport {
         schema_version: 2,
-        vm_handler: handler.entry,
+        vm_handler,
         fault_sites,
         coverage,
         all_fault_sites_have_language_handler,

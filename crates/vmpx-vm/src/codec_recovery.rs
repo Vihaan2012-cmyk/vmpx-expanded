@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 use iced_x86::{InstructionInfoFactory, Register};
 use serde::Serialize;
@@ -115,6 +116,12 @@ pub struct HandlerCodecRecoveryReport {
     #[serde(skip)]
     pub table_dispatch: Option<TableDispatchFacts>,
     pub confidence: u8,
+    /// Conditional branches the trace walked through by taking the fallthrough,
+    /// when the clean attempt failed and the labeled retry succeeded. Non-empty
+    /// means this specification holds only on those arms, so every entry that
+    /// decodes through it carries
+    /// [`crate::VmCfgAssumption::AssumesHandlerConditionalArm`].
+    pub conditional_arms: Vec<Rva>,
     pub diagnostics: Vec<String>,
 }
 
@@ -254,12 +261,164 @@ fn apply_keyless_reentry_facts(
 /// Propagates invalid entry, decode, or postlude-proof setup errors. Ordinary
 /// extraction failures remain diagnostics with a non-recovered status.
 #[allow(clippy::too_many_lines)]
+/// Recovers a handler's codecs.
+///
+/// The trace is NOT continued past a conditional branch, and two ways of doing
+/// that have been tried and reverted. Both were caught by
+/// `postlude_dispatch::inexact_postlude_shapes_are_not_recognized`.
+///
+/// 1. Walk one arm and label the result. A postlude can then be stitched out of
+///    instructions no execution runs, so the specification is WRONG rather than
+///    unproven.
+/// 2. Walk both arms and accept only what they agree on. With at most one
+///    conditional the two arms are every path, so agreement does prove the
+///    decoded stream is path-insensitive -- but it discards WHICH arm the
+///    predicate selects, and the stack-check postlude recogniser depends on
+///    exactly that. It accepted `jb` where the shape requires `ja`.
+///
+/// So the trace stopping at a conditional is load-bearing, not a limitation: a
+/// VMProtect handler's conditional is sometimes a junk predicate joining two
+/// fragments and sometimes a real guard the recogniser reads, and nothing in the
+/// trace alone separates them. A fix has to prove a given predicate is opaque
+/// before crossing it, rather than crossing all of them.
+///
+/// This is the largest single blocker left -- 162 of 197 handler refusals stop
+/// at a ConditionalBranch, and "no popped-target transition recovered" (171) and
+/// "trace does not terminate through the recovered handler register" (128) are
+/// symptoms of the same truncation.
+///
+/// # Errors
+///
+/// Propagates a decode failure at the handler entry.
+/// Where the dispatch actually starts on a native-call RESUME path.
+///
+/// After the call the VM restores its role registers with `pop`, and puts junk
+/// writes to those same registers in between:
+///
+/// ```text
+/// mov rsp,[rbp-10h] ; cmc ; dec r15w ; mov rbp,[rbp-8] ; mov [rbp],rax
+/// pop rbx ; pop r15 ; adc r10b,dil ; bt r10w,r13w ; pop r10 ; sub r10,4 ; jmp
+/// ```
+///
+/// An extractor reading from the raw resume point sees every role "modified
+/// before the encoded load" -- `pop r15` for the handler, `pop r10` for the VIP,
+/// `pop rbx` for the key -- which is true, and is exactly why a native-call
+/// handler was never recoverable on its return path. The codec lives AFTER the
+/// restore.
+///
+/// Returns the address just past the last leading `pop <role>`, and only when
+/// ALL THREE dispatch roles are restored there; otherwise `resume` unchanged, so
+/// no other shape changes behaviour. Trimming can only lose definitions the
+/// codec would then be missing, and the codec shapes are exact, so a wrong trim
+/// refuses rather than mis-recovers.
+fn resume_after_role_restore(
+    pe: &PeImage<'_>,
+    resume: Rva,
+    roles: HandlerRegisterRoles,
+    limits: DirectJumpTraceLimits,
+) -> Rva {
+    let Ok(trace) = trace_direct_jump_fragments(pe, resume, limits) else {
+        return resume;
+    };
+    let mut remaining: BTreeSet<iced_x86::Register> =
+        [roles.vip, roles.rolling_key, roles.handler]
+            .into_iter()
+            .map(crate::dispatch_extract::canonical)
+            .collect();
+    let mut after = None;
+    for decoded in trace.instructions() {
+        let instruction = &decoded.instruction;
+        if instruction.mnemonic() == iced_x86::Mnemonic::Pop
+            && instruction.op0_kind() == iced_x86::OpKind::Register
+            && remaining.remove(&crate::dispatch_extract::canonical(instruction.op0_register()))
+        {
+            after = decoded.next_rva();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+    }
+    if remaining.is_empty() {
+        after.unwrap_or(resume)
+    } else {
+        resume
+    }
+}
+
+
+/// Process-global memo of handler-codec recoveries. Every guard of one VM
+/// re-recovers the same handlers, and the recovery is a deterministic function
+/// of the handler's bytes and config, so caching it lets guards after the first
+/// skip it (worth minutes across a thousand-guard image). The key is a content
+/// hash of the handler's bytes, not its address, so two different images that
+/// happen to share a base and RVA never alias (the address-keyed version
+/// contaminated the synthetic-PE tests); the config is compared too. The `Mutex`
+/// makes it safe for the parallel guard devirtualization.
+type HandlerCodecMemo =
+    HashMap<u64, (HandlerCodecRecoveryConfig, HandlerCodecRecoveryReport)>;
+static HANDLER_CODEC_MEMO: OnceLock<Mutex<HandlerCodecMemo>> = OnceLock::new();
+
+/// A cheap FNV-1a hash of up to 1 KiB of the handler's bytes, enough to tell
+/// distinct handlers apart. `None` when the bytes are not addressable.
+fn handler_content_key(pe: &PeImage<'_>, entry: Rva) -> Option<u64> {
+    let offset = pe.rva_to_file_offset(entry).ok()?.0 as usize;
+    let bytes = pe.data().get(offset..(offset + 1024).min(pe.data().len()))?;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    // Fold the RVA in so two identical byte windows at different addresses (a
+    // handler and its padding-identical neighbour) stay distinct.
+    Some(hash ^ u64::from(entry.0))
+}
+
 pub fn recover_handler_codecs(
     pe: &PeImage<'_>,
     entry: Rva,
     config: &HandlerCodecRecoveryConfig,
 ) -> Result<HandlerCodecRecoveryReport, DisasmError> {
+    let key = handler_content_key(pe, entry);
+    let memo = HANDLER_CODEC_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(key) = key
+        && let Ok(cache) = memo.lock()
+        && let Some((cached_config, report)) = cache.get(&key)
+        && cached_config == config
+    {
+        return Ok(report.clone());
+    }
+    let report = recover_handler_codecs_inner(pe, entry, config)?;
+    if let Some(key) = key
+        && let Ok(mut cache) = memo.lock()
+    {
+        cache.insert(key, (config.clone(), report.clone()));
+    }
+    Ok(report)
+}
+
+fn recover_handler_codecs_inner(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    config: &HandlerCodecRecoveryConfig,
+) -> Result<HandlerCodecRecoveryReport, DisasmError> {
+    // No arm walk here any more. Following one arm of a handler's conditional
+    // was built, labeled and measured at +0 on N1 across all 814 entries -- and
+    // `postlude_dispatch::inexact_postlude_shapes_are_not_recognized` then
+    // caught what it cost: a handler whose stack-check guard compares the WRONG
+    // register used to refuse, and instead got recovered by walking past the
+    // guard to the dispatch head. A fail-closed shape check is worth more than a
+    // labeled path that buys nothing, so the retry is gone rather than special-
+    // cased.
+    recover_handler_codecs_once(pe, entry, config)
+}
+
+fn recover_handler_codecs_once(
+    pe: &PeImage<'_>,
+    entry: Rva,
+    config: &HandlerCodecRecoveryConfig,
+) -> Result<HandlerCodecRecoveryReport, DisasmError> {
     let trace = trace_direct_jump_fragments(pe, entry, config.trace_limits)?;
+    let conditional_arms = trace.conditional_continuations.clone();
     let slice = backward_slice_handler_trace(
         &trace,
         &HandlerSliceConfig {
@@ -367,8 +526,16 @@ pub fn recover_handler_codecs(
         )?;
         if let Some(recovered) = analysis.recovered {
             if let Some(dispatch_source) = recovered.report.dispatch_source {
-                let resume_trace =
-                    trace_direct_jump_fragments(pe, dispatch_source, config.trace_limits)?;
+                let resume_trace = trace_direct_jump_fragments(
+                    pe,
+                    resume_after_role_restore(
+                        pe,
+                        dispatch_source,
+                        config.roles,
+                        config.trace_limits,
+                    ),
+                    config.trace_limits,
+                )?;
                 let resume_slice = backward_slice_handler_trace(
                     &resume_trace,
                     &HandlerSliceConfig {
@@ -432,6 +599,7 @@ pub fn recover_handler_codecs(
                 selector.decoded_register_id,
                 selector.encoded_load,
                 i64::from(selector.codec.width.bytes()),
+                config.bytecode_direction,
                 CfgLimits {
                     max_blocks: config.trace_limits.max_fragments,
                     max_instructions: config.trace_limits.max_instructions,
@@ -439,8 +607,11 @@ pub fn recover_handler_codecs(
                 },
                 |resume| {
                     let extracted = (|| {
-                        let resume_trace =
-                            trace_direct_jump_fragments(pe, resume, config.trace_limits)?;
+                        let resume_trace = trace_direct_jump_fragments(
+                            pe,
+                            resume_after_role_restore(pe, resume, config.roles, config.trace_limits),
+                            config.trace_limits,
+                        )?;
                         let resume_slice = backward_slice_handler_trace(
                             &resume_trace,
                             &HandlerSliceConfig {
@@ -466,21 +637,40 @@ pub fn recover_handler_codecs(
                         }
                     };
                     let resolved = match report.candidates.as_slice() {
+                        // A table dispatch keeps its base register; a relative
+                        // one has none, and this path only ever used the
+                        // register to protect a base. Both are accepted.
                         [candidate]
-                            if candidate.codec.table.is_some()
-                                && candidate.postlude.is_none()
+                            if candidate.postlude.is_none()
                                 && !candidate.vip_rebased_before_source =>
                         {
-                            candidate.table_register.map(|table| {
-                                (candidate.encoded_load, candidate.terminal_dispatch, table)
-                            })
+                            Some((
+                                candidate.encoded_load,
+                                candidate.terminal_dispatch,
+                                candidate.table_register,
+                            ))
                         }
                         _ => None,
                     };
                     let Some(resolved) = resolved else {
+                        let why = report.candidates.first().map_or_else(
+                            || "no candidate".to_owned(),
+                            |candidate| {
+                                format!(
+                                    "table={} postlude={} vip_rebased={} table_register={:?}",
+                                    candidate.codec.table.is_some(),
+                                    candidate.postlude.is_some(),
+                                    candidate.vip_rebased_before_source,
+                                    candidate.table_register,
+                                )
+                            },
+                        );
                         return Err(format!(
-                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch",
-                            report.candidates.len()
+                            "native-call return path recovered {} dispatch codecs, none a plain keyless table dispatch [{why}]{}",
+                            report.candidates.len(),
+                            report.rejected_sources.first().map_or(String::new(), |rejection| {
+                                format!(" (first rejection at {}: {})", rejection.encoded_load, rejection.reason)
+                            })
                         ));
                     };
                     resumed = Some(report);
@@ -502,6 +692,23 @@ pub fn recover_handler_codecs(
                     native_call = Some(analysis.report);
                 }
             }
+        } else {
+            // The keyless fallback exists so a native-call handler whose body
+            // spans the call -- and whose rolling key is therefore restored by a
+            // `pop` the operand model cannot pair -- can still be recovered. When
+            // even that finds no selector, say so: silence here reads exactly
+            // like "this is not a native-call handler".
+            native_call_resume_diagnostic = Some(format!(
+                "keyless native-call selector not recovered: {} candidate(s){}",
+                raw_operand.candidates.len(),
+                raw_operand
+                    .rejected_sources
+                    .first()
+                    .map_or(String::new(), |rejection| format!(
+                        ", first rejection: {}",
+                        rejection.reason
+                    )),
+            ));
         }
     }
 
@@ -515,6 +722,12 @@ pub fn recover_handler_codecs(
             dispatch_analysis.candidates.len()
         ));
     }
+    diagnostics.extend(dispatch_analysis.rejected_sources.iter().map(|rejection| {
+        format!(
+            "dispatch source {}: {}",
+            rejection.encoded_load, rejection.reason
+        )
+    }));
     if operand_analysis.candidates.len() > 1 {
         diagnostics.push(format!(
             "multiple operand codecs remain: {}",
@@ -807,6 +1020,23 @@ pub fn recover_handler_codecs(
         } else {
             diagnostics
                 .push("handler codecs recovered but semantic effects remain unknown".to_owned());
+            // Say WHY it is unknown. The analysis records which classification
+            // clause refused, but in its own `evidence`, which no caller of this
+            // reads -- so the one refusal a reader actually sees carried none of
+            // it. Says plainly when the analysis was never produced, too, since
+            // that is a different problem from a classification that ran and
+            // matched nothing.
+            match handler_analysis.as_ref() {
+                Some(analysis) => diagnostics.extend(
+                    analysis
+                        .evidence
+                        .iter()
+                        .filter(|line| line.starts_with("no semantic candidate matched"))
+                        .cloned(),
+                ),
+                None => diagnostics
+                    .push("no handler analysis was produced for this handler".to_owned()),
+            }
         }
         status = RecoveryStatus::PartiallyRecovered;
     }
@@ -853,6 +1083,7 @@ pub fn recover_handler_codecs(
         decode_spec,
         table_dispatch,
         confidence,
+        conditional_arms,
         diagnostics,
     })
 }
@@ -1059,6 +1290,7 @@ pub fn recover_and_decode_linear_vm_stream_with_table(
         max_instructions,
         global_table,
         &mut LinearDecodeCache::default(),
+        None,
     )
 }
 
@@ -1087,6 +1319,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
     max_instructions: usize,
     global_table: Option<GlobalTableBase>,
     cache: &mut LinearDecodeCache,
+    deadline: Option<std::time::Instant>,
 ) -> Result<LinearHandlerRecoveryReport, LinearHandlerRecoveryError> {
     let mut instructions = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1116,6 +1349,16 @@ pub fn recover_and_decode_linear_vm_stream_cached(
         });
 
     for _ in 0..max_instructions {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            return Ok(linear_report(
+                instructions,
+                state,
+                cumulative_vsp_delta,
+                LinearDecodeStop::Deadline,
+                None,
+                handler_recoveries,
+            ));
+        }
         if !seen.insert(state) {
             return Ok(linear_report(
                 instructions,
@@ -1191,6 +1434,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                     partial: Box::new(partial),
                 });
             };
+            let recovery_at = std::time::Instant::now();
             let mut recovery = match recover_handler_codecs(pe, handler_rva, config) {
                 Ok(recovery) => recovery,
                 Err(source) => {
@@ -1267,6 +1511,7 @@ pub fn recover_and_decode_linear_vm_stream_cached(
                     .handler_analysis
                     .as_ref()
                     .is_some_and(|analysis| analysis.semantic.ends_linear_block());
+            crate::cfg::note_decode_slow("recover_handler_codecs", recovery_at);
             cache.recoveries.insert(state.handler, recovery.clone());
             handler_recoveries.insert(state.handler, recovery);
             let Some(spec) = spec else {

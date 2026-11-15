@@ -40,6 +40,15 @@ pub struct CollectedStore {
     pub address: Expr,
     pub value: Expr,
     pub width: vmpx_vm::BitWidth,
+    /// Memory epoch immediately after this store committed, carried through from
+    /// `SymbolicMemoryWrite`. Reads at or above it observe this store; reads
+    /// below it precede it.
+    ///
+    /// Without it a replacement could be told WHAT to write and WHAT to read but
+    /// not in what order, so the only sound way to emit an unresolved read was
+    /// to require a path with no stores at all -- which VM exits essentially
+    /// never are.
+    pub epoch: u64,
 }
 
 /// One imported call a replacement must perform, keyed by the intrinsic that
@@ -81,6 +90,20 @@ fn path_reports<'a>(
         reports.extend(segment.transition_pop.iter());
     }
     reports
+}
+
+/// The epoch after the LAST write anywhere on the path -- including the
+/// VSP-relative ones [`collect_path_effects`] drops, since a read ordered after
+/// every emitted store can still precede a VM-stack store at a higher epoch.
+/// A read at or above this value observes the whole path's memory.
+#[must_use]
+pub fn last_write_epoch(family: &RecoveredEntryPathFamily, path: &RecoveredEntryPath) -> u64 {
+    path_reports(family, path)
+        .iter()
+        .flat_map(|report| report.external_writes.iter())
+        .map(|write| write.epoch)
+        .max()
+        .unwrap_or(0)
 }
 
 fn fresh_names(reports: &[&SymbolicVmExecutionReport]) -> BTreeSet<String> {
@@ -338,6 +361,7 @@ pub fn collect_path_effects(
                 address: write.address.clone(),
                 value: write.value.clone(),
                 width: write.value.width,
+                epoch: write.epoch,
             });
         }
         for call in &report.native_calls {

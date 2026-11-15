@@ -92,6 +92,61 @@ pub struct VmProfileChainSegment {
     pub next_profile_roles: Option<VmProfileRoleResolutionReport>,
 }
 
+/// Whether a symbolic failure is a proven null read whose exception provably
+/// unwinds out of the VM, and the evidence if so.
+///
+/// Requires all of: the failure really is the proven-null-read one, in a handler
+/// proven to implement a VM memory load; a recovered handler codec for it; every
+/// proven external read site covered by a language handler; and a continuation
+/// resolved to `ZeroSeedUnwind`. Anything less returns `None` and the path keeps
+/// failing, because "the fault is caught" does not say where control resumes.
+fn zero_seed_exception_exit(
+    pe: &PeImage<'_>,
+    segment: &VmProfileChainSegment,
+    error: &crate::SymbolicExecutionError,
+) -> Option<String> {
+    if !error.message.contains("null memory read")
+        || error.semantic != VmHandlerSemantic::MemoryLoad
+    {
+        return None;
+    }
+    // The FAULTING instruction's handler, not the segment's final one. The
+    // segment ends wherever the decode stopped, which is not where the null
+    // read is, and looking it up from the final state silently found the wrong
+    // handler (or none) -- the same mistake as deriving the fault site from a
+    // recovery that had failed.
+    let handler = segment
+        .decode
+        .handler_recoveries
+        .get(
+            &segment
+                .decode
+                .decode
+                .instructions
+                .get(error.instruction_index)?
+                .state_before
+                .handler,
+        )?;
+    let coverage = crate::analyze_vm_memory_exception_coverage_with_state(
+        pe,
+        handler,
+        segment.symbolic.as_ref(),
+    )
+    .ok()?;
+    if !coverage.all_fault_sites_have_language_handler {
+        return None;
+    }
+    let unwound = coverage.continuation_resolutions.iter().find(|resolution| {
+        resolution.status == crate::RecoveryStatus::Recovered
+            && resolution.source == Some(crate::ExceptionContinuationSource::ZeroSeedUnwind)
+    })?;
+    Some(format!(
+        "zero-seed unwind via sled handler {:?}, {} fault site(s) SEH-covered",
+        unwound.handler,
+        coverage.fault_sites.len()
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmProfileChainStop {
@@ -326,6 +381,26 @@ pub fn explore_vm_profile_chain(
         if let Some(error) = segment.symbolic_error.clone() {
             let next = segment.decode.decode.final_state;
             let diagnostic = error.to_string();
+            // A proven null read is not the end of the analysis: the protector
+            // reads address 0 on purpose, the access violation reaches a
+            // registered language handler, and a zero continuation seed leaves a
+            // pure RET sled that unwinds back through the original native frame
+            // to the caller. That is a VM exit.
+            //
+            // The coverage for this was already being computed for the report
+            // and never consulted here, so the path family stayed incomplete --
+            // which is what kept the original entry point unrecovered and the
+            // protector sections unstrippable.
+            if let Some(evidence) = zero_seed_exception_exit(pe, &segment, &error) {
+                segments.push(segment);
+                return Ok(stopped_report(
+                    segments,
+                    total_instructions,
+                    VmProfileChainStop::VmExit,
+                    Some(next),
+                    vec![format!("{diagnostic} [exception exit: {evidence}]")],
+                ));
+            }
             segments.push(segment);
             return Ok(stopped_report(
                 segments,

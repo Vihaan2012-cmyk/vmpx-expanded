@@ -26,12 +26,19 @@ fn main() {
             }
             for (f, st) in &s.flags {
                 match st {
-                    FlagState::Value(e) => println!("  flag {} = {}", f.name(), pretty(&e.simplify(), 8)),
+                    FlagState::Value(e) => {
+                        println!("  flag {} = {}", f.name(), pretty(&e.simplify(), 8))
+                    }
                     FlagState::Clobbered => println!("  flag {} = clobbered", f.name()),
                 }
             }
             for w in &s.writes {
-                println!("  store {:?} [{}] = {}", w.width, pretty(&w.address, 6), pretty(&w.value, 8));
+                println!(
+                    "  store {:?} [{}] = {}",
+                    w.width,
+                    pretty(&w.address, 6),
+                    pretty(&w.value, 8)
+                );
             }
         }
     }

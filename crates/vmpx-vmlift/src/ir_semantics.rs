@@ -366,6 +366,8 @@ impl Machine<'_> {
                     address: a,
                     value,
                     width,
+                    // No epoch at the IR layer; see `CollectedStore::epoch`.
+                    epoch: u64::MAX,
                 });
             }
             Operation::SpillLoad { destination, slot } => {
@@ -414,6 +416,21 @@ impl Machine<'_> {
                 let v = self.read_as(*value, BitWidth::W64)?;
                 self.flags = FlagState::Known(v.clone());
                 self.rflags = Some(v);
+            }
+            Operation::Rdtsc { out } => {
+                // The counter is opaque and differs on every execution, so the
+                // read-back value is an intrinsic, exactly as the executor's
+                // `read_timestamp_counter_N` is. Two reads are NOT the same
+                // value, which is why this is also a side effect below.
+                let value = Expr::intrinsic(BitWidth::W64, "x86_rdtsc", Vec::new());
+                self.slots.insert(
+                    out.0,
+                    Slot {
+                        width: BitWidth::W64,
+                        value,
+                        narrow: None,
+                    },
+                );
             }
             Operation::Cpuid {
                 leaf,
@@ -844,6 +861,7 @@ fn volatile_indices(function: &Function) -> std::collections::BTreeSet<usize> {
                     | Operation::GsLoad { .. }
                     | Operation::Call { .. }
                     | Operation::RestoreFlags { .. }
+                    | Operation::Rdtsc { .. }
                     | Operation::Cpuid { .. }
                     | Operation::MultiplyFlags { .. }
                     | Operation::UnsignedDivide { .. }
@@ -1109,6 +1127,7 @@ fn rewrite_exit(
                         address: r(&s.address)?,
                         value: r(&s.value)?,
                         width: s.width,
+                        epoch: s.epoch,
                     })
                 })
                 .collect::<Result<_, String>>()?,

@@ -7,6 +7,9 @@
 
 pub mod pipeline;
 
+#[cfg(test)]
+mod bench;
+
 pub use pipeline::{Gated, Tournament, run_pipeline};
 
 use std::cmp::Ordering;

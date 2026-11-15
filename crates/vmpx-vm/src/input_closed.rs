@@ -8,7 +8,8 @@ use crate::{Expr, NativeExitState};
 /// Intrinsic families that are pure functions of their arguments. Everything
 /// else (memory epochs/snapshots, native-call results, fresh allocations,
 /// timestamp counter, unknown names) is opaque machine state and never closed.
-fn is_pure_intrinsic(name: &str) -> bool {
+#[must_use]
+pub fn is_pure_intrinsic(name: &str) -> bool {
     name.starts_with("vm_flags_") || name.starts_with("x86_unsigned_")
 }
 
@@ -17,6 +18,20 @@ fn is_pure_intrinsic(name: &str) -> bool {
 /// it not closed. Conservative: unknown shapes are never closed.
 #[must_use]
 pub fn is_expr_input_closed(expr: &Expr, allowed: &BTreeSet<String>) -> bool {
+    input_closure_violation(expr, allowed).is_none()
+}
+
+/// WHY `expr` is not closed over `allowed`, or `None` when it is. The three
+/// causes are not interchangeable and the fixes do not overlap: an unbound
+/// REGISTER can be admitted by widening the replacement's input set, while a
+/// LOAD or an opaque INTRINSIC cannot -- the replacement would have to perform
+/// the read or reproduce the machine state. Reporting them as one message hid
+/// that distinction behind 244 identical refusals on systems.xpl.
+///
+/// Shares its implementation with [`is_expr_input_closed`] so the predicate and
+/// the explanation cannot drift apart.
+#[must_use]
+pub fn input_closure_violation(expr: &Expr, allowed: &BTreeSet<String>) -> Option<String> {
     use crate::ExprKind;
     let mut pending = vec![expr];
     while let Some(current) = pending.pop() {
@@ -24,13 +39,19 @@ pub fn is_expr_input_closed(expr: &Expr, allowed: &BTreeSet<String>) -> bool {
             ExprKind::Const { .. } => {}
             ExprKind::Register { name } => {
                 if !allowed.contains(name) {
-                    return false;
+                    return Some(format!("unbound register {name}"));
                 }
             }
-            ExprKind::Load { .. } => return false,
+            ExprKind::Load { address } => {
+                return Some(format!(
+                    "memory load of {} byte(s) at {}",
+                    current.width.bytes(),
+                    short(address)
+                ));
+            }
             ExprKind::Intrinsic { name, arguments } => {
                 if !is_pure_intrinsic(name) {
-                    return false;
+                    return Some(format!("opaque intrinsic {name}"));
                 }
                 pending.extend(arguments);
             }
@@ -47,7 +68,78 @@ pub fn is_expr_input_closed(expr: &Expr, allowed: &BTreeSet<String>) -> bool {
             }
         }
     }
-    true
+    None
+}
+
+/// A bounded rendering of an address, so one diagnostic cannot carry a whole
+/// obfuscated expression tree.
+fn short(expr: &Expr) -> String {
+    let text = format!("{expr:?}");
+    if text.len() <= 120 {
+        return text;
+    }
+    text.chars().take(120).collect::<String>() + "..."
+}
+
+/// As [`input_closure_violation`], but a `Load` is permitted when its ADDRESS is
+/// closed: the replacement computes the address and performs the read itself.
+///
+/// Sound only once the caller has established that the read may happen where the
+/// replacement puts it -- see [`crate::materialize_epoch_loads_from`]. The
+/// ordinary predicate refuses every load because that does not hold in general.
+#[must_use]
+pub fn input_closure_violation_allowing_loads(
+    expr: &Expr,
+    allowed: &BTreeSet<String>,
+) -> Option<String> {
+    use crate::ExprKind;
+    let mut pending = vec![expr];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => {}
+            ExprKind::Register { name } => {
+                if !allowed.contains(name) {
+                    return Some(format!("unbound register {name}"));
+                }
+            }
+            // The read is allowed; its ADDRESS still has to be computable.
+            ExprKind::Load { address } => pending.push(address),
+            ExprKind::Intrinsic { name, arguments } => {
+                if !is_pure_intrinsic(name) {
+                    return Some(format!("opaque intrinsic {name}"));
+                }
+                pending.extend(arguments);
+            }
+            ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    None
+}
+
+/// WHY the exit is not closed, naming the slot as well as the term.
+#[must_use]
+pub fn exit_closure_violation(exit: &NativeExitState, allowed: &BTreeSet<String>) -> Option<String> {
+    for (register, value) in &exit.registers {
+        if let Some(why) = input_closure_violation(value, allowed) {
+            return Some(format!("{register:?} = {why}"));
+        }
+    }
+    for (slot, value) in [("rflags", &exit.rflags), ("return_address", &exit.return_address)] {
+        if let Some(why) = input_closure_violation(value, allowed) {
+            return Some(format!("{slot} = {why}"));
+        }
+    }
+    None
 }
 
 /// True iff every value the exit carries (each register, `rflags`, the return

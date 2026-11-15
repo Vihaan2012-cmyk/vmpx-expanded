@@ -162,6 +162,18 @@ pub struct LoopInfo {
 /// `native_return_address_initial` at the preferred image base. `None` (no such
 /// cell, or more than one) leaves the symbol unmaterializable so the lift fails
 /// closed rather than inventing a continuation address.
+/// A frame cell taken at its on-disk value is valid at the preferred base only.
+fn relocated_frame_assumptions(frame: &[NativeFrameSource]) -> Vec<LiftAssumption> {
+    if frame
+        .iter()
+        .any(|cell| matches!(cell, NativeFrameSource::RelocatedConstant { .. }))
+    {
+        vec![LiftAssumption::PreferredImageBase]
+    } else {
+        Vec::new()
+    }
+}
+
 fn return_address_va(frame: &[NativeFrameSource], image_base: u64) -> Option<u64> {
     let mut found = None;
     for cell in frame {
@@ -1188,6 +1200,7 @@ impl Builder<'_> {
                         layout,
                         input.frame.len(),
                         input.top_offset,
+                        crate::decoded_lift::RegionStaging::Full,
                     )
                     .map_err(|error| DecodedLiftError::Cfg {
                         block: key,
@@ -1195,6 +1208,16 @@ impl Builder<'_> {
                     })?;
                     let exit = match recovered {
                         RecoveredExit::Callee(exit) => exit,
+                        // Unchanged behaviour: this case used to be refused
+                        // inside `recover_exit` itself, and only the decompiler
+                        // can use it. Native reintegration cannot, because there
+                        // is no staged region for it to retain.
+                        RecoveredExit::Trampoline(_) => {
+                            return Err(DecodedLiftError::Cfg {
+                                block: key,
+                                reason: "the exit transfers to a computed continuation above the entry frame".to_owned(),
+                            });
+                        }
                         RecoveredExit::Region(exit) => {
                             let rflags = if is_native_rflags_initial(&exit.rflags) {
                                 None
@@ -1758,7 +1781,7 @@ impl Builder<'_> {
 /// Re-bases the nested entry's frame onto the exact state the exit left: its
 /// stack sits where the exit's `ret` leaves the stack pointer, its registers and
 /// flags are what the exit restored, and the outer memory carries over.
-fn compose_nested_state(
+pub(crate) fn compose_nested_state(
     prior: &SymbolicVmExecutionReport,
     exit: &NativeExitState,
     entry: &NestedEntry,
@@ -1878,7 +1901,7 @@ pub fn probe_decoded_cfg(input: &DecodedCfgInput<'_>) -> CfgProbe {
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
         uses_entry_flags: false,
-        assumptions: Vec::new(),
+        assumptions: relocated_frame_assumptions(input.frame),
         loop_bodies: recover_natural_loops(input.cfg),
         loop_phis: 0,
         phi_widths: Vec::new(),
@@ -1964,7 +1987,7 @@ fn lift_with_nested(
         uses_root: false,
         return_address_va: return_address_va(input.frame, input.image_base),
         uses_entry_flags: false,
-        assumptions: Vec::new(),
+        assumptions: relocated_frame_assumptions(input.frame),
         loop_bodies: recover_natural_loops(cfg),
         loop_phis: 0,
         phi_widths: Vec::new(),
@@ -2550,6 +2573,9 @@ impl Collector<'_> {
                         address,
                         value,
                         width: store.width,
+                        // Lowered from a replacement config, which carries no
+                        // epoch; u64::MAX is the conservative value.
+                        epoch: u64::MAX,
                     });
                 }
                 StepKind::Load(read) => {
@@ -2646,6 +2672,10 @@ impl Collector<'_> {
                         address,
                         value: bind_reads(word, &acc.bindings)?,
                         width: BitWidth::W64,
+                        // No epoch at this layer: u64::MAX is the conservative
+                        // value, since a read must be at or above every store's
+                        // epoch to be materialised and nothing reaches MAX.
+                        epoch: u64::MAX,
                     });
                 }
                 let retained = u32::try_from(leaf.staged.len() * 8).unwrap_or(u32::MAX);

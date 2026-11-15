@@ -31,6 +31,9 @@ impl CpuidOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Passthrough {
     Cpuid(CpuidOutput),
+    /// `rdtsc`. Like `cpuid` it reads machine state, so it is an environment
+    /// boundary: correct by identity, never provable from the expression.
+    Rdtsc,
     GsLoad,
     DoubleShift {
         left: bool,
@@ -82,6 +85,12 @@ pub(crate) fn classify(name: &str) -> Option<Passthrough> {
         };
         return index_suffix(index).then_some(Passthrough::Cpuid(output));
     }
+    // Keeps the executor's own name: `neutralize`, `env_gate`, `cfg` and
+    // `image_concretize` all key on this prefix, so renaming it to the `x86_`
+    // convention would be a wider change than the lowering is worth.
+    if let Some(index) = name.strip_prefix("read_timestamp_counter_") {
+        return index_suffix(index).then_some(Passthrough::Rdtsc);
+    }
     if let Some(index) = name.strip_prefix("x86_gs_load_") {
         return index_suffix(index).then_some(Passthrough::GsLoad);
     }
@@ -103,14 +112,15 @@ pub fn is_native_passthrough(name: &str) -> bool {
     classify(name).is_some()
 }
 
-/// True for a passthrough that reads machine state (`cpuid`, `gs`-relative
-/// loads). Such a value is correct by identity re-emission but is a trusted
-/// boundary, not something a static value-equivalence proof can establish.
+/// True for a passthrough that reads machine state (`cpuid`, `rdtsc`,
+/// `gs`-relative loads). Such a value is correct by identity re-emission but is
+/// a trusted boundary, not something a static value-equivalence proof can
+/// establish — `rdtsc` most of all, since it differs on every execution.
 #[must_use]
 pub fn is_environment_boundary(name: &str) -> bool {
     matches!(
         classify(name),
-        Some(Passthrough::Cpuid(_) | Passthrough::GsLoad)
+        Some(Passthrough::Cpuid(_) | Passthrough::Rdtsc | Passthrough::GsLoad)
     )
 }
 
@@ -150,10 +160,15 @@ mod tests {
             "x86_double_shift_up_w32_1",
             "x86_double_shift_left_w32_1_2",
             "vm_flags_add_w32",
-            "read_timestamp_counter_1",
+            "read_timestamp_counter_",
+            "read_timestamp_counter_x",
         ] {
             assert_eq!(classify(rejected), None, "{rejected}");
         }
+        // rdtsc now lowers by re-emission. It was the single biggest blocker on
+        // devirtualized output for systems.xpl: 146 of 462 CFG-complete entries.
+        assert_eq!(classify("read_timestamp_counter_1"), Some(Passthrough::Rdtsc));
+        assert!(is_environment_boundary("read_timestamp_counter_1"));
         assert!(is_environment_boundary("x86_gs_load_1"));
         assert!(!is_environment_boundary("x86_popfq_1"));
     }

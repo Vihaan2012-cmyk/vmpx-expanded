@@ -341,6 +341,9 @@ impl Renamer {
                 destination: self.register(destination)?,
                 address: self.address(at)?,
             },
+            Operation::Rdtsc { out } => Operation::Rdtsc {
+                out: self.slot(out)?,
+            },
             Operation::Cpuid {
                 leaf,
                 subleaf,
@@ -385,6 +388,21 @@ impl Renamer {
                 out_quotient: self.slot(out_quotient)?,
                 out_remainder: self.slot(out_remainder)?,
                 out_flags: self.slot(out_flags)?,
+            },
+            Operation::WideMultiply {
+                signed,
+                width,
+                left,
+                right,
+                out_low,
+                out_high,
+            } => Operation::WideMultiply {
+                signed,
+                width,
+                left: self.slot(left)?,
+                right: self.slot(right)?,
+                out_low: self.slot(out_low)?,
+                out_high: self.slot(out_high)?,
             },
             Operation::BranchIf { condition, target } => Operation::BranchIf {
                 condition,

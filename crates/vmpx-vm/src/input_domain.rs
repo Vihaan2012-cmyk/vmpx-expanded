@@ -104,7 +104,16 @@ pub enum InputDomainRefusal {
 
 fn unsupported(register: &str, reason: &str) -> InputDomainRefusal {
     let register = match register.split_once('@') {
-        Some((load, _)) => format!("{load} (untracked memory read)"),
+        // Keep the address. That suffix is the load's own argument expression
+        // (built as `{name}@{arguments:?}`), so it says WHERE the read comes
+        // from, and discarding it left the refusal naming an unknown without
+        // saying what it was a read OF -- the single fact that separates a
+        // jump-table index from an integrity check reading the image's own
+        // bytes. Bounded, since an address expression can be arbitrarily deep.
+        Some((load, address)) => {
+            let shown: String = address.chars().take(180).collect();
+            format!("{load} (untracked memory read at {shown})")
+        }
         None => register.to_owned(),
     };
     InputDomainRefusal::Unsupported {
@@ -358,7 +367,156 @@ fn submasks(observed: u64, limits: InputDomainLimits) -> Option<Vec<u64>> {
 pub fn abstract_epoch_loads(expr: &Expr) -> Result<Expr, crate::ExprError> {
     expr.rewrite_intrinsics(&mut |width, name, arguments| {
         (name.starts_with("memory_load_epoch_") && arguments.len() == 1)
-            .then(|| Expr::register(width, format!("{name}@{arguments:?}")))
+            .then(|| Expr::register(width, format!("{name}@{:032x}", arguments_identity(arguments))))
+    })
+}
+
+/// A bounded 128-bit identity of an intrinsic's arguments, used to name the free
+/// variable one abstracts to. Expressions are hash-consed, so each argument's
+/// `Hash` reads a precomputed per-node hash in O(1) -- there is no walk of the
+/// shared DAG. Debug-formatting them instead expands that DAG into a tree, which
+/// on a pathological input reached tens of gigabytes and aborted the process.
+/// 128 bits makes a collision (which would wrongly merge two distinct reads)
+/// negligible for any realistic function.
+fn arguments_identity(arguments: &[Expr]) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut high = std::collections::hash_map::DefaultHasher::new();
+    arguments.hash(&mut high);
+    let mut low = std::collections::hash_map::DefaultHasher::new();
+    0x9E37_79B9_7F4A_7C15_u64.hash(&mut low);
+    arguments.hash(&mut low);
+    (u128::from(high.finish()) << 64) | u128::from(low.finish())
+}
+
+/// The inverse of [`abstract_epoch_loads`], for reads that already observe every
+/// store: turns `memory_load_epoch_N(address)` into a real `Load` when
+/// `N >= min_epoch`, leaving earlier reads untouched.
+///
+/// An unresolved read becomes an opaque intrinsic, which is why a replacement
+/// refuses it -- yet a replacement needs only to perform the same read, and
+/// `expr_codegen` already lowers `ExprKind::Load`. The intrinsic form is what
+/// hides that.
+///
+/// The epoch is what makes it sound. A replacement emits every store before it
+/// computes any value, so a materialised read observes ALL of them -- which is
+/// what the VM saw exactly when the read's epoch was already at or above every
+/// store's. Pass `min_epoch` as the maximum store epoch on the path; reads below
+/// it must keep refusing, because they ran before a write they would now see.
+///
+/// # Errors
+///
+/// Propagates expression reconstruction failures.
+/// The prefix every abstracted opaque-state variable carries, so a caller can
+/// tell whether the simplifier cancelled it out.
+pub const OPAQUE_STATE_PREFIX: &str = "__opaque_state@";
+
+/// Replaces every OPAQUE intrinsic with one free variable per distinct
+/// `(name, arguments)`, so repeated occurrences of the same checksum or `rdtsc`
+/// read share a variable while unrelated ones stay independent.
+///
+/// If the variable does not survive simplification, the expression provably does
+/// not depend on that opaque state -- the cancellation is syntactic and needs no
+/// solver. If it does survive, independence is still possible but only a
+/// decision procedure can establish it.
+///
+/// # Errors
+///
+/// Propagates expression rebuild failures.
+pub fn abstract_opaque_intrinsics(expression: &Expr) -> Result<Expr, crate::ExprError> {
+    expression.rewrite_intrinsics(&mut |width, name, arguments| {
+        (!crate::is_pure_intrinsic(name)).then(|| {
+            Expr::register(
+                width,
+                format!("{OPAQUE_STATE_PREFIX}{name}@{:032x}", arguments_identity(arguments)),
+            )
+        })
+    })
+}
+
+/// True iff any abstracted opaque-state variable survives in `expression`.
+#[must_use]
+pub fn mentions_opaque_state(expression: &Expr) -> bool {
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => {}
+            ExprKind::Register { name } => {
+                if name.starts_with(OPAQUE_STATE_PREFIX) {
+                    return true;
+                }
+            }
+            ExprKind::Load { address: value }
+            | ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    false
+}
+
+/// Replaces every OPAQUE intrinsic with a constant derived from `seed` AND the
+/// intrinsic's own identity, leaving pure intrinsics alone.
+///
+/// Substituting several seeds and comparing the results tests whether an
+/// expression depends on opaque machine state at all. VMProtect mixes integrity
+/// checksums and `rdtsc` into register values that cancel out again, so a
+/// syntactic dependence is often not a semantic one.
+///
+/// The value MUST depend on the intrinsic's identity, not on the seed alone:
+/// giving every opaque term one shared constant makes `checksum_a ^ checksum_b`
+/// fold to zero under every seed, which would accept an exit that in fact
+/// differs on every run. Equal terms still share a value, so genuine
+/// cancellation is preserved.
+///
+/// Agreement across seeds is evidence, not proof -- only a decision procedure
+/// over a free variable (see [`abstract_opaque_intrinsics`]) settles it.
+///
+/// # Errors
+///
+/// Propagates width errors from rebuilding the expression.
+pub fn substitute_opaque_intrinsics(expression: &Expr, seed: u64) -> Result<Expr, crate::ExprError> {
+    expression.rewrite_intrinsics(&mut |width, name, arguments| {
+        (!crate::is_pure_intrinsic(name))
+            .then(|| Expr::constant(width, opaque_fill(seed, name, arguments)))
+    })
+}
+
+/// A per-term value: FxHash-style mixing of the seed with the term's identity.
+fn opaque_fill(seed: u64, name: &str, arguments: &[Expr]) -> u64 {
+    const K: u64 = 0x517C_C1B7_2722_0A95;
+    let mut hash = seed ^ K;
+    let mut absorb = |byte: u8| {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(K);
+        hash ^= hash >> 29;
+    };
+    for byte in name.as_bytes() {
+        absorb(*byte);
+    }
+    for byte in arguments_identity(arguments).to_le_bytes() {
+        absorb(byte);
+    }
+    hash
+}
+
+pub fn materialize_epoch_loads_from(
+    expr: &Expr,
+    min_epoch: u64,
+) -> Result<Expr, crate::ExprError> {
+    expr.rewrite_intrinsics(&mut |width, name, arguments| {
+        let epoch = name
+            .strip_prefix("memory_load_epoch_")
+            .and_then(|suffix| suffix.parse::<u64>().ok())?;
+        (epoch >= min_epoch && arguments.len() == 1)
+            .then(|| Expr::load(width, arguments[0].clone()))
     })
 }
 
@@ -765,6 +923,20 @@ struct Scan {
     /// when `collect` is set; never read by recovery.
     collect: bool,
     all_refusals: Vec<RawLeaf>,
+    /// Nodes already scanned.
+    ///
+    /// `Expr` is hash-consed, so a target whose subtree is shared N ways was
+    /// walked N times: the scan was exponential in SHARING rather than linear in
+    /// nodes. Measured on entry 0xc48d670, `infer_branch_input_domains` did not
+    /// return in 540s against a 120s budget -- the spin recorded at
+    /// `ReportOptions::new` ("around entry index 385-388, rva ~0xc82b466"), which
+    /// is why the default per-block instruction limit is pinned at 512.
+    ///
+    /// Scanning a node twice does nothing the first scan did not: every handler
+    /// is a function of the node itself, `direct_mask` is OR-accumulated and a
+    /// refusal is sticky. Hashing is O(1) (each node caches its structural hash)
+    /// and equality is a pointer test, so the set costs nothing per node.
+    seen: std::collections::HashSet<Expr, crate::expr::FxBuild>,
 }
 
 /// One offending leaf as the scan saw it (diagnostic).
@@ -811,6 +983,9 @@ impl Scan {
     }
 
     fn visit(&mut self, expr: &Expr) {
+        if !self.seen.insert(expr.clone()) {
+            return;
+        }
         match &expr.kind {
             ExprKind::Const { .. } => {}
             ExprKind::Load { address } => {
@@ -1398,6 +1573,7 @@ pub fn infer_branch_input_domains(
         refusal: None,
         collect: false,
         all_refusals: Vec::new(),
+        seen: std::collections::HashSet::default(),
     };
     scan.visit(target);
     if let Some(refusal) = scan.refusal {
@@ -1584,6 +1760,7 @@ pub fn diagnose_branch_refusals(target: &Expr, limits: InputDomainLimits) -> Vec
         refusal: None,
         collect: true,
         all_refusals: Vec::new(),
+        seen: std::collections::HashSet::default(),
     };
     scan.visit(&abstracted);
     let mut leaves: Vec<(&'static str, RawLeaf)> = std::mem::take(&mut scan.all_refusals)
@@ -3363,5 +3540,94 @@ mod tests {
             ),
             Err(crate::SymbolicDomainError::NonConcreteResult)
         ));
+    }
+
+    #[test]
+    fn opaque_substitution_spares_pure_intrinsics() {
+        let opaque = Expr::intrinsic(BitWidth::W32, "read_timestamp_counter_7", vec![]);
+        let pure = Expr::intrinsic(
+            BitWidth::W32,
+            "vm_flags_add_w32",
+            vec![Expr::constant(BitWidth::W32, 3)],
+        );
+        let filled = substitute_opaque_intrinsics(&opaque, 0x99).expect("substitute");
+        assert!(matches!(filled.kind, crate::ExprKind::Const { .. }));
+        let kept = substitute_opaque_intrinsics(&pure, 0x99).expect("substitute");
+        assert_eq!(kept, pure);
+    }
+
+    #[test]
+    fn distinct_opaque_terms_must_not_share_a_probe_value() {
+        // The trap: one shared constant makes `a ^ b` fold to zero under every
+        // seed, so an exit that differs on every run looks input-closed. Equal
+        // terms still have to cancel.
+        let term = |name: &str| Expr::intrinsic(BitWidth::W32, name, vec![]);
+        let differing = Expr::binary(
+            BinaryOp::Xor,
+            term("table_checksum_low_byte_xor_w32"),
+            term("read_timestamp_counter_3"),
+        )
+        .expect("xor");
+        let same = Expr::binary(
+            BinaryOp::Xor,
+            term("read_timestamp_counter_3"),
+            term("read_timestamp_counter_3"),
+        )
+        .expect("xor");
+        for seed in [0_u64, 1, 0xDEAD_BEEF, u64::MAX] {
+            assert_ne!(
+                substitute_opaque_intrinsics(&differing, seed).expect("substitute"),
+                Expr::constant(BitWidth::W32, 0),
+                "two different opaque terms must not cancel at seed {seed:#x}"
+            );
+            assert_eq!(
+                substitute_opaque_intrinsics(&same, seed).expect("substitute"),
+                Expr::constant(BitWidth::W32, 0),
+                "one term xored with itself must cancel at seed {seed:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_probe_sees_a_cancellation_the_free_variable_abstraction_does_not() {
+        // `x ^ c ^ c` is x whatever c is, but recognising that needs XOR
+        // reassociation across a non-constant operand, which neither the folder
+        // nor the abstraction performs. This is the gap a decision procedure has
+        // to close, and why the acceptance below it stays an assumption.
+        let checksum = Expr::intrinsic(BitWidth::W32, "table_checksum_low_byte_xor_w32", vec![]);
+        let x = Expr::register(BitWidth::W32, "native_rax_initial");
+        let mixed = Expr::binary(
+            BinaryOp::Xor,
+            Expr::binary(BinaryOp::Xor, x.clone(), checksum.clone()).expect("xor"),
+            checksum,
+        )
+        .expect("xor");
+        assert_ne!(
+            substitute_opaque_intrinsics(&mixed, 0).expect("substitute"),
+            x,
+            "folding alone does not reassociate across a register"
+        );
+        let abstracted = abstract_opaque_intrinsics(&mixed).expect("abstract");
+        assert!(mentions_opaque_state(&abstracted));
+    }
+
+    #[test]
+    fn repeated_opaque_reads_share_one_abstraction_variable() {
+        let read = |epoch: u32| {
+            Expr::intrinsic(
+                BitWidth::W64,
+                format!("memory_load_epoch_{epoch}"),
+                vec![Expr::constant(BitWidth::W64, 0x1000)],
+            )
+        };
+        let same = Expr::binary(BinaryOp::Sub, read(4), read(4)).expect("sub");
+        let differing = Expr::binary(BinaryOp::Sub, read(4), read(5)).expect("sub");
+        // One variable for equal reads, so a difference of equal reads folds.
+        let same = abstract_opaque_intrinsics(&same).expect("abstract");
+        assert_eq!(same, Expr::constant(BitWidth::W64, 0));
+        assert!(!mentions_opaque_state(&same));
+        // Different reads stay independent and cannot fold.
+        let differing = abstract_opaque_intrinsics(&differing).expect("abstract");
+        assert!(mentions_opaque_state(&differing));
     }
 }

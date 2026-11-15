@@ -33,6 +33,54 @@ const P_UN: u8 = 14;
 
 pub struct Renderer<'a> {
     pub names: &'a BTreeMap<String, String>,
+    /// Image base, so the recovered absolute addresses can print as `IMAGE_BASE`
+    /// instead of a bare constant. Zero when unknown.
+    pub image_base: u64,
+    /// Subtrees that have been given a local name (see [`crate::cse`]). Any
+    /// expression in here renders AS that name instead of being printed again,
+    /// which is what keeps a shared value from appearing ten times in one line.
+    pub temps: &'a std::collections::HashMap<Expr, String>,
+    /// Exit components every `return` agrees on, stated once for the function
+    /// instead of on each return. See [`common_exit_components`].
+    pub exit_common: &'a BTreeMap<String, Expr>,
+}
+
+/// The exit components (past the C return value) that every `return` in the
+/// function agrees on.
+///
+/// Those say nothing about which branch was taken, and there are many of them:
+/// on vm_c43d80e each return carries 15, of which 1 to 3 differ. Printing all 15
+/// on every line buries the one that matters, so the agreed ones are reported
+/// once for the whole function and dropped from the individual returns.
+pub fn common_exit_components(stmts: &[Stmt]) -> BTreeMap<String, Expr> {
+    let mut common: Option<BTreeMap<String, Expr>> = None;
+    for_each_return(stmts, &mut |vals| {
+        let here: BTreeMap<String, Expr> = vals.iter().skip(1).cloned().collect();
+        common = Some(match common.take() {
+            None => here,
+            Some(prev) => prev
+                .into_iter()
+                .filter(|(name, value)| here.get(name) == Some(value))
+                .collect(),
+        });
+    });
+    common.unwrap_or_default()
+}
+
+fn for_each_return(stmts: &[Stmt], visit: &mut impl FnMut(&[(String, Expr)])) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Return(vals) => visit(vals),
+            Stmt::If { then, els, .. } => {
+                for_each_return(then, visit);
+                for_each_return(els, visit);
+            }
+            Stmt::Loop(body) | Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                for_each_return(body, visit);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn hex(width: BitWidth, v: u64) -> String {
@@ -49,9 +97,32 @@ fn shift_mask(w: BitWidth) -> u64 {
     if w == BitWidth::W64 { 63 } else { 31 }
 }
 
+/// Display name for an intrinsic. Drops the trailing hash-cons `_<digits>`
+/// suffix that only distinguishes otherwise-identical reads
+/// (`read_timestamp_counter_110` -> `read_timestamp_counter`), keeping the
+/// meaningful width suffix (`_w32`). Printing only -- the IR keeps the full
+/// name, and the C re-evaluator rejects any such call either way, so this
+/// cannot change what evaluates.
+fn intrinsic_display(name: &str) -> &str {
+    match name.rsplit_once('_') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    }
+}
+
 impl Renderer<'_> {
     fn name(&self, n: &str) -> String {
         self.names.get(n).cloned().unwrap_or_else(|| n.to_owned())
+    }
+
+    /// A constant, as `IMAGE_BASE` when it is the image base and a hex literal
+    /// otherwise.
+    fn const_str(&self, w: BitWidth, v: u64) -> String {
+        if v != 0 && v == self.image_base {
+            "IMAGE_BASE".to_owned()
+        } else {
+            hex(w, v)
+        }
     }
 
     fn child(&self, c: &Expr, parent: Option<BinaryOp>, right: bool, ring: bool) -> String {
@@ -69,7 +140,11 @@ impl Renderer<'_> {
                     right
                         && !matches!(
                             pop,
-                            BinaryOp::Add | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul
+                            BinaryOp::Add
+                                | BinaryOp::Xor
+                                | BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::Mul
                         )
                 } else {
                     !(matches!(pop, BinaryOp::Add | BinaryOp::Sub) && *op == BinaryOp::Mul)
@@ -86,10 +161,25 @@ impl Renderer<'_> {
     /// Renders `e`; `ring_ok` means the consumer only looks at the low bits (an
     /// assignment into a narrow variable, or a parent low-bits-only operator),
     /// so a narrow ring operation need not truncate itself.
+    /// Renders `e`, substituting any named subtree for its name.
     pub fn rx(&self, e: &Expr, ring_ok: bool) -> (String, u8) {
+        if let Some(name) = self.temps.get(e) {
+            return (name.clone(), P_ATOM);
+        }
+        self.rx_body(e, ring_ok)
+    }
+
+    /// Renders a temporary's DEFINITION: the root is printed in full (or the
+    /// definition would be `t3 = t3`), while nested named subtrees still
+    /// substitute.
+    pub fn define(&self, e: &Expr) -> String {
+        self.rx_body(e, true).0
+    }
+
+    fn rx_body(&self, e: &Expr, ring_ok: bool) -> (String, u8) {
         let narrow = e.width.bits() < 32;
         match &e.kind {
-            ExprKind::Const { value } => (hex(e.width, *value), P_ATOM),
+            ExprKind::Const { value } => (self.const_str(e.width, *value), P_ATOM),
             ExprKind::Register { name } => (self.name(name), P_ATOM),
             ExprKind::Unary { op, value } => {
                 let o = match op {
@@ -111,7 +201,10 @@ impl Renderer<'_> {
             }
             ExprKind::Intrinsic { name, arguments } => {
                 let args: Vec<String> = arguments.iter().map(|a| self.rx(a, false).0).collect();
-                (format!("{name}({})", args.join(", ")), P_ATOM)
+                (
+                    format!("{}({})", intrinsic_display(name), args.join(", ")),
+                    P_ATOM,
+                )
             }
             ExprKind::Extract { value, lsb } => {
                 let v = self.wrap_child(value, None, false);
@@ -136,7 +229,12 @@ impl Renderer<'_> {
                     ResizeOp::Truncate => (format!("({}){v}", ty(e.width)), P_UN),
                     ResizeOp::ZeroExtend => (format!("({}){v}", ty(e.width)), P_UN),
                     ResizeOp::SignExtend => (
-                        format!("({})({})({}){v}", ty(e.width), sty(e.width), sty(value.width)),
+                        format!(
+                            "({})({})({}){v}",
+                            ty(e.width),
+                            sty(e.width),
+                            sty(value.width)
+                        ),
                         P_UN,
                     ),
                 }
@@ -160,7 +258,11 @@ impl Renderer<'_> {
         if let ExprKind::Const { value } = n.kind {
             return (value & mask).to_string();
         }
-        if let ExprKind::Binary { op: BinaryOp::And, right, .. } = &n.kind
+        if let ExprKind::Binary {
+            op: BinaryOp::And,
+            right,
+            ..
+        } = &n.kind
             && let ExprKind::Const { value } = right.kind
             && value == mask
         {
@@ -224,7 +326,11 @@ impl Renderer<'_> {
                 }
                 let a = self.wrap_child(l, None, false);
                 let c = self.count(r, w);
-                let a = if narrow && op == BinaryOp::Shl { format!("(u32){a}") } else { a };
+                let a = if narrow && op == BinaryOp::Shl {
+                    format!("(u32){a}")
+                } else {
+                    a
+                };
                 let s = format!("{a} {sym} {c}");
                 if narrow {
                     (format!("({}){}", ty(w), paren(&s)), P_UN)
@@ -252,7 +358,11 @@ impl Renderer<'_> {
                     let mut o = op;
                     if c > bits / 2 {
                         c = bits - c;
-                        o = if op == BinaryOp::Rol { BinaryOp::Ror } else { BinaryOp::Rol };
+                        o = if op == BinaryOp::Rol {
+                            BinaryOp::Ror
+                        } else {
+                            BinaryOp::Rol
+                        };
                     }
                     let f = if o == BinaryOp::Rol { "rol" } else { "ror" };
                     let a = self.rx(l, false).0;
@@ -314,7 +424,14 @@ fn signed_value(w: BitWidth, v: u64) -> i64 {
 fn is_infix(op: BinaryOp) -> bool {
     matches!(
         op,
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Xor
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Mul
+            | BinaryOp::Shl
+            | BinaryOp::Shr
     )
 }
 
@@ -324,7 +441,10 @@ fn is_ring(e: &Expr) -> bool {
 }
 
 fn is_low_bits_op(op: BinaryOp) -> bool {
-    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or)
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Xor | BinaryOp::And | BinaryOp::Or
+    )
 }
 
 fn is_cast_wrapped(_e: &Expr) -> bool {
@@ -435,7 +555,21 @@ impl Ctx<'_> {
                 let (_, first) = &vals[0];
                 let e = self.lexpr(first);
                 let _ = ret_w;
-                self.line(depth, &format!("return {e};"));
+                // `vals[1..]` are the function's other exit components (callee-saved
+                // registers and the like). They used to be dropped, which made
+                // branch arms that differ ONLY in them print as identical code: on
+                // vm_c43d80e one 4-line block appeared 12 times and nothing in the
+                // text said why the branches existed.
+                let rest = vals[1..]
+                    .iter()
+                    .filter(|(name, value)| self.r.exit_common.get(name) != Some(value))
+                    .map(|(name, value)| format!("{name}={}", self.lexpr(value)))
+                    .collect::<Vec<_>>();
+                if rest.is_empty() {
+                    self.line(depth, &format!("return {e};"));
+                } else {
+                    self.line(depth, &format!("return {e};  // exit: {}", rest.join(", ")));
+                }
             }
             Stmt::Label(n) => self.line(0, &format!("L_{n:x}:")),
             Stmt::Goto(n) => self.line(depth, &format!("goto L_{n:x};")),

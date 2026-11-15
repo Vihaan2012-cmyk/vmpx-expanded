@@ -15,10 +15,53 @@ use crate::{
     resolve_native_call_import, summarize_known_import,
 };
 
+thread_local! {
+    static SERVED_READ_AUDIT: std::cell::RefCell<Option<BTreeSet<(u64, u8)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Image bytes served as constants, by provenance (audit only).
+pub const SERVED_UNSUPPRESSED: u8 = 0;
+pub const SERVED_PROVEN_SUPPRESSED: u8 = 1;
+pub const SERVED_LABELED_SUPPRESSED: u8 = 2;
+
+/// DIAGNOSTIC ONLY: start (or stop) recording, per thread, the byte addresses of
+/// image bytes served as constants, with their provenance, so a run can be
+/// audited against runtime evidence.
+pub fn set_served_page_audit(enabled: bool) {
+    SERVED_READ_AUDIT.with(|sink| *sink.borrow_mut() = enabled.then(BTreeSet::new));
+}
+
+/// Drains the `(address, provenance)` audit recorded on this thread.
+#[must_use]
+pub fn take_served_page_audit() -> Vec<(u64, u8)> {
+    SERVED_READ_AUDIT.with(|sink| {
+        sink.borrow_mut()
+            .as_mut()
+            .map(|set| std::mem::take(set).into_iter().collect())
+            .unwrap_or_default()
+    })
+}
+
+fn note_served_read(address: u64, kind: u8) {
+    SERVED_READ_AUDIT.with(|sink| {
+        if let Some(set) = sink.borrow_mut().as_mut() {
+            set.insert((address, kind));
+        }
+    });
+}
+
 const WIN64_ARGUMENT_REGISTERS: [&str; 4] = ["RCX", "RDX", "R8", "R9"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SymbolicExecutionLimits {
+    /// Top of the entry stub's fresh frame, in `vsp_initial` coordinates.
+    ///
+    /// A tracked cell at or above this is NOT in the VM's private allocation --
+    /// it is caller memory an external pointer may alias -- so the narrowed
+    /// havoc discards it. That makes the discharge's "every cell lies inside the
+    /// frame" obligation hold directly.
+    pub private_frame_hi: Option<i64>,
     pub max_instructions: usize,
     pub max_memory_bytes: usize,
     pub max_expression_nodes: usize,
@@ -27,15 +70,43 @@ pub struct SymbolicExecutionLimits {
     /// page is re-protected writable at runtime; the block is labeled
     /// `AssumesImageProtectionStable`.
     pub serve_read_only_when_suppressed: bool,
+    /// Serve declared read-only file-backed pages after an external store when
+    /// no call that may change page protection has run on the path (a proof,
+    /// no assumption). Off only to A/B the baseline.
+    pub prove_read_only_when_suppressed: bool,
+    /// OBSERVED TIER: after an external store suppressed image reads, serve a
+    /// constant read of a non-writable image address from the observed seed (a
+    /// post-init snapshot) when the file byte is withheld. Valid for the captured
+    /// state only; consulting the seed labels the block `ObservedGlobal`, so it
+    /// never reaches the proven tier.
+    pub serve_observed_when_suppressed: bool,
+    /// Treat an external store address that is data read from the VM frame (not a
+    /// frame pointer) like any other opaque pointer: the labeled
+    /// `AssumesExternalStoresDisjointFromVmStack` narrowing instead of the
+    /// tainting havoc. Only while no frame pointer has escaped or been lost.
+    pub assume_loaded_store_addresses_disjoint: bool,
+    /// Instant past which this block's execution gives up, so the per-entry
+    /// wall-clock budget bounds ONE block and not merely the gaps between
+    /// blocks. The CFG walk checked its deadline only between worklist items, so
+    /// a single block whose expressions blow up superlinearly ran unbounded --
+    /// which is why the per-block instruction limit could not be raised past 512
+    /// despite 102 entries being refused on it: doubling it hung the sweep
+    /// instead of failing closed. `None` leaves execution untimed.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for SymbolicExecutionLimits {
     fn default() -> Self {
         Self {
+            private_frame_hi: None,
             max_instructions: 4_096,
             max_memory_bytes: 1_048_576,
             max_expression_nodes: 200_000,
             serve_read_only_when_suppressed: false,
+            prove_read_only_when_suppressed: true,
+            serve_observed_when_suppressed: false,
+            assume_loaded_store_addresses_disjoint: false,
+            deadline: None,
         }
     }
 }
@@ -106,9 +177,23 @@ pub struct SymbolicVmExecutionReport {
     /// labeled `AssumesExternalStoresDisjointFromVmStack` assumption instead of
     /// the broad havoc. Surfaced so the CFG can record the assumption.
     pub assumed_external_disjoint_from_vm_stack: bool,
+    /// Whether the narrowed havoc preserved a cell rooted at an allocation this
+    /// frame made. Set only when such a cell was actually retained, so with
+    /// none present the run is byte-for-byte what it was before.
+    pub assumed_external_disjoint_from_fresh_allocations: bool,
+    /// Whether a store with no upper bound was placed by its LOWER bound alone,
+    /// which holds only if the indexed address does not wrap the address space.
+    pub assumed_indexed_store_in_bounds: bool,
     /// True when a suppressed constant read was served from a read-only
     /// file-backed page; the CFG records `AssumesImageProtectionStable`.
     pub served_read_only_image: bool,
+    /// True once a native call that is not a trusted allocation contract has run
+    /// on this path since VM entry: the callee could change page protections.
+    /// While false, no instruction on the path can make a non-writable image
+    /// page writable, so a store can never alter a declared read-only page
+    /// (it faults) and such pages are served from the file even after an
+    /// external store, with no assumption. Carried across blocks; OR-merged.
+    pub protection_may_have_changed: bool,
     /// True when a value derived from `vsp_initial` was stored to an address that
     /// is not a tracked VM-stack cell, or passed to a native call as target or
     /// argument: the frame address may then be reachable from outside the VM.
@@ -156,6 +241,8 @@ pub struct SymbolicVmInitialState {
     /// successor block so its image-source reads stay withheld after a narrowed
     /// external store.
     pub image_reads_suppressed: bool,
+    /// See `SymbolicVmExecutionReport::protection_may_have_changed`.
+    pub protection_may_have_changed: bool,
     pub next_native_call_epoch: u64,
     pub fresh_allocations: Vec<SymbolicFreshAllocation>,
 }
@@ -170,6 +257,7 @@ impl Default for SymbolicVmInitialState {
             memory_epoch: 0,
             memory_tainted: false,
             image_reads_suppressed: false,
+            protection_may_have_changed: false,
             next_native_call_epoch: 0,
             fresh_allocations: Vec::new(),
         }
@@ -206,6 +294,7 @@ impl SymbolicVmInitialState {
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
             image_reads_suppressed: self.image_reads_suppressed,
+            protection_may_have_changed: self.protection_may_have_changed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self
                 .fresh_allocations
@@ -236,6 +325,7 @@ impl SymbolicVmExecutionReport {
             memory_epoch: self.memory_epoch,
             memory_tainted: self.memory_tainted,
             image_reads_suppressed: self.image_reads_suppressed,
+            protection_may_have_changed: self.protection_may_have_changed,
             next_native_call_epoch: self.next_native_call_epoch,
             fresh_allocations: self.fresh_allocations.clone(),
         }
@@ -294,6 +384,20 @@ pub trait SymbolicMemorySource {
     /// immune to stores, provided the page protection never changes.
     fn read_only_byte(&self, _address: Va) -> Option<u8> {
         None
+    }
+
+    /// True when `address` lies in a readable, non-writable image section (or the
+    /// headers), regardless of any volatility veto on its bytes.
+    fn is_read_only_address(&self, _address: Va) -> bool {
+        false
+    }
+
+    /// PROOF that nothing in the analyzed image can change page protection (see
+    /// `image_cannot_reprotect`). While true and no call on the path can either,
+    /// a non-writable page keeps its loader protection, so no store can alter
+    /// it. The default `false` keeps every serve a labeled assumption.
+    fn protection_stability_proven(&self) -> bool {
+        false
     }
 
     fn resolve_native_call_import(&self, _target: u64) -> Option<NativeCallImportResolution> {
@@ -427,16 +531,47 @@ struct SymbolicMachine<'a> {
     resolved_image_addresses: BTreeSet<Va>,
     memory_source: Option<&'a dyn SymbolicMemorySource>,
     memory_epoch: u64,
+    /// Bumped by any store this machine cannot place at a concrete byte, so it
+    /// could reach anything. Names unresolved loads AT A CONCRETE ADDRESS,
+    /// together with that byte's own version below.
+    opaque_store_epoch: u64,
+    /// Per concrete byte address, how many times it has been stored.
+    ///
+    /// `memory_epoch` counts EVERY store, and naming unresolved loads from it
+    /// meant the same load of the same address read as a different value on
+    /// each pass: a VM handler's ordinary pushes and pops race it forward by
+    /// ~1000 per loop iteration, so two iterations never compared equal and no
+    /// loop carrying an unresolved load could converge. A store to one concrete
+    /// byte cannot change a different concrete byte, so it must not rename that
+    /// byte's loads.
+    byte_versions: BTreeMap<u64, u64>,
+    /// Address of the most recent image byte served as ZERO with no observed
+    /// seed behind it. A pointer slot that is zero in the file but initialised
+    /// at run time produces the null-read stall several instructions later, by
+    /// which point the address is just `0` and the slot is unrecoverable -- so
+    /// the slot is recorded here and reported with the refusal.
+    last_zero_image_read: Option<u64>,
+    /// Index of the instruction currently being applied, so helpers without the
+    /// index in scope (e.g. `load_external`) can label a havoc with it.
+    current_instruction_index: usize,
     memory_tainted: bool,
     image_reads_suppressed: bool,
     assumed_external_disjoint_from_vm_stack: bool,
+    assumed_external_disjoint_from_fresh_allocations: bool,
+    assumed_indexed_store_in_bounds: bool,
     serve_read_only_when_suppressed: bool,
+    assume_loaded_store_addresses_disjoint: bool,
+    prove_read_only_when_suppressed: bool,
+    serve_observed_when_suppressed: bool,
     served_read_only_image: bool,
+    protection_may_have_changed: bool,
+    image_protection_stable_cache: Option<bool>,
     vm_stack_address_escapes: bool,
     vm_stack_derived_escapes: bool,
     vm_stack_pointer_lost: bool,
     frame_pointer_in_memory: bool,
     vm_stack_store_hi: Option<i64>,
+    limits_private_frame_hi: Option<i64>,
     checksum_byte_limit: usize,
 }
 
@@ -452,7 +587,7 @@ impl<'a> SymbolicMachine<'a> {
         if initial.flags.width != BitWidth::W64 {
             return Err("initial flags value is not 64 bits".to_owned());
         }
-        if initial.memory_tainted {
+        if initial.memory_tainted && !resume_tainted() {
             return Err(
                 "initial memory is tainted by an unbounded alias and cannot be resumed soundly"
                     .to_owned(),
@@ -515,11 +650,26 @@ impl<'a> SymbolicMachine<'a> {
             resolved_image_addresses: BTreeSet::new(),
             memory_source,
             memory_epoch: initial.memory_epoch,
+            opaque_store_epoch: initial.memory_epoch,
+            byte_versions: BTreeMap::new(),
+            last_zero_image_read: None,
+            current_instruction_index: 0,
             memory_tainted: initial.memory_tainted,
-            image_reads_suppressed: initial.image_reads_suppressed,
+            // A tainted state must never serve a file constant: the store that
+            // tainted it could have written that very address. The broad havoc
+            // sets the taint without setting this, so it is forced here rather
+            // than relied on.
+            image_reads_suppressed: initial.image_reads_suppressed || initial.memory_tainted,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
+            assumed_indexed_store_in_bounds: false,
             serve_read_only_when_suppressed: limits.serve_read_only_when_suppressed,
+            assume_loaded_store_addresses_disjoint: limits.assume_loaded_store_addresses_disjoint,
+            prove_read_only_when_suppressed: limits.prove_read_only_when_suppressed,
+            serve_observed_when_suppressed: limits.serve_observed_when_suppressed,
             served_read_only_image: false,
+            protection_may_have_changed: initial.protection_may_have_changed,
+            image_protection_stable_cache: None,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,
@@ -528,6 +678,7 @@ impl<'a> SymbolicMachine<'a> {
                 .iter()
                 .any(|(_, value)| is_frame_pointer_value(value)),
             vm_stack_store_hi: None,
+            limits_private_frame_hi: limits.private_frame_hi,
             checksum_byte_limit: limits.max_memory_bytes,
         };
         for (offset, value) in &initial.context_values {
@@ -574,6 +725,13 @@ impl<'a> SymbolicMachine<'a> {
         self.store_memory(&address, value)
     }
 
+    fn image_protection_stable(&mut self) -> bool {
+        let source = self.memory_source;
+        *self.image_protection_stable_cache.get_or_insert_with(|| {
+            source.is_some_and(|source| source.protection_stability_proven())
+        })
+    }
+
     fn load_memory(&mut self, address: Expr, width: BitWidth) -> Result<Expr, String> {
         let address = canonicalize_pointer(address);
         let mut bytes = Vec::with_capacity(width.bytes() as usize);
@@ -599,6 +757,21 @@ impl<'a> SymbolicMachine<'a> {
                 // null read. EXPERIMENTAL, observed-labeled (not sound output);
                 // a non-zero image byte is genuinely resolvable and never
                 // overridden.
+                //
+                // MEASURED: this does NOT reach the null reads that block 25
+                // entries on systems.xpl. Their slots (0x378135cd4, 0x377e387a2,
+                // 0x377fcdf9c) are in .vmp2, which is read-only and so eligible
+                // for the seed -- and the seed still does not carry them. Two
+                // post-init snapshots, one at 39.1B steps and one at 120B, give
+                // a byte-identical seed (7365 bytes over 1559 ranges), because
+                // the protector finishes writing its read-only sections early
+                // (idata writes stop at 16.8B). The slots are zero at every
+                // depth, so they are not runtime-initialized globals at all.
+                //
+                // Those reads are therefore real null dereferences -- VMProtect
+                // reading address 0 on purpose -- and the refusal's own wording
+                // is the prescription: they need exception-flow analysis, not a
+                // deeper snapshot. The observed bridge cannot close them.
                 let seeded = if image_byte.is_none_or(|byte| byte == 0) {
                     self.memory_source
                         .and_then(|source| source.observed_byte(byte_va))
@@ -611,6 +784,10 @@ impl<'a> SymbolicMachine<'a> {
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else if let Some(byte) = image_byte {
                     all_unknown = false;
+                    if byte == 0 {
+                        self.last_zero_image_read = Some(value);
+                    }
+                    note_served_read(value, SERVED_UNSUPPRESSED);
                     self.resolved_image_addresses.insert(byte_va);
                     bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
                 } else {
@@ -621,17 +798,62 @@ impl<'a> SymbolicMachine<'a> {
                     ));
                 }
             } else if let ExprKind::Const { value } = byte_address.kind
-                && self.serve_read_only_when_suppressed
+                && self.prove_read_only_when_suppressed
+                && self.image_reads_suppressed
+                && !self.protection_may_have_changed
                 && !self.memory_tainted
+                && self.image_protection_stable()
+                && let Some(byte) = self
+                    .memory_source
+                    .and_then(|source| source.read_only_byte(Va(value)))
+            {
+                // PROVEN: only a non-writable file-backed page reaches here, and no
+                // instruction on this path since VM entry can have changed page
+                // protection, so an external store cannot have altered it.
+                all_unknown = false;
+                note_served_read(value, SERVED_PROVEN_SUPPRESSED);
+                self.resolved_image_addresses.insert(Va(value));
+                bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value } = byte_address.kind
+                && self.serve_read_only_when_suppressed
+                && (!self.memory_tainted || serve_read_only_when_tainted())
                 && let Some(byte) = self
                     .memory_source
                     .and_then(|source| source.read_only_byte(Va(value)))
             {
                 all_unknown = false;
                 self.served_read_only_image = true;
+                note_served_read(value, SERVED_LABELED_SUPPRESSED);
                 self.resolved_image_addresses.insert(Va(value));
                 bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value } = byte_address.kind
+                && self.serve_observed_when_suppressed
+                && self.image_reads_suppressed
+                && !self.memory_tainted
+                && let Some(source) = self.memory_source
+                && source.is_read_only_address(Va(value))
+                && let Some(byte) = source.observed_byte(Va(value))
+            {
+                // OBSERVED: a non-writable image address whose file byte is withheld
+                // (volatile) read from the post-init snapshot. `observed_byte`
+                // flips the source's seeded flag, which labels the CFG
+                // `ObservedGlobal` (observed tier, never proven).
+                all_unknown = false;
+                self.resolved_image_addresses.insert(Va(value));
+                bytes.push(Expr::constant(BitWidth::W8, u64::from(byte)));
+            } else if let ExprKind::Const { value: at } = byte_address.kind {
+                // A concrete byte: only a store that could reach THIS byte may
+                // rename it. The `memory_load_epoch_` prefix is kept because
+                // consumers match on it.
+                let version = self.byte_versions.get(&at).copied().unwrap_or(0);
+                bytes.push(Expr::intrinsic(
+                    BitWidth::W8,
+                    format!("memory_load_epoch_{}_{version}", self.opaque_store_epoch),
+                    vec![byte_address],
+                ));
             } else {
+                // A symbolic address could be any byte, so every store still
+                // renames it: that is exactly what `memory_epoch` counts.
                 bytes.push(Expr::intrinsic(
                     BitWidth::W8,
                     format!("memory_load_epoch_{}", self.memory_epoch),
@@ -660,9 +882,19 @@ impl<'a> SymbolicMachine<'a> {
 
     fn write_memory_bytes(&mut self, address: &Expr, value: &Expr) -> Result<(), String> {
         for byte in 0..value.width.bytes() {
+            let byte_address = add_pointer_offset(address.clone(), i64::from(byte))
+                .map_err(|error| error.to_string())?;
+            // Version the byte so that if this cell is later discarded, loads of
+            // it cannot reuse a name minted before the store. A byte we cannot
+            // place could be any byte, so that invalidates every concrete name.
+            match byte_address.kind {
+                ExprKind::Const { value: at } => {
+                    *self.byte_versions.entry(at).or_default() += 1;
+                }
+                _ => self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1),
+            }
             self.memory.insert(
-                add_pointer_offset(address.clone(), i64::from(byte))
-                    .map_err(|error| error.to_string())?,
+                byte_address,
                 Expr::extract(BitWidth::W8, byte * 8, value.clone())
                     .map_err(|error| error.to_string())?,
             );
@@ -732,6 +964,9 @@ impl<'a> SymbolicMachine<'a> {
         width: BitWidth,
     ) -> Result<(), String> {
         self.advance_memory_epoch()?;
+        // The address could not be placed, so it could have reached any byte:
+        // concrete names minted before it are no longer valid either.
+        self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1);
         // Proof path: when the store address provably lies within a bounded byte
         // range over a single proven-region root (vsp_initial or a fresh
         // allocation), preserve exactly the tracked cells proven disjoint from
@@ -757,26 +992,126 @@ impl<'a> SymbolicMachine<'a> {
             });
             return Ok(());
         }
-        if address.dependencies().contains("vsp_initial") {
+        // No upper bound, but a LOWER one: an indexed store over a proven region
+        // root, where the index is unsigned and so at least zero. Every tracked
+        // cell below that bound is disjoint, and -- the part that matters --
+        // this takes the PROOF path, so memory is not tainted and the branch
+        // after it still resolves.
+        //
+        // Labeled, because the one thing it cannot prove is that the index does
+        // not wrap the address space back around to a low address.
+        if indexed_store_in_bounds()
+            && let Some((root, slo)) = proven_store_lower_bound(address)
+        {
+            let width = i64::from(width.bytes());
+            self.retain_memory(|cell_address| {
+                store_below_disjoint_from_cell(&root, slo, width, cell_address)
+            });
+            self.image_reads_suppressed = true;
+            self.assumed_indexed_store_in_bounds = true;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index,
+                cause: format!(
+                    "external store placed by its lower bound {slo:#x} over a VM-region base; \
+                     cells below it preserved, assuming the index does not wrap"
+                ),
+            });
+            return Ok(());
+        }
+        // A frame pointer can only be read back from a tracked cell, so with none
+        // lost or escaped an untracked read is caller data, not a frame pointer.
+        let loaded_data_address = self.assume_loaded_store_addresses_disjoint
+            && !is_frame_pointer_value(address)
+            && !self.vm_stack_address_escapes
+            && !self.vm_stack_pointer_lost;
+        if address.dependencies().contains("vsp_initial") && !loaded_data_address {
             // The address may alias the VM operand stack itself; keep the broad,
             // assumption-free havoc.
             self.retain_memory(|_| false);
             self.memory_tainted = true;
             self.memory_havocs.push(SymbolicMemoryHavoc {
                 instruction_index,
-                cause: "external store address may alias tracked VM memory".to_owned(),
+                // Which sub-condition refused: the entry-level retry gate can be
+                // widened without effect while this one still holds, so the two
+                // have to be distinguishable from the stall text alone.
+                cause: format!(
+                    "external store address may alias tracked VM memory                      (assume_disjoint={} is_frame_ptr={} stack_escapes={} ptr_lost={})",
+                    self.assume_loaded_store_addresses_disjoint,
+                    is_frame_pointer_value(address),
+                    self.vm_stack_address_escapes,
+                    self.vm_stack_pointer_lost,
+                ) + &format!(
+                    " ADDR={} lower_bound={:?} cells={:?} offset={:?} unbounded_at={}",
+                    {
+                        let rendered = format!("{address:?}");
+                        rendered.chars().take(700).collect::<String>()
+                    },
+                    address_lower_bound(address).map(|bounds| (
+                        bounds.root.is_some(),
+                        format!("{:#x}", bounds.lo)
+                    )),
+                    {
+                        let offsets: Vec<i64> =
+                            self.memory.iter().filter_map(|(cell, _)| pointer_offset(cell)).collect();
+                        offsets
+                            .iter()
+                            .copied()
+                            .min()
+                            .map(|lo| (format!("{lo:#x}"), format!("{:#x}", offsets.iter().copied().max().unwrap_or(lo)), offsets.len()))
+                    },
+                    pointer_offset(address).map(|offset| format!("{offset:#x}")),
+                    // Which node kind `address_bounds` has no arm for. The
+                    // address renders to more than 400 bytes, so the text is
+                    // useless; the failing kind is the actionable part.
+                    unbounded_node_kind(address).unwrap_or("<bounded>"),
+                ),
             });
             return Ok(());
         }
-        // Preserve the provably vsp-rooted cells, discard the rest.
-        self.retain_memory(|cell_address| pointer_offset(cell_address).is_some());
+        // Preserve the cells rooted at a proven region, discard the rest.
+        //
+        // This kept only `vsp_initial`-rooted cells until now, which threw away
+        // every cell rooted at an allocation the frame itself made -- and those
+        // discards are where the `memory_load_epoch` cascade starts: a later
+        // read of a discarded cell returns an opaque value, that value lands in
+        // the next store's address, the address has no provable range, and the
+        // store havocs again. `proven_store_byte_range` already treats a
+        // fresh-allocation return as a proven region root, so this is the same
+        // root set applied to what survives a havoc rather than a new one.
+        //
+        // It is a SEPARATE concession from the VM-stack one and carries its own
+        // label, because an opaque external store could land inside an
+        // allocation this frame made exactly as it could land in the operand
+        // stack, and because the VM-stack assumption is discharged for a
+        // provably private frame -- which says nothing about an allocation
+        // whose pointer the frame may have handed out.
+        // Out-of-frame vsp-rooted cells are caller memory; an external store
+        // may alias them, so they cannot be preserved on trust.
+        let frame_hi = frame_scoped_retain()
+            .then_some(self.limits_private_frame_hi)
+            .flatten();
+        let in_frame = move |address: &Expr| {
+            frame_hi.is_none_or(|hi| pointer_offset(address).is_some_and(|off| off < hi))
+        };
+        let keep_allocations = retain_fresh_allocations();
+        let retained_fresh_allocation = keep_allocations
+            && self.memory.iter().any(|(address, _)| {
+                pointer_offset(address).is_none() && fresh_allocation_offset(address).is_some()
+            });
+        self.retain_memory(|cell_address| {
+            (pointer_offset(cell_address).is_some() && in_frame(cell_address))
+                || (keep_allocations && fresh_allocation_offset(cell_address).is_some())
+        });
         self.image_reads_suppressed = true;
         self.assumed_external_disjoint_from_vm_stack = true;
+        self.assumed_external_disjoint_from_fresh_allocations |= retained_fresh_allocation;
         self.memory_havocs.push(SymbolicMemoryHavoc {
             instruction_index,
-            cause: "external store assumed disjoint from the VM operand stack; non-vsp-rooted \
-                    cells discarded, vsp-rooted cells preserved"
-                .to_owned(),
+            cause: format!(
+                "external store assumed disjoint from the VM operand stack; \
+                 non-region-rooted cells discarded, vsp-rooted cells preserved \
+                 (fresh-allocation cells preserved: {retained_fresh_allocation})"
+            ),
         });
         Ok(())
     }
@@ -785,9 +1120,43 @@ impl<'a> SymbolicMachine<'a> {
         let address = canonicalize_pointer(address);
         if matches!(address.kind, ExprKind::Const { value: 0 }) {
             return Err(format!(
-                "proven null memory read of {} byte(s) requires exception-flow analysis",
-                width.bytes()
+                "proven null memory read of {} byte(s) requires exception-flow analysis \
+                 [zero slot {}]",
+                width.bytes(),
+                self.last_zero_image_read
+                    .map_or_else(|| "none".to_owned(), |slot| format!("{slot:#x}")),
             ));
+        }
+        // A load whose pointer collapsed into the null page (a small non-zero
+        // constant). The base is a VM register holding a proven-zero seed --
+        // VMProtect's static placeholder for a pointer the OS/exception
+        // dispatcher supplies at run time (e.g. the CONTEXT an anti-debug guard
+        // reads: ContextFlags at +0x30, the Dr0-Dr3 debug registers at
+        // +0x48..+0x60) -- so the literal address is `base(=0) + field_offset`.
+        // Emitting a bare `read(0x30)` would present a faulting null dereference
+        // as recovered behaviour. Instead bind the base to a symbolic
+        // exception-supplied pointer, so the field offset is preserved
+        // (`exception_context + 0x30`), and record the dependency as a labeled
+        // havoc so the entry is reported as resting on that assumption rather
+        // than as proven. The exact-zero case above keeps refusing: it is
+        // load-bearing for the zero-seed VM-exit (unwind) detection, and a read
+        // at offset 0 has no field to anchor the CONTEXT interpretation.
+        if let ExprKind::Const { value } = address.kind
+            && value < 0x1000
+        {
+            let base = Expr::register(BitWidth::W64, "exception_context");
+            let redirected = add_pointer_offset(base, value.cast_signed())
+                .map_err(|error| error.to_string())?;
+            self.memory_havocs.push(SymbolicMemoryHavoc {
+                instruction_index: self.current_instruction_index,
+                cause: format!(
+                    "null-page read at field offset {value:#x} bound to a symbolic \
+                     exception-supplied CONTEXT base; the base is a proven-zero VM \
+                     register seed that VMProtect populates via exception flow, which \
+                     is not statically modelled"
+                ),
+            });
+            return self.load_memory(redirected, width);
         }
         self.load_memory(address, width)
     }
@@ -939,7 +1308,9 @@ impl<'a> SymbolicMachine<'a> {
 
         match &applied.memory {
             NativeCallMemoryDecision::HavocTracked { reason } => {
+                self.protection_may_have_changed = true;
                 self.advance_memory_epoch()?;
+                self.opaque_store_epoch = self.opaque_store_epoch.wrapping_add(1);
                 self.retain_memory(|_| false);
                 self.memory_tainted = false;
                 let touched_context = self.context.touched_cells.clone();
@@ -955,7 +1326,9 @@ impl<'a> SymbolicMachine<'a> {
                     cause: reason.clone(),
                 });
             }
-            NativeCallMemoryDecision::PreserveTracked => {}
+            NativeCallMemoryDecision::PreserveTracked => {
+                self.protection_may_have_changed = true;
+            }
             NativeCallMemoryDecision::PreserveTrackedAndCreateFreshAllocation {
                 allocation,
                 size,
@@ -1034,32 +1407,102 @@ impl std::fmt::Write for BoundedKey {
     }
 }
 
+/// Up to `limit` bytes of `expression`'s `Debug` text, stopping there.
+///
+/// `format!("{e:?}").chars().take(n)` renders the WHOLE tree first and then
+/// throws nearly all of it away. `Debug` prints a hash-consed DAG as a tree, so
+/// for a shared expression that is megabytes of text for an n-character
+/// snippet. `BoundedKey` already keeps what it wrote before going over budget.
+pub(crate) fn debug_prefix(expression: &Expr, limit: usize) -> String {
+    use std::fmt::Write;
+    let mut key = BoundedKey { text: String::new(), remaining: limit };
+    let _ = write!(key, "{expression:?}");
+    key.text
+}
+
+/// `Debug` text of `expression`, or `None` when it renders past `limit` bytes.
+pub(crate) fn bounded_debug(expression: &Expr, limit: usize) -> Option<String> {
+    use std::fmt::Write;
+    let mut key = BoundedKey { text: String::new(), remaining: limit };
+    write!(key, "{expression:?}").ok()?;
+    Some(key.text)
+}
+
 /// Orders tracked memory by the rendered address. `Debug` prints a shared DAG
 /// as a tree, so a heavily shared address can render exponentially large; the
-/// rendering is bounded and the block fails closed rather than exhausting RAM.
+/// rendering is bounded and the set falls back to structural-hash order rather
+/// than exhausting RAM.
+///
+/// The rendered order (or the over-budget failure) depends only on the address
+/// set, so it is memoized on the addresses in a canonical hash order: successive
+/// blocks mostly track the same addresses and would otherwise re-render and
+/// re-sort hundreds of KB of text per address each time.
 fn sorted_memory_values(
     memory: HashMap<Expr, Expr>,
 ) -> Result<Vec<(Expr, Expr)>, String> {
     use std::fmt::Write;
-    let mut remaining = MAX_SORT_KEY_BYTES;
-    let mut keyed = Vec::with_capacity(memory.len());
-    for (address, value) in memory {
-        let mut key = BoundedKey {
-            text: String::new(),
-            remaining,
-        };
-        if write!(key, "{address:?}").is_err() {
-            return Err(format!(
-                "tracked memory addresses exceed {MAX_SORT_KEY_BYTES} rendered bytes"
-            ));
-        }
-        remaining = key.remaining;
-        keyed.push((key.text, address, value));
+    use std::hash::BuildHasher;
+    type Order = Option<Vec<usize>>;
+    thread_local! {
+        static ORDERS: std::cell::RefCell<Vec<(Vec<Expr>, Order)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
-    keyed.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(keyed
+    const CACHED_ORDERS: usize = 64;
+    let hasher = crate::expr::FxBuild::default();
+    let mut items: Vec<(u64, Expr, Expr)> = memory
         .into_iter()
-        .map(|(_, address, value)| (address, value))
+        .map(|(address, value)| (hasher.hash_one(&address), address, value))
+        .collect();
+    items.sort_by_key(|item| item.0);
+    let cached = ORDERS.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(addresses, _)| {
+                addresses.len() == items.len()
+                    && addresses.iter().zip(&items).all(|(cached, item)| *cached == item.1)
+            })
+            .map(|(_, order)| order.clone())
+    });
+    let order = if let Some(order) = cached {
+        order
+    } else {
+        let mut remaining = MAX_SORT_KEY_BYTES;
+        let mut keyed = Vec::with_capacity(items.len());
+        let mut failed = false;
+        for (index, (_, address, _)) in items.iter().enumerate() {
+            let mut key = BoundedKey {
+                text: String::new(),
+                remaining,
+            };
+            if write!(key, "{address:?}").is_err() {
+                failed = true;
+                break;
+            }
+            remaining = key.remaining;
+            keyed.push((key.text, index));
+        }
+        let order = if failed {
+            None
+        } else {
+            keyed.sort_by(|left, right| left.0.cmp(&right.0));
+            Some(keyed.into_iter().map(|(_, index)| index).collect())
+        };
+        ORDERS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= CACHED_ORDERS {
+                cache.remove(0);
+            }
+            cache.push((items.iter().map(|item| item.1.clone()).collect(), order.clone()));
+        });
+        order
+    };
+    // Over-budget address text falls back to the structural-hash order the items
+    // are already in: the order is canonical either way and never semantic.
+    let order = order.unwrap_or_else(|| (0..items.len()).collect());
+    Ok(order
+        .into_iter()
+        .map(|index| (items[index].1.clone(), items[index].2.clone()))
         .collect())
 }
 
@@ -1226,10 +1669,69 @@ fn depends_on_vsp_root(expression: &Expr) -> bool {
 
 /// True unless `vsp_initial` occurs only as (part of) the address of an untracked
 /// memory read, i.e. the value is data read from the frame, not a frame pointer.
-fn is_frame_pointer_value(expression: &Expr) -> bool {
+pub(crate) fn is_frame_pointer_value(expression: &Expr) -> bool {
     expression.register_outside_intrinsic_args("vsp_initial", |name| {
         name.starts_with("memory_load_epoch_")
     })
+}
+
+/// Whether the narrowed havoc keeps allocation-rooted cells.
+///
+/// On by default; `VMPX_NO_FRESH_ALLOC_RETAIN=1` restores the vsp-only
+/// retention. The switch exists so the change can be measured against itself in
+/// one build rather than across two, which is how a change that looked like a
+/// gain on one metric and a loss on another got caught before.
+/// Whether a read-only image byte is still served after a BROAD havoc.
+///
+/// A store to a non-writable page faults, so only a protection change could
+/// have altered it -- which is exactly what `AssumesImageProtectionStable`
+/// already concedes for the suppressed case. Measured: this is the sole
+/// remaining blocker on 5 store-class entries, whose broad havoc sets
+/// `memory_tainted` and so stops their constant image reads being served.
+/// `VMPX_NO_SERVE_RO_TAINTED=1` restores the stricter gate.
+/// Whether a machine may be built from an already-tainted state.
+fn resume_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
+}
+
+fn serve_read_only_when_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_SERVE_RO_TAINTED").is_none())
+}
+
+/// Whether the narrowed havoc keeps only cells inside the private frame.
+///
+/// OPT-IN (`VMPX_FRAME_SCOPED_RETAIN=1`), because on its own it measured N1
+/// 733 -> 732 and N2 unchanged: discarding out-of-frame cells costs precision
+/// and buys nothing until the discharge stops using `past_frame` as its proxy
+/// for "every cell lies inside the frame". It exists because it is the
+/// prerequisite for that change, which is worth 119 entries on N2.
+fn frame_scoped_retain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_FRAME_SCOPED_RETAIN").is_ok_and(|v| v == "1"))
+}
+
+fn retain_fresh_allocations() -> bool {
+    static CHOICE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| std::env::var_os("VMPX_NO_FRESH_ALLOC_RETAIN").is_none())
+}
+
+/// A cell address's byte offset from a fresh-allocation root, if it has one.
+///
+/// The allocation-rooted counterpart of [`pointer_offset`], which only accepts
+/// `vsp_initial`. Both roots are what [`proven_store_byte_range`] already calls
+/// a proven region root, via `is_proven_region_root`.
+fn fresh_allocation_offset(expression: &Expr) -> Option<i64> {
+    let PointerAffine {
+        root: Some(root),
+        coefficient: 1,
+        constant,
+    } = pointer_affine(expression)?
+    else {
+        return None;
+    };
+    is_fresh_allocation_root(&root).then(|| i64::from_ne_bytes(constant.to_ne_bytes()))
 }
 
 fn pointer_offset(expression: &Expr) -> Option<i64> {
@@ -1309,6 +1811,113 @@ fn unsigned_width_range(width: BitWidth) -> Option<(i64, i64)> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// The kind of the first node `address_bounds` has no arm for, or `None` when
+/// the whole address bounds.
+///
+/// `address_bounds` is structural: one unsupported node anywhere makes the whole
+/// address unbounded, and the store then havocs memory. These addresses render
+/// past any sane budget, so the failing KIND is the only part worth printing --
+/// it names the arm to add.
+fn unbounded_node_kind(expression: &Expr) -> Option<&'static str> {
+    if address_bounds(expression).is_some() {
+        return None;
+    }
+    let children: Vec<&Expr> = match &expression.kind {
+        ExprKind::Binary { left, right, .. } => vec![left, right],
+        ExprKind::Unary { value, .. } | ExprKind::Resize { value, .. } => vec![value],
+        ExprKind::Concat { high, low } => vec![high, low],
+        ExprKind::Extract { value, .. } => vec![value],
+        ExprKind::Load { address } => vec![address],
+        _ => Vec::new(),
+    };
+    // Deepest unsupported node first: a parent only fails because a child did.
+    for child in children {
+        if let Some(kind) = unbounded_node_kind(child) {
+            return Some(kind);
+        }
+    }
+    Some(match &expression.kind {
+        ExprKind::Binary { op, .. } => match op {
+            // An `Add` only refuses when BOTH sides carry a root, which is a
+            // non-unit coefficient, not a missing arm.
+            BinaryOp::Add => "Add/two-roots",
+            BinaryOp::Sub => "Sub",
+            BinaryOp::Mul => "Mul",
+            BinaryOp::Shl => "Shl",
+            BinaryOp::And => "And",
+            BinaryOp::Or => "Or",
+            BinaryOp::Xor => "Xor",
+            // The OP, not just "other". Naming the intrinsic is what turned
+            // this diagnostic actionable once already; a bare "Binary(other)"
+            // hides which arm `address_bounds` is missing.
+            other => {
+                return Some(Box::leak(format!("Binary:{other:?}").into_boxed_str()));
+            }
+        },
+        ExprKind::Unary { .. } => "Unary",
+        ExprKind::Resize { op, .. } => match op {
+            ResizeOp::SignExtend => "SignExtend",
+            ResizeOp::ZeroExtend => "ZeroExtend",
+            ResizeOp::Truncate => "Truncate",
+        },
+        ExprKind::Load { .. } => "Load",
+        // The NAME, not just the kind: closing this class means proving
+        // `f(vsp + k) = vsp + g(k)` for the specific functions VMProtect emits,
+        // so which ones they are is the whole scope of that work.
+        // For an opaque read, also classify WHERE it read from: that separates
+        // a cell a havoc discarded from one never written.
+        ExprKind::Intrinsic { name, arguments } if name.starts_with("memory_load_epoch_") => {
+            let site = arguments.first().map_or("none", |address| {
+                if matches!(address.kind, ExprKind::Const { .. }) {
+                    "image-const"
+                } else if pointer_offset(address).is_some() {
+                    "vsp-rooted"
+                } else if address.dependencies().contains("vsp_initial") {
+                    "vsp-derived"
+                } else if unbounded_node_kind(address)
+                    .is_some_and(|kind| kind.starts_with("Intrinsic:memory_load_epoch_"))
+                {
+                    "opaque-chain"
+                } else {
+                    "other"
+                }
+            });
+            return Some(Box::leak(
+                format!(
+                    "Intrinsic:memory_load_epoch@{site}/w{}",
+                    expression.width.bits()
+                )
+                .into_boxed_str(),
+            ));
+        }
+        ExprKind::Intrinsic { name, .. } => return Some(Box::leak(
+            format!("Intrinsic:{name}").into_boxed_str(),
+        )),
+        ExprKind::Extract { .. } => "Extract",
+        // Both halves bound (the recursion above would have reported a child
+        // otherwise), so say which of the arm's own conditions refused.
+        ExprKind::Concat { high, low } => {
+            let reason = if u32::from(low.width.bits()) >= 64 {
+                "wide-low"
+            } else if address_bounds(high).is_some_and(|bounds| bounds.root.is_some()) {
+                "rooted-high"
+            } else {
+                "overflow"
+            };
+            return Some(Box::leak(format!("Concat/{reason}").into_boxed_str()));
+        }
+        // Name it: a bare 64-bit register is the one shape nothing can bound, so
+        // WHICH register says whether that is a caller value (genuinely runtime)
+        // or VM state that something else should have resolved.
+        ExprKind::Register { name } => {
+            return Some(Box::leak(
+                format!("Register:{name}/w{}", expression.width.bits()).into_boxed_str(),
+            ));
+        }
+        ExprKind::Const { .. } => "Const",
+    })
+}
+
 fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
     match &expression.kind {
         ExprKind::Register { name } if name == "vsp_initial" => Some(AddressBounds {
@@ -1327,6 +1936,19 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 root: None,
                 lo: signed,
                 hi: signed,
+            })
+        }
+        // An opaque load is unknown in VALUE but not in RANGE: it was loaded at
+        // a width, and a load of w bits lies in `[0, 2^w)`. That is the same
+        // argument as the narrow-register arm below, and it is what places a
+        // vsp-rooted store whose displacement runs through one. A 64-bit load
+        // stays unbounded -- `unsigned_width_range` returns `None` for it.
+        ExprKind::Intrinsic { name, .. } if name.starts_with("memory_load_epoch_") => {
+            let (lo, hi) = unsigned_width_range(expression.width)?;
+            Some(AddressBounds {
+                root: None,
+                lo,
+                hi,
             })
         }
         // A bare symbolic register below 64 bits, or any truncation, is an
@@ -1369,6 +1991,92 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
         // `concat(0, low)` is a zero-extension of `low`.
         ExprKind::Concat { high, low } if matches!(high.kind, ExprKind::Const { value: 0 }) => {
             address_bounds(low)
+        }
+        // `concat(high, low)` is `(high << width(low)) + low`: the halves do not
+        // overlap. A rootless bounded high half therefore contributes a bounded
+        // displacement and the low half's root survives, which is what
+        // `proven_store_byte_range` needs. A wider range is still sound here --
+        // it preserves fewer cells, never more.
+        ExprKind::Concat { high, low } => {
+            let width = u32::from(low.width.bits());
+            if width >= 64 {
+                return None;
+            }
+            let high = address_bounds(high)?;
+            if high.root.is_some() {
+                return None;
+            }
+            let low = address_bounds(low)?;
+            // `checked_shl` validates only the shift amount, not value
+            // overflow, so a wide high half would wrap into a WRONG bound --
+            // and a wrong bound preserves cells the store can reach.
+            let scale = 1i64.checked_shl(width)?;
+            let shift = |value: i64| value.checked_mul(scale);
+            Some(AddressBounds {
+                root: low.root,
+                lo: shift(high.lo)?.checked_add(low.lo)?,
+                hi: shift(high.hi)?.checked_add(low.hi)?,
+            })
+        }
+        // `!x` over w bits is exactly `(2^w - 1) - x`, so a rootless bounded
+        // operand stays bounded with its ends swapped. A rooted operand is
+        // refused: complementing a root is not `root + constant`.
+        ExprKind::Unary {
+            op: UnaryOp::Not,
+            value,
+        } => {
+            let (_, mask) = unsigned_width_range(expression.width)?;
+            let inner = address_bounds(value)?;
+            if inner.root.is_some() || inner.lo < 0 || inner.hi > mask {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: mask - inner.hi,
+                hi: mask - inner.lo,
+            })
+        }
+        // `-x` wraps as soon as `x` can be zero, so its image is not a
+        // contiguous range and the operand's own bounds do not carry over. The
+        // width bound is the sound answer, and it still bounds a sub-64-bit
+        // value. Rooted operands are refused as above.
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            value,
+        } => {
+            let (lo, hi) = unsigned_width_range(expression.width)?;
+            if address_bounds(value)?.root.is_some() {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo,
+                hi,
+            })
+        }
+        // `x >> c` on a rootless non-negative range. A rooted operand is
+        // refused: shifting a root is not `root + constant`.
+        ExprKind::Binary {
+            op: BinaryOp::Shr,
+            left,
+            right,
+        } => {
+            let ExprKind::Const { value: shift } = right.kind else {
+                return None;
+            };
+            let shift = u32::try_from(shift).ok()?;
+            if shift >= 64 {
+                return None;
+            }
+            let base = address_bounds(left)?;
+            if base.root.is_some() || base.lo < 0 {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: base.lo >> shift,
+                hi: base.hi >> shift,
+            })
         }
         ExprKind::Binary {
             op: op @ (BinaryOp::Add | BinaryOp::Sub),
@@ -1431,6 +2139,31 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
             }
             scale_rootless(base.lo, base.hi, i64::try_from(scalar).ok()?)
         }
+        // `x | y` is at least either operand and never sets a bit above the
+        // highest bit either one can set, so a rootless non-negative pair lands
+        // in `[max(lo), 2^bits(max(hi)) - 1]`. A rooted operand is refused:
+        // OR-ing a root is not `root + constant`.
+        ExprKind::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } => {
+            let left = address_bounds(left)?;
+            let right = address_bounds(right)?;
+            if left.root.is_some() || right.root.is_some() || left.lo < 0 || right.lo < 0 {
+                return None;
+            }
+            let span = u64::try_from(left.hi.max(right.hi)).ok()?;
+            let bits = 64 - span.leading_zeros();
+            if bits >= 63 {
+                return None;
+            }
+            Some(AddressBounds {
+                root: None,
+                lo: left.lo.max(right.lo),
+                hi: (1i64 << bits) - 1,
+            })
+        }
         // `index & mask` with a small positive mask bounds the value to [0, mask].
         ExprKind::Binary {
             op: BinaryOp::And,
@@ -1448,6 +2181,35 @@ fn address_bounds(expression: &Expr) -> Option<AddressBounds> {
                 hi,
             })
         }
+        // No arm, deliberately, and NOT because the missing arm is arithmetic.
+        //
+        // Measured on the affected entries, the node that stops the bound is
+        // `memory_load_epoch_N` in 31 of 45 occurrences -- the opaque value a
+        // read of UNTRACKED memory returns. So the store address is not
+        // `f(vsp + k)` for some VMProtect function f whose semantics could be
+        // modelled; it depends on a value the recovery already lost. There is
+        // no g to prove.
+        //
+        // That makes this class and the "branch target depends on unproven
+        // input" class one cause, not two: 96 of 98 of those refuse on
+        // `OtherLeaf(memory_load_epoch)` as well. And it is circular -- a store
+        // with an unbounded address havocs memory, later reads of it come back
+        // opaque, those reads feed the next store's address, which havocs
+        // again. Closing either class means not starting that cascade, which is
+        // memory precision, not intrinsic semantics.
+        //
+        // Bounding an unsupported node by its own width
+        // was tried and reverted: it is sound as a VALUE bound but it discards
+        // the ROOT, and `proven_store_byte_range` needs one, so it cannot reach
+        // the proof path and measured +0.
+        //
+        // It could not have worked. Measured on systems.xpl, the node that stops
+        // the bound is an `Intrinsic` in 31 of 45 occurrences (then
+        // Binary(other) 7, Concat 6, Register 1), and in these addresses
+        // `vsp_initial` sits INSIDE that intrinsic. The address is therefore
+        // `f(frame_pointer)` for an opaque `f`, which has no provable byte range
+        // relative to the VM stack root at all. The havoc those stores take is
+        // not conservative, it is the only sound answer without knowing `f`.
         _ => None,
     }
 }
@@ -1467,6 +2229,110 @@ fn scale_rootless(lo: i64, hi: i64, scale: i64) -> Option<AddressBounds> {
 /// proven-region `root`) that a `width`-wide store provably stays within.
 /// Returns `None` unless the address reduces to `root + [lo, hi]` over a
 /// `vsp_initial` / fresh-allocation root with representable signed bounds.
+/// A LOWER bound on an address, when no two-sided bound exists.
+///
+/// `store_range_disjoint_from_cell` keeps a cell when `offset < slo` OR
+/// `offset >= shi`, so the two halves are independent: proving only `slo`
+/// already saves every tracked cell below the store. That matters because the
+/// addresses that defeat `address_bounds` are indexed stores --
+/// `vsp_initial + k + <64-bit index>` -- where the index has no upper bound but
+/// is trivially non-negative.
+///
+/// Every value is treated as UNSIGNED, which is what makes a lower bound
+/// available at all: a 64-bit register has no `i64` upper bound but its
+/// unsigned minimum is 0. Subtraction and anything unmodelled refuse, since
+/// they can move the address down.
+///
+/// This rests on the sum not wrapping the address space. That is the same thing
+/// the existing `vsp_initial + const` handling assumes, but it is a real
+/// assumption once an unbounded index is involved, so a caller that uses this
+/// must label it.
+fn address_lower_bound(expression: &Expr) -> Option<AddressBounds> {
+    // A two-sided bound is strictly better; only fall back when there is none.
+    if let Some(bounds) = address_bounds(expression) {
+        return Some(bounds);
+    }
+    match &expression.kind {
+        ExprKind::Register { name } if name == "vsp_initial" => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Intrinsic { .. } if is_fresh_allocation_root(expression) => Some(AddressBounds {
+            root: Some(expression.clone()),
+            lo: 0,
+            hi: 0,
+        }),
+        // An unsigned value of any width is at least zero. This is the whole
+        // point of the fallback: a 64-bit register lands here.
+        ExprKind::Register { .. }
+        | ExprKind::Intrinsic { .. }
+        | ExprKind::Load { .. }
+        | ExprKind::Extract { .. }
+        | ExprKind::Unary { .. }
+        | ExprKind::Resize { .. } => Some(AddressBounds {
+            root: None,
+            lo: 0,
+            hi: 0,
+        }),
+        ExprKind::Concat { high, low } => {
+            let high = address_lower_bound(high)?;
+            let low = address_lower_bound(low)?;
+            (high.root.is_none()).then_some(AddressBounds {
+                root: low.root,
+                // The high half contributes at least `high.lo << width(low)`,
+                // but that product is what overflowed in the two-sided arm, so
+                // the sound floor to keep is the low half's own.
+                lo: low.lo,
+                hi: 0,
+            })
+        }
+        ExprKind::Binary { op, left, right } => match op {
+            // `a + b >= lo(a) + lo(b)` for unsigned halves that do not wrap.
+            BinaryOp::Add => {
+                let left = address_lower_bound(left)?;
+                let right = address_lower_bound(right)?;
+                let ((None, root) | (root, None)) = (left.root, right.root) else {
+                    return None;
+                };
+                Some(AddressBounds {
+                    root,
+                    lo: left.lo.checked_add(right.lo)?,
+                    hi: 0,
+                })
+            }
+            // `a | b >= max(a, b)`, and `a * c`, `a << c` scale a floor up.
+            BinaryOp::Or => {
+                let left = address_lower_bound(left)?;
+                let right = address_lower_bound(right)?;
+                (left.root.is_none() && right.root.is_none()).then_some(AddressBounds {
+                    root: None,
+                    lo: left.lo.max(right.lo),
+                    hi: 0,
+                })
+            }
+            BinaryOp::Shl | BinaryOp::Mul => {
+                let left = address_lower_bound(left)?;
+                (left.root.is_none()).then_some(AddressBounds {
+                    root: None,
+                    lo: 0,
+                    hi: 0,
+                })
+            }
+            // `a & m` and a shift right can only move a value DOWN, to zero.
+            BinaryOp::And | BinaryOp::Shr => Some(AddressBounds {
+                root: None,
+                lo: 0,
+                hi: 0,
+            }),
+            // Subtraction moves the address down by an unbounded amount.
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+
 fn proven_store_byte_range(address: &Expr, width: BitWidth) -> Option<(Expr, i64, i64)> {
     let bounds = address_bounds(address)?;
     let root = bounds.root?;
@@ -1484,6 +2350,52 @@ fn proven_store_byte_range(address: &Expr, width: BitWidth) -> Option<(Expr, i64
 /// base / distinct fresh allocation) is disjoint by region; everything else
 /// (concrete cells, unprovable roots) is treated as possibly aliasing and
 /// discarded.
+/// A store's lower bound over a proven region root, when no upper bound exists.
+fn proven_store_lower_bound(address: &Expr) -> Option<(Expr, i64)> {
+    // Only when the two-sided bound genuinely failed; otherwise the caller has
+    // already taken the stronger path.
+    if address_bounds(address).is_some() {
+        return None;
+    }
+    let bounds = address_lower_bound(address)?;
+    let root = bounds.root?;
+    is_proven_region_root(&root).then_some((root, bounds.lo))
+}
+
+/// Whether a one-byte tracked cell lies strictly BELOW a store that starts at
+/// `slo` over `store_root` and has no upper bound. A cell in a different proven
+/// region is disjoint by region, as in the two-sided case.
+fn store_below_disjoint_from_cell(
+    store_root: &Expr,
+    slo: i64,
+    width: i64,
+    cell_address: &Expr,
+) -> bool {
+    let Some(PointerAffine {
+        root: Some(cell_root),
+        coefficient: 1,
+        constant,
+    }) = pointer_affine(cell_address)
+    else {
+        return false;
+    };
+    if !is_proven_region_root(&cell_root) {
+        return false;
+    }
+    if &cell_root == store_root {
+        // The cell's own byte must end at or before the store's first byte.
+        i64::from_ne_bytes(constant.to_ne_bytes()).checked_add(width).is_some_and(|end| end <= slo)
+    } else {
+        true
+    }
+}
+
+/// Whether a store with only a lower bound may be placed by it.
+fn indexed_store_in_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_INDEXED_STORE_BOUNDS").is_ok_and(|v| v == "1"))
+}
+
 fn store_range_disjoint_from_cell(
     store_root: &Expr,
     slo: i64,
@@ -1795,6 +2707,7 @@ fn execute_instruction(
         return Ok(());
     }
     let width = operation_width(instruction)?;
+    machine.current_instruction_index = instruction_index;
     match instruction.semantic {
         VmHandlerSemantic::ConstantPush => {
             let operand = instruction
@@ -2256,6 +3169,18 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         }
     })?;
     for (instruction_index, instruction) in instructions.iter().enumerate() {
+        // Sampled, not per-instruction: a clock read costs more than many of the
+        // steps it guards, and a block is capped at a few thousand instructions.
+        if instruction_index % 32 == 0
+            && limits.deadline.is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            return Err(SymbolicExecutionError {
+                instruction_index,
+                vip: instruction.state_before.vip,
+                semantic: instruction.semantic,
+                message: "per-entry wall-clock budget exceeded".to_owned(),
+            });
+        }
         if instruction_index >= limits.max_instructions {
             return Err(SymbolicExecutionError {
                 instruction_index,
@@ -2408,7 +3333,11 @@ pub fn execute_symbolic_linear_block_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_indexed_store_in_bounds: machine.assumed_indexed_store_in_bounds,
+        assumed_external_disjoint_from_fresh_allocations: machine
+            .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,
+        protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
         vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
         vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
@@ -2507,7 +3436,11 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
         image_reads_suppressed: machine.image_reads_suppressed,
         assumed_external_disjoint_from_vm_stack: machine
             .assumed_external_disjoint_from_vm_stack,
+        assumed_indexed_store_in_bounds: machine.assumed_indexed_store_in_bounds,
+        assumed_external_disjoint_from_fresh_allocations: machine
+            .assumed_external_disjoint_from_fresh_allocations,
         served_read_only_image: machine.served_read_only_image,
+        protection_may_have_changed: machine.protection_may_have_changed,
         vm_stack_address_escapes: machine.vm_stack_address_escapes,
         vm_stack_derived_escapes: machine.vm_stack_derived_escapes,
         vm_stack_pointer_lost: machine.vm_stack_pointer_lost,
@@ -2526,10 +3459,10 @@ pub fn execute_symbolic_native_call_boundary_with_initial_state(
 #[cfg(test)]
 mod tests {
     /// A heavily shared DAG has few distinct nodes but renders as an
-    /// exponentially large tree; sorting its address must fail closed instead of
-    /// allocating the tree.
+    /// exponentially large tree; sorting its address must fall back to hash order
+    /// instead of allocating the tree.
     #[test]
-    fn shared_dag_address_sort_key_fails_closed() {
+    fn shared_dag_address_sort_key_falls_back_to_hash_order() {
         let mut address = Expr::register(BitWidth::W64, "native_rax_initial");
         for round in 0..48_u64 {
             let mixed = Expr::binary(
@@ -2542,8 +3475,13 @@ mod tests {
         }
         assert!(address.node_count_bounded(1_000_000) < 10_000, "DAG stays small");
         let mut memory = HashMap::new();
-        memory.insert(address, Expr::constant(BitWidth::W8, 0));
-        assert!(sorted_memory_values(memory).is_err());
+        memory.insert(address.clone(), Expr::constant(BitWidth::W8, 0));
+        memory.insert(Expr::constant(BitWidth::W64, 7), Expr::constant(BitWidth::W8, 1));
+        let first = sorted_memory_values(memory.clone()).unwrap();
+        let second = sorted_memory_values(memory).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first, second);
+        assert!(bounded_debug(&address, 1 << 20).is_none());
 
         let mut small = HashMap::new();
         small.insert(Expr::constant(BitWidth::W64, 2), Expr::constant(BitWidth::W8, 0));
@@ -2568,6 +3506,7 @@ mod tests {
             memory_epoch: 3,
             memory_tainted: false,
             image_reads_suppressed: false,
+            protection_may_have_changed: true,
             next_native_call_epoch: 5,
             fresh_allocations: vec![SymbolicFreshAllocation {
                 allocation: dependency.clone(),
@@ -2583,6 +3522,7 @@ mod tests {
             )]))
             .expect("replacement width matches");
         assert_eq!(specialized.vsp, constant);
+        assert!(specialized.protection_may_have_changed);
         assert!(
             specialized
                 .context_values
@@ -3145,21 +4085,41 @@ mod tests {
         assert_eq!(report.final_vsp_offset, Some(-24));
     }
 
+    // A tainted state used to be refused outright, to keep stale aliases from
+    // being resumed. There are none to resume: the havoc that sets the taint
+    // empties tracked memory, so every later read returns a fresh opaque value.
+    // What the refusal was really protecting is the IMAGE: a store that could
+    // have written anywhere must stop file bytes being served as constants, and
+    // the broad havoc sets the taint WITHOUT setting that flag. So the machine
+    // carries the taint and forces image reads suppressed, and the properties
+    // are asserted here instead of the whole resume being refused.
     #[test]
-    fn rejects_tainted_or_oversized_initial_state() {
+    fn a_tainted_state_resumes_with_image_reads_suppressed() {
         let tainted = SymbolicVmInitialState {
             memory_tainted: true,
             ..SymbolicVmInitialState::default()
         };
-        let error = execute_symbolic_linear_block_with_initial_state(
+        let report = execute_symbolic_linear_block_with_initial_state(
             &[],
             None,
             SymbolicExecutionLimits::default(),
             &tainted,
             None,
         )
-        .expect_err("tainted state must not be resumed with stale aliases");
-        assert!(error.message.contains("cannot be resumed soundly"));
+        .expect("a tainted state resumes");
+        assert!(report.memory_tainted, "the taint must survive the resume");
+        assert!(
+            report.image_reads_suppressed,
+            "a tainted resume must never serve a file constant"
+        );
+        assert!(
+            report.memory_values.is_empty(),
+            "there are no tracked cells to be stale"
+        );
+    }
+
+    #[test]
+    fn rejects_an_oversized_initial_state() {
 
         let mut oversized = SymbolicVmInitialState::default();
         oversized
@@ -3250,6 +4210,217 @@ mod tests {
         assert!(is_free_read(&discarded));
     }
 
+    // The narrowed havoc preserves cells rooted at an allocation this frame
+    // made, not only `vsp_initial`-rooted ones.
+    //
+    // Those discards are where the `memory_load_epoch` cascade starts: a read of
+    // a discarded cell returns an opaque value, that value lands in the next
+    // store's address, the address has no provable range, and the store havocs
+    // again. The point of keeping them is to not start that chain.
+    //
+    // The concession is recorded separately, and only when a cell was actually
+    // retained, so an entry with no allocation-rooted cells behaves exactly as
+    // it did before and carries no new label.
+    // `concat(c, vsp + k)` is still `vsp + constant`, so the bound must keep the
+    // root -- that is the only reason this arm is worth having. A bound without
+    // a root cannot reach `proven_store_byte_range`, which is why bounding an
+    // unsupported node by its own width measured +0 before.
+    #[test]
+    fn a_constant_high_concat_keeps_the_root_and_shifts_the_offset() {
+        let low = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("same-width pointer expression");
+        let address = Expr::concat(Expr::constant(BitWidth::W32, 3), low).expect("concat");
+        let bounds = address_bounds(&address).expect("bounded");
+        // The halves do not overlap, so the value is (3 << 32) + vsp + 8.
+        let shifted = 3i64 << 32;
+        assert_eq!(bounds.lo, shifted + 8);
+        assert_eq!(bounds.hi, shifted + 8);
+        assert!(bounds.root.is_some(), "the root must survive the concat");
+    }
+
+    // A non-constant high half is not a constant displacement, so it must still
+    // refuse rather than invent a bound from the low half alone.
+    #[test]
+    fn a_symbolic_high_concat_is_not_bounded() {
+        let address = Expr::concat(
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::register(BitWidth::W32, "vsp_initial"),
+        )
+        .expect("concat");
+        assert!(address_bounds(&address).is_none());
+    }
+
+    // `x | y` never sets a bit above the highest bit either side can set.
+    #[test]
+    fn an_or_of_two_bounded_values_rounds_up_to_the_next_power_of_two() {
+        let masked = |mask| {
+            Expr::binary(
+                BinaryOp::And,
+                Expr::register(BitWidth::W32, "native_rax_initial"),
+                Expr::constant(BitWidth::W32, mask),
+            )
+            .expect("mask")
+        };
+        let address =
+            Expr::binary(BinaryOp::Or, masked(0x5), masked(0x12)).expect("or");
+        let bounds = address_bounds(&address).expect("bounded");
+        // 0x12 is five significant bits, so nothing above 0x1f can be set.
+        assert_eq!((bounds.lo, bounds.hi), (0, 0x1f));
+        assert!(bounds.root.is_none());
+    }
+
+    // A rooted operand must still refuse: OR-ing a root is not an offset.
+    #[test]
+    fn an_or_over_a_rooted_operand_is_refused() {
+        let rooted = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("rooted");
+        let address = Expr::binary(BinaryOp::Or, rooted, Expr::constant(BitWidth::W32, 3))
+            .expect("or");
+        assert!(address_bounds(&address).is_none());
+    }
+
+    // `!x` over w bits is `(2^w - 1) - x`, so a rootless bounded operand stays
+    // bounded with its ends swapped.
+    #[test]
+    fn a_complement_of_a_narrow_value_is_bounded_by_its_width() {
+        let masked = Expr::binary(
+            BinaryOp::And,
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::constant(BitWidth::W32, 0xff),
+        )
+        .expect("mask");
+        let bounds = address_bounds(&Expr::unary(UnaryOp::Not, masked))
+            .expect("bounded");
+        assert_eq!((bounds.lo, bounds.hi), (0xffff_ff00, 0xffff_ffff));
+        assert!(bounds.root.is_none());
+    }
+
+    // `-x` wraps once x can be zero, so the operand's range must NOT carry over;
+    // the width bound is what is sound.
+    #[test]
+    fn a_negation_falls_back_to_the_width_bound() {
+        let masked = Expr::binary(
+            BinaryOp::And,
+            Expr::register(BitWidth::W32, "native_rax_initial"),
+            Expr::constant(BitWidth::W32, 0xff),
+        )
+        .expect("mask");
+        let bounds = address_bounds(&Expr::unary(UnaryOp::Neg, masked))
+            .expect("bounded");
+        assert_eq!((bounds.lo, bounds.hi), (0, 0xffff_ffff));
+    }
+
+    // Both arms must refuse a ROOTED operand: complementing or negating a root
+    // is not `root + constant`, and trading the root away for a value bound is
+    // the mistake this file already measured at +0.
+    #[test]
+    fn a_unary_over_a_rooted_operand_is_refused() {
+        let rooted = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W32, "vsp_initial"),
+            Expr::constant(BitWidth::W32, 8),
+        )
+        .expect("rooted");
+        for op in [UnaryOp::Not, UnaryOp::Neg] {
+            let address = Expr::unary(op, rooted.clone());
+            assert!(address_bounds(&address).is_none(), "{op:?} must refuse a root");
+        }
+    }
+
+    // A 64-bit complement has no width bound to fall back on.
+    #[test]
+    fn a_full_width_complement_is_not_bounded() {
+        let address = Expr::unary(
+            UnaryOp::Not,
+            Expr::register(BitWidth::W64, "native_rax_initial"),
+        );
+        assert!(address_bounds(&address).is_none());
+    }
+
+    #[test]
+    fn narrowed_havoc_preserves_fresh_allocation_cells_under_its_own_label() {
+        let mut machine = default_machine();
+        let allocation = Expr::intrinsic(
+            BitWidth::W64,
+            "fresh_allocation_return_epoch_1".to_owned(),
+            Vec::new(),
+        );
+        assert!(is_fresh_allocation_root(&allocation));
+        let allocation_cell = Expr::binary(
+            BinaryOp::Add,
+            allocation,
+            Expr::constant(BitWidth::W64, 24),
+        )
+        .expect("same-width pointer expression");
+        assert_eq!(fresh_allocation_offset(&allocation_cell), Some(24));
+        machine
+            .store_memory(&allocation_cell, &Expr::constant(BitWidth::W64, 0x77))
+            .expect("seed a cell in this frame's own allocation");
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed a precise VM-stack cell");
+        machine
+            .store_memory(
+                &Expr::constant(BitWidth::W64, 0x1_4000_1000),
+                &Expr::constant(BitWidth::W64, 0x33),
+            )
+            .expect("seed a cell rooted at neither region");
+
+        // An opaque, native-register-rooted address: no vsp dependency, so it
+        // takes the narrowing rather than the broad havoc.
+        let address = Expr::register(BitWidth::W64, "native_rbx_initial");
+        machine
+            .store_external(7, address, Expr::constant(BitWidth::W64, 0x55))
+            .expect("unproven store is over-approximated, not refused");
+
+        assert!(machine.assumed_external_disjoint_from_vm_stack);
+        assert!(machine.assumed_external_disjoint_from_fresh_allocations);
+
+        let kept_allocation = machine
+            .load_memory(allocation_cell, BitWidth::W64)
+            .expect("load the preserved allocation cell");
+        assert!(
+            matches!(kept_allocation.kind, ExprKind::Const { value: 0x77 }),
+            "allocation-rooted cell must survive: {kept_allocation:?}"
+        );
+        let kept_stack = machine
+            .load_memory(stack_address(16), BitWidth::W64)
+            .expect("load the preserved VM-stack cell");
+        assert!(matches!(kept_stack.kind, ExprKind::Const { value: 9 }));
+        // A cell rooted at neither region is still discarded.
+        let discarded = machine
+            .load_memory(Expr::constant(BitWidth::W64, 0x1_4000_1000), BitWidth::W64)
+            .expect("load the discarded cell");
+        assert!(is_free_read(&discarded), "must not survive: {discarded:?}");
+    }
+
+    // With no allocation-rooted cell present, nothing changed and no new label
+    // is taken -- the guard against a concession recorded wider than it is used.
+    #[test]
+    fn narrowed_havoc_takes_no_allocation_label_when_there_is_nothing_to_keep() {
+        let mut machine = default_machine();
+        machine
+            .store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed a precise VM-stack cell");
+        machine
+            .store_external(
+                3,
+                Expr::register(BitWidth::W64, "native_rbx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("unproven store is over-approximated, not refused");
+        assert!(machine.assumed_external_disjoint_from_vm_stack);
+        assert!(!machine.assumed_external_disjoint_from_fresh_allocations);
+    }
+
     // (b) An external store whose address still references the VM stack pointer
     // could alias the VM's private operand stack, so no assumption applies: the
     // broad, assumption-free havoc discards all tracked cells and taints memory.
@@ -3287,6 +4458,69 @@ mod tests {
             is_free_read(&reloaded),
             "stale pre-store value must not survive the havoc: {reloaded:?}"
         );
+    }
+
+    // A store whose address is data read from the VM frame (vsp_initial only
+    // inside an untracked load's address) is a frame pointer only if one was lost
+    // or escaped. Under the opt-in flag it takes the labeled narrowing instead of
+    // tainting; without the flag, or once a frame pointer is lost, it still taints.
+    #[test]
+    fn loaded_data_store_address_takes_labeled_narrowing_only_when_opted_in() {
+        let loaded = Expr::intrinsic(
+            BitWidth::W64,
+            "memory_load_epoch_3".to_owned(),
+            vec![stack_address(192)],
+        );
+        let address = Expr::binary(
+            BinaryOp::Add,
+            loaded,
+            Expr::register(BitWidth::W64, "native_rbx_initial"),
+        )
+        .expect("same-width pointer expression");
+        assert!(!is_frame_pointer_value(&address));
+        let limits = SymbolicExecutionLimits {
+            assume_loaded_store_addresses_disjoint: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let machine = |limits| {
+            SymbolicMachine::new(&SymbolicVmInitialState::default(), None, limits)
+                .expect("default state")
+        };
+
+        let mut off = machine(SymbolicExecutionLimits::default());
+        off.store_external(1, address.clone(), Expr::constant(BitWidth::W8, 1))
+            .expect("over-approximated");
+        assert!(off.memory_tainted);
+        assert!(!off.assumed_external_disjoint_from_vm_stack);
+
+        let mut on = machine(limits);
+        on.store_memory(&stack_address(16), &Expr::constant(BitWidth::W64, 9))
+            .expect("seed");
+        on.store_external(1, address.clone(), Expr::constant(BitWidth::W8, 1))
+            .expect("narrowed");
+        assert!(!on.memory_tainted);
+        assert!(on.assumed_external_disjoint_from_vm_stack);
+        let kept = on.load_memory(stack_address(16), BitWidth::W64).expect("load");
+        assert!(matches!(kept.kind, ExprKind::Const { value: 9 }));
+
+        let mut lost = machine(limits);
+        lost.vm_stack_pointer_lost = true;
+        lost.store_external(1, address, Expr::constant(BitWidth::W8, 1))
+            .expect("over-approximated");
+        assert!(lost.memory_tainted);
+        assert!(!lost.assumed_external_disjoint_from_vm_stack);
+
+        let indexed = Expr::binary(
+            BinaryOp::Add,
+            Expr::register(BitWidth::W64, "native_rbx_initial"),
+            stack_address(216),
+        )
+        .expect("same-width pointer expression");
+        let mut array = machine(limits);
+        array
+            .store_external(1, indexed, Expr::constant(BitWidth::W64, 1))
+            .expect("over-approximated");
+        assert!(array.memory_tainted, "a vsp-rooted indexed store stays refused");
     }
 
     // The frame address is non-escaping while it only flows into VM-stack cells
@@ -4036,6 +5270,7 @@ mod tests {
         let data = Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA);
         let suppressed = SymbolicVmInitialState {
             image_reads_suppressed: true,
+            protection_may_have_changed: true,
             ..SymbolicVmInitialState::default()
         };
         let mut off = SymbolicMachine::new(
@@ -4063,6 +5298,83 @@ mod tests {
         let value = writable.load_memory(data, BitWidth::W32).expect("load");
         assert!(!matches!(value.kind, ExprKind::Const { .. }));
         assert!(!writable.served_read_only_image);
+    }
+
+    // After an external store, a declared read-only page is served PROVEN (no
+    // assumption flag) while no non-allocation call has run on the path; an
+    // opaque native call (which may change protection) withdraws the proof.
+    #[test]
+    fn suppressed_read_only_page_is_proven_until_a_call_may_reprotect() {
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = crate::ReadOnlyImage(&pe);
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let data = Expr::constant(BitWidth::W64, crate::immutable_image::tests::DATA_VA);
+        let mut machine = SymbolicMachine::new(
+            &SymbolicVmInitialState::default(),
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        machine
+            .store_external(
+                1,
+                Expr::register(BitWidth::W64, "native_rcx_initial"),
+                Expr::constant(BitWidth::W64, 0x55),
+            )
+            .expect("external store");
+        assert!(machine.image_reads_suppressed);
+        let value = machine
+            .load_memory(rdata.clone(), BitWidth::W32)
+            .expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(!machine.served_read_only_image, "proven serve carries no assumption");
+        let writable = machine.load_memory(data, BitWidth::W32).expect("load");
+        assert!(!matches!(writable.kind, ExprKind::Const { .. }));
+
+        machine.protection_may_have_changed = true;
+        let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+        assert!(machine.protection_may_have_changed && machine.image_reads_suppressed);
+    }
+
+    // Without a whole-image proof that protection cannot change, the in-path
+    // proof alone is not enough: nothing is served unless the labeled flag is on.
+    #[test]
+    fn unwitnessed_image_is_never_served_as_proven() {
+        struct Unwitnessed<'a, 'data>(crate::ReadOnlyImage<'a, 'data>);
+        impl SymbolicMemorySource for Unwitnessed<'_, '_> {
+            fn read_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_byte(address)
+            }
+            fn read_only_byte(&self, address: Va) -> Option<u8> {
+                self.0.read_only_byte(address)
+            }
+        }
+        let bytes = crate::immutable_image::tests::two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let source = Unwitnessed(crate::ReadOnlyImage(&pe));
+        let rdata = Expr::constant(BitWidth::W64, crate::immutable_image::tests::RDATA_VA);
+        let suppressed = SymbolicVmInitialState {
+            image_reads_suppressed: true,
+            ..SymbolicVmInitialState::default()
+        };
+        let mut machine = SymbolicMachine::new(
+            &suppressed,
+            Some(&source),
+            SymbolicExecutionLimits::default(),
+        )
+        .expect("state");
+        let value = machine.load_memory(rdata.clone(), BitWidth::W32).expect("load");
+        assert!(!matches!(value.kind, ExprKind::Const { .. }), "{value:?}");
+        let labeled = SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: true,
+            ..SymbolicExecutionLimits::default()
+        };
+        let mut machine = SymbolicMachine::new(&suppressed, Some(&source), labeled).expect("state");
+        let value = machine.load_memory(rdata, BitWidth::W32).expect("load");
+        assert!(matches!(value.kind, ExprKind::Const { value: 0xDEAD_BEEF }));
+        assert!(machine.served_read_only_image, "served only as a labeled assumption");
     }
 
     #[test]

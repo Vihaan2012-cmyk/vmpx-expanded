@@ -247,6 +247,18 @@ impl LoweringContext<'_> {
                     self.release_slot();
                 }
             }
+            Passthrough::Rdtsc => {
+                if !arguments.is_empty() || expression.width != BitWidth::W64 {
+                    return Err(malformed(name, "rdtsc takes no operands and yields 64 bits"));
+                }
+                let out = self.allocate_slot()?;
+                self.operations.push(Operation::Rdtsc { out });
+                self.operations.push(Operation::SpillLoad {
+                    destination: accumulator(BitWidth::W64),
+                    slot: out,
+                });
+                self.release_slot();
+            }
             Passthrough::GsLoad => {
                 let [pointer] = arguments else {
                     return Err(malformed(name, "a gs load takes one pointer"));
@@ -400,6 +412,62 @@ impl LoweringContext<'_> {
         Ok(())
     }
 
+    /// Computes the status-flag word a VM shift left/right produced, by running
+    /// the same native shift and reading the flags it sets. The shift count goes
+    /// in CL (x86 variable-shift semantics); CF/SF/ZF/PF/OF are defined by the
+    /// shift and AF is reproduced by identity (the handler executed the same
+    /// shift), exactly as the add/sub path trusts the hardware flag read.
+    fn lower_shift_flags(
+        &mut self,
+        name: &str,
+        shift: ShiftOp,
+        width: BitWidth,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [value, count] = arguments else {
+            return Err(malformed(name, "shift flags take a value and a count"));
+        };
+        if value.width != width || count.width != width || expression.width != BitWidth::W64 {
+            return Err(malformed(name, "shift-flag operand widths disagree"));
+        }
+        self.lower(value)?;
+        let value_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: value_slot,
+            source: accumulator(width),
+        });
+        self.lower(count)?;
+        self.operations.push(Operation::Move {
+            destination: register(SHIFT_COUNT_ID, BitWidth::W8),
+            source: accumulator(BitWidth::W8),
+        });
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(width),
+            slot: value_slot,
+        });
+        self.release_slot();
+        self.operations.push(Operation::Shift {
+            operation: shift,
+            destination: accumulator(width),
+            count: ShiftCount::Register(register(SHIFT_COUNT_ID, BitWidth::W8)),
+        });
+        self.operations.push(Operation::ReadFlags {
+            destination: accumulator(BitWidth::W64),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::And,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_MASK),
+        });
+        self.operations.push(Operation::Binary {
+            operation: NativeBinaryOp::Or,
+            destination: accumulator(BitWidth::W64),
+            source: BinarySource::Immediate(STATUS_FLAG_FIXED),
+        });
+        Ok(())
+    }
+
     /// Computes the status-flag word of a VM `nor`/`nand` with the native
     /// logical instruction that defines it. The VM semantics are
     /// `nor(a, b) = (~a) & (~b)` and `nand(a, b) = (~a) | (~b)`, so the flags are
@@ -513,6 +581,63 @@ impl LoweringContext<'_> {
             .and_then(|left| widen(right).and_then(|right| Expr::binary(BinaryOp::Mul, left, right)))
             .map_err(|_| malformed(name, "wide-multiply widening failed"))?;
         self.lower(&product)
+    }
+
+    /// Lowers one half of a 64-bit wide multiply: emits the `mul`/`imul` whose
+    /// 128-bit product lands in RDX:RAX and reads back the requested half (RAX
+    /// low, RDX high). The narrower forms fit one qword and go through
+    /// `lower_wide_multiply`; only the 64-bit product is split this way.
+    fn lower_wide_multiply_half(
+        &mut self,
+        name: &str,
+        signed: bool,
+        half: MultiplyHalf,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> Result<(), ExpressionCodegenError> {
+        let [left, right] = arguments else {
+            return Err(malformed(name, "a wide multiply takes two operands"));
+        };
+        if left.width != BitWidth::W64
+            || right.width != BitWidth::W64
+            || expression.width != BitWidth::W64
+        {
+            return Err(malformed(name, "a 64-bit wide-multiply half is a qword"));
+        }
+        self.lower(left)?;
+        let left_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: left_slot,
+            source: accumulator(BitWidth::W64),
+        });
+        self.lower(right)?;
+        let right_slot = self.allocate_slot()?;
+        self.operations.push(Operation::SpillStore {
+            slot: right_slot,
+            source: accumulator(BitWidth::W64),
+        });
+        let low_slot = self.allocate_slot()?;
+        let high_slot = self.allocate_slot()?;
+        self.operations.push(Operation::WideMultiply {
+            signed,
+            width: native_width(BitWidth::W64),
+            left: left_slot,
+            right: right_slot,
+            out_low: low_slot,
+            out_high: high_slot,
+        });
+        let wanted = match half {
+            MultiplyHalf::Low => low_slot,
+            MultiplyHalf::High => high_slot,
+        };
+        self.operations.push(Operation::SpillLoad {
+            destination: accumulator(BitWidth::W64),
+            slot: wanted,
+        });
+        for _ in 0..4 {
+            self.release_slot();
+        }
+        Ok(())
     }
 
     /// Lowers a VM multiply-flag word by re-emitting the exact `mul`/`imul` the
@@ -844,6 +969,31 @@ fn status_flags_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
     Some((subtract, width))
 }
 
+/// `vm_flags_shiftleft_wN` / `vm_flags_shiftrightlogical_wN` /
+/// `vm_flags_shiftrightarithmetic_wN`: the native shift it flags, and its width.
+/// The VM handler ran exactly this shift and captured the result with pushfq, so
+/// re-running the shift and reading the flags reproduces them by identity -- the
+/// same trust basis as the add/sub and double-shift flag reads.
+fn shift_flags_intrinsic(name: &str) -> Option<(ShiftOp, BitWidth)> {
+    let (shift, rest) = if let Some(rest) = name.strip_prefix("vm_flags_shiftleft_") {
+        (ShiftOp::Left, rest)
+    } else if let Some(rest) = name.strip_prefix("vm_flags_shiftrightlogical_") {
+        (ShiftOp::RightLogical, rest)
+    } else if let Some(rest) = name.strip_prefix("vm_flags_shiftrightarithmetic_") {
+        (ShiftOp::RightArithmetic, rest)
+    } else {
+        return None;
+    };
+    let width = match rest {
+        "w8" => BitWidth::W8,
+        "w16" => BitWidth::W16,
+        "w32" => BitWidth::W32,
+        "w64" => BitWidth::W64,
+        _ => return None,
+    };
+    Some((shift, width))
+}
+
 /// `vm_flags_nor_wN` / `vm_flags_nand_wN`: whether the native op is `or` (the
 /// NAND form, `(~a) | (~b)`) rather than `and` (the NOR form, `(~a) & (~b)`),
 /// and its width.
@@ -879,6 +1029,35 @@ fn wide_multiply_intrinsic(name: &str) -> Option<(bool, BitWidth)> {
         _ => return None,
     };
     Some((signed, width))
+}
+
+/// Which half of the 128-bit product a 64-bit wide multiply names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MultiplyHalf {
+    Low,
+    High,
+}
+
+/// `x86_signed_multiply_w64_K_{low,high}` / `x86_unsigned_multiply_w64_K_{low,high}`:
+/// the 64-bit wide multiply's signedness and which half of the 128-bit product
+/// (RAX / RDX) this names. The narrower widths fit one qword and are handled by
+/// `wide_multiply_intrinsic`; only the 64-bit form splits into low/high.
+fn wide_multiply_half_intrinsic(name: &str) -> Option<(bool, MultiplyHalf)> {
+    let (signed, rest) = if let Some(rest) = name.strip_prefix("x86_signed_multiply_w64_") {
+        (true, rest)
+    } else {
+        (false, name.strip_prefix("x86_unsigned_multiply_w64_")?)
+    };
+    let mut parts = rest.split('_');
+    if !is_index(parts.next()?) {
+        return None;
+    }
+    let half = match parts.next()? {
+        "low" => MultiplyHalf::Low,
+        "high" => MultiplyHalf::High,
+        _ => return None,
+    };
+    parts.next().is_none().then_some((signed, half))
 }
 
 fn width_from_digits(text: &str) -> Option<BitWidth> {
@@ -1055,8 +1234,12 @@ impl LoweringContext<'_> {
                     self.lower_status_flags(name, subtract, width, expression, arguments)?;
                 } else if let Some((or, width)) = logical_flags_intrinsic(name) {
                     self.lower_logical_flags(name, or, width, expression, arguments)?;
+                } else if let Some((shift, width)) = shift_flags_intrinsic(name) {
+                    self.lower_shift_flags(name, shift, width, expression, arguments)?;
                 } else if let Some((signed, width)) = wide_multiply_intrinsic(name) {
                     self.lower_wide_multiply(name, signed, width, expression, arguments)?;
+                } else if let Some((signed, half)) = wide_multiply_half_intrinsic(name) {
+                    self.lower_wide_multiply_half(name, signed, half, expression, arguments)?;
                 } else if let Some((signed, width)) = multiply_flags_intrinsic(name) {
                     self.lower_multiply_flags(name, signed, width, expression, arguments)?;
                 } else if let Some((width, part)) = unsigned_divide_value_intrinsic(name) {
@@ -1731,6 +1914,32 @@ mod tests {
     }
 
     #[test]
+    fn wide_multiply_sixty_four_bit_halves_each_lower_to_a_mul() {
+        // The 128-bit product splits into _low (RAX) and _high (RDX); both halves
+        // are emitted by the same one-operand multiply.
+        for half in ["low", "high"] {
+            let operands = || {
+                vec![
+                    Expr::register(BitWidth::W64, "p"),
+                    Expr::constant(BitWidth::W64, 3),
+                ]
+            };
+            let unsigned = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_unsigned_multiply_w64_7_{half}"),
+                operands(),
+            );
+            lowers_to(&unsigned, iced_x86::Mnemonic::Mul);
+            let signed = Expr::intrinsic(
+                BitWidth::W64,
+                format!("x86_signed_multiply_w64_7_{half}"),
+                operands(),
+            );
+            lowers_to(&signed, iced_x86::Mnemonic::Imul);
+        }
+    }
+
+    #[test]
     fn unsigned_divide_flags_lower_to_div_and_a_raw_flag_read() {
         let expression = Expr::intrinsic(
             BitWidth::W64,
@@ -1913,11 +2122,13 @@ mod tests {
     }
 
     #[test]
-    fn shift_flags_fail_closed_rather_than_emit_approximate_bits() {
-        // VM shift-flag intrinsics (`vm_flags_shiftleft_wN`, etc.) are left
-        // unlowered on purpose: a variable shift's CF is the last bit shifted
-        // out and its OF is ISA-undefined for counts other than one, so there
-        // is no shape we can prove exact here. Fail closed instead of guessing.
+    fn shift_flags_lower_by_re_executing_the_native_shift() {
+        // A VM shift-flag intrinsic is not computed by formula -- where CF (the
+        // last bit shifted out) and the count>1 OF would indeed be impossible to
+        // prove exact -- but reproduced by identity: the handler ran this shift
+        // and captured its flags with pushfq, so re-running the shift and reading
+        // the flags yields the same bits. Same basis as the accepted double-shift
+        // passthrough. So it lowers rather than failing closed.
         let expression = Expr::intrinsic(
             BitWidth::W64,
             "vm_flags_shiftleft_w32",
@@ -1927,10 +2138,23 @@ mod tests {
             ],
         );
         let config = passthrough_config();
-        assert!(matches!(
-            lower_expression(&expression, &config),
-            Err(ExpressionCodegenError::UnsupportedIntrinsic { name }) if name == "vm_flags_shiftleft_w32"
-        ));
+        let lowered = lower_expression(&expression, &config).expect("shift flags must lower");
+        assert!(
+            lowered
+                .function
+                .operations
+                .iter()
+                .any(|op| matches!(op, Operation::Shift { operation: ShiftOp::Left, .. })),
+            "a native left shift must be emitted"
+        );
+        assert!(
+            lowered
+                .function
+                .operations
+                .iter()
+                .any(|op| matches!(op, Operation::ReadFlags { .. })),
+            "the shift's flags must be read back"
+        );
     }
 
     #[test]

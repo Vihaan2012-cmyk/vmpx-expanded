@@ -50,6 +50,8 @@
 )]
 
 mod alu;
+mod checksum_loop;
+mod copy_loop;
 mod cpu;
 mod detonate;
 mod differential;
@@ -58,7 +60,9 @@ mod emu;
 mod iat_fill;
 mod hostmodel;
 mod loader;
+mod lzma_literal;
 mod memory;
+mod replay;
 mod ntdll;
 mod observe;
 mod predecode;
@@ -86,6 +90,7 @@ pub use differential::{
 };
 pub use emu::{
     Emulator, FlowEvent, FlowKind, Hook, HookAction, InsnAudit, Interest, MemEvent, ObserveConfig,
+    Prof,
     Span, Stop, TraceEntry,
 };
 pub use iat_fill::{

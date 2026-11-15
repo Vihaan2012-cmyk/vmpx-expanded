@@ -38,6 +38,7 @@ REASON_RE = re.compile(r"^\s+reason: (.*)$")
 
 # (class, regex on reason) in priority order; hint = what to fix next.
 CLASSES = [
+    ("input-dependent-loop", r"input-dependent loop", "pair the original's cut-point loop segments with a rolled recovered-side loop (vmpx_verify::loops)"),
     ("FP-not-supported", r"(?i)\b(xmm\d*|ymm\d*|st\d|x87|sse\d*|avx\d*|float\w*|fp|fpu|mxcsr)\b|unmodeled (instruction|mnemonic)", "model FP/SSE cells in lifter + comparator"),
     ("store-aliasing", r"may alias an earlier store|stores outside its frame|load/store ordering", "symbolic memory: model store/load ordering and aliasing"),
     ("input-dependent-branch", r"depends on the function's inputs|branch `[^`]*` reads flag", "multi-path native unroll: fork on input-dependent branches"),

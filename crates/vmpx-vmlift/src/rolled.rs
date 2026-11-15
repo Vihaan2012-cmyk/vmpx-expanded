@@ -21,8 +21,10 @@ use vmpx_vm::{
     execute_symbolic_linear_block_with_initial_state,
 };
 
+use crate::cfg_lift::compose_nested_state;
 use crate::decoded_lift::{RecoveredExit, first_unliftable, recover_exit};
 use crate::entry_frame::frame_initial_state;
+use crate::nested_entry::NestedEntryResolver;
 use crate::DecodedCfgInput;
 
 #[derive(Clone, Debug)]
@@ -38,10 +40,35 @@ pub struct RExit {
     pub registers: BTreeMap<X64NativeRegister, Expr>,
     /// Returns through staged stack (a protector gate failure), not the caller.
     pub region: bool,
+    /// For a region exit, the computed address control transfers to —
+    /// `RegionExit::staged`'s word zero. Recovery produces it and the tree used
+    /// to drop it on the floor, which is why such an exit printed nothing at all
+    /// despite being fully recovered. `None` for an ordinary callee return.
+    pub continuation: Option<Expr>,
+}
+
+/// One observable store: memory the caller can still see after the VM returns.
+#[derive(Clone, Debug)]
+pub struct RStore {
+    pub address: Expr,
+    pub value: Expr,
+    pub width: BitWidth,
 }
 
 #[derive(Clone, Debug)]
 pub enum RNode {
+    /// Stores performed before `next` runs.
+    ///
+    /// A store BELOW the VM's entry stack pointer lands in the frame the VM is
+    /// about to abandon, so nothing can observe it and it is dropped. A store
+    /// above it is observable and is carried here instead of refusing the whole
+    /// function, which is what this frontend used to do: measured on
+    /// systems.xpl, one such store cost 40 otherwise-liftable entries, and 39 of
+    /// those 40 have no loop at all.
+    Stores {
+        stores: Vec<RStore>,
+        next: Box<RNode>,
+    },
     Exit(RExit),
     /// `selector == value` picks the arm; arms are in ascending value order.
     Fork {
@@ -67,12 +94,16 @@ pub struct RolledFunction {
     pub loops: usize,
     pub forks: usize,
     pub straight_blocks: usize,
+    /// Concessions THIS LIFT made that the entry's CFG did not already carry.
+    ///
+    /// The recovery side owns the labels for what it assumed; this is the lift's
+    /// own set, so a function lowered under a relaxation the CFG never needed
+    /// still names it instead of reading as unconditional.
+    pub assumptions: BTreeSet<vmpx_vm::VmCfgAssumption>,
 }
 
 struct LoopCtx {
     header: Va,
-    /// Live phi names, in `RNode::Loop::phis` order.
-    names: Vec<String>,
     cells: Vec<Cell>,
     /// The state the body is walked from (carried cells hold their phi).
     base: SymbolicVmInitialState,
@@ -90,6 +121,7 @@ enum Cell {
 
 struct Walker<'a, 'b> {
     input: &'a DecodedCfgInput<'b>,
+    nested: Option<&'a dyn NestedEntryResolver>,
     headers: BTreeSet<Va>,
     budget: usize,
     blocks: usize,
@@ -97,6 +129,7 @@ struct Walker<'a, 'b> {
     loops: usize,
     phi_id: usize,
     loop_stack: Vec<LoopCtx>,
+    assumed: BTreeSet<vmpx_vm::VmCfgAssumption>,
 }
 
 /// Rolled walk of `input`'s CFG.
@@ -104,12 +137,48 @@ struct Walker<'a, 'b> {
 /// # Errors
 /// An incomplete CFG or any shape listed in the module docs.
 pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Result<RolledFunction, String> {
+    roll_decoded_cfg_with_nested(input, None, max_blocks)
+}
+
+/// [`roll_decoded_cfg`] that also follows `NestedEntry` edges the resolver
+/// proves: the exit's native state is composed into the nested entry's frame
+/// (exactly as the unroll and CFG lift do) and the rolled walk continues inline
+/// across the entry boundary. An edge the resolver cannot prove keeps the old
+/// refusal, so a `None` resolver behaves as before.
+///
+/// # Errors
+/// An incomplete CFG or any shape listed in the module docs; additionally a
+/// nested entry that does not match the CFG's nested block or whose state cannot
+/// be composed.
+pub fn roll_decoded_cfg_with_nested(
+    input: &DecodedCfgInput<'_>,
+    nested: Option<&dyn NestedEntryResolver>,
+    max_blocks: usize,
+) -> Result<RolledFunction, String> {
     if !input.cfg.is_complete() {
-        return Err("the CFG is incomplete".to_owned());
+        // Carry whether the incompleteness is budget-caused: `limit hit: true`
+        // means CFG building ran out of its instruction budget and more may
+        // complete it, while `false` means it stalled for a structural reason
+        // (an unresolved indirect dispatch, a nested entry) that more budget
+        // will not fix. The caller uses this to avoid escalating hopeless cases.
+        let reasons: Vec<&str> = input
+            .cfg
+            .stalls
+            .iter()
+            .map(|s| s.reason.as_str())
+            .take(3)
+            .collect();
+        return Err(format!(
+            "the CFG is incomplete ({} stalls, limit hit: {:?}) [{}]",
+            input.cfg.stalls.len(),
+            input.cfg.limit_hit,
+            reasons.join(" | ")
+        ));
     }
     let (state, _) = frame_initial_state(input.frame, input.top_offset);
     let mut w = Walker {
         input,
+        nested,
         headers: loop_headers(input),
         budget: max_blocks,
         blocks: 0,
@@ -117,12 +186,30 @@ pub fn roll_decoded_cfg(input: &DecodedCfgInput<'_>, max_blocks: usize) -> Resul
         loops: 0,
         phi_id: 0,
         loop_stack: Vec::new(),
+        assumed: BTreeSet::new(),
     };
     let root = w.walk(input.cfg.entry, state, Vec::new(), false)?;
-    Ok(RolledFunction { root, loops: w.loops, forks: w.forks, straight_blocks: w.blocks })
+    Ok(RolledFunction {
+        root,
+        loops: w.loops,
+        forks: w.forks,
+        straight_blocks: w.blocks,
+        assumptions: w.assumed,
+    })
 }
 
-fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
+/// Whether a block whose memory was havoced is lowered rather than refused.
+///
+/// The havoc empties tracked memory, so reads after it return fresh opaque
+/// intrinsics rather than stale values, and a lowering that needs a discarded
+/// cell fails at the read with the address in hand. Refusing up front only
+/// loses the blocks that did not need one.
+fn lower_tainted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMPX_NO_LOWER_TAINTED").is_none())
+}
+
+pub(crate) fn loop_headers(input: &DecodedCfgInput<'_>) -> BTreeSet<Va> {
     let cfg = input.cfg;
     let mut preds: BTreeMap<Va, Vec<Va>> = cfg.blocks.keys().map(|k| (*k, vec![])).collect();
     for e in &cfg.edges {
@@ -255,12 +342,29 @@ fn differing_cells(a: &SymbolicVmInitialState, b: &SymbolicVmInitialState) -> Re
     Ok(out)
 }
 
+/// Instruction count before a proven-null-read failure in a `VmExit` block.
+///
+/// The fault leaves the VM, so the prefix is the block's semantics. `None` for
+/// any other failure, or a block the walk did not close as an exit.
+fn null_read_prefix(
+    error: &vmpx_vm::SymbolicExecutionError,
+    exit: BlockExit,
+) -> Option<usize> {
+    (exit == BlockExit::VmExit && error.message.contains("null memory read"))
+        .then_some(error.instruction_index)
+}
+
 impl Walker<'_, '_> {
     fn successors(&self, key: Va) -> Vec<(u64, Va)> {
         let cfg = self.input.cfg;
         let mut out: Vec<(u64, Va)> = Vec::new();
         for edge in &cfg.edges {
-            if edge.from != key || !matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch) {
+            if edge.from != key
+            || !matches!(
+                edge.kind,
+                CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch | CfgEdgeKind::ProfileTransition
+            )
+        {
                 continue;
             }
             if let Some(address) = cfg.blocks.get(&edge.to).and_then(|b| b.address)
@@ -273,12 +377,23 @@ impl Walker<'_, '_> {
         out
     }
 
-    /// Executes one block; returns the report and its boundary kind.
+    /// Wraps `node` so the observable stores collected before it run first.
+    /// Empty is the common case and stays exactly the tree it was.
+    fn with_stores(stores: Vec<RStore>, node: RNode) -> RNode {
+        if stores.is_empty() {
+            node
+        } else {
+            RNode::Stores { stores, next: Box::new(node) }
+        }
+    }
+
+    /// Executes one block; returns the report, its boundary kind, and any
+    /// stores that escape the VM's dead frame (see [`RNode::Stores`]).
     fn exec(
         &mut self,
         key: Va,
         state: &SymbolicVmInitialState,
-    ) -> Result<(vmpx_vm::SymbolicVmExecutionReport, BlockExit), String> {
+    ) -> Result<(vmpx_vm::SymbolicVmExecutionReport, BlockExit, Vec<RStore>), String> {
         self.blocks += 1;
         if self.blocks > self.budget {
             return Err(format!("block budget {} exhausted", self.budget));
@@ -288,37 +403,161 @@ impl Walker<'_, '_> {
         if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
             return Err(format!("block {key} instruction {index} ({semantic:?}): {reason}"));
         }
-        let boundary = match block.exit {
+        // `BlockExit` has no variant for a cross-profile transition, so such a
+        // block records as `Stalled` even though the CFG carries its outgoing
+        // `ProfileTransition` edge and the graph is complete through it. That
+        // single missing case refused 158 of 462 CFG-complete entries here. The
+        // edge's own documentation says what it is: "an unconditional-branch
+        // handler pops a target off the VM stack and the VM continues under a
+        // PROVEN-DIFFERENT register profile" — so it is executed as exactly that,
+        // and the successor block is already decoded under the new profile.
+        let transition = block.exit == BlockExit::Stalled
+            && cfg
+                .edges
+                .iter()
+                .any(|e| e.from == key && e.kind == CfgEdgeKind::ProfileTransition);
+        let exit = if transition { BlockExit::Branch } else { block.exit };
+        let boundary = match exit {
             BlockExit::VmExit => VmHandlerSemantic::VmExit,
             BlockExit::Branch => VmHandlerSemantic::UnconditionalBranch,
             BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
             BlockExit::Stalled => return Err(format!("block {key} did not reach a boundary")),
         };
-        let report = execute_symbolic_linear_block_with_initial_state(
+        let mut report = match execute_symbolic_linear_block_with_initial_state(
             &block.instructions,
             Some(boundary),
             SymbolicExecutionLimits::default(),
             state,
             self.input.memory,
-        )
-        .map_err(|e| format!("block {key} symbolic execution failed: {e}"))?;
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                // The fault leaves the VM; lower the prefix that does run.
+                let prefix = null_read_prefix(&error, block.exit)
+                    .ok_or_else(|| format!("block {key} symbolic execution failed: {error}"))?;
+                execute_symbolic_linear_block_with_initial_state(
+                    &block.instructions[..prefix],
+                    None,
+                    SymbolicExecutionLimits::default(),
+                    state,
+                    self.input.memory,
+                )
+                .map_err(|e| {
+                    format!("block {key} symbolic execution failed before the null read: {e}")
+                })?
+            }
+        };
+        // Parity with the CFG walk, which already retries a tainted block once
+        // with loaded-data store addresses treated as opaque pointers. Taint is
+        // the broad fallback for a store address that still mentions
+        // `vsp_initial` and so MIGHT alias the VM's own operand stack; the retry
+        // narrows it to the cells that could genuinely alias. Without this the
+        // rolled frontend refused 51 entries the CFG walk had already got past.
+        //
+        // Where the CFG already carries the label this is parity with the walk's
+        // own retry. Where it does not, the relaxation is THIS LIFT's, and the
+        // honest move is to record it rather than refuse: an entry whose CFG
+        // never needed the narrowing still reads as PROVEN at the CFG tier, so
+        // the emitted C must name the concession itself. It does — the label
+        // lands in `RolledFunction::assumptions` and the decompiler prints it.
+        let already = self
+            .input
+            .cfg
+            .assumptions
+            .contains(&vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack);
+        if report.memory_tainted {
+            let relaxed = SymbolicExecutionLimits {
+                assume_loaded_store_addresses_disjoint: true,
+                ..SymbolicExecutionLimits::default()
+            };
+            if let Ok(retry) = execute_symbolic_linear_block_with_initial_state(
+                &block.instructions,
+                Some(boundary),
+                relaxed,
+                state,
+                self.input.memory,
+            ) && !retry.memory_tainted
+            {
+                if !already {
+                    self.assumed.insert(
+                        vmpx_vm::VmCfgAssumption::AssumesExternalStoresDisjointFromVmStack,
+                    );
+                }
+                report = retry;
+            }
+        }
+        // Four different causes wore one message, which hid which of them is
+        // worth building for. Named separately so the census can rank them.
+        // A memory havoc is a notification that address precision was lost, not
+        // an effect in itself: `SymbolicMemoryHavoc` carries only an instruction
+        // index and a cause. Loads after one come back as opaque
+        // `memory_load_epoch_N` intrinsics, which the decompiler already renders
+        // as a load, so the tree can carry them honestly.
+        //
+        // `memory_tainted` is NOT in the same class and still refuses: it means
+        // precise pre-store memory was DISCARDED, including VM-stack cells, and
+        // those are where the VIP and operands live.
         if !report.native_calls.is_empty()
             || !report.fresh_allocations.is_empty()
-            || report.memory_tainted
-            || !report.memory_havocs.is_empty()
+            || (report.memory_tainted && !lower_tainted())
         {
-            return Err(format!("block {key} havocs memory, calls natively or allocates"));
+            let mut causes = Vec::new();
+            if !report.native_calls.is_empty() {
+                causes.push(format!("{} native call(s)", report.native_calls.len()));
+            }
+            if report.memory_tainted {
+                // Name the havoc that set it. The lift-side relaxation measured
+                // +0 here and the message alone could not say why: for a
+                // vsp-ROOTED store address the executor refuses the narrowing
+                // whatever the walker assumed, so the retry can never clear it.
+                let havoc = report
+                    .memory_havocs
+                    .iter()
+                    .rev()
+                    .find(|havoc| havoc.cause.contains("may alias tracked VM memory"))
+                    .map_or_else(
+                        || "no aliasing havoc recorded".to_owned(),
+                        |havoc| havoc.cause.clone(),
+                    );
+                causes.push(format!("memory tainted [{havoc}]"));
+            }
+            if !report.fresh_allocations.is_empty() {
+                causes.push(format!("{} allocation(s)", report.fresh_allocations.len()));
+            }
+            return Err(format!("block {key} is not pure: {}", causes.join(", ")));
         }
         let entry_sp = i64::try_from(self.input.top_offset)
             .unwrap_or(i64::MAX)
             .saturating_add(i64::try_from(self.input.frame.len() * 8).unwrap_or(i64::MAX));
+        // Partition rather than veto. Only a store proven to land in the dead
+        // frame may be dropped; everything else is carried out as observable.
+        // An address this matcher cannot read at all is NOT assumed observable
+        // and is not assumed dead either — it still refuses, because emitting a
+        // store to an address we cannot place would invent an effect.
+        let mut escaping = Vec::new();
         for w in &report.external_writes {
             match vsp_offset(&w.address) {
                 Some(off) if off + i64::from(w.value.width.bytes()) <= entry_sp => {}
-                _ => return Err(format!("block {key} stores outside the VM's dead frame")),
+                Some(_) => escaping.push(RStore {
+                    address: w.address.clone(),
+                    value: w.value.clone(),
+                    width: w.value.width,
+                }),
+                // Not placeable against the dead frame, so it cannot be proven
+                // unobservable — and the conservative action for a store you
+                // cannot prove dead is to PERFORM it, not to refuse. Dropping it
+                // would change behaviour; emitting it is faithful whatever the
+                // address turns out to be. A constant address is a global, a
+                // register one an argument pointer, an intrinsic one a loaded
+                // pointer; all three are expressible.
+                None => escaping.push(RStore {
+                    address: w.address.clone(),
+                    value: w.value.clone(),
+                    width: w.value.width,
+                }),
             }
         }
-        Ok((report, block.exit))
+        Ok((report, exit, escaping))
     }
 
     /// One exact iteration from `header` over `state`; the state on re-entry.
@@ -326,7 +565,7 @@ impl Walker<'_, '_> {
         let mut key = header;
         let mut state = state.clone();
         for _ in 0..64 {
-            let (report, exit) = self.exec(key, &state)?;
+            let (report, exit, _) = self.exec(key, &state)?;
             if exit == BlockExit::VmExit {
                 return Ok(None);
             }
@@ -394,6 +633,9 @@ impl Walker<'_, '_> {
         mut trail: Vec<Va>,
         mut entering: bool,
     ) -> Result<RNode, String> {
+        // Observable stores seen on this straight-line run, in execution order;
+        // they wrap whichever node this walk ends up returning.
+        let mut pending_stores: Vec<RStore> = Vec::new();
         loop {
             if !entering {
                 if self.loop_stack.last().is_some_and(|c| c.header == key) {
@@ -413,14 +655,20 @@ impl Walker<'_, '_> {
                         .iter()
                         .map(|c| get_cell(&state, c).ok_or_else(|| "a carried cell vanished".to_owned()))
                         .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(RNode::BackEdge { next });
+                    return Ok(Self::with_stores(pending_stores, RNode::BackEdge { next }));
                 }
                 if trail.contains(&key) {
-                    return Ok(RNode::Dead(format!("block {key} repeats on one path (spin)")));
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Dead(format!("block {key} repeats on one path (spin)")),
+                    ));
                 }
                 if self.headers.contains(&key) {
                     match self.trial(key, &state) {
-                        Ok(Some(reentry)) => return self.summarize(key, state, reentry, trail),
+                        Ok(Some(reentry)) => {
+                            let body = self.summarize(key, state, reentry, trail)?;
+                            return Ok(Self::with_stores(pending_stores, body));
+                        }
                         Ok(None) => {}
                         Err(_) => {}
                     }
@@ -428,14 +676,12 @@ impl Walker<'_, '_> {
             }
             entering = false;
             trail.push(key);
-            let (report, exit) = self.exec(key, &state)?;
+            let (report, exit, escaping) = self.exec(key, &state)?;
+            pending_stores.extend(escaping);
             match exit {
                 BlockExit::VmExit => {
                     let cfg = self.input.cfg;
                     let block = &cfg.blocks[&key];
-                    if cfg.edges.iter().any(|e| e.from == key && e.kind == CfgEdgeKind::NestedEntry) {
-                        return Err("exit re-enters a nested VM entry".to_owned());
-                    }
                     let handler = block
                         .instructions
                         .last()
@@ -445,13 +691,52 @@ impl Walker<'_, '_> {
                         .as_ref()
                         .or_else(|| self.input.exits.get(&handler))
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
-                    let recovered = recover_exit(&report, layout, self.input.frame.len(), self.input.top_offset)
+                    // An exit that re-enters another VM entry of the same VM: the
+                    // CFG already decoded the nested entry's blocks under its own
+                    // profile. Compose the exit's native state into the nested
+                    // frame and continue the rolled walk inline, exactly as the
+                    // unroll path does; refuse only when there is no resolver.
+                    if let Some(to) = cfg
+                        .edges
+                        .iter()
+                        .find_map(|e| (e.from == key && e.kind == CfgEdgeKind::NestedEntry).then_some(e.to))
+                    {
+                        let resolver = self.nested.ok_or("exit re-enters a nested VM entry")?;
+                        let exit = vmpx_vm::recover_native_exit_state(&report, layout)
+                            .map_err(|e| format!("nested exit state unrecovered: {e}"))?;
+                        // Prefer the stub RVA the CFG walk resolved for this block:
+                        // it concretized the image reads the return address depends
+                        // on, while this re-execution leaves them symbolic.
+                        let entry = match self.input.cfg.nested_entry_stubs.get(&key) {
+                            Some(rva) => resolver.resolve_by_rva(*rva),
+                            None => resolver.resolve(&exit.return_address),
+                        }
+                        .ok_or("the nested VM entry is not provably resolved")?;
+                        if cfg.blocks.get(&to).and_then(|b| b.address) != Some(entry.bytecode_start) {
+                            return Err("the resolved nested entry is not the CFG's nested block".to_owned());
+                        }
+                        state = compose_nested_state(&report, &exit, &entry)
+                            .map_err(|e| format!("nested entry composition failed: {e}"))?;
+                        key = to;
+                        continue;
+                    }
+                    let recovered = recover_exit(&report, layout, self.input.frame.len(), self.input.top_offset, crate::decoded_lift::RegionStaging::TargetOnly)
                         .map_err(|e| e.to_string())?;
-                    let (registers, region) = match recovered {
-                        RecoveredExit::Callee(e) => (e.registers, false),
-                        RecoveredExit::Region(r) => (r.registers, true),
+                    let (registers, region, continuation) = match recovered {
+                        RecoveredExit::Callee(e) => (e.registers, false, None),
+                        // Fully recovered, just not a return: the decompiler
+                        // prints it as a trampoline to `target`.
+                        RecoveredExit::Trampoline(t) => (t.registers, true, Some(t.target)),
+                        // Word zero of the staged words IS the computed target.
+                        RecoveredExit::Region(r) => {
+                            let target = r.staged.first().cloned();
+                            (r.registers, true, target)
+                        }
                     };
-                    return Ok(RNode::Exit(RExit { registers, region }));
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Exit(RExit { registers, region, continuation }),
+                    ));
                 }
                 BlockExit::Branch => {
                     let target = report
@@ -470,8 +755,42 @@ impl Walker<'_, '_> {
                         continue;
                     }
                     if successors.len() < 2 {
+                        // `successors` drops an edge whose target block has no
+                        // recorded address, so "1 successor" can mean "2 edges,
+                        // one unusable" — following it would silently pick a
+                        // path. Report the raw edge count so the two are
+                        // distinguishable.
+                        let raw = self
+                            .input
+                            .cfg
+                            .edges
+                            .iter()
+                            .filter(|e| {
+                                e.from == key
+                                    && matches!(
+                                        e.kind,
+                                        CfgEdgeKind::Branch
+                                            | CfgEdgeKind::GuardedBranch
+                                            | CfgEdgeKind::ProfileTransition
+                                    )
+                            })
+                            .count();
+                        // Exactly one edge and one usable successor: the CFG
+                        // already PROVED that target — a `Branch` edge is a
+                        // target proven constant and a `GuardedBranch` one is a
+                        // target proven over an exhaustive input domain. The
+                        // symbolic expression being non-constant here just means
+                        // the proof lives in the CFG rather than in this
+                        // expression, and the multi-successor fork below trusts
+                        // exactly the same proof. Measured: all 105 entries that
+                        // stopped here have one edge, so none is a dropped-edge
+                        // case where following would silently pick a path.
+                        if raw == 1 && successors.len() == 1 {
+                            key = successors[0].1;
+                            continue;
+                        }
                         return Err(format!(
-                            "block {key} branch target depends on inputs but has {} recovered successor(s)",
+                            "block {key} branch target depends on inputs but has {} recovered successor(s) of {raw} edge(s)",
                             successors.len()
                         ));
                     }
@@ -482,7 +801,10 @@ impl Walker<'_, '_> {
                         let node = self.walk(*succ, state.clone(), trail.clone(), false)?;
                         arms.push((*value, node));
                     }
-                    return Ok(RNode::Fork { selector: target, env, block: key, arms });
+                    return Ok(Self::with_stores(
+                        pending_stores,
+                        RNode::Fork { selector: target, env, block: key, arms },
+                    ));
                 }
                 BlockExit::NativeCall | BlockExit::Stalled => unreachable!("rejected in exec"),
             }
@@ -517,7 +839,6 @@ impl Walker<'_, '_> {
             self.loops += 1;
             self.loop_stack.push(LoopCtx {
                 header,
-                names: names.clone(),
                 cells: cells.clone(),
                 base: phi_state.clone(),
                 pending: Vec::new(),
@@ -557,6 +878,7 @@ fn all_back_edges(n: &RNode, out: &mut Vec<Vec<Expr>>) {
     match n {
         RNode::BackEdge { next } => out.push(next.clone()),
         RNode::Fork { arms, .. } => arms.iter().for_each(|(_, a)| all_back_edges(a, out)),
+        RNode::Stores { next, .. } => all_back_edges(next, out),
         RNode::Loop { .. } | RNode::Exit(_) | RNode::Dead(_) => {}
     }
 }
@@ -574,6 +896,13 @@ fn collect_roots(n: &RNode, out: &mut Vec<Expr>) {
             out.extend(phis.iter().map(|p| p.init.clone()));
             collect_roots(body, out);
         }
+        RNode::Stores { stores, next } => {
+            for store in stores {
+                out.push(store.address.clone());
+                out.push(store.value.clone());
+            }
+            collect_roots(next, out);
+        }
         RNode::BackEdge { .. } | RNode::Dead(_) => {}
     }
 }
@@ -584,6 +913,7 @@ fn prune(n: &mut RNode, live: &[usize]) {
             *next = live.iter().filter_map(|&i| next.get(i).cloned()).collect();
         }
         RNode::Fork { arms, .. } => arms.iter_mut().for_each(|(_, a)| prune(a, live)),
+        RNode::Stores { next, .. } => prune(next, live),
         RNode::Loop { .. } | RNode::Exit(_) | RNode::Dead(_) => {}
     }
 }

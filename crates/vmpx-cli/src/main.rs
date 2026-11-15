@@ -17,16 +17,21 @@ use vmpx_pe::{PeImage, PeReport};
 use vmpx_unpack::{UnpackLimits, unpack_to_mapped_image};
 use vmpx_vm::{VmDiscoveryLimits, VmDiscoveryReport, VmEntrySource, discover_vm_entries};
 
+mod auto_cmd;
+mod auto_imports;
 mod clean;
 mod clean_wiring;
 #[allow(dead_code)]
 mod coverage_gate;
 mod decoded_splice;
 mod decompile_cmd;
+mod dwarf_syms;
+mod devirt_cmd;
 mod diff_original;
 mod equiv_gate;
 mod generic_unpack;
 mod input_closed_functions;
+mod logkit;
 mod native_chain;
 mod report_cmd;
 mod strip_wiring;
@@ -102,13 +107,29 @@ enum Command {
         /// Sweep every discovered VM entry (can be slow and memory-heavy).
         #[arg(long)]
         all: bool,
-        /// Worker threads for the CFG sweep.
-        #[arg(long, default_value_t = 2)]
+        /// Worker threads for the CFG sweep (default: logical CPUs, capped at 16).
+        #[arg(long, default_value_t = default_sweep_threads())]
         threads: usize,
         /// Also run the contained emulator detonation and an OBSERVED-tier
         /// re-sweep of the incomplete entries (can take very long).
         #[arg(long)]
         dynamic: bool,
+        /// Post-init emulator snapshot (VMPXSNP1) of the same, already-mapped image.
+        /// Every image byte that differs from it is treated as volatile and is never
+        /// served as a constant from the file (veto only; the snapshot supplies no
+        /// value). Use it to keep runtime-rewritten pages out of the proven tier.
+        #[arg(long)]
+        volatility_snapshot: Option<PathBuf>,
+        /// Labeled OPENED tier: serve unvetoed read-only image bytes under
+        /// suppression. Such entries carry an unproven assumption and never
+        /// count toward N2 PROVEN.
+        #[arg(long)]
+        serve_ro: bool,
+        /// OBSERVED tier: with --volatility-snapshot, serve the volatile
+        /// read-only image bytes the veto withholds from the post-init snapshot.
+        /// Such entries carry ObservedGlobal and never count toward N2 PROVEN.
+        #[arg(long)]
+        serve_observed_ro: bool,
     },
     /// Inspect a PE-family file by content, regardless of extension.
     Info {
@@ -206,6 +227,71 @@ enum Command {
         /// VM instruction budget for entry-stream recovery.
         #[arg(long, default_value_t = 100_000)]
         instruction_limit: usize,
+        /// Readable output (sugar for `--dialect rust`).
+        #[arg(long)]
+        readable: bool,
+        /// Output dialect: c (default) | rust | c99 | c23 | cpp | pseudo.
+        #[arg(long, default_value = "c")]
+        dialect: String,
+        /// Fold level: named (default) | proven. `proven` bakes every subtree
+        /// proven constant against the image (rdtsc reads, .vmp2 checksum).
+        #[arg(long, default_value = "named")]
+        fold: String,
+    },
+    /// One command: analyse a mapped VMProtect image and produce a clean PE --
+    /// strip, directory rebuild, OEP, native relocation, guard devirtualization,
+    /// and (with a snapshot) import binding.
+    Auto {
+        /// Mapped analysis image, or a packed `.dll`/`.exe` with --unpack.
+        input: PathBuf,
+        /// Output image name (placed under --dir when relative).
+        output: PathBuf,
+        /// Output directory; created if absent.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Post-init snapshot (VMPXSNP1) for import recovery.
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        /// Print the full per-step trace on the terminal (the file transcript is
+        /// always full).
+        #[arg(long)]
+        log: bool,
+        /// Where to write the full transcript (default: output with `.log`).
+        #[arg(long = "log-file")]
+        log_file: Option<PathBuf>,
+        /// Treat the input as a packed on-disk image and unpack it first.
+        #[arg(long)]
+        unpack: bool,
+        /// Never prompt; take the default for every optional step.
+        #[arg(long = "no-prompt")]
+        no_prompt: bool,
+        /// With no snapshot, detonate to recover imports, up to this many steps
+        /// (implies yes to the detonation prompt).
+        #[arg(long = "detonate-steps")]
+        detonate_steps: Option<u64>,
+        /// Also write the detonation's post-init state here as a reusable VMPXSNP1
+        /// snapshot (implies detonation); reuse it later with --snapshot.
+        #[arg(long = "save-snapshot")]
+        save_snapshot: Option<PathBuf>,
+        /// Embed DWARF debug symbols (named functions + ranges) in the clean PE.
+        #[arg(long = "emit-dwarf")]
+        emit_dwarf: bool,
+    },
+    /// Devirtualize guard functions to native code and reintegrate them into a
+    /// stripped image, folding the integrity checksum to a constant.
+    Devirt {
+        /// Intact image (the `.vmp2` checksum regions must still be present).
+        intact: PathBuf,
+        /// Stripped image to emit into and retarget.
+        stripped: PathBuf,
+        /// Output image; omit to only report.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// VM entry RVAs to devirtualize (hex); repeatable.
+        #[arg(long = "rva", value_parser = parse_rva)]
+        rva: Vec<u32>,
+        #[arg(long, default_value_t = 2048)]
+        instruction_limit: usize,
     },
     /// Perform structural validation without executing the input.
     Verify {
@@ -244,10 +330,7 @@ enum Command {
     /// dynamic unpack to OEP, writing the rebuilt (OBSERVED) PE. Fails closed if
     /// OEP is not reached within the step bound; never fabricates output for an
     /// unsupported/heuristic detection. The sample is never executed natively.
-    GenericUnpack {
-        input: PathBuf,
-        output: PathBuf,
-    },
+    GenericUnpack { input: PathBuf, output: PathBuf },
     /// Discover evidence-scored VM entry stubs and mutated bootstrap profiles.
     VmList {
         input: PathBuf,
@@ -282,6 +365,37 @@ enum Command {
         /// wholly inside a removed section may be dropped.
         #[arg(long = "drop-directory", value_name = "INDEX")]
         drop_directory: Vec<usize>,
+        /// Rebuild the export directory into an appended standard section first,
+        /// so removing the protector section it currently lives in is possible
+        /// without dropping the exports.
+        #[arg(long)]
+        rebuild_exports: bool,
+        /// Rebuild the exception directory into an appended standard section
+        /// first, dropping the RUNTIME_FUNCTION entries that describe code in
+        /// the sections being removed (those would dangle).
+        #[arg(long)]
+        rebuild_exceptions: bool,
+        /// Rebuild the import directory, its lookup tables and its IAT into an
+        /// appended writable section first. Only sound where nothing outside
+        /// the removed sections reaches the old IAT by address.
+        #[arg(long)]
+        rebuild_imports: bool,
+        /// Rebuild the TLS directory, its raw-data template and its callback
+        /// array into an appended section, then rebuild the base-relocation
+        /// table for the result. Callbacks inside a removed section are dropped
+        /// and named, since they would otherwise dangle.
+        #[arg(long)]
+        rebuild_tls: bool,
+        /// Move the IAT even though the reference scan could not decode every
+        /// surviving executable byte. Without this, an incomplete scan refuses:
+        /// finding no references in 95% of the code is a sample, not a proof.
+        #[arg(long)]
+        accept_unverified_iat: bool,
+        /// Rebuild EVERY directory that lives in a removed section into one
+        /// appended section. The header has room for a single extra section, so
+        /// the per-directory flags can only ever move one of them.
+        #[arg(long)]
+        rebuild_directories: bool,
     },
 }
 
@@ -902,9 +1016,23 @@ fn analyze_oep(pe: &PeImage<'_>) -> Result<OepAnalysis> {
     })
 }
 
+/// Sweep workers scale well to ~16; peak memory is far below the per-entry cap
+/// times workers in practice.
+fn default_sweep_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 16))
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Provenance assertion: the caller states the input is a faithful post-init
+    // mapped snapshot (e.g. a swept `*_mapped.bin`), so non-writable section
+    // bytes are the runtime bytes and may be served SOUNDLY -- upgrading them
+    // from the `--serve-ro` labelled assumption to proven-under-asserted-
+    // provenance. Runtime mutation stays guarded per path (see immutable_image).
+    if std::env::var_os("VMPX_TRUST_MAPPED_IMAGE").is_some() {
+        vmpx_vm::set_trusted_mapped_image(true);
+    }
     match cli.command {
         Command::Clean {
             input,
@@ -963,13 +1091,12 @@ fn main() -> Result<()> {
                 );
             }
             let input_data = read_file(&input)?;
-            let (mut clean, conventional, reintegrated) =
-                clean::analyze_clean_with_image(
-                    &input.display().to_string(),
-                    &input_data,
-                    decoded_lift,
-                    dynamic,
-                )?;
+            let (mut clean, conventional, reintegrated) = clean::analyze_clean_with_image(
+                &input.display().to_string(),
+                &input_data,
+                decoded_lift,
+                dynamic,
+            )?;
             println!(
                 "[clean] protection={:?} layout={:?} vm_entries={} routines={} blockers={}",
                 clean.protection.verdict,
@@ -1064,6 +1191,30 @@ fn main() -> Result<()> {
                         } else {
                             std::borrow::Cow::Borrowed(bytes.as_slice())
                         };
+                        // Neutralization stage (experimental image only, after any
+                        // strip): force each residual guard thunk -- a `.text`
+                        // tail-transfer into removed space whose virtualized body
+                        // could not be lifted -- to its pass path, so the written
+                        // image has no reference into removed space. Only matters
+                        // once `.vmp` is gone (so a transfer into it dangles).
+                        // Behaviour-changing; the sound `output` path is untouched.
+                        let mut to_write = to_write.into_owned();
+                        match auto_cmd::neutralize_dangling_guard_thunks(&mut to_write) {
+                            Ok(done) if !done.is_empty() => {
+                                for action in &done {
+                                    println!(
+                                        "[neutralize] guard {:#x}: thunk {:#x} forced to return 1 (pass), {} byte(s)",
+                                        action.guard_rva, action.thunk_begin, action.thunk_bytes
+                                    );
+                                }
+                                println!(
+                                    "[neutralize] {} residual guard thunk(s) neutralized (behaviour-changing)",
+                                    done.len()
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => eprintln!("[neutralize] skipped: {error}"),
+                        }
                         fs::write(path, &to_write)
                             .with_context(|| format!("failed to write {}", path.display()))?;
                         // A stripped image is validated before being offered; the
@@ -1115,7 +1266,10 @@ fn main() -> Result<()> {
                     "[dump-pe] rebuilt standalone PE: {} bytes, {} section(s), size_of_image={:#X}",
                     outcome.file_size, outcome.sections, outcome.size_of_image
                 );
-                println!("[dump-pe] loader validation passed: {}", outcome.loader_summary);
+                println!(
+                    "[dump-pe] loader validation passed: {}",
+                    outcome.loader_summary
+                );
                 println!("[dump-pe] {}", path.display());
                 println!("[verify] dumped PE reparsed successfully from disk");
             }
@@ -1164,9 +1318,21 @@ fn main() -> Result<()> {
             all,
             threads,
             dynamic,
+            volatility_snapshot,
+            serve_ro,
+            serve_observed_ro,
         } => {
             let data = fs::read(&input).with_context(|| format!("read {}", input.display()))?;
-            let opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
+            if let Some(snapshot) = &volatility_snapshot {
+                let (ranges, bytes) =
+                    report_cmd::install_volatility_veto(&data, snapshot, serve_observed_ro)?;
+                eprintln!(
+                    "[report] volatility veto: {bytes} byte(s) in {ranges} range(s) differ from the post-init snapshot"
+                );
+            }
+            let mut opts = report_cmd::ReportOptions::new(sample, all, threads, dynamic);
+            opts.serve_ro = serve_ro;
+            opts.serve_observed_ro = serve_observed_ro;
             let report = report_cmd::build_report(&input.display().to_string(), &data, &opts)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1245,6 +1411,9 @@ fn main() -> Result<()> {
             original,
             probe,
             instruction_limit,
+            readable,
+            dialect,
+            fold,
         } => decompile_cmd::run(decompile_cmd::Options {
             input,
             only: function,
@@ -1253,7 +1422,53 @@ fn main() -> Result<()> {
             original,
             probe,
             instruction_limit,
+            dialect: if readable && dialect == "c" {
+                "rust".to_owned()
+            } else {
+                dialect
+            },
+            fold,
         })?,
+        Command::Auto {
+            input,
+            output,
+            dir,
+            snapshot,
+            log,
+            log_file,
+            unpack,
+            no_prompt,
+            detonate_steps,
+            save_snapshot,
+            emit_dwarf,
+        } => auto_cmd::run(auto_cmd::Options {
+            input,
+            output,
+            dir,
+            snapshot,
+            verbose: log,
+            log_file,
+            unpack,
+            yes_to_all_defaults: no_prompt,
+            detonate_steps,
+            save_snapshot,
+            emit_dwarf,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?,
+        Command::Devirt {
+            intact,
+            stripped,
+            output,
+            rva,
+            instruction_limit,
+        } => devirt_cmd::run(devirt_cmd::Options {
+            intact,
+            stripped,
+            output,
+            rvas: rva,
+            instruction_limit,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?,
         Command::Verify { input, json } => {
             let (data, report) = inspect(&input)?;
             let digest = sha256(&data);
@@ -1438,7 +1653,12 @@ fn main() -> Result<()> {
                         kind.label()
                     );
                 }
-                generic_unpack::UnpackOutcome::UnpackedToOep { kind, oep, steps, pe_bytes } => {
+                generic_unpack::UnpackOutcome::UnpackedToOep {
+                    kind,
+                    oep,
+                    steps,
+                    pe_bytes,
+                } => {
                     fs::write(&output, &pe_bytes)
                         .with_context(|| format!("failed to write {}", output.display()))?;
                     let disk = read_file(&output)?;
@@ -1626,8 +1846,25 @@ fn main() -> Result<()> {
             output,
             remove,
             drop_directory,
+            rebuild_exports,
+            rebuild_exceptions,
+            rebuild_imports,
+            rebuild_tls,
+            accept_unverified_iat,
+            rebuild_directories,
         } => {
-            strip_wiring::run_strip(&input, &output, &remove, &drop_directory)?;
+            strip_wiring::run_strip(
+                &input,
+                &output,
+                &remove,
+                &drop_directory,
+                rebuild_exports,
+                rebuild_exceptions,
+                rebuild_imports,
+                rebuild_tls,
+                accept_unverified_iat,
+                rebuild_directories,
+            )?;
         }
     }
     Ok(())

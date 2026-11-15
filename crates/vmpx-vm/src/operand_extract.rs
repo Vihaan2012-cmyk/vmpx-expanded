@@ -15,6 +15,157 @@ use crate::{
     },
 };
 
+/// Sites inside `active` where `register` is written but the value written is
+/// DEAD: a later instruction in the interval overwrites the whole register
+/// before anything reads it.
+///
+/// VMProtect pads handlers with writes whose results never reach a consumer.
+/// Refusing a codec because of one discards a handler that is otherwise fully
+/// recovered, and the pad is identifiable rather than guessed at: the overwrite
+/// has to be present in the same interval, and a read between the two -- which
+/// includes a read-modify-write like `add key, imm` -- means the first value
+/// did reach a consumer and the site is not dead.
+///
+/// A sub-32-bit destination is never a kill: writing `ax` or `al` preserves the
+/// rest of the register, while any write of 32 bits or more fully defines the
+/// 64-bit container on x86-64.
+fn dead_write_sites(
+    active: &[&vmpx_disasm::DecodedInstruction],
+    register: iced_x86::Register,
+    width: crate::BitWidth,
+) -> BTreeSet<Rva> {
+    let mut dead = BTreeSet::new();
+    let mut factory = InstructionInfoFactory::new();
+    for (index, decoded) in active.iter().enumerate() {
+        if !writes_register(&mut factory, &decoded.instruction, register) {
+            continue;
+        }
+        for later in active.iter().skip(index + 1) {
+            // Checked BEFORE the overwrite test, so a read-modify-write stops
+            // the walk instead of counting as a kill.
+            if reads_register_value(&mut factory, &later.instruction, register, width) {
+                break;
+            }
+            let kills = later.instruction.op0_kind() == OpKind::Register
+                && canonical(later.instruction.op0_register()) == canonical(register)
+                && later.instruction.op0_register().size() >= 4;
+            if kills {
+                dead.insert(decoded.rva);
+                break;
+            }
+        }
+    }
+    dead
+}
+
+/// Sites inside `active` where `register` is written while SPILLED, and whose
+/// writes therefore do not change its value.
+///
+/// VMProtect borrows a role register rather than finding a free one: it pushes
+/// the register, uses it as scratch, and pops it back. Measured on handler
+/// 0x37A9C5E85, which blocks more entries than any other:
+///
+/// ```text
+///     xor bl,r11b     ; the real rolling-key update
+///     push rbx        ; key spilled
+///     mov ebx,r11d    ; register borrowed as scratch  <- refused here
+///     cmp ebx,4
+/// ```
+///
+/// The scratch write is real, but the pop restores the spilled value, so the
+/// key is intact afterwards and the codec is still recoverable. Without this the
+/// extractor refuses the whole handler over an obfuscation that changes nothing.
+///
+/// Two conditions make the bracket a proof rather than a guess, and both are
+/// visible in the instruction list:
+///
+/// - The matching `pop` must be present at the same stack depth. A trace that
+///   stops before the pop proves no restore, so nothing is allowed and the
+///   original refusal stands.
+///
+///   MEASURED: on systems.xpl this is currently always the case, so the whole
+///   check is worth +0 — N1 699/814 and every stall count identical, the
+///   "unmodelled write" refusal still firing 80 times. The handler traces stop
+///   at a `ConditionalBranch` (`DirectJumpTraceStopKind::ConditionalBranch`)
+///   before reaching the pop. It is kept because it is the half of the fix that
+///   is sound on its own; it pays nothing until the trace continues past a
+///   conditional branch, which is the other half.
+/// - Nothing between them may write memory. `push r8 / xor [rsp],r10d / pop r8`
+///   is a VMProtect register update written through the stack slot: the pop
+///   then restores a DIFFERENT value. Refusing on any intervening memory write
+///   keeps that case out, at the cost of a few brackets that were in fact safe.
+fn spilled_write_sites(
+    active: &[&vmpx_disasm::DecodedInstruction],
+    register: iced_x86::Register,
+) -> BTreeSet<Rva> {
+    let mut allowed = BTreeSet::new();
+    let mut factory = InstructionInfoFactory::new();
+    // Stack depth in pushed slots, and the depth each unmatched `push <register>`
+    // was taken at, so a nested spill of another register cannot close ours.
+    let mut depth: i64 = 0;
+    let mut open: Vec<(usize, i64)> = Vec::new();
+    let mut wrote_memory_since: Vec<bool> = Vec::new();
+    for (index, decoded) in active.iter().enumerate() {
+        let instruction = &decoded.instruction;
+        let is_register_operand = instruction.op0_kind() == OpKind::Register
+            && canonical(instruction.op0_register()) == register;
+        // A nested `push` cannot reach our slot: it writes at a stack depth
+        // BELOW the one we are holding, by construction. Excluding the two
+        // stack mnemonics from the dirty test is therefore exact, not a
+        // relaxation -- and without it a spill that merely has another register
+        // saved inside it is rejected.
+        let stack_op = matches!(instruction.mnemonic(), Mnemonic::Push | Mnemonic::Pop);
+        if !stack_op && instruction_writes_memory(&mut factory, instruction) {
+            for flag in &mut wrote_memory_since {
+                *flag = true;
+            }
+        }
+        match instruction.mnemonic() {
+            Mnemonic::Push => {
+                depth += 1;
+                if is_register_operand {
+                    open.push((index, depth));
+                    wrote_memory_since.push(false);
+                }
+            }
+            Mnemonic::Pop => {
+                if is_register_operand && open.last().is_some_and(|(_, at)| *at == depth) {
+                    let (start, _) = open.pop().expect("checked above");
+                    let dirty = wrote_memory_since.pop().expect("paired with open");
+                    if !dirty {
+                        for site in &active[start + 1..index] {
+                            allowed.insert(site.rva);
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    allowed
+}
+
+/// Whether the instruction writes to any memory operand.
+fn instruction_writes_memory(
+    factory: &mut InstructionInfoFactory,
+    instruction: &iced_x86::Instruction,
+) -> bool {
+    factory
+        .info(instruction)
+        .used_memory()
+        .iter()
+        .any(|memory| {
+            matches!(
+                memory.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct KeyedOperandCodecCandidate {
     pub encoded_load: Rva,
@@ -73,9 +224,6 @@ fn attempt_keyless_operand(
     direction: BytecodeDirection,
     mut vip_delta: i64,
 ) -> Result<KeyedOperandCodecCandidate, String> {
-    if direction != BytecodeDirection::Ascending {
-        return Err("keyless operands require an ascending bytecode stream".to_owned());
-    }
     let source = active
         .first()
         .copied()
@@ -139,9 +287,18 @@ fn attempt_keyless_operand(
     if first_consumer.is_none() {
         return Err("raw operand has no live consumer".to_owned());
     }
-    if vip_delta != i64::from(width.bytes()) {
+    // The only thing the direction changes is which way the VIP then moves;
+    // the keyed extractor below computes exactly this and always has.
+    let expected_vip_delta = match direction {
+        BytecodeDirection::Ascending => i64::from(width.bytes()),
+        BytecodeDirection::Descending => -i64::from(width.bytes()),
+        BytecodeDirection::StateDependent | BytecodeDirection::Unknown => {
+            return Err("bytecode direction is not concrete".to_owned());
+        }
+    };
+    if vip_delta != expected_vip_delta {
         return Err(format!(
-            "VIP delta {vip_delta} does not match raw width {}",
+            "VIP delta {vip_delta} does not match raw width {} for a {direction:?} stream",
             width.bytes()
         ));
     }
@@ -280,7 +437,15 @@ fn attempt_operand(
     {
         return Err("rolling-key update is out of semantic order".to_owned());
     }
-    let allowed_key_writes = BTreeSet::from([update.completion_rva]);
+    let mut allowed_key_writes = BTreeSet::from([update.completion_rva]);
+    allowed_key_writes.extend(spilled_write_sites(active, canonical(roles.rolling_key)));
+    // A write whose value never reaches a consumer changes nothing about the
+    // key, so it cannot disqualify the codec.
+    allowed_key_writes.extend(dead_write_sites(
+        active,
+        canonical(roles.rolling_key),
+        width,
+    ));
     if active.iter().any(|decoded| {
         writes_register(
             &mut factory,
@@ -288,7 +453,20 @@ fn attempt_operand(
             canonical(roles.rolling_key),
         ) && !allowed_key_writes.contains(&decoded.rva)
     }) {
-        return Err("rolling-key register has an unmodelled write".to_owned());
+        // Name the write. "unmodelled" is the biggest single handler-spec
+        // diagnostic and says nothing about WHICH instruction to model.
+        let offender = active.iter().find(|decoded| {
+            writes_register(
+                &mut factory,
+                &decoded.instruction,
+                canonical(roles.rolling_key),
+            ) && !allowed_key_writes.contains(&decoded.rva)
+        });
+        return Err(format!(
+            "rolling-key register has an unmodelled write ({:?} at {:?})",
+            offender.map(|decoded| decoded.instruction.mnemonic()),
+            offender.map(|decoded| decoded.rva),
+        ));
     }
     let input_key_operation =
         input_key_operation.ok_or_else(|| "input-key operation was not recovered".to_owned())?;
@@ -849,6 +1027,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::IndirectBranch,
                 at: terminal_rva,

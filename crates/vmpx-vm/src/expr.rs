@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -98,25 +98,101 @@ struct Node {
 #[derive(Clone)]
 pub struct ExprRef(Arc<Node>);
 
-type SubMemo = HashMap<*const Node, Expr>;
-type RwMemo = HashMap<*const Node, Expr>;
+type SubMemo = HashMap<*const Node, Expr, FxBuild>;
+type RwMemo = HashMap<*const Node, Expr, FxBuild>;
+
+/// Fast non-cryptographic hasher for membership-only sets and memo maps keyed by
+/// pointers or already-mixed hashes (std's `SipHash` dominated the walk profile).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FxHasher(u64);
+
+pub(crate) type FxBuild = BuildHasherDefault<FxHasher>;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0_u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+const INTERNER_SHARDS: usize = 1024;
+
+/// The interner keys are already hashes, so the bucket map passes them through.
+#[derive(Default)]
+struct PassThroughHasher(u64);
+
+impl Hasher for PassThroughHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 << 8) | u64::from(*b);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
 
 #[derive(Default)]
 struct Interner {
-    buckets: HashMap<u64, Vec<Weak<Node>>>,
+    buckets: HashMap<u64, Vec<Weak<Node>>, BuildHasherDefault<PassThroughHasher>>,
     inserted: usize,
     sweep_at: usize,
 }
 
-static INTERNER: LazyLock<Mutex<Interner>> = LazyLock::new(|| Mutex::new(Interner::default()));
+/// Sharded by hash so concurrent entry walks do not serialize on one lock.
+static INTERNER: LazyLock<Vec<Mutex<Interner>>> =
+    LazyLock::new(|| (0..INTERNER_SHARDS).map(|_| Mutex::new(Interner::default())).collect());
 
 impl ExprRef {
     #[must_use]
     pub fn new(expr: Expr) -> Self {
-        let mut hasher = std::hash::DefaultHasher::new();
-        expr.hash(&mut hasher);
-        let hash = hasher.finish();
-        let mut guard = INTERNER.lock().unwrap_or_else(|e| e.into_inner());
+        let hash = FxBuild::default().hash_one(&expr);
+        let mut guard = INTERNER[(hash >> 32) as usize % INTERNER_SHARDS]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let interner = &mut *guard;
         let bucket = interner.buckets.entry(hash).or_default();
         let mut index = 0;
@@ -136,7 +212,7 @@ impl ExprRef {
         });
         bucket.push(Arc::downgrade(&node));
         interner.inserted += 1;
-        if interner.inserted >= interner.sweep_at.max(1 << 16) {
+        if interner.inserted >= interner.sweep_at.max((1 << 16) / INTERNER_SHARDS) {
             interner.buckets.retain(|_, bucket| {
                 bucket.retain(|weak| weak.strong_count() > 0);
                 !bucket.is_empty()
@@ -439,7 +515,7 @@ impl Expr {
         register: &str,
         opaque: impl Fn(&str) -> bool,
     ) -> bool {
-        let mut seen: HashSet<*const Node> = HashSet::new();
+        let mut seen: HashSet<*const Node, FxBuild> = HashSet::default();
         let mut pending = vec![self];
         while let Some(expression) = pending.pop() {
             let mut push = |child: &'a ExprRef, pending: &mut Vec<&'a Self>| {
@@ -478,7 +554,7 @@ impl Expr {
 
     /// Visits this expression and every distinct shared descendant once.
     pub(crate) fn walk_distinct<'a>(&'a self, visit: &mut impl FnMut(&'a Self)) {
-        let mut seen: HashSet<*const Node> = HashSet::new();
+        let mut seen: HashSet<*const Node, FxBuild> = HashSet::default();
         let mut pending = vec![self];
         while let Some(expression) = pending.pop() {
             visit(expression);
@@ -512,7 +588,7 @@ impl Expr {
     ///
     /// A replacement must have the same width as the register it replaces.
     pub fn substitute(&self, replacements: &BTreeMap<String, Self>) -> Result<Self, ExprError> {
-        self.sub_memo(replacements, &mut HashMap::new())
+        self.sub_memo(replacements, &mut HashMap::default())
     }
 
     /// Rebuilds an expression bottom-up and permits a caller to replace opaque
@@ -528,7 +604,62 @@ impl Expr {
     where
         F: FnMut(BitWidth, &str, &[Self]) -> Option<Self>,
     {
-        self.rw_memo(rewrite, &mut HashMap::new())
+        self.rw_memo(rewrite, &mut HashMap::default())
+    }
+
+    /// Folds every memory read whose address depends on `register` to zero.
+    ///
+    /// VMProtect's anti-debug guards read the OS-supplied exception CONTEXT (the
+    /// debug registers Dr0-Dr3, ContextFlags) through a base the recovery binds
+    /// to a symbolic register (`exception_context`). On a clean run -- the only
+    /// run a devirtualized image has -- those fields read zero (no hardware
+    /// breakpoints set), so the check takes its pass path. Folding the reads to
+    /// zero emits that clean-run behaviour: the same anti-debug neutralization
+    /// the residual-guard stage applies, done at the expression level so the
+    /// surrounding function still lowers instead of failing on an unmapped input.
+    #[must_use]
+    pub fn fold_reads_through_register(&self, register: &str) -> Self {
+        let rebuilt = match &self.kind {
+            ExprKind::Const { .. } | ExprKind::Register { .. } => self.clone(),
+            ExprKind::Load { address } => {
+                if address.dependencies().contains(register) {
+                    Self::constant(self.width, 0)
+                } else {
+                    Self::load(self.width, address.fold_reads_through_register(register))
+                }
+            }
+            ExprKind::Unary { op, value } => {
+                Self::unary(*op, value.fold_reads_through_register(register))
+            }
+            ExprKind::Binary { op, left, right } => Self::binary(
+                *op,
+                left.fold_reads_through_register(register),
+                right.fold_reads_through_register(register),
+            )
+            .expect("width preserved: a read folds to a same-width constant"),
+            ExprKind::Intrinsic { name, arguments } => Self::intrinsic(
+                self.width,
+                name.clone(),
+                arguments
+                    .iter()
+                    .map(|argument| argument.fold_reads_through_register(register))
+                    .collect(),
+            ),
+            ExprKind::Extract { value, lsb } => {
+                Self::extract(self.width, *lsb, value.fold_reads_through_register(register))
+                    .expect("width preserved")
+            }
+            ExprKind::Concat { high, low } => Self::concat(
+                high.fold_reads_through_register(register),
+                low.fold_reads_through_register(register),
+            )
+            .expect("width preserved"),
+            ExprKind::Resize { op, value } => {
+                Self::resize(*op, self.width, value.fold_reads_through_register(register))
+                    .expect("width preserved")
+            }
+        };
+        rebuilt.simplify()
     }
 
     fn sub_memo(
@@ -671,6 +802,33 @@ impl Expr {
     }
 }
 
+thread_local! {
+    static COUNT_HINT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Diagnostic: interned nodes still held somewhere (`live`) and dead weak slots
+/// awaiting a sweep (`dead`). Every live node is at least one `Node` plus its
+/// bucket entry, so this is the only part of the heap no per-entry accounting
+/// sees — the walker charges for the state it holds, not for the interner.
+#[must_use]
+pub fn interner_census() -> (usize, usize) {
+    let mut live = 0;
+    let mut dead = 0;
+    for shard in INTERNER.iter() {
+        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        for bucket in guard.buckets.values() {
+            for weak in bucket {
+                if weak.strong_count() > 0 {
+                    live += 1;
+                } else {
+                    dead += 1;
+                }
+            }
+        }
+    }
+    (live, dead)
+}
+
 /// Counts distinct nodes reachable from all `roots` together, so a subtree shared
 /// between expressions is counted once. Saturates at `limit + 1`.
 pub fn distinct_node_count_bounded<'a>(
@@ -678,16 +836,22 @@ pub fn distinct_node_count_bounded<'a>(
     limit: usize,
 ) -> usize {
     let overflow = limit.saturating_add(1);
-    let mut seen: HashSet<*const Node> = HashSet::new();
+    // The previous call's sizes pre-size the sets (the walk re-counts a slowly
+    // growing state after every instruction), avoiding repeated rehash growth.
+    let (seen_hint, roots_hint) = COUNT_HINT.with(std::cell::Cell::get);
+    let mut seen: HashSet<*const Node, FxBuild> =
+        HashSet::with_capacity_and_hasher(seen_hint, FxBuild::default());
     let mut count = 0_usize;
     let mut pending: Vec<&Expr> = Vec::new();
-    let mut seen_roots: HashSet<&Expr> = HashSet::new();
+    let mut seen_roots: HashSet<&Expr, FxBuild> =
+        HashSet::with_capacity_and_hasher(roots_hint, FxBuild::default());
     for root in roots {
         if !seen_roots.insert(root) {
             continue;
         }
         count += 1;
         if count > limit {
+            COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
             return overflow;
         }
         pending.push(root);
@@ -720,10 +884,12 @@ pub fn distinct_node_count_bounded<'a>(
                 }
             }
             if count > limit {
+                COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
                 return overflow;
             }
         }
     }
+    COUNT_HINT.with(|h| h.set((seen.len().min(1 << 14), seen_roots.len().min(1 << 14))));
     count
 }
 
@@ -1124,6 +1290,9 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         BinaryOp::Xor | BinaryOp::Sub if left == right => return Expr::constant(width, 0),
         _ => {}
     }
+    if let Some(simplified) = simplify_mba(op, &left, &right) {
+        return simplified;
+    }
     Expr {
         width,
         kind: ExprKind::Binary {
@@ -1132,6 +1301,84 @@ fn simplify_binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
             right: ExprRef::new(right),
         },
     }
+}
+
+/// Collapses the mixed boolean-arithmetic identities VMProtect's mutation pass
+/// weaves in. Every rule here is a pure bitwise identity, exhaustively verified
+/// per operand pair in the tests, so applying it is sound. These dominate the
+/// recovered output for Ultra-protected code (`a ^ (a | b)` and friends).
+fn simplify_mba(op: BinaryOp, left: &Expr, right: &Expr) -> Option<Expr> {
+    let as_bin = |e: &Expr| match &e.kind {
+        ExprKind::Binary {
+            op,
+            left: l,
+            right: r,
+        } => Some((*op, l.as_ref().clone(), r.as_ref().clone())),
+        _ => None,
+    };
+    // (a & ~b) | (~a & b) == a ^ b. The and-or form of XOR; recognizing it keeps
+    // the simplifier from leaving a disjunction of masked complements where a
+    // single XOR belongs (and restores the collapse `mba_fold` relies on).
+    if op == BinaryOp::Or {
+        let strip_not = |e: &Expr| match &e.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                value,
+            } => Some(value.as_ref().clone()),
+            _ => None,
+        };
+        // An `And` where exactly one operand is a `Not`: returns (plain, inner).
+        let and_parts = |e: &Expr| -> Option<(Expr, Expr)> {
+            let (iop, a, b) = as_bin(e)?;
+            if iop != BinaryOp::And {
+                return None;
+            }
+            if let Some(inner) = strip_not(&a) {
+                return Some((b, inner));
+            }
+            if let Some(inner) = strip_not(&b) {
+                return Some((a, inner));
+            }
+            None
+        };
+        if let (Some((lp, ln)), Some((rp, rn))) = (and_parts(left), and_parts(right))
+            && lp == rn
+            && ln == rp
+        {
+            return Expr::binary(BinaryOp::Xor, lp, rp).ok();
+        }
+    }
+    // Match `x OP (inner_l IOP inner_r)` for both operand orders; `other` is the
+    // inner operand that is NOT `x`.
+    for (x, inner) in [(left, right), (right, left)] {
+        let Some((iop, a, b)) = as_bin(inner) else {
+            continue;
+        };
+        let other = if &a == x {
+            b
+        } else if &b == x {
+            a
+        } else {
+            continue;
+        };
+        let not = |e: Expr| Expr::unary(UnaryOp::Not, e);
+        match (op, iop) {
+            // a ^ (a | b) == ~a & b
+            (BinaryOp::Xor, BinaryOp::Or) => {
+                return Expr::binary(BinaryOp::And, not(x.clone()), other).ok();
+            }
+            // a ^ (a & b) == a & ~b
+            (BinaryOp::Xor, BinaryOp::And) => {
+                return Expr::binary(BinaryOp::And, x.clone(), not(other)).ok();
+            }
+            // a | (a & b) == a   and   a & (a | b) == a   (absorption)
+            (BinaryOp::Or, BinaryOp::And) | (BinaryOp::And, BinaryOp::Or) => {
+                return Some(x.clone());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn normalize_addition(width: BitWidth, left: Expr, right: Expr) -> Expr {
@@ -1339,6 +1586,56 @@ fn rotate_right(value: u64, width: BitWidth, count: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mba_identities_are_sound_over_w8() {
+        // Exhaustive proof that each MBA rewrite in `simplify_mba` is a true
+        // bitwise identity (every pattern is width-independent, so W8 suffices).
+        let w = BitWidth::W8;
+        let m = w.mask();
+        for a in 0..=0xff_u64 {
+            for b in 0..=0xff_u64 {
+                let or = evaluate_binary(BinaryOp::Or, w, a, b);
+                let and = evaluate_binary(BinaryOp::And, w, a, b);
+                // a ^ (a | b) == ~a & b
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Xor, w, a, or),
+                    evaluate_binary(BinaryOp::And, w, (!a) & m, b),
+                );
+                // a ^ (a & b) == a & ~b
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Xor, w, a, and),
+                    evaluate_binary(BinaryOp::And, w, a, (!b) & m),
+                );
+                // a | (a & b) == a  and  a & (a | b) == a
+                assert_eq!(evaluate_binary(BinaryOp::Or, w, a, and), a);
+                assert_eq!(evaluate_binary(BinaryOp::And, w, a, or), a);
+                // (a & ~b) | (~a & b) == a ^ b
+                let a_nb = evaluate_binary(BinaryOp::And, w, a, (!b) & m);
+                let na_b = evaluate_binary(BinaryOp::And, w, (!a) & m, b);
+                assert_eq!(
+                    evaluate_binary(BinaryOp::Or, w, a_nb, na_b),
+                    evaluate_binary(BinaryOp::Xor, w, a, b),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simplify_collapses_xor_or_mba() {
+        // `a ^ (a | b)` -> `~a & b`, the pattern that dominates Ultra output.
+        let a = Expr::register(BitWidth::W32, "a");
+        let b = Expr::register(BitWidth::W32, "b");
+        let expr = Expr::binary(
+            BinaryOp::Xor,
+            a.clone(),
+            Expr::binary(BinaryOp::Or, a.clone(), b.clone()).unwrap(),
+        )
+        .unwrap();
+        let expected =
+            Expr::binary(BinaryOp::And, Expr::unary(UnaryOp::Not, a), b).unwrap();
+        assert_eq!(expr.simplify(), expected.simplify());
+    }
 
     #[test]
     fn flag_intrinsics_fold_with_symbolic_operands() {

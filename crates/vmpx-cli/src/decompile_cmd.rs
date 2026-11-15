@@ -6,6 +6,73 @@ use anyhow::{Context, Result};
 use vmpx_mutation::cfg_recovery::{CfgOptions, recover_native_cfg_pe_with};
 use vmpx_pe::{PeImage, Rva};
 
+/// `--fold proven`: collapse a subtree to a constant when it is PROVEN constant
+/// against the image -- the rdtsc-invariant reads (timing fold) and the `.vmp2`
+/// checksum (image concretization). Anything unproven is left symbolic.
+fn fold_proven_expr(e: &vmpx_vm::Expr, pe: &PeImage<'_>) -> vmpx_vm::Expr {
+    let limits = vmpx_vm::ImageConcretizationLimits {
+        max_expression_nodes: 400_000,
+        max_checksum_bytes: 64 * 1024 * 1024,
+    };
+    let modulo = vmpx_vm::ModuloImageTargetLimits {
+        concretization: limits,
+        ..vmpx_vm::ModuloImageTargetLimits::default()
+    };
+    let timing = vmpx_vm::fold_timing_invariant_loads(pe, e, modulo)
+        .map(|r| r.expression)
+        .unwrap_or_else(|_| e.clone());
+    vmpx_vm::concretize_with_immutable_image(
+        pe,
+        &timing,
+        &std::collections::BTreeMap::new(),
+        limits,
+    )
+    .map(|r| r.expression)
+    .unwrap_or(timing)
+}
+
+/// Fold the rolled tree's exprs BEFORE lowering: lowering rewrites the image
+/// reads from `memory_load_epoch_*` intrinsics (which the fold recognises) into
+/// `Load` nodes (which it does not), so folding must happen here.
+fn fold_rolled(n: &mut vmpx_vmlift::RNode, pe: &PeImage<'_>) {
+    use vmpx_vmlift::RNode;
+    match n {
+        RNode::Stores { stores, next } => {
+            for s in stores.iter_mut() {
+                s.address = fold_proven_expr(&s.address, pe);
+                s.value = fold_proven_expr(&s.value, pe);
+            }
+            fold_rolled(next, pe);
+        }
+        RNode::Exit(e) => {
+            for v in e.registers.values_mut() {
+                *v = fold_proven_expr(v, pe);
+            }
+            if let Some(c) = &mut e.continuation {
+                *c = fold_proven_expr(c, pe);
+            }
+        }
+        RNode::Fork { selector, arms, .. } => {
+            *selector = fold_proven_expr(selector, pe);
+            for (_, a) in arms.iter_mut() {
+                fold_rolled(a, pe);
+            }
+        }
+        RNode::Loop { phis, body, .. } => {
+            for p in phis.iter_mut() {
+                p.init = fold_proven_expr(&p.init, pe);
+            }
+            fold_rolled(body, pe);
+        }
+        RNode::BackEdge { next } => {
+            for e in next.iter_mut() {
+                *e = fold_proven_expr(e, pe);
+            }
+        }
+        RNode::Dead(_) => {}
+    }
+}
+
 pub(crate) struct Options {
     pub input: PathBuf,
     pub only: Vec<String>,
@@ -14,6 +81,45 @@ pub(crate) struct Options {
     pub original: Option<PathBuf>,
     pub probe: bool,
     pub instruction_limit: usize,
+    /// Output dialect: "c" (default) or "rust".
+    pub dialect: String,
+    /// Fold level: "named" (default) or "proven".
+    pub fold: String,
+}
+
+/// Import slots from the image's own import directory, so the decompiler can
+/// name an IAT address instead of printing it, and label what the import
+/// reaches (network, licensing, anti-debug, dynamic loading).
+fn image_symbols(pe: &PeImage<'_>) -> vmpx_decompile::symbols::Symbols {
+    let report = pe.report();
+    let image_base = report.optional.image_base.0;
+    let mut symbols = vmpx_decompile::symbols::Symbols::from_imports(
+        image_base,
+        report.imports.iter().map(|module| {
+            (
+                module.name.clone(),
+                module
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.iat_rva.0, entry.name.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    );
+    // A recovered code address is usually a tail-call to another export; name it.
+    if let Some(exports) = report.exports.as_ref() {
+        symbols.set_functions(
+            exports
+                .symbols
+                .iter()
+                .filter_map(|sym| {
+                    let name = sym.name.as_ref()?;
+                    Some((image_base + u64::from(sym.rva.0), short_name(name)))
+                })
+                .collect(),
+        );
+    }
+    symbols
 }
 
 pub(crate) fn run(o: Options) -> Result<()> {
@@ -26,6 +132,10 @@ pub(crate) fn run(o: Options) -> Result<()> {
 }
 
 fn go(o: &Options) -> Result<()> {
+    vmpx_decompile::readable::set_dialect(match o.dialect.as_str() {
+        "" | "c" => None,
+        d => Some(d.to_owned()),
+    });
     let bytes = std::fs::read(&o.input).context("read input")?;
     if o.native {
         return native(o, &bytes);
@@ -33,56 +143,205 @@ fn go(o: &Options) -> Result<()> {
     let mapped = crate::equiv_gate::load_pe(&bytes)?;
     let pe = PeImage::parse(&mapped).context("image failed reparse")?;
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
-    let mut targets: Vec<(String, u32)> = Vec::new();
+    // (full symbol, short C-identifier name, stub rva)
+    let mut targets: Vec<(String, String, u32)> = Vec::new();
     for sym in symbols {
-        let Some(name) = sym.name.clone() else { continue };
+        let Some(name) = sym.name.clone() else {
+            continue;
+        };
         if !o.only.is_empty() && !o.only.contains(&name) {
             continue;
         }
         match crate::diff_original::resolve_stub(&pe, &mapped, sym.rva.0) {
-            Ok(stub) => targets.push((name, stub)),
+            Ok(stub) => {
+                let short = short_name(&name);
+                targets.push((name, short, stub));
+            }
             Err(why) => println!("// {name}: not a virtualized user function ({why})"),
         }
     }
     for rva in &o.rvas {
-        targets.push((format!("vm_{rva:x}"), *rva));
+        targets.push((format!("vm_{rva:x}"), format!("vm_{rva:x}"), *rva));
     }
-    for (name, stub) in targets {
-        println!("// ==== {name} [{stub:#x}]");
-        match vm_one(o, &pe, &name, stub) {
+    for (full, short, stub) in targets {
+        // Keep the full mangled symbol in a comment; use the short readable name
+        // as the function identifier.
+        if full == short {
+            println!("// ==== {short} [{stub:#x}]");
+        } else {
+            println!("// ==== {short} [{stub:#x}]  ({full})");
+        }
+        match vm_one(o, &pe, &short, stub) {
             Ok(()) => {}
-            Err(e) => println!("// {name}: {e}\n"),
+            Err(e) => println!("// {short}: {e}\n"),
         }
     }
     Ok(())
+}
+
+/// A short, readable, C-identifier-safe name from a Rust v0 mangled symbol
+/// (`_R...`): the first few length-prefixed identifiers joined with `_`, skipping
+/// crate-hash disambiguators. Non-Rust names are sanitized to identifier chars.
+fn short_name(mangled: &str) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .take(60)
+            .collect()
+    };
+    if !mangled.starts_with("_R") {
+        return sanitize(mangled);
+    }
+    let b = mangled.as_bytes();
+    let mut i = 0;
+    let mut idents: Vec<&str> = Vec::new();
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        let mut len = 0usize;
+        while j < b.len() && b[j].is_ascii_digit() {
+            len = len.saturating_mul(10).saturating_add((b[j] - b'0') as usize);
+            j += 1;
+        }
+        if (2..=40).contains(&len)
+            && j + len <= b.len()
+            && mangled[j..j + len]
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            let ident = &mangled[j..j + len];
+            // Crate-hash disambiguators look like `ioKvcERoOwE`: long, mixed case,
+            // no underscore. Keep real identifiers, skip those.
+            let is_hash = ident.len() >= 10
+                && !ident.contains('_')
+                && ident.bytes().any(|c| c.is_ascii_uppercase())
+                && ident.bytes().any(|c| c.is_ascii_lowercase());
+            if !is_hash {
+                idents.push(ident);
+            }
+            i = j + len;
+        } else {
+            i = j;
+        }
+    }
+    if idents.is_empty() {
+        return sanitize(mangled.get(..20).unwrap_or(mangled));
+    }
+    idents.into_iter().take(4).collect::<Vec<_>>().join("_")
 }
 
 fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::Result<(), String> {
     if o.probe {
         crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
             let cfg = input.cfg;
-            println!("// cfg: entry={} blocks={} edges={} stalls={} complete={}", cfg.entry, cfg.blocks.len(), cfg.edges.len(), cfg.stalls.len(), cfg.is_complete());
+            println!(
+                "// cfg: entry={} blocks={} edges={} stalls={} complete={}",
+                cfg.entry,
+                cfg.blocks.len(),
+                cfg.edges.len(),
+                cfg.stalls.len(),
+                cfg.is_complete()
+            );
             for (k, b) in &cfg.blocks {
-                println!("//  block {k} addr={:?} instrs={} exit={:?}", b.address, b.instructions.len(), b.exit);
+                println!(
+                    "//  block {k} addr={:?} instrs={} exit={:?}",
+                    b.address,
+                    b.instructions.len(),
+                    b.exit
+                );
             }
             for e in &cfg.edges {
                 println!("//  edge {} -> {} {:?}", e.from, e.to, e.kind);
             }
         })?;
-        let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-            vmpx_vmlift::roll_decoded_cfg(input, 200_000)
-        })??;
-        println!("// rolled: loops={} forks={} blocks_walked={}", rolled.loops, rolled.forks, rolled.straight_blocks);
+        let rolled = crate::decoded_splice::with_entry_input(
+            pe,
+            Rva(stub),
+            o.instruction_limit,
+            |input| {
+                let resolver = vmpx_vmlift::PeNestedEntries {
+                    pe,
+                    limits: vmpx_vm::EntryProfileRecoveryLimits {
+                        instruction_limit: o.instruction_limit,
+                        ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                    },
+                };
+                vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+            },
+        )??;
+        println!(
+            "// rolled: loops={} forks={} blocks_walked={}",
+            rolled.loops, rolled.forks, rolled.straight_blocks
+        );
         print_tree(&rolled.root, 0);
         return Ok(());
     }
-    let rolled = crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
-        vmpx_vmlift::roll_decoded_cfg(input, 200_000)
-    })??;
+    if std::env::var_os("VMPX_PROBE_UNROLLED").is_some() {
+        // The rolled frontend refuses a store outside the VM's dead frame; the
+        // unrolled one has no such guard. Reports which of the two can reach this
+        // entry at all, so the size of an unrolled fallback is measurable before
+        // anyone builds the lowering it would need.
+        let rolled =
+            crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+                let resolver = vmpx_vmlift::PeNestedEntries {
+                    pe,
+                    limits: vmpx_vm::EntryProfileRecoveryLimits {
+                        instruction_limit: o.instruction_limit,
+                        ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                    },
+                };
+                vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+            })
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        let unrolled = crate::decoded_splice::unroll_entry_cfg(
+            pe,
+            Rva(stub),
+            o.instruction_limit,
+            200_000,
+            64,
+        );
+        println!(
+            "// probe-unrolled {name}: rolled={} unrolled={}",
+            match &rolled {
+                Ok(_) => "ok".to_owned(),
+                Err(e) => format!("ERR({})", e.chars().take(60).collect::<String>()),
+            },
+            match &unrolled {
+                Ok(u) => format!("ok({} paths)", u.paths.len()),
+                Err(e) => format!("ERR({})", e.chars().take(60).collect::<String>()),
+            }
+        );
+        return Ok(());
+    }
+    let rolled =
+        crate::decoded_splice::with_entry_input(pe, Rva(stub), o.instruction_limit, |input| {
+            let resolver = vmpx_vmlift::PeNestedEntries {
+                pe,
+                limits: vmpx_vm::EntryProfileRecoveryLimits {
+                    instruction_limit: o.instruction_limit,
+                    ..vmpx_vm::EntryProfileRecoveryLimits::default()
+                },
+            };
+            vmpx_vmlift::roll_decoded_cfg_with_nested(input, Some(&resolver), 200_000)
+        })??;
+    let mut rolled = rolled;
+    if o.fold == "proven" {
+        fold_rolled(&mut rolled.root, pe);
+    }
     let low = vmpx_decompile::vm::lower(&rolled, name)?;
-    let d = vmpx_decompile::decompile(&low.func)?;
-    for n in &low.notes {
-        println!("// note: {n}");
+    let d = vmpx_decompile::decompile_with(&low.func, &image_symbols(pe))?;
+    // The lifter records a note per path it lowered, so the same caveat arrives
+    // once for every path that hit it -- 20 lines for 8 distinct notes on
+    // vm_c447739. Say each one once, in the order first seen.
+    let mut said = std::collections::HashSet::new();
+    for note in &low.notes {
+        if said.insert(note.as_str()) {
+            println!("// note: {note}");
+        }
     }
     print!("{}", d.text);
     println!(
@@ -92,10 +351,16 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
         d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
     );
     // linkage 1: the decompiled function against the unrolled (PROVEN) paths
-    let unrolled = crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64)?;
+    let unrolled =
+        crate::decoded_splice::unroll_entry_cfg(pe, Rva(stub), o.instruction_limit, 200_000, 64)?;
     let mut targets = Vec::new();
     for path in unrolled.paths.iter().filter(|p| !p.region_exit) {
-        if let Some(rax) = path.semantics.exit.registers.get(&vmpx_vm::X64NativeRegister::Rax) {
+        if let Some(rax) = path
+            .semantics
+            .exit
+            .registers
+            .get(&vmpx_vm::X64NativeRegister::Rax)
+        {
             targets.push(vmpx_decompile::vm::fix(rax));
         }
     }
@@ -115,7 +380,8 @@ fn vm_one(o: &Options, pe: &PeImage<'_>, name: &str, stub: u32) -> std::result::
             .into_iter()
             .find(|s| s.name.as_deref() == Some(name))
             .ok_or("no such export in the original")?;
-        let cfg = recover_native_cfg_pe_with(&ope, Rva(osym.rva.0), CfgOptions::PROVEN).map_err(|e| e.to_string())?;
+        let cfg = recover_native_cfg_pe_with(&ope, Rva(osym.rva.0), CfgOptions::PROVEN)
+            .map_err(|e| e.to_string())?;
         let nf = vmpx_decompile::native::lower(&cfg, name)?;
         println!(
             "// linkage vs ORIGINAL native function (both lifted to IR): {:?}",
@@ -137,8 +403,28 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
                 println!("// {pad}  {r:?} = {}", p(e, 7));
             }
         }
-        RNode::Fork { selector, env, block, arms } => {
-            println!("// {pad}FORK at {block} env={env} selector={}", p(selector, 9));
+        RNode::Stores { stores, next } => {
+            println!("// {pad}STORES ({})", stores.len());
+            for st in stores {
+                println!(
+                    "// {pad}  [{}] <- {} ({:?})",
+                    p(&st.address, 7),
+                    p(&st.value, 7),
+                    st.width
+                );
+            }
+            print_tree(next, depth);
+        }
+        RNode::Fork {
+            selector,
+            env,
+            block,
+            arms,
+        } => {
+            println!(
+                "// {pad}FORK at {block} env={env} selector={}",
+                p(selector, 9)
+            );
             for (v, a) in arms {
                 println!("// {pad} arm {v:#x}:");
                 print_tree(a, depth + 2);
@@ -147,7 +433,12 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
         RNode::Loop { header, phis, body } => {
             println!("// {pad}LOOP header={header} phis={}", phis.len());
             for ph in phis {
-                println!("// {pad}  {} ({:?}) init={}", ph.name, ph.width, p(&ph.init, 7));
+                println!(
+                    "// {pad}  {} ({:?}) init={}",
+                    ph.name,
+                    ph.width,
+                    p(&ph.init, 7)
+                );
             }
             print_tree(body, depth + 1);
         }
@@ -163,9 +454,41 @@ fn print_tree(n: &vmpx_vmlift::RNode, depth: usize) {
 
 fn native(o: &Options, bytes: &[u8]) -> Result<()> {
     let pe = PeImage::parse(bytes).context("not a supported PE")?;
+    // Explicit RVAs take precedence over the export scan: decompile exactly
+    // those native functions (e.g. the mutated natives that `auto` relocates).
+    if !o.rvas.is_empty() {
+        for rva in &o.rvas {
+            let name = format!("native_{rva:x}");
+            println!("// ==== {name} [{rva:#x}]");
+            // PROVEN_FP models call terminators (a `call` becomes Terminator::Call
+            // with the clobber modeled), so the lift can follow past it.
+            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), CfgOptions::PROVEN_FP) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("// {name}: cfg recovery failed: {e}\n");
+                    continue;
+                }
+            };
+            match vmpx_decompile::native::lower(&cfg, &name)
+                .and_then(|f| vmpx_decompile::decompile(&f))
+            {
+                Err(e) => println!("// {name}: {e}\n"),
+                Ok(d) => {
+                    print!("{}", d.text);
+                    println!(
+                        "// structured={} loops={} ifs={} gotos={} fallback={:?} roundtrip={:?} ctext={:?}\n",
+                        d.structured, d.loops, d.ifs, d.gotos, d.fallback_reason, d.check, d.text_check
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     let symbols = pe.report().exports.map(|e| e.symbols).unwrap_or_default();
     for sym in symbols {
-        let Some(name) = sym.name.clone() else { continue };
+        let Some(name) = sym.name.clone() else {
+            continue;
+        };
         if !o.only.is_empty() && !o.only.contains(&name) {
             continue;
         }
@@ -176,7 +499,8 @@ fn native(o: &Options, bytes: &[u8]) -> Result<()> {
                 continue;
             }
         };
-        match vmpx_decompile::native::lower(&cfg, &name).and_then(|f| vmpx_decompile::decompile(&f)) {
+        match vmpx_decompile::native::lower(&cfg, &name).and_then(|f| vmpx_decompile::decompile(&f))
+        {
             Err(e) => println!("// {name}: {e}\n"),
             Ok(d) => {
                 print!("{}", d.text);

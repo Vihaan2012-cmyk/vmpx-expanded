@@ -75,8 +75,11 @@ fn resolved_imports(
     let calls = cfg.native_calls();
     let mut found = BTreeSet::new();
     let mut budget = MAX_WALK_BLOCKS;
-    let mut work: Vec<(Va, SymbolicVmInitialState, Vec<Va>)> =
-        vec![(cfg.entry, frame_initial_state(frame, top_offset).0, Vec::new())];
+    let mut work: Vec<(Va, SymbolicVmInitialState, Vec<Va>)> = vec![(
+        cfg.entry,
+        frame_initial_state(frame, top_offset).0,
+        Vec::new(),
+    )];
     while let Some((mut key, mut state, mut trail)) = work.pop() {
         loop {
             if budget == 0 || trail.contains(&key) {
@@ -225,9 +228,18 @@ pub(crate) fn lift_entry(
         None => "stream does not end at a recovered VM-exit handler".to_owned(),
     };
 
+    // Parity with `report`, taken from its own definition rather than a copy:
+    // the cross-section follow was already shared this way, but every other
+    // env-scaled cap was not, so raising one moved N1 and left this building a
+    // different graph.
     let limits = VmCfgLimits {
         entry: entry_limits,
-        ..VmCfgLimits::default()
+        ..crate::report_cmd::cfg_limits(
+            entry_limits.instruction_limit,
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
+            false,
+        )
     };
     let cfg = recover_vm_cfg_with_observed(pe, &candidate, limits, &observed)
         .map_err(|error| format!("linear: {linear_error}; cfg recovery failed: {error}"))?;
@@ -260,7 +272,13 @@ pub(crate) fn lift_entry(
     let lifted = lift_decoded_cfg(&input, address)
         .map_err(|error| format!("linear: {linear_error}; cfg: {error}"))?;
     let imports = if lifted.native_calls > 0 {
-        resolved_imports(&cfg, &frame, top_offset, image, SymbolicExecutionLimits::default())
+        resolved_imports(
+            &cfg,
+            &frame,
+            top_offset,
+            image,
+            SymbolicExecutionLimits::default(),
+        )
     } else {
         BTreeSet::new()
     };
@@ -294,8 +312,29 @@ pub(crate) fn unroll_entry_cfg(
     max_paths: usize,
 ) -> Result<vmpx_vmlift::UnrolledFunction, String> {
     with_entry_input(pe, rva, instruction_limit, |input| {
-        vmpx_vmlift::unroll_decoded_cfg(input, max_blocks, max_paths)
+        let resolver = vmpx_vmlift::PeNestedEntries {
+            pe,
+            limits: vmpx_vm::EntryProfileRecoveryLimits {
+                instruction_limit,
+                ..vmpx_vm::EntryProfileRecoveryLimits::default()
+            },
+        };
+        vmpx_vmlift::unroll_decoded_cfg_with_nested(input, Some(&resolver), max_blocks, max_paths)
     })?
+}
+
+thread_local! {
+    /// Seed for the next entry analyzed when its stub pushes a register, not an
+    /// immediate (set by the native-chain follower from the proven exit state).
+    static SEED_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with `seed` as the seed of a register-pushing entry stub.
+pub(crate) fn with_seed_override<R>(seed: Option<u64>, f: impl FnOnce() -> R) -> R {
+    let previous = SEED_OVERRIDE.replace(seed);
+    let result = f();
+    SEED_OVERRIDE.set(previous);
+    result
 }
 
 pub(crate) fn with_entry_input<R>(
@@ -304,10 +343,25 @@ pub(crate) fn with_entry_input<R>(
     instruction_limit: usize,
     f: impl FnOnce(&DecodedCfgInput<'_>) -> R,
 ) -> Result<R, String> {
-    let candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
+    let mut candidate = analyze_vm_entry_at(pe, rva, VmDiscoveryLimits::default())
         .ok_or_else(|| "no VM entry stub at this RVA".to_owned())?;
+    if candidate.seed.is_none() {
+        candidate.seed = SEED_OVERRIDE.get();
+    }
     let entry_limits = EntryProfileRecoveryLimits {
         instruction_limit,
+        // Parity with `report --serve-ro`, which is the mode the lift census is
+        // measured against: without it an entry counted CFG-complete there is
+        // refused here as "the CFG is incomplete" purely because the image reads
+        // it needs are withheld. Labeled exactly as `report` labels it — the CFG
+        // carries `AssumesImageProtectionStable` — so this widens what can be
+        // decompiled, never what is claimed proven.
+        symbolic: vmpx_vm::SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: (std::env::var_os("VMPX_DECOMPILE_SERVE_RO")
+                .is_some()
+                || crate::auto_cmd::auto_settings()),
+            ..vmpx_vm::SymbolicExecutionLimits::default()
+        },
         ..EntryProfileRecoveryLimits::default()
     };
     let stream = recover_entry_stream(pe, &candidate, entry_limits)
@@ -319,9 +373,18 @@ pub(crate) fn with_entry_input<R>(
         entry_limits.trace,
     )
     .map_err(|error| format!("entry frame not recovered: {error}"))?;
+    // Parity with `report`, taken from its own definition rather than a copy:
+    // the cross-section follow was already shared this way, but every other
+    // env-scaled cap was not, so raising one moved N1 and left this building a
+    // different graph.
     let limits = VmCfgLimits {
         entry: entry_limits,
-        ..VmCfgLimits::default()
+        ..crate::report_cmd::cfg_limits(
+            entry_limits.instruction_limit,
+            std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
+            false,
+        )
     };
     let observed = ObservedRun::default();
     let seeded = Cell::new(false);
@@ -343,7 +406,17 @@ pub(crate) fn with_entry_input<R>(
         exits: &exits,
         native_calls: &calls,
         memory: Some(&overlay),
-        limits: SymbolicExecutionLimits::default(),
+        // Serve read-only image bytes under suppression during the rolled/
+        // unrolled RE-EXECUTION too, not only during CFG recovery. Without it a
+        // checksum POINTER read from a non-writable `.vmp` address stays an
+        // opaque `memory_load_epoch`, so the checksum argument is not constant
+        // and cannot be folded -- which is exactly what blocked two of the
+        // guards. Matches the CFG-recovery setting above.
+        limits: SymbolicExecutionLimits {
+            serve_read_only_when_suppressed: std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()
+                || crate::auto_cmd::auto_settings(),
+            ..SymbolicExecutionLimits::default()
+        },
         target_limits: limits,
         max_expanded_blocks: 256,
     };

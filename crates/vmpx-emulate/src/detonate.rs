@@ -33,7 +33,22 @@ use crate::winapi::WinApiHook;
 use crate::xplm::{CallbackKind, GuestCall, RecordedCallback, RetKind, Xplm};
 use std::cell::RefCell;
 
-const DEFAULT_MAX_STEPS: u64 = 2_000_000;
+/// A step CEILING, not a target: a sample that halts naturally is unaffected, so
+/// this only has to be high enough that a real one is not cut off before it
+/// observes anything.
+///
+/// 2_000_000 was not. systems.xpl (a 253 MB plugin whose LZMA depack alone
+/// dominates that) ended `stop=StepLimit` with `imports captured=0,
+/// observed globals=0, observed loop depths=0` -- the detonation contributed
+/// NOTHING and read as "the bridge does not help" rather than "the budget ran
+/// out". Raised to 1.2e9, measured at ~7M steps/s, so ~170 s worst case on an
+/// opt-in `--dynamic` path; at that budget the same sample captured 6 imports.
+/// `VMPX_DYNAMIC_MAXSTEPS` still overrides it.
+///
+/// Known not to be enough for everything: this sample needs ~27e9 steps to
+/// reach its OEP, so OEP-gated facts stay out of reach here -- and a fully
+/// virtualized DllMain has no write-then-execute OEP to detect at any budget.
+const DEFAULT_MAX_STEPS: u64 = 1_200_000_000;
 
 // COFF characteristic: the image is a DLL.
 const IMAGE_FILE_DLL: u16 = 0x2000;
@@ -90,6 +105,10 @@ pub struct DetonateOptions {
     /// rather than stopping. Observed/quarantined tier — never sound static
     /// output. Set `false` to reproduce the sound fail-closed stop.
     pub resolve_undefined_flags: bool,
+    /// Execute recognized protector integrity/copy loops natively rather than
+    /// interpreting them byte by byte (see [`crate::Emulator::accelerate_checksums`]).
+    /// Default `true` for the detonation, which is Observed tier already.
+    pub accelerate_protector_loops: bool,
     /// Region watched for import-slot fills (see [`DetonationResult::iat_fill`]).
     pub iat_region: IatRegion,
     /// After the entry returns, drive the X-Plane plugin lifecycle in the same emulator
@@ -104,6 +123,10 @@ pub struct DetonateOptions {
     /// reaches a base case in-model. Observed what-if tier: the resulting post-init
     /// state is used only to drive the lifecycle, and is validated downstream.
     pub force_return_stack_mb: Option<u64>,
+    /// After the run completes, persist the emulator's post-init CPU+memory as a
+    /// reusable VMPXSNP1 snapshot at this path -- the same format `start_from_snapshot`
+    /// and the CLI's `--snapshot` consume, so a later run can skip the long init.
+    pub save_snapshot: Option<std::path::PathBuf>,
 }
 
 /// Bounds for the in-model plugin lifecycle (all offline, step-capped).
@@ -143,10 +166,12 @@ impl Default for DetonateOptions {
             export_reference: BTreeMap::new(),
             dump: true,
             resolve_undefined_flags: true,
+            accelerate_protector_loops: true,
             iat_region: IatRegion::Auto,
             lifecycle: None,
             start_from_snapshot: None,
             force_return_stack_mb: None,
+            save_snapshot: None,
         }
     }
 }
@@ -401,6 +426,19 @@ fn detonate_with(
     let xplm = (opts.xplm || opts.lifecycle.is_some()).then(|| Rc::new(RefCell::new(Xplm::new())));
     if let Some(x) = &xplm {
         winapi = winapi.with_xplm(Rc::clone(x));
+        if let Some(path) = std::env::var_os("VMPX_REPLAY") {
+            match crate::replay::Replay::load(std::path::Path::new(&path)) {
+                Ok(r) => {
+                    eprintln!(
+                        "[replay] loaded {} frames / {} datarefs from VMPX_REPLAY",
+                        r.n_frames(),
+                        r.n_datarefs()
+                    );
+                    x.borrow_mut().set_replay(r);
+                }
+                Err(e) => eprintln!("[replay] could not load VMPX_REPLAY: {e}"),
+            }
+        }
     }
     let facts = winapi.facts();
     let book = winapi.address_book();
@@ -463,6 +501,13 @@ fn detonate_with(
     emu.resolve_undefined_flags = opts.resolve_undefined_flags;
     // Only the retired count is consumed; skip the per-step trace allocation.
     emu.record_trace = false;
+    // Run the protector byte-at-a-time integrity and copy loops natively. The
+    // detonation is Observed tier by construction and these folds are gated on
+    // reaching the same state the interpreter would (see `checksum_loop` and
+    // `copy_loop`), so the budget buys progress instead of LZMA bookkeeping:
+    // measured on systems.xpl, 161MB of copies and rip-sample concentration
+    // falling from 99.7% to 5.9% inside the same 20B steps.
+    emu.accelerate_checksums = opts.accelerate_protector_loops;
     let stop = if let Some(snap) = &opts.start_from_snapshot {
         let (c, m) = crate::snapshot::load(snap).map_err(|e| DetonateError::Snapshot(e.kind()))?;
         emu.cpu = c;
@@ -517,6 +562,13 @@ fn detonate_with(
         run_lifecycle(lc, &mut emu, &env, &stop)
     });
     let steps = emu.steps() as usize;
+
+    // Persist the post-init state as a reusable VMPXSNP1 so a later run can
+    // `--snapshot` it and skip this ~billions-of-steps init.
+    if let Some(path) = &opts.save_snapshot {
+        crate::snapshot::save(&emu.cpu, &emu.mem, path)
+            .map_err(|e| DetonateError::Snapshot(e.kind()))?;
+    }
 
     let mut observed = facts.borrow().clone();
     if !opts.capture_globals.is_empty() {
@@ -788,7 +840,23 @@ fn run_lifecycle(
     // Registered callbacks. A callback that fails to return is retired; a flight loop that
     // returns 0.0 asks not to be called again.
     let mut retired = Vec::new();
-    for it in 0..lc.iterations {
+    // With a recorded flight loaded, drive one iteration per captured frame (capped)
+    // and advance the recording each round, so callbacks read time-varying real sim
+    // state. Without a recording, behavior is unchanged (lc.iterations rounds).
+    let replay_frames = xplm.borrow().replay_frames();
+    let cap = std::env::var("VMPX_REPLAY_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000usize);
+    let iters: u32 = if replay_frames > 0 {
+        replay_frames.min(cap) as u32
+    } else {
+        lc.iterations
+    };
+    for it in 0..iters {
+        if replay_frames > 0 {
+            xplm.borrow_mut().replay_advance();
+        }
         let live: Vec<RecordedCallback> =
             xplm.borrow().callbacks().iter().filter(|c| c.active).cloned().collect();
         for cb in live {

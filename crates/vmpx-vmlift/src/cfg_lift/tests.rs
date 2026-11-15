@@ -78,11 +78,13 @@ fn cfg(blocks: Vec<(Va, VmBasicBlock)>, edges: Vec<CfgEdge>, entry: u64) -> VmCf
         blocks: blocks.into_iter().collect(),
         edges,
         stalls: Vec::new(),
+        discharge_refusal: None,
         limit_hit: None,
         visits: 0,
         frame_cells_known: 17,
         frame_note: None,
         assumptions: std::collections::BTreeSet::new(),
+        nested_entry_stubs: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1955,6 +1957,12 @@ impl NestedEntryResolver for StubResolver {
                 continuation: None,
             }
         })
+    }
+
+    fn resolve_by_rva(&self, _rva: vmpx_pe::Rva) -> Option<NestedEntry> {
+        // These tests build CFGs with an empty nested-entry-stub map, so the lift
+        // takes the return-address path above; this never runs.
+        None
     }
 }
 

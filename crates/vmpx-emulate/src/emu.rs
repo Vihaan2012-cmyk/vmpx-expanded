@@ -408,6 +408,172 @@ pub struct Emulator {
     bcache: Vec<Option<Box<Block>>>,
     /// Which hook events `run`/`run_until` still need to deliver (see [`Interest`]).
     gate: Gate,
+    /// Dispatch counters, for finding where a long run spends its steps.
+    pub prof: Prof,
+    /// DETONATION-only. When `true`, `run`/`run_until` may execute a recognized
+    /// integrity-checksum loop natively instead of interpreting it byte by byte
+    /// (see [`crate::checksum_loop`]). Default `false`, so every sound and test
+    /// path is byte-for-byte unchanged.
+    ///
+    /// A fold retires many guest iterations while charging ONE step, so
+    /// `steps()` stops being an instruction count once this is on. That is the
+    /// point -- a step budget then buys progress rather than checksum arithmetic
+    /// -- and [`Prof::folded_iterations`] records what was skipped.
+    pub accelerate_checksums: bool,
+    /// Whether to also try the LZMA literal decoder, separately from the other
+    /// folds so its cost and its benefit can be measured against them.
+    pub accelerate_literals: bool,
+    /// Recognizer cache, direct-mapped by loop-head rip. `None` records a
+    /// declined address so it is not re-examined every iteration. Keyed by the
+    /// code generation too, so modified code is re-examined.
+    csum: Box<[Option<(u64, u64, Option<crate::checksum_loop::Shape>)>]>,
+    /// Recognizer cache for the copy loop, same scheme as `csum`.
+    cpyc: Box<[Option<(u64, u64, Option<crate::copy_loop::Shape>)>]>,
+    /// Recognizer cache for the LZMA literal decoder, same scheme as `csum`.
+    lzmc: Box<[Option<(u64, u64, Option<crate::lzma_literal::Shape>)>]>,
+    /// Addresses known to hold no shape of any kind, one word each.
+    ///
+    /// The three caches above each answer "is there a shape at this rip", and
+    /// almost always the answer is no: a 400M-step init probes them 47M times
+    /// and finds a shape for 0.2% of those. Paying three random accesses into
+    /// three tables of ~100-byte entries for that answer costs more than the
+    /// walks it avoids -- widening those tables cut walks 14x and moved the rate
+    /// by 3%, which is what said the probe itself was the cost.
+    ///
+    /// This table holds one `u64` per slot, so the whole thing stays in L2, and
+    /// a hit settles all three caches with a single load. The stored key mixes
+    /// in the code generation, so a guest code write invalidates it the same way
+    /// it invalidates the caches.
+    absent: Box<[u64]>,
+}
+
+// Slots in each shape-recognizer cache. The protector flattens its
+// decompressor over ~960 hot addresses and `run_loop` probes a shape at
+// every block start, so 256 slots had hot heads evicting each other and
+// re-walking: 2.05M walks over a 400M-step init, against a hot set that
+// fits several times over in this many.
+const CSUM_SLOTS: usize = 4096;
+
+/// Slots in the negative filter. One `u64` each, so this is 32KiB and stays
+/// resident; it is consulted on every block start.
+const ABSENT_SLOTS: usize = 4096;
+
+/// The filter's stored key for `rip` under code generation `epoch`.
+///
+/// Never zero, which is the empty marker, and it mixes the epoch in so a code
+/// write cannot leave a stale "nothing here" behind.
+fn absent_key(rip: u64, epoch: u64) -> u64 {
+    (rip ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1
+}
+
+/// Which filter slot `rip` falls in.
+fn absent_slot(rip: u64) -> usize {
+    ((rip ^ (rip >> 13)) as usize) & (ABSENT_SLOTS - 1)
+}
+
+/// Where a run's steps went. Plain counters: the interpreter is single-threaded
+/// and an increment is far cheaper than the step it measures.
+#[derive(Clone)]
+pub struct Prof {
+    /// Steps dispatched through the pre-resolved fast path.
+    pub fast: u64,
+    /// Steps that fell back to the generic `exec` (full iced `Instruction`).
+    pub slow: u64,
+    /// Blocks executed whole, and the ops they retired.
+    pub blocks: u64,
+    pub block_ops: u64,
+    /// Steps taken one at a time because no block was available.
+    pub single: u64,
+    /// Ops that are a direct `jmp` fused onto the previous op. They still
+    /// occupy an op slot, so each costs a step and a flow-interest check while
+    /// doing nothing but moving `rip` -- VMProtect scatters a handler across
+    /// fragments joined by these, so the share is worth knowing. Measured at
+    /// 14-16% of all steps on systems.xpl.
+    ///
+    /// Dropping them at block build was tried twice and must not be: a step
+    /// budget is a CONTRACT that k steps are k guest instructions, and
+    /// `fast_paths_match_reference_interpreter` enforces it by requiring
+    /// `run_until(target, k)` to behave exactly as k reference steps. Eliding
+    /// lets the block path outrun the reference inside the same budget, so it
+    /// reaches the target where the reference stops at the limit. It also
+    /// bought no wall-clock -- the fused path is already nearly free -- so the
+    /// only thing it changed was the meaning of a step.
+    pub fused_jumps: u64,
+    /// `Jcc` ops whose immediately preceding op in the block is the flag
+    /// producer they read. Fusing the pair would let the condition come
+    /// straight from the operands, skipping the rflags materialisation, the
+    /// undefined-flag guard and the `cc_val` read.
+    pub cmp_jcc_pairs: u64,
+    /// `Jcc` ops in total, for the share.
+    pub jcc_total: u64,
+    /// Checksum loops folded, and guest iterations those folds retired.
+    pub folded: u64,
+    pub folded_iterations: u64,
+    /// Copy loops folded, and the bytes those folds moved.
+    pub copies_folded: u64,
+    pub copied_bytes: u64,
+    /// LZMA literal symbols folded, and the bit decodes those folds retired.
+    pub literals_folded: u64,
+    pub literal_bits: u64,
+    /// Iterations declined because a byte was unreadable.
+    pub fold_declined: u64,
+    /// Shape-cache probes, and the ones that had to run a recognizer walk.
+    ///
+    /// Recognition decodes and walks up to a few hundred instructions, so the
+    /// walk rate decides whether the folds pay for themselves at all. These two
+    /// counters separate the only two reasons a probe misses -- a hot head
+    /// evicted by another (raise the cache) and a cached head invalidated by a
+    /// guest code write (the epoch is too coarse) -- which need opposite fixes.
+    pub shape_probes: u64,
+    pub shape_walks: u64,
+    /// Probes that missed because the code generation moved, not because the
+    /// slot held a different address.
+    pub shape_stale: u64,
+    /// Slow-path steps per mnemonic, indexed by `mnemonic as usize & 2047`.
+    pub slow_mn: Box<[u64]>,
+}
+
+impl Default for Prof {
+    fn default() -> Self {
+        Self {
+            fast: 0,
+            slow: 0,
+            blocks: 0,
+            block_ops: 0,
+            single: 0,
+            fused_jumps: 0,
+            cmp_jcc_pairs: 0,
+            jcc_total: 0,
+            folded: 0,
+            folded_iterations: 0,
+            copies_folded: 0,
+            copied_bytes: 0,
+            literals_folded: 0,
+            literal_bits: 0,
+            fold_declined: 0,
+            shape_probes: 0,
+            shape_walks: 0,
+            shape_stale: 0,
+            slow_mn: vec![0; 2048].into_boxed_slice(),
+        }
+    }
+}
+
+impl Prof {
+    /// The mnemonics that most often took the slow path, most frequent first.
+    #[must_use]
+    pub fn top_slow(&self, count: usize) -> Vec<(usize, u64)> {
+        let mut rows: Vec<(usize, u64)> = self
+            .slow_mn
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| (i, *n))
+            .collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        rows.truncate(count);
+        rows
+    }
 }
 
 /// A straight-line run of pre-resolved instructions starting at `start`,
@@ -434,6 +600,7 @@ struct Block {
     /// One bit per `bloom_bit(op rip)`: a `run_until` target absent from it is
     /// not any op's address.
     bloom: u64,
+
 }
 
 /// A contiguous run of guest code inside a [`Block`].
@@ -497,7 +664,8 @@ impl Block {
     #[inline]
     fn has(&self, target: Option<u64>) -> bool {
         target.is_some_and(|t| {
-            self.bloom >> bloom_bit(t) & 1 != 0 && self.ops[1..].iter().any(|p| p.rip == t)
+            self.bloom >> bloom_bit(t) & 1 != 0
+                && self.ops[1..].iter().any(|p| p.rip == t)
         })
     }
 }
@@ -566,6 +734,13 @@ impl Emulator {
             .into_boxed_slice(),
             bcache: (0..BCACHE_SIZE).map(|_| None).collect(),
             gate: Gate::ALL,
+            prof: Prof::default(),
+            accelerate_checksums: false,
+            accelerate_literals: true,
+            csum: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            cpyc: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            lzmc: vec![None; CSUM_SLOTS].into_boxed_slice(),
+            absent: vec![0u64; ABSENT_SLOTS].into_boxed_slice(),
         }
     }
 
@@ -600,9 +775,12 @@ impl Emulator {
         self.cur.1 = p.mn;
         let next = rip.wrapping_add(u64::from(p.len));
         let new_rip = if p.kind == K::Slow {
+            self.prof.slow += 1;
+            self.prof.slow_mn[p.mn as usize & 2047] += 1;
             let ins = self.dcache[slot].ins;
             self.exec(&ins, next)?
         } else {
+            self.prof.fast += 1;
             self.exec_fast(&p, next)?
         };
         self.cpu.rip = new_rip;
@@ -668,6 +846,445 @@ impl Emulator {
         stop
     }
 
+    /// Folding may only elide events no hook wants. The test is OVERLAP, not
+    /// presence: the detonation hook always registers read and flow spans (for
+    /// `KUSER_SHARED_DATA` and the import stubs), so declining whenever any
+    /// exist would decline every fold.
+    ///
+    /// The fold reads `[pointer, pointer + iterations)` and the 1KiB table, and
+    /// elides the body's own control transfers. Nothing else is skipped: it
+    /// writes no guest memory, so no write interest can be missed.
+    fn fold_elides_wanted_event(
+        &self,
+        shape: &crate::checksum_loop::Shape,
+        pointer: u64,
+        iterations: u64,
+        table: u64,
+    ) -> bool {
+        if self.gate.read_all || self.gate.flow_all || self.gate.flow_pages {
+            return true;
+        }
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        for span in self.gate.read {
+            if overlaps(span, pointer, iterations) || overlaps(span, table, 256 * 4) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if span.0 == span.1 {
+                continue;
+            }
+            for (from, to) in &shape.flow_sites[..usize::from(shape.flow_site_count)] {
+                if (*from >= span.0 && *from < span.1) || (*to >= span.0 && *to < span.1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The checksum shape at `rip`, recognized once and cached per code
+    /// generation. `None` means "not this loop"; it is cached too, so a hot
+    /// non-matching address is not re-decoded on every pass.
+    fn checksum_shape(&mut self, rip: u64) -> Option<crate::checksum_loop::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.csum[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
+        }
+        self.prof.shape_walks += 1;
+        let mem = &self.mem;
+        let shape = crate::checksum_loop::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder =
+                Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.csum[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized checksum loop natively, leaving its LAST iteration to
+    /// the interpreter so the exit state (flags included) is produced by the
+    /// ordinary instruction semantics.
+    ///
+    /// Returns the guest iterations retired, or 0 when nothing was folded (too
+    /// few iterations left, a register the shape names is unavailable, or the
+    /// very first byte is unreadable) -- in which case the caller just
+    /// interprets as usual.
+    fn fold_checksum(&mut self, shape: &crate::checksum_loop::Shape) -> u64 {
+        use crate::checksum_loop::Shape;
+        let Some(counter) = self.cpu.reg(shape.counter) else {
+            return 0;
+        };
+        // Leave at least one iteration, which also means a 1-iteration loop is
+        // never folded and the trip count cannot underflow.
+        let Some(iterations) = counter.checked_sub(1).filter(|n| *n > 0) else {
+            return 0;
+        };
+        let (Some(pointer), Some(table), Some(accumulator)) = (
+            self.cpu.reg(shape.pointer),
+            self.cpu.reg(shape.table),
+            self.cpu.reg(shape.accumulator),
+        ) else {
+            return 0;
+        };
+        if self.fold_elides_wanted_event(shape, pointer, iterations, table) {
+            return 0;
+        }
+        let mut accumulator = accumulator as u32;
+        let mut entry = 0u32;
+        let mut done = 0u64;
+        // State after `done - 1` iterations, for the rollback below.
+        let mut previous = (accumulator, entry);
+        let mut declined = false;
+        while done < iterations {
+            let Ok(input) = self.mem.read_uint(pointer.wrapping_add(done), 1) else {
+                declined = true;
+                break;
+            };
+            let input = input as u8;
+            let index = u64::from(Shape::index(accumulator, input));
+            let Ok(loaded) = self.mem.read_uint(table.wrapping_add(index * 4), 4) else {
+                declined = true;
+                break;
+            };
+            previous = (accumulator, entry);
+            entry = loaded as u32;
+            accumulator = shape.step(accumulator, input, entry);
+            done += 1;
+        }
+        if declined {
+            // A fault makes the PREVIOUS iteration's flags observable, and this
+            // fold writes no flags. Give that iteration back to the interpreter
+            // so it produces them, then let it fault where it would have.
+            self.prof.fold_declined += 1;
+            done = done.saturating_sub(1);
+            (accumulator, entry) = previous;
+        }
+        if done == 0 {
+            return 0;
+        }
+        // 32-bit writes zero-extend, which `set_reg` applies for a 32-bit name.
+        self.cpu.set_reg(shape.accumulator, u64::from(accumulator));
+        self.cpu.set_reg(shape.scratch, u64::from(entry));
+        self.cpu.set_reg(shape.pointer, pointer.wrapping_add(done));
+        self.cpu.set_reg(shape.counter, counter - done);
+        self.prof.folded += 1;
+        self.prof.folded_iterations += done;
+        done
+    }
+
+    /// The copy shape at `rip`, cached like [`Emulator::checksum_shape`].
+    fn copy_shape(&mut self, rip: u64) -> Option<crate::copy_loop::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.cpyc[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
+        }
+        self.prof.shape_walks += 1;
+        let mem = &self.mem;
+        let shape = crate::copy_loop::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder = Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.cpyc[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized copy loop natively. Unlike the checksum fold this one
+    /// WRITES, so every byte goes through [`Memory::write`], which enforces page
+    /// permissions and bumps the code generation when the page holds cached
+    /// code; a hook that wants those writes declines the fold.
+    ///
+    /// As with the checksum fold the LAST iteration is left to the interpreter,
+    /// so the exit state and its flags come from the ordinary semantics.
+    fn fold_copy(&mut self, shape: &crate::copy_loop::Shape) -> u64 {
+        let (Some(source), Some(destination), Some(other), Some(counter)) = (
+            self.cpu.reg(shape.source),
+            self.cpu.reg(shape.destination),
+            self.cpu.reg(shape.other),
+            self.cpu.reg(shape.counter),
+        ) else {
+            return 0;
+        };
+        // The counter is 32-bit, and zero would wrap to 2^32 iterations. That is
+        // the interpreter to handle, not a fold.
+        let counter = counter & 0xFFFF_FFFF;
+        let Some(iterations) = counter.checked_sub(1).filter(|n| *n > 0) else {
+            return 0;
+        };
+        // `cmp destination, -1` / `jb head` leaves the loop if the incremented
+        // destination ever reaches u64::MAX, so never fold through that point.
+        let iterations = iterations.min(u64::MAX - destination);
+        if iterations == 0 {
+            return 0;
+        }
+        if self.fold_copy_elides_wanted_event(shape, source, destination, other, iterations) {
+            return 0;
+        }
+        let mut done = 0u64;
+        let mut declined = false;
+        while done < iterations {
+            let Ok(byte) = self.mem.read_uint(source.wrapping_add(done), 1) else {
+                declined = true;
+                break;
+            };
+            let address = shape.store_address(destination.wrapping_add(done + 1), other);
+            #[allow(clippy::cast_possible_truncation)]
+            let byte = byte as u8;
+            if self.mem.write(address, &[byte]).is_err() {
+                declined = true;
+                break;
+            }
+            done += 1;
+        }
+        if declined {
+            // A fault makes the previous iteration flags observable, and this
+            // fold writes none, so hand that iteration back as well.
+            self.prof.fold_declined += 1;
+            done = done.saturating_sub(1);
+        }
+        if done == 0 {
+            return 0;
+        }
+        self.cpu.set_reg(shape.source, source.wrapping_add(done));
+        self.cpu.set_reg(shape.destination, destination.wrapping_add(done));
+        // A 32-bit write zero-extends, matching `sub counter32, 1`.
+        self.cpu.set_reg(shape.counter, counter - done);
+        self.prof.copies_folded += 1;
+        self.prof.copied_bytes += done;
+        done
+    }
+
+    /// As [`Emulator::fold_elides_wanted_event`], plus the write range.
+    fn fold_copy_elides_wanted_event(
+        &self,
+        shape: &crate::copy_loop::Shape,
+        source: u64,
+        destination: u64,
+        other: u64,
+        iterations: u64,
+    ) -> bool {
+        if self.gate.read_all
+            || self.gate.write_all
+            || self.gate.flow_all
+            || self.gate.write_pages
+            || self.gate.flow_pages
+        {
+            return true;
+        }
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        let first_store = shape.store_address(destination.wrapping_add(1), other);
+        for span in self.gate.read {
+            if overlaps(span, source, iterations) {
+                return true;
+            }
+        }
+        for span in self.gate.write {
+            if overlaps(span, first_store, iterations) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if span.0 == span.1 {
+                continue;
+            }
+            for (from, to) in &shape.flow_sites[..usize::from(shape.flow_site_count)] {
+                if (*from >= span.0 && *from < span.1) || (*to >= span.0 && *to < span.1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The LZMA literal-decoder shape at `rip`, cached like
+    /// [`Emulator::checksum_shape`].
+    fn lzma_shape(&mut self, rip: u64) -> Option<crate::lzma_literal::Shape> {
+        let epoch = self.mem.code_gen();
+        let slot = ((rip ^ (rip >> 11)) as usize) & (CSUM_SLOTS - 1);
+        self.prof.shape_probes += 1;
+        if let Some((cached_rip, cached_epoch, shape)) = self.lzmc[slot] {
+            if cached_rip == rip && cached_epoch == epoch {
+                return shape;
+            }
+            if cached_rip == rip {
+                self.prof.shape_stale += 1;
+            }
+        }
+        self.prof.shape_walks += 1;
+        let mem = &self.mem;
+        let shape = crate::lzma_literal::Shape::recognize(rip, |address| {
+            let mut buf = [0u8; 15];
+            let read = mem.fetch(address, &mut buf).ok()?;
+            let mut decoder = Decoder::with_ip(64, &buf[..read], address, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            (!instruction.is_invalid()).then_some(instruction)
+        });
+        self.lzmc[slot] = Some((rip, epoch, shape));
+        shape
+    }
+
+    /// Runs a recognized LZMA literal decoder natively, one bit per step
+    /// instead of the ~30 interpreted instructions a bit costs.
+    ///
+    /// Two properties make this cheaper to get right than the other folds.
+    ///
+    /// First, no rollback is needed. Nothing is committed until the whole fold
+    /// is done: `range`, `code` and `symbol` are local, and an iteration that
+    /// cannot read its input byte or probability, or cannot store the updated
+    /// probability, simply ends the fold with that iteration not counted. The
+    /// interpreter then resumes at the head and faults exactly where the guest
+    /// would. The other folds hand an iteration BACK so the faulting state's
+    /// flags come from real instruction semantics; here that is unnecessary,
+    /// because `cmp range, kTopValue` at the head overwrites every arithmetic
+    /// flag before anything reads one -- flags are dead across the head, which
+    /// the matched shape proves rather than assumes.
+    ///
+    /// Second, the stopping point is structural. The symbol doubles each bit
+    /// and the loop leaves when it reaches `0x100`, so folding while it stays
+    /// below `0x80` leaves the LAST bit to the interpreter -- which is what
+    /// produces the exit flags and takes the fall-through out of the loop.
+    ///
+    /// Returns the bit decodes retired, or 0 when nothing was folded.
+    fn fold_lzma_literal(&mut self, shape: &crate::lzma_literal::Shape) -> u64 {
+        use crate::lzma_literal::Shape;
+        let (Some(symbol), Some(probs), Some(range), Some(code), Some(input), Some(input_end)) = (
+            self.cpu.reg(shape.symbol),
+            self.cpu.reg(shape.probs),
+            self.cpu.reg(shape.range),
+            self.cpu.reg(shape.code),
+            self.cpu.reg(shape.input),
+            self.cpu.reg(shape.input_end),
+        ) else {
+            return 0;
+        };
+        let mut symbol = symbol as u32;
+        let mut range = range as u32;
+        let mut code = code as u32;
+        // Entered with the symbol already at or past the halfway mark, the only
+        // bit left is the one the interpreter must run anyway.
+        if symbol == 0 || Shape::complete(symbol << 1) {
+            return 0;
+        }
+        if self.fold_lzma_elides_wanted_event(shape, input, probs) {
+            return 0;
+        }
+        let mut cursor = input;
+        let mut index = 0u64;
+        let mut scratch = (0u32, 0u32);
+        let mut done = 0u64;
+        // Fold while the next doubling still leaves the symbol inside the
+        // tree, which is precisely "this is not the last bit".
+        while !Shape::complete(symbol << 1) {
+            if Shape::needs_normalise(range) {
+                // The guest leaves the loop when the input runs out; that exit
+                // is outside the matched shape, so stop and let it happen.
+                if cursor == input_end {
+                    break;
+                }
+                let Ok(byte) = self.mem.read_uint(cursor, 1) else {
+                    break;
+                };
+                (range, code) = Shape::normalise(range, code, byte as u8);
+                cursor = cursor.wrapping_add(1);
+            }
+            let slot = probs.wrapping_add(u64::from(symbol) * 2);
+            let Ok(probability) = self.mem.read_uint(slot, 2) else {
+                break;
+            };
+            let step = Shape::step(range, code, symbol, probability as u16);
+            if self.mem.write(slot, &step.probability.to_le_bytes()).is_err() {
+                break;
+            }
+            // `movsxd index, symbol` runs at the head, so the index the guest
+            // holds on re-entry is the one this iteration used.
+            index = i64::from(symbol as i32) as u64;
+            range = step.range;
+            code = step.code;
+            symbol = step.symbol;
+            scratch = (step.scratch_a, step.scratch_c);
+            done += 1;
+        }
+        if done == 0 {
+            return 0;
+        }
+        self.cpu.set_reg(shape.symbol, u64::from(symbol));
+        self.cpu.set_reg(shape.range, u64::from(range));
+        self.cpu.set_reg(shape.code, u64::from(code));
+        self.cpu.set_reg(shape.input, cursor);
+        self.cpu.set_reg(shape.index, index);
+        self.cpu.set_reg(shape.scratch_a, u64::from(scratch.0));
+        self.cpu.set_reg(shape.scratch_c, u64::from(scratch.1));
+        self.prof.literals_folded += 1;
+        self.prof.literal_bits += done;
+        done
+    }
+
+    /// As [`Emulator::fold_elides_wanted_event`], for the literal decoder.
+    ///
+    /// The read span is bounded without knowing the trip count: at most seven
+    /// bits are folded, so at most seven input bytes are pulled, and the symbol
+    /// stays below `0x100`, so every probability slot lies in the first 512
+    /// bytes of the array. That array is both read and written.
+    fn fold_lzma_elides_wanted_event(
+        &self,
+        shape: &crate::lzma_literal::Shape,
+        input: u64,
+        probs: u64,
+    ) -> bool {
+        if self.gate.read_all
+            || self.gate.write_all
+            || self.gate.flow_all
+            || self.gate.write_pages
+            || self.gate.flow_pages
+        {
+            return true;
+        }
+        const PROB_BYTES: u64 = 0x200;
+        let overlaps = |span: Span, start: u64, len: u64| {
+            span.0 != span.1 && start < span.1 && span.0 < start.saturating_add(len)
+        };
+        for span in self.gate.read {
+            if overlaps(span, input, 7) || overlaps(span, probs, PROB_BYTES) {
+                return true;
+            }
+        }
+        for span in self.gate.write {
+            if overlaps(span, probs, PROB_BYTES) {
+                return true;
+            }
+        }
+        for span in self.gate.flow {
+            if overlaps(span, shape.body.0, shape.body.1 - shape.body.0) {
+                return true;
+            }
+        }
+        false
+    }
+
     #[allow(clippy::collapsible_if)]
     fn run_loop(&mut self, target: Option<u64>, max_steps: u64) -> Stop {
         let mut left = max_steps;
@@ -678,13 +1295,42 @@ impl Emulator {
             if target == Some(rip) {
                 return Stop::Reached;
             }
+            if self.accelerate_checksums && blocks {
+                let key = absent_key(rip, self.mem.code_gen());
+                let slot = absent_slot(rip);
+                let folded = if self.absent[slot] == key {
+                    0
+                } else if let Some(shape) = self.checksum_shape(rip) {
+                    self.fold_checksum(&shape)
+                } else if let Some(shape) = self.copy_shape(rip) {
+                    self.fold_copy(&shape)
+                } else if let Some(shape) =
+                    if self.accelerate_literals { self.lzma_shape(rip) } else { None }
+                {
+                    self.fold_lzma_literal(&shape)
+                } else {
+                    // No shape of any kind here, which is the common case and
+                    // the one worth remembering cheaply.
+                    self.absent[slot] = key;
+                    0
+                };
+                if folded > 0 {
+                    // One step for the whole fold: the budget now buys progress
+                    // instead of byte-at-a-time protector bookkeeping.
+                    self.steps += 1;
+                    left -= 1;
+                    continue;
+                }
+            }
             if blocks {
                 if let Some((slot, b)) = self.block_for(rip) {
                     // Run whole only if it fits the budget (it may still exit
                     // early at a taken branch, a redirect, the target or a
                     // code write).
                     if b.ops.len() as u64 <= left && !b.has(target) {
+                        self.prof.blocks += 1;
                         let (done, stop) = self.exec_block(&b);
+                        self.prof.block_ops += done;
                         self.bcache[slot] = Some(b);
                         left -= done;
                         if let Some(s) = stop {
@@ -695,6 +1341,7 @@ impl Emulator {
                     self.bcache[slot] = Some(b);
                 }
             }
+            self.prof.single += 1;
             if let Err(s) = self.step() {
                 return s;
             }
@@ -795,6 +1442,25 @@ impl Emulator {
                 && t.rip == j.a.v;
             b.ops[i].fj = fuse;
         }
+        // A `Jcc` is pairable with the nearest preceding op that WRITES flags,
+        // not merely the adjacent one: VMProtect puts a direct `jmp` (and other
+        // flag-neutral junk) between the producer and the consumer, so adjacency
+        // alone finds almost none of them.
+        for i in 1..b.ops.len() {
+            if b.ops[i].kind != K::Jcc {
+                continue;
+            }
+            for j in (0..i).rev() {
+                let k = b.ops[j].kind;
+                if k == K::Slow {
+                    break;
+                }
+                if flag_def(k).is_some() || matches!(k, K::AdcSbbRR | K::AdcSbbRI | K::Cmc) {
+                    b.ops[i].pairable = flag_prod(k).is_some();
+                    break;
+                }
+            }
+        }
         mark_dead_flags(&mut b.ops);
         for p in &mut b.ops {
             p.chk = !(flag_def(p.kind).is_some() || matches!(p.kind, K::AdcSbbRR | K::AdcSbbRI | K::Cmc));
@@ -821,12 +1487,15 @@ impl Emulator {
             self.cur.0 = rip;
             let next = rip.wrapping_add(u64::from(p.len));
             let r = if p.kind == K::Slow {
+                self.prof.slow += 1;
+                self.prof.slow_mn[p.mn as usize & 2047] += 1;
                 self.cpu.rip = rip;
                 self.cur.1 = p.mn;
                 self.steps = base + i as u64;
                 let ins = b.slow[p.t as usize];
                 self.exec(&ins, next).map_err(Box::new)
             } else {
+                self.prof.fast += 1;
                 self.exec_fast(p, next)
             };
             let nr = match r {
@@ -848,6 +1517,7 @@ impl Emulator {
                 }
                 if p.fj {
                     // Direct `jmp` right after this op, run without a dispatch.
+                    self.prof.fused_jumps += 1;
                     let j = &ops[i];
                     let to = j.a.v;
                     let jnext = next.wrapping_add(u64::from(j.len));
@@ -1316,6 +1986,29 @@ impl Emulator {
         }
     }
 
+    /// Two-operand `imul r, r`: the same `alu::imul_n` and flag application the
+    /// generic path uses, with the operands already resolved.
+    #[inline(always)]
+    fn imul_rr(&mut self, p: &Pre) {
+        let a = self.rreg(&p.a);
+        let b = self.rreg(&p.b);
+        let (r, fl) = alu::imul_n(a, b, u32::from(p.n));
+        self.wreg(&p.a, r);
+        self.apply(fl);
+    }
+
+    /// Two-operand `imul r, m`.
+    #[inline(always)]
+    fn imul_rm(&mut self, p: &Pre) -> Result<(), Trap> {
+        let a = self.rreg(&p.a);
+        let ea = self.ea_of(&p.b);
+        let b = self.load(ea, u32::from(p.n))?;
+        let (r, fl) = alu::imul_n(a, b, u32::from(p.n));
+        self.wreg(&p.a, r);
+        self.apply(fl);
+        Ok(())
+    }
+
     #[inline(always)]
     fn alu_rm<const OP: u8, const W: bool>(&mut self, p: &Pre) -> Result<(), Trap> {
         let a = self.rreg(&p.a);
@@ -1425,6 +2118,8 @@ impl Emulator {
                 let a = self.ea_of(&p.b);
                 self.wdst(&p.a, p.n, a);
             }
+            K::ImulRR => self.imul_rr(p),
+            K::ImulRM => self.imul_rm(p)?,
             K::AddRR => self.alu_rr::<0, true>(p),
             K::AddRI => self.alu_ri::<0, true>(p),
             K::AddRM => self.alu_rm::<0, true>(p)?,
@@ -1553,6 +2248,10 @@ impl Emulator {
                 return Ok(t);
             }
             K::Jcc => {
+                self.prof.jcc_total += 1;
+                if p.pairable {
+                    self.prof.cmp_jcc_pairs += 1;
+                }
                 let und = self.cpu.undef_flags & u64::from(p.m);
                 if und != 0 {
                     return Err(Box::new(Stop::UndefinedFlags { rip: self.cur.0, mask: und }));
@@ -2504,6 +3203,9 @@ mod tests {
             0x50, 0x51, 0x58, 0x59, 0xc3, 0xc7, 0xc6, 0x88, 0x8a, 0xf8, 0xf9, 0xf5, 0x9c, 0x98,
             0x99, 0xa9, 0xa8, 0xc0, 0xd0, 0x87, 0x0f, 0xc1, 0xc8, 0xbc, 0xbd, 0xa3, 0xab, 0xba,
             0x00, 0x04, 0x24, 0x44, 0x80, 0x84, 0x05, 0x15, 0x1d, 0xe8, 0xe9, 0x6a, 0x68, 0xb8,
+            // `imul`: 0F AF (two-operand, now on the fast path) and 69/6B (the
+            // three-operand forms, which must still take the generic path).
+            0xaf, 0x69, 0x6b,
         ];
         let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut mem = Memory::new();

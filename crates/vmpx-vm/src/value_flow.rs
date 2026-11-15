@@ -1461,6 +1461,7 @@ fn cpuid_flow(
 }
 
 fn pop_flags_flow(
+    trace: &DirectJumpTrace,
     active: &[&DecodedInstruction],
     summary: &HandlerEffectSummary,
 ) -> Option<(Rva, Rva, String)> {
@@ -1468,14 +1469,16 @@ fn pop_flags_flow(
         return None;
     };
     let restore_index = instruction_index(active, *restore)?;
+    if active[restore_index].instruction.mnemonic() != Mnemonic::Popfq {
+        return None;
+    }
     let push_index = restore_index.checked_sub(1)?;
     let push = &active[push_index].instruction;
-    if active[restore_index].instruction.mnemonic() != Mnemonic::Popfq
-        || push.mnemonic() != Mnemonic::Push
+    if push.mnemonic() != Mnemonic::Push
         || push.op0_kind() != OpKind::Register
         || push.op0_register().size() != 8
     {
-        return None;
+        return pop_flags_memory_push_flow(trace, active, summary, restore_index);
     }
     let register = push.op0_register();
     let definition = latest_definition(active, push_index, register)?;
@@ -1493,6 +1496,70 @@ fn pop_flags_flow(
             *restore,
             active[definition].rva,
             "the qword popped from the VM stack reaches POPFQ through a native push".to_owned(),
+        )
+    })
+}
+
+/// `push qword ptr [vsp]` straight onto the native stack, then `popfq`: the
+/// popped VM-stack qword reaches the flags with no register in between. VSP
+/// adjustments may sit between the push and the `popfq`; nothing else active may.
+fn pop_flags_memory_push_flow(
+    trace: &DirectJumpTrace,
+    active: &[&DecodedInstruction],
+    summary: &HandlerEffectSummary,
+    restore_index: usize,
+) -> Option<(Rva, Rva, String)> {
+    let restore = active[restore_index].rva;
+    let mut push_index = restore_index;
+    let push_index = loop {
+        push_index = push_index.checked_sub(1)?;
+        let rva = active[push_index].rva;
+        if !summary.vsp_adjustments.iter().any(|adjustment| adjustment.rva == rva) {
+            break push_index;
+        }
+    };
+    let push = &active[push_index];
+    let instruction = &push.instruction;
+    if instruction.mnemonic() != Mnemonic::Push
+        || instruction.op0_kind() != OpKind::Memory
+        || instruction.memory_size().size() != 8
+        || !has_plain_memory_address(instruction)
+        || instruction.memory_displacement64() != 0
+        || canonical(instruction.memory_base()) == Register::RSP
+        || unique_effect_rva(summary, HandlerMemoryRegion::VmStack, 0, BitWidth::W64, true, false)
+            != Some(push.rva)
+        || !effect_has_entry_displacement(summary, push.rva, 0)
+    {
+        return None;
+    }
+    // Every raw instruction between the push and the popfq (dead ones included)
+    // must leave the native stack top untouched: no memory write, no stack-pointer
+    // change.
+    let mut factory = InstructionInfoFactory::new();
+    let mut between = trace
+        .instructions()
+        .skip_while(|decoded| decoded.rva != push.rva)
+        .skip(1)
+        .take_while(|decoded| decoded.rva != restore);
+    let clean = between.all(|decoded| {
+        let instruction = &decoded.instruction;
+        instruction.stack_pointer_increment() == 0
+            && !writes_register(&mut factory, instruction, Register::RSP)
+            && !factory.info(instruction).used_memory().iter().any(|used| {
+                matches!(
+                    used.access(),
+                    iced_x86::OpAccess::Write
+                        | iced_x86::OpAccess::CondWrite
+                        | iced_x86::OpAccess::ReadWrite
+                        | iced_x86::OpAccess::ReadCondWrite
+                )
+            })
+    });
+    clean.then(|| {
+        (
+            restore,
+            push.rva,
+            "the top VM-stack qword reaches POPFQ through a memory-operand native push".to_owned(),
         )
     })
 }
@@ -1825,7 +1892,7 @@ pub fn prove_handler_value_flow(
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
             VmHandlerSemantic::Cpuid => cpuid_flow(&active, summary)
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
-            VmHandlerSemantic::PopFlags => pop_flags_flow(&active, summary)
+            VmHandlerSemantic::PopFlags => pop_flags_flow(trace, &active, summary)
                 .map(|(producer, consumer, evidence)| (Some(producer), consumer, evidence)),
             VmHandlerSemantic::Push if width != BitWidth::W64 => {
                 narrow_vsp_push_flow(width, summary).map(|consumer| {

@@ -14,14 +14,17 @@ mod equivalence;
 mod expr_codegen;
 mod ir_semantics;
 mod live_in;
+mod loop_replacement;
 mod nested_entry;
 mod passthrough;
 mod replacement;
 mod rolled;
+mod segments;
 mod unroll;
 
-pub use unroll::{RegionTarget, UnrolledFunction, UnrolledPath, unroll_decoded_cfg};
-pub use rolled::{RExit, RNode, RPhi, RolledFunction, roll_decoded_cfg};
+pub use segments::{SegEnd, SegPath, SegPhi, Segment, SegmentedFunction, segment_decoded_cfg};
+pub use unroll::{RegionTarget, UnrolledFunction, UnrolledPath, unroll_decoded_cfg, unroll_decoded_cfg_with_nested};
+pub use rolled::{RExit, RNode, RPhi, RStore, RolledFunction, roll_decoded_cfg, roll_decoded_cfg_with_nested};
 pub use passthrough::{is_environment_boundary, is_native_passthrough};
 
 pub use cfg_lift::{
@@ -39,7 +42,7 @@ pub use decoded_lift::{
 pub use entry_frame::{frame_initial_state, recover_entry_frame};
 pub use effect_liveness::{
     CollectedCall, CollectedEffects, CollectedStore, EntryEffectLivenessReport,
-    PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects,
+    PathEffectLivenessReport, audit_entry_effect_liveness, collect_path_effects, last_write_epoch,
 };
 pub use equivalence::{
     Assignment, AssignmentDivergence, Divergence, ExitSemantics, Side, Verdict, VerificationReport,
@@ -58,9 +61,14 @@ pub use live_in::{
     AccessKind, EntryCallingConvention, RegisterAccess, calling_convention, infer_live_in,
 };
 pub use replacement::{
-    EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementError, build_replacement,
+    EffectCall, EffectStore, Replacement, ReplacementConfig, ReplacementContinuation,
+    NATIVE_RETURN_ADDRESS_INITIAL, ReplacementError, build_replacement,
     build_replacement_popping,
 };
+/// The VM-model symbol for the entry condition state, which a replacement
+/// captures for itself. Exported so the closedness check can admit it.
+pub use replacement::NATIVE_RFLAGS_INITIAL as ENTRY_FLAGS_SYMBOL;
+pub use loop_replacement::{build_control_flow_function, build_control_flow_replacement};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -774,7 +782,10 @@ mod tests {
             memory_tainted: true,
             image_reads_suppressed: false,
             assumed_external_disjoint_from_vm_stack: false,
+            assumed_external_disjoint_from_fresh_allocations: false,
+            assumed_indexed_store_in_bounds: false,
             served_read_only_image: false,
+            protection_may_have_changed: false,
             vm_stack_address_escapes: false,
             vm_stack_derived_escapes: false,
             vm_stack_pointer_lost: false,

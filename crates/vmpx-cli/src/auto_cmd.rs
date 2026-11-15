@@ -71,6 +71,9 @@ fn is_protector_section(name: &str) -> bool {
         ".text", ".data", ".rdata", ".idata", ".edata", ".pdata", ".xdata",
         ".bss", ".tls", ".reloc", ".rsrc", ".eh_fram", ".crt", ".gfids",
         ".giats", ".00cfg", ".sxdata", ".debug", ".ndata", ".didat", ".drectve",
+        // MSVC read-only data (e.g. jump/function tables under /Gy); not a dot
+        // section, so it would otherwise be mistaken for a protector section.
+        "_RDATA",
     ];
     if name.starts_with(".vmp") {
         return true;
@@ -95,7 +98,16 @@ struct Targets {
 /// The opaque protector sections -- VM runtime, bytecode, the rebuilt IAT -- are
 /// not pure code and stay removable.
 fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
-    const PURE_CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    // Pure executable code: CODE | EXECUTE | READ set, and crucially neither
+    // writable nor INITIALIZED_DATA -- the opaque protector sections (VM runtime,
+    // bytecode) carry the data bit or are writable, while a renamed `.text` does
+    // not. Matched by mask, not exact equality: VMProtect copies the real `.text`
+    // characteristics verbatim, which on some binaries carry extra flags (e.g.
+    // NOT_PAGED, 0x0800_0000) that an exact `0x6000_0020` test rejected -- which is
+    // how A380's `.IG(` (exactly `0x6000_0020`) was retained but win.xpl's `.K9-`
+    // (`0x6800_0020`, 15 MiB, 921 `.pdata` entries) was not.
+    const CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
+    const NON_CODE: u32 = 0x8000_0040; // MEM_WRITE | CNT_INITIALIZED_DATA
     const DENSE: usize = 64;
     let mut pdata: BTreeMap<usize, usize> = BTreeMap::new();
     for function in &pe.report().exception_functions {
@@ -107,12 +119,28 @@ fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
             *pdata.entry(section.index).or_default() += 1;
         }
     }
+    // A small, read-only, non-executable protector section is application
+    // read-only data left in place (a jump table, or the string table the app's
+    // `lea`s point at); the application references it where it sits, so removing
+    // it only strands those references. The multi-MB VM runtime is executable and
+    // so excluded, and writable sections (live VM state) are too.
+    const READ: u32 = 0x4000_0000;
+    const EXECUTE: u32 = 0x2000_0000;
+    const WRITE: u32 = 0x8000_0000;
+    const SMALL_DATA: u32 = 0x1_0000;
     pe.sections
         .iter()
         .filter(|s| {
-            is_protector_section(s.name.as_str())
-                && s.characteristics == PURE_CODE
-                && pdata.get(&s.index).copied().unwrap_or(0) >= DENSE
+            if !is_protector_section(s.name.as_str()) {
+                return false;
+            }
+            let code = (s.characteristics & CODE) == CODE
+                && (s.characteristics & NON_CODE) == 0
+                && pdata.get(&s.index).copied().unwrap_or(0) >= DENSE;
+            let ro_data = (s.characteristics & READ) != 0
+                && (s.characteristics & (EXECUTE | WRITE)) == 0
+                && s.virtual_size <= SMALL_DATA;
+            code || ro_data
         })
         .map(|s| s.name.as_str().to_owned())
         .collect()
@@ -942,8 +970,30 @@ pub fn run(o: Options) -> Result<(), String> {
         .iter()
         .map(|name| vmpx_pe::SectionSelector::Name(name.clone()))
         .collect();
-    let (stripped, summary) = crate::strip_wiring::strip_and_validate(&dir_bytes, &selectors, &[])
-        .map_err(|e| format!("strip refused: {e}"))?;
+    // A directory the relocator does not rebuild can sit inside a protector
+    // section VMProtect placed it in (e.g. load_config on a mutation-only binary).
+    // It is in removed protector space and is non-essential to execution, so drop
+    // each one the strip refuses over and retry. Essential directories (export,
+    // import, iat, exception, tls, basereloc) are relocated out already and
+    // app-data ones (resource, security) are not in this set, so a refusal over
+    // anything else still surfaces instead of silently dropping it.
+    // Indices: 6 debug, 7 architecture, 8 globalptr, 10 load_config, 11 bound_import.
+    const DROPPABLE_DIRS: [usize; 5] = [6, 7, 8, 10, 11];
+    let mut drop_dirs: Vec<usize> = Vec::new();
+    let (stripped, summary) = loop {
+        match crate::strip_wiring::strip_and_validate(&dir_bytes, &selectors, &drop_dirs) {
+            Ok(result) => break result,
+            Err(crate::strip_wiring::StripFailure::Refused(
+                vmpx_pe::StripError::DirectoryInRemoved { index, name, section },
+            )) if DROPPABLE_DIRS.contains(&index) && !drop_dirs.contains(&index) => {
+                log.warn(&format!(
+                    "{name} directory is in removed section {section}; dropping it (non-essential)"
+                ));
+                drop_dirs.push(index);
+            }
+            Err(e) => return Err(format!("strip refused: {e}")),
+        }
+    };
     log.step(
         "protector sections removed",
         &format!(
@@ -1295,7 +1345,14 @@ fn count_dangling(image: &[u8]) -> usize {
     };
     let base = pe.optional.image_base.0;
     let soi = pe.optional.size_of_image;
-    let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+    // The PE headers [0, size_of_headers) are mapped by the loader even though no
+    // section covers them, so a `lea reg, [rip-disp]` that computes the image base
+    // (RVA 0, ubiquitous in position-independent / mutated code) reaches mapped
+    // memory. Counting it as dangling was a false positive -- 810 of them on
+    // win.xpl alone.
+    let soh = pe.optional.size_of_headers;
+    let mapped =
+        |rva: u32| rva < soh || pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
     let mut count = 0;
     // `.pdata` bodies AND executable gaps -- a branch into removed space that
     // lives in a gap (outside any `.pdata` record) must be counted, or the
@@ -1396,131 +1453,108 @@ fn relocate_natives(
         }
     }
     let section_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
-    let mut payload: Vec<u8> = Vec::new();
-    let mut placement: BTreeMap<u64, u64> = BTreeMap::new();
-    for (start, end) in &blocks {
-        while payload.len() % 16 != 0 {
-            payload.push(0xCC);
+    let payload_base = base + u64::from(section_rva);
+    // Re-assemble every block at the relocation base with iced's block encoder.
+    // It relaxes a branch whose target landed out of range once the blocks were
+    // scattered here -- a short `jcc` between two blocks that originally sat
+    // within rel8 reach grows to the near form automatically. The old fixed-size
+    // in-place patch could not grow an instruction and refused such a move.
+    //
+    // A reference into a `.vmp` section that is not one of the relocated blocks is
+    // genuinely into removed space and unrecoverable (fail closed). Every other
+    // target BlockEncoder resolves: intra-payload by matching the branch target to
+    // a decoded instruction's IP, retained sections by its absolute address. (The
+    // `.vmp`-prefix test matches the prior behaviour; randomized protector-section
+    // names are left to the downstream dangling-reference check, as before.)
+    let in_block = |t: u64| {
+        blocks
+            .range(..=t)
+            .next_back()
+            .is_some_and(|(_, end)| t < *end)
+    };
+    let in_vmp = |t: u64| {
+        t.checked_sub(base)
+            .and_then(|v| u32::try_from(v).ok())
+            .and_then(|r| intact.sections.iter().find(|s| s.contains_mapped_rva(Rva(r))))
+            .is_some_and(|s| s.name.as_str().starts_with(".vmp"))
+    };
+    let reference_target = |ins: &iced_x86::Instruction| -> Option<u64> {
+        if matches!(
+            ins.flow_control(),
+            FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch
+        ) && ins.near_branch64() != 0
+        {
+            Some(ins.near_branch64())
+        } else if ins.memory_base() == Register::RIP {
+            Some(ins.ip_rel_memory_address())
+        } else {
+            None
         }
-        placement.insert(*start, base + u64::from(section_rva) + payload.len() as u64);
+    };
+    // Overlapping blocks (a basic block that shares a tail with another, common
+    // where control flow merges) decode the same instruction twice; the encoder
+    // needs one instruction per IP, so keep the first decode of each address. The
+    // shared bytes are identical, and a branch into them resolves to the single
+    // copy. A misaligned overlap decodes to a DIFFERENT instruction at a distinct
+    // IP, so it is kept and placed separately, exactly as the old copy-per-block
+    // path did.
+    let mut instrs: Vec<iced_x86::Instruction> = Vec::new();
+    let mut seen_ip: BTreeSet<u64> = BTreeSet::new();
+    for (start, end) in &blocks {
         let rva = u32::try_from(start - base).unwrap_or(0);
         let off = intact
             .rva_to_file_offset(Rva(rva))
             .map_err(|e| e.to_string())?
             .0 as usize;
-        payload.extend_from_slice(
-            intact_bytes
-                .get(off..off + (end - start) as usize)
-                .ok_or("block past file")?,
-        );
-    }
-    let moved = |va: u64| -> Option<u64> {
-        let (start, end) = blocks.range(..=va).next_back()?;
-        (va < *end).then(|| placement[start] + (va - start))
-    };
-    // Fix every rel32/RIP displacement pointing back into the component.
-    for (start, end) in &blocks {
-        let new_start = placement[start];
-        let len = (end - start) as usize;
-        let at = (new_start - base - u64::from(section_rva)) as usize;
-        let mut cursor = 0;
-        while cursor < len {
-            let window = &payload[at + cursor..at + len];
-            let ins =
-                Decoder::with_ip(64, window, start + cursor as u64, DecoderOptions::NONE).decode();
+        let window = intact_bytes
+            .get(off..off + (end - start) as usize)
+            .ok_or("block past file")?;
+        let mut decoder = Decoder::with_ip(64, window, *start, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let ins = decoder.decode();
             if ins.is_invalid() {
                 break;
             }
-            let size = ins.len();
-            let target = if matches!(
-                ins.flow_control(),
-                FlowControl::Call
-                    | FlowControl::UnconditionalBranch
-                    | FlowControl::ConditionalBranch
-            ) && ins.near_branch64() != 0
+            if let Some(t) = reference_target(&ins)
+                && !in_block(t)
+                && in_vmp(t)
             {
-                Some(ins.near_branch64())
-            } else if ins.memory_base() == Register::RIP {
-                Some(ins.ip_rel_memory_address())
-            } else {
-                None
-            };
-            // The absolute address the reference must still reach after the
-            // move. A target that moved with the component follows it. A target
-            // in a RETAINED section stays put -- but a rel32/RIP displacement is
-            // measured from the instruction, which DID move, so it must be
-            // recomputed to the same address or it would shift by the move
-            // delta. Only a reference into removed `.vmp` space is unrecoverable.
-            let destination = match target {
-                Some(t) if moved(t).is_some() => moved(t),
-                Some(t) => {
-                    let section = t
-                        .checked_sub(base)
-                        .and_then(|v| u32::try_from(v).ok())
-                        .and_then(|r| {
-                            intact
-                                .sections
-                                .iter()
-                                .find(|s| s.contains_mapped_rva(Rva(r)))
-                        });
-                    match section {
-                        // Not covered (moved was None), so a `.vmp` target is
-                        // genuinely in removed space.
-                        Some(s) if s.name.as_str().starts_with(".vmp") => {
-                            return Err(format!(
-                                "component references removed space at {start:#x}"
-                            ));
-                        }
-                        // Retained section: rebase the displacement to the same
-                        // address from the instruction's new location.
-                        Some(_) => Some(t),
-                        // Unmapped immediate/scratch: nothing to rebase.
-                        None => None,
-                    }
-                }
-                None => None,
-            };
-            if let Some(nt) = destination {
-                let new_ip = new_start + cursor as u64;
-                let next = new_ip + size as u64;
-                let value = i32::try_from(nt.cast_signed() - next.cast_signed())
-                    .map_err(|_| "rel32 out of range")?;
-                let branch = ins.near_branch64() != 0;
-                let slot = &mut payload[at + cursor..at + cursor + size];
-                let saved = slot.to_vec();
-                let mut ok = false;
-                for w in 0..size.saturating_sub(3) {
-                    slot.copy_from_slice(&saved);
-                    slot[w..w + 4].copy_from_slice(&value.to_le_bytes());
-                    let re = Decoder::with_ip(64, slot, new_ip, DecoderOptions::NONE).decode();
-                    let reaches = if branch {
-                        re.near_branch64() == nt
-                    } else {
-                        re.ip_rel_memory_address() == nt
-                    };
-                    if !re.is_invalid()
-                        && re.len() == size
-                        && re.mnemonic() == ins.mnemonic()
-                        && reaches
-                    {
-                        ok = true;
-                        break;
-                    }
-                }
-                if !ok {
-                    slot.copy_from_slice(&saved);
-                    return Err(format!("cannot rebase {start:#x}+{cursor}"));
-                }
+                return Err(format!("component references removed space at {start:#x}"));
             }
-            cursor += size;
+            if seen_ip.insert(ins.ip()) {
+                instrs.push(ins);
+            }
         }
     }
-    if payload.is_empty() {
+    if instrs.is_empty() {
         // Every candidate native was skipped (all incomplete): nothing to
         // relocate, so append no section. Their `.text` references then dangle
         // and the dangling-ref check refuses the write, fail-closed.
         return Ok((stripped.to_vec(), BTreeMap::new()));
     }
+    let block = iced_x86::InstructionBlock::new(&instrs, payload_base);
+    let encoded = iced_x86::BlockEncoder::encode(
+        64,
+        block,
+        iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+    )
+    .map_err(|e| format!("relocation re-encode: {e}"))?;
+    let payload = encoded.code_buffer;
+    // Map each instruction's original IP to where the encoder placed it, so a
+    // `.text` reference to any relocated entry (a block start) resolves to its new
+    // address. Block starts are instruction starts, so every seed is covered.
+    let mut moved_ip: BTreeMap<u64, u64> = BTreeMap::new();
+    for (index, ins) in instrs.iter().enumerate() {
+        if let Some(off) = encoded
+            .new_instruction_offsets
+            .get(index)
+            .copied()
+            .filter(|o| *o != u32::MAX)
+        {
+            moved_ip.insert(ins.ip(), payload_base + u64::from(off));
+        }
+    }
+    let moved = |va: u64| -> Option<u64> { moved_ip.get(&va).copied() };
     let rebuilt = append_section(
         stripped,
         AppendSection {

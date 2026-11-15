@@ -15,7 +15,8 @@ use vmpx_vm::{
     BranchingRecoveryLimits, DomainCertificate, EntryPathRecoveryLimits, Expr, NativeExitState,
     RecoveredEntryPath, RecoveredEntryPathFamily, VmDiscoveryLimits, VmEntryCandidate,
     VmProfileExplorerLimits, X64NativeRegister, analyze_vm_entry_at, analyze_x64_native_frame,
-    is_expr_input_closed, is_input_closed, recover_branching_entry_paths, recover_entry_paths,
+    exit_closure_violation, input_closure_violation, recover_branching_entry_paths,
+    recover_entry_paths,
 };
 use vmpx_vmlift::{CollectedEffects, calling_convention, collect_path_effects};
 
@@ -38,6 +39,12 @@ pub(crate) struct InputClosedFunction {
     /// Task 3's inferred live-in registers. Informational only: it
     /// under-reports, so it never narrows `inputs`.
     pub live_in: BTreeSet<X64NativeRegister>,
+    /// True when closing this function required folding an image-backed read to
+    /// a constant, which holds only while the image's protection does. Such a
+    /// recovery rests on `AssumesImageProtectionStable` and is never PROVEN.
+    /// Recorded assumption state; not yet consumed by a reader.
+    #[allow(dead_code)]
+    pub assumes_image_protection: bool,
 }
 
 /// A virtualized function whose first virtual branch depends on its inputs and
@@ -101,15 +108,51 @@ fn memory_is_exact(family: &RecoveredEntryPathFamily, path: &RecoveredEntryPath)
         .all(|report| report.memory_havocs.is_empty() && !report.memory_tainted)
 }
 
+/// The two labeled relaxations the CFG sweep uses, as input-closure never did.
+///
+/// `report --serve-ro` takes N1 from 402 to 733 on systems.xpl, and 481 of
+/// those 733 carry `AssumesExternalStoresDisjointFromVmStack`. Input-closure
+/// re-derives each entry with `SymbolicExecutionLimits::default()`, where BOTH
+/// of those are off -- so it was refusing, as "no provably finite domain" and
+/// "exit depends on a symbol outside the replacement inputs", reads the CFG
+/// path resolves. The configurations are now the same, and an entry that used
+/// either relaxation says so in its assumption set.
+///
+/// MEASURED +0 on all 814, so it stays OPT-IN (`VMPX_CLOSURE_RELAXATIONS=1`):
+/// enabling an unproven assumption that buys nothing is a cost, not a default.
+/// The reason it buys nothing is in the diagnostics -- of the 289 entries
+/// refused as "no provably finite domain", 224 name a read whose ADDRESS is
+/// symbolic (114 Register, 110 Unary, 24 Binary) and only 22 a constant. A
+/// read-only image serve needs an address to look up; these have none.
+fn closure_symbolic_limits() -> vmpx_vm::SymbolicExecutionLimits {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VMPX_CLOSURE_RELAXATIONS").is_some());
+    vmpx_vm::SymbolicExecutionLimits {
+        serve_read_only_when_suppressed: on,
+        assume_loaded_store_addresses_disjoint: on,
+        ..vmpx_vm::SymbolicExecutionLimits::default()
+    }
+}
+
 fn recovery_limits() -> EntryPathRecoveryLimits {
+    // The same scaled caps `clean.rs` uses. This site drives input-closure and
+    // was the one hardcoded copy left unscaled when the knob was added, which
+    // is why raising it measured +0: the experiment never reached here.
+    //
+    // Note these are TIGHTER than `VmProfileExplorerLimits::default()` (64 /
+    // 4096 / 65536), so input-closure explores less than the explorer's own
+    // default before refusing "entry paths are not complete".
+    let default = EntryPathRecoveryLimits::default();
     EntryPathRecoveryLimits {
         chain: VmProfileExplorerLimits {
-            max_segments: 32,
-            max_instructions_per_segment: 2_048,
-            max_total_instructions: 8_192,
-            ..VmProfileExplorerLimits::default()
+            symbolic: closure_symbolic_limits(),
+            ..crate::clean::chain_limits()
         },
-        ..EntryPathRecoveryLimits::default()
+        entry: vmpx_vm::EntryProfileRecoveryLimits {
+            symbolic: closure_symbolic_limits(),
+            ..default.entry
+        },
+        ..default
     }
 }
 
@@ -128,40 +171,272 @@ fn entry_inputs(
     let allowed = inputs
         .into_iter()
         .map(|(name, _)| name)
+        // The entry condition state. Not an architectural GP register, so
+        // `replacement_inputs` never listed it, and a routine that preserves its
+        // caller's flags -- exit rflags == this symbol -- was refused for
+        // depending on something outside the inputs. 135 of 264 closedness
+        // refusals on systems.xpl, 125 on the rflags slot itself.
+        //
+        // The replacement DOES provide it: `build_replacement` captures it with
+        // `Operation::ReadFlags` whenever a lowered expression reads it, so
+        // admitting it here is backed by a real binding, not an assumption.
+        .chain([vmpx_vmlift::ENTRY_FLAGS_SYMBOL.to_owned()])
+        // The caller's return address, likewise provided rather than assumed:
+        // `build_replacement` captures it as an entry-stack-pointer read plus a
+        // load through it. 4 refusals on systems.xpl.
+        .chain([vmpx_vmlift::NATIVE_RETURN_ADDRESS_INITIAL.to_owned()])
         .chain(rewrites.into_keys())
         .collect();
     Ok((candidate, allowed))
 }
 
+/// `VMPX_CONCRETIZE_IMAGE=1`: fold image-backed opaque intrinsics to constants
+/// before the closedness check.
+///
+/// Opt-in for the same reason `--serve-ro` is. `concretize_with_immutable_image`
+/// states that it "deliberately does not infer memory immutability" and that a
+/// caller may treat its result as a proof "only after separately establishing
+/// that all represented memory epochs preserve the referenced image bytes".
+/// This binary imports `VirtualProtect`, so that cannot be established -- a
+/// recovery that depends on this rests on `AssumesImageProtectionStable` and can
+/// never be PROVEN.
+fn concretize_image_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VMPX_CONCRETIZE_IMAGE").is_ok_and(|value| value == "1"))
+}
+
+/// Folds image-backed opaque intrinsics in `expression` to constants, returning
+/// the rewritten expression and whether anything was resolved.
+///
+/// Resolves exactly the two shapes that dominate the closedness refusals:
+/// `memory_load_epoch_N` at a constant address, and the table-checksum
+/// recurrence. Both read bytes the file already contains, so the value is
+/// computable -- but only under image immutability, which is why the caller
+/// records the assumption.
+fn concretize(pe: &PeImage<'_>, expression: &vmpx_vm::Expr) -> (vmpx_vm::Expr, bool) {
+    if !concretize_image_reads() {
+        return (expression.clone(), false);
+    }
+    match vmpx_vm::concretize_with_immutable_image(
+        pe,
+        expression,
+        &BTreeMap::new(),
+        vmpx_vm::ImageConcretizationLimits::default(),
+    ) {
+        Ok(report) if report.resolved_intrinsics > 0 => (report.expression, true),
+        // Unresolved or over budget: keep the original and let the closedness
+        // check refuse it exactly as before.
+        _ => (expression.clone(), false),
+    }
+}
+
+/// Seeds the opaque-state probe substitutes, for the diagnostic alone.
+///
+/// MEASURED on systems.xpl (2026-11-07): of 241 exits refused for opaque state,
+/// all 241 come back VARIES, so this route recovers nothing. An earlier probe
+/// that gave every opaque term ONE shared constant reported 146 as independent
+/// and drove `recovered` 20 -> 158; that was an artefact -- a shared constant
+/// makes `checksum_a ^ checksum_b` fold to zero under every seed. The fills are
+/// per-term (see `substitute_opaque_intrinsics`) and the number collapses back
+/// to 0. The dependence on distinct integrity terms is real, so these functions
+/// are not pure functions of their inputs under any purely static reading.
+/// A wide spread matters: on systems.xpl, going from 4 fills to 7 removed 8 of
+/// 146 acceptances, so a narrow probe does produce false positives.
+const OPAQUE_STATE_FILLS: [u64; 23] = [
+    1,
+    2,
+    3,
+    u64::MAX,
+    u64::MAX - 1,
+    0x5555_5555_5555_5555,
+    0xAAAA_AAAA_AAAA_AAAA,
+    0x8000_0000_0000_0000,
+    0x0000_0000_8000_0000,
+    0x0000_0000_0000_0080,
+    0x0123_4567_89AB_CDEF,
+    0xDEAD_BEEF_CAFE_F00D,
+    0xFFFF_FFFF_0000_0000,
+    0x0000_0000_FFFF_FFFF,
+    0xFF00_FF00_FF00_FF00,
+    0x00FF_00FF_00FF_00FF,
+    0x7FFF_FFFF_FFFF_FFFF,
+    0x0F0F_0F0F_0F0F_0F0F,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0x1234_5678_9ABC_DEF0,
+    0xA5A5_A5A5_A5A5_A5A5,
+    0x3141_5926_5358_9793,
+    0x2718_2818_2845_9045,
+];
+
+/// What closing a function rested on. Each flag marks a recovery that is never
+/// PROVEN, so the tier it feeds must stay below N2.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ClosedAssumptions {
+    /// Closing required folding an image-backed read: holds only while the
+    /// image's protection does (`AssumesImageProtectionStable`).
+    pub image_protection: bool,
+}
+
 /// The native exit of `path` if it, its stores and its memory are all closed
-/// over `allowed`.
+/// over `allowed`. `assumptions` records what closing it rested on.
 fn closed_exit(
+    pe: &PeImage<'_>,
     family: &RecoveredEntryPathFamily,
     path: &RecoveredEntryPath,
     allowed: &BTreeSet<String>,
+    assumptions: &mut ClosedAssumptions,
 ) -> Result<(NativeExitState, CollectedEffects), String> {
-    let exit = path
+    let mut exit = path
         .native_exit
         .clone()
         .ok_or_else(|| "no native exit state".to_owned())?;
-    if !is_input_closed(&exit, allowed) {
-        return Err("exit depends on a symbol outside the replacement inputs".to_owned());
+    for value in exit
+        .registers
+        .values_mut()
+        .chain([&mut exit.rflags, &mut exit.return_address])
+    {
+        let (folded, resolved) = concretize(pe, value);
+        *value = folded;
+        assumptions.image_protection |= resolved;
+    }
+    // Name the TERM, not just the fact. The three causes need different work: an
+    // unbound register can be admitted by widening the replacement's input set,
+    // while a load or an opaque intrinsic cannot.
+    if let Some(why) = exit_closure_violation(&exit, allowed) {
+        // An unresolved read is an opaque `memory_load_epoch_N` intrinsic, and a
+        // replacement needs only to perform the same read, which `expr_codegen`
+        // already lowers. The epoch makes it sound: a replacement emits every
+        // store before computing any value, so a materialised read observes all
+        // of them -- which is what the VM saw exactly when the read's epoch was
+        // already at or above every store's. Reads below that keep refusing.
+        let after_every_store = vmpx_vmlift::last_write_epoch(family, path);
+        let retried = {
+            let mut candidate = exit.clone();
+            for value in candidate
+                .registers
+                .values_mut()
+                .chain([&mut candidate.rflags, &mut candidate.return_address])
+            {
+                if let Ok(materialised) =
+                    vmpx_vm::materialize_epoch_loads_from(value, after_every_store)
+                {
+                    *value = materialised;
+                }
+            }
+            candidate
+        };
+        let still_open = retried
+            .registers
+            .values()
+            .chain([&retried.rflags, &retried.return_address])
+            .find_map(|value| vmpx_vm::input_closure_violation_allowing_loads(value, allowed));
+        match still_open {
+            None => exit = retried,
+            Some(remaining) => {
+                // DIAGNOSTIC: is the dependence on opaque state SEMANTIC or only
+                // syntactic? VMProtect mixes integrity checksums and `rdtsc`
+                // into register values and cancels them out again. Substituting
+                // several fills and comparing says whether the exit actually
+                // varies. Evidence for a ceiling, never a basis for accepting.
+                let probe = |fill: u64| {
+                    let mut candidate = exit.clone();
+                    for value in candidate
+                        .registers
+                        .values_mut()
+                        .chain([&mut candidate.rflags, &mut candidate.return_address])
+                    {
+                        if let Ok(substituted) = vmpx_vm::substitute_opaque_intrinsics(value, fill)
+                        {
+                            *value = substituted;
+                        }
+                    }
+                    candidate
+                };
+                let reference = probe(0);
+                let independent = OPAQUE_STATE_FILLS
+                    .iter()
+                    .all(|fill| probe(*fill) == reference);
+                let closed_after = independent
+                    && reference
+                        .registers
+                        .values()
+                        .chain([&reference.rflags, &reference.return_address])
+                        .all(|value| input_closure_violation(value, allowed).is_none());
+                let probe_verdict = if !independent {
+                    "VARIES"
+                } else if closed_after {
+                    "INDEPENDENT-AND-CLOSED"
+                } else {
+                    "INDEPENDENT-BUT-OPEN"
+                };
+                return Err(format!(
+                    "exit depends on a symbol outside the replacement inputs: {why} \
+                     (after materialising reads at or above store epoch \
+                     {after_every_store}: {remaining}; opaque-state probe: {probe_verdict})"
+                ));
+            }
+        }
     }
     // Side effects must be closed too, and nothing may be hidden in memory the
     // exit expressions do not mention.
-    let effects = collect_path_effects(family, path);
+    let mut effects = collect_path_effects(family, path);
     if !effects.unsupported.is_empty() || !effects.calls.is_empty() {
         return Err("path has unsupported effects or native calls".to_owned());
     }
-    if !effects.stores.iter().all(|store| {
-        is_expr_input_closed(&store.address, allowed) && is_expr_input_closed(&store.value, allowed)
+    for store in &mut effects.stores {
+        let (address, address_resolved) = concretize(pe, &store.address);
+        let (value, value_resolved) = concretize(pe, &store.value);
+        store.address = address;
+        store.value = value;
+        assumptions.image_protection |= address_resolved || value_resolved;
+    }
+    if let Some(why) = effects.stores.iter().find_map(|store| {
+        input_closure_violation(&store.address, allowed)
+            .map(|w| format!("address: {w}"))
+            .or_else(|| {
+                input_closure_violation(&store.value, allowed).map(|w| format!("value: {w}"))
+            })
     }) {
-        return Err("a store depends on a symbol outside the replacement inputs".to_owned());
+        return Err(format!(
+            "a store depends on a symbol outside the replacement inputs: {why}"
+        ));
     }
     if !memory_is_exact(family, path) {
         return Err("path has memory havocs or tainted memory".to_owned());
     }
     Ok((exit, effects))
+}
+
+/// Why each path that did not reach a VM exit stopped: its chain's stop reason
+/// and the last diagnostic the explorer left. Without this a whole bucket of
+/// refusals reads only "paths are not complete", which names no cause.
+fn incomplete_paths(family: &vmpx_vm::RecoveredEntryPathFamily) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for path in family
+        .paths
+        .iter()
+        .filter(|path| path.native_exit.is_none())
+    {
+        let last = path.chain.diagnostics.last().map_or("", String::as_str);
+        parts.push(format!(
+            "{:?} after {} instruction(s) in {} segment(s){}",
+            path.chain.stop_reason,
+            path.chain.total_instructions,
+            path.chain.segments.len(),
+            if last.is_empty() {
+                String::new()
+            } else {
+                format!(" [{last}]")
+            }
+        ));
+        if parts.len() == 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        return "no path reported a stop".to_owned();
+    }
+    parts.join("; ")
 }
 
 /// Recovers `rva` as an input-closed function: an empty input domain, so the
@@ -178,9 +453,10 @@ pub(crate) fn recover_input_closed(
         return Err(ClosedFailure::BranchesOnInput);
     }
     if !family.all_paths_reach_vm_exit {
-        return Err(ClosedFailure::Rejected(
-            "entry paths are not complete".to_owned(),
-        ));
+        return Err(ClosedFailure::Rejected(format!(
+            "entry paths are not complete: {}",
+            incomplete_paths(&family)
+        )));
     }
     let [path] = family.paths.as_slice() else {
         return Err(ClosedFailure::Rejected(format!(
@@ -193,7 +469,8 @@ pub(crate) fn recover_input_closed(
             "path depends on an enumerated input".to_owned(),
         ));
     }
-    let (exit, effects) = closed_exit(&family, path, &allowed)?;
+    let mut assumptions = ClosedAssumptions::default();
+    let (exit, effects) = closed_exit(pe, &family, path, &allowed, &mut assumptions)?;
     let frame = analyze_x64_native_frame(pe, rva, DirectJumpTraceLimits::default())
         .map_err(|error| error.to_string())?;
     Ok(InputClosedFunction {
@@ -202,6 +479,7 @@ pub(crate) fn recover_input_closed(
         effects,
         inputs: allowed,
         live_in: calling_convention(&family, &frame).live_in,
+        assumes_image_protection: assumptions.image_protection,
     })
 }
 
@@ -220,19 +498,28 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
     .map_err(|error| error.to_string())?;
     let family = &guarded.family;
     if !family.domain_complete || !family.all_paths_reach_vm_exit {
-        return Err("branch paths are not complete".to_owned());
+        return Err(format!(
+            "branch paths are not complete (domain_complete={}): {}",
+            family.domain_complete,
+            incomplete_paths(family)
+        ));
     }
+    let mut assumptions = ClosedAssumptions::default();
     // The replacement evaluates the branch target to pick a path, so the guard
     // itself must be closed over the replacement's inputs.
-    if !is_expr_input_closed(&guarded.branch_target, &allowed) {
-        return Err("branch target depends on a symbol outside the replacement inputs".to_owned());
+    let (branch_target, branch_resolved) = concretize(pe, &guarded.branch_target);
+    assumptions.image_protection |= branch_resolved;
+    if let Some(why) = input_closure_violation(&branch_target, &allowed) {
+        return Err(format!(
+            "branch target depends on a symbol outside the replacement inputs: {why}"
+        ));
     }
     let mut paths = Vec::with_capacity(family.paths.len());
     for (path, target) in family.paths.iter().zip(&guarded.targets) {
         if !path.assignments.is_empty() {
             return Err("branching path was specialized by an input".to_owned());
         }
-        let (exit, effects) = closed_exit(family, path, &allowed)?;
+        let (exit, effects) = closed_exit(pe, family, path, &allowed, &mut assumptions)?;
         paths.push(BranchPath {
             target: *target,
             exit,
@@ -243,7 +530,7 @@ pub(crate) fn recover_branching(pe: &PeImage<'_>, rva: Rva) -> Result<BranchingF
         .map_err(|error| error.to_string())?;
     Ok(BranchingFunction {
         rva,
-        branch_target: guarded.branch_target.clone(),
+        branch_target,
         paths,
         domain_complete: family.domain_complete,
         inputs: allowed,
@@ -309,10 +596,19 @@ pub(crate) fn recover_input_closed_functions(
     skip: Option<Rva>,
 ) -> RecoveredFunctions {
     let mut recovered = RecoveredFunctions::default();
-    for entry in inventory
-        .iter()
-        .filter(|entry| entry.confidence >= MIN_CONFIDENCE && Some(entry.rva) != skip)
-    {
+    // Diagnostic, mirroring `report`'s knob of the same name: restrict the
+    // sweep to these entry RVAs (comma-separated hex) so one hypothesis costs
+    // seconds instead of re-deriving all 814.
+    let only: Option<Vec<u32>> = std::env::var("VMPX_ONLY_ENTRIES").ok().map(|list| {
+        list.split(',')
+            .filter_map(|rva| u32::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    });
+    for entry in inventory.iter().filter(|entry| {
+        entry.confidence >= MIN_CONFIDENCE
+            && Some(entry.rva) != skip
+            && only.as_ref().is_none_or(|keep| keep.contains(&entry.rva.0))
+    }) {
         match recover_input_closed(pe, entry.rva) {
             Ok(function) => recovered.closed.push(function),
             Err(ClosedFailure::BranchesOnInput) => match recover_branching(pe, entry.rva) {
@@ -356,6 +652,7 @@ mod tests {
             },
             inputs: BTreeSet::new(),
             live_in: BTreeSet::new(),
+            assumes_image_protection: false,
         }
     }
 

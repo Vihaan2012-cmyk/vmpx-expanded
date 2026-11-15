@@ -406,11 +406,44 @@ fn flags_are_modeled_or_marked_clobbered() {
 }
 
 #[test]
+fn pushfq_pushes_an_opaque_value_and_popfq_unknows_the_flags() {
+    // RFLAGS carries bits this lifter does not model, so the pushed value is a
+    // free term: rsp moves by 8 and the slot holds something no evaluation can
+    // pin down.
+    let sem = ok(|a| a.pushfq().unwrap());
+    assert_eq!(sem.writes.len(), 1);
+    assert_eq!(sem.writes[0].address, rsp_off(-8));
+    assert_eq!(
+        eval_with(&sem.writes[0].value, &|name| input_value(0, name)),
+        None
+    );
+
+    // `popfq` restores whatever that was, so every modeled flag is unknown and
+    // a later read of one refuses rather than inventing a value.
+    let round = ok(|a| {
+        a.pushfq().unwrap();
+        a.popfq().unwrap();
+    });
+    assert_eq!(round.regs[&Gpr::Rsp], input("rsp_in"));
+    for flag in [Flag::Cf, Flag::Pf, Flag::Af, Flag::Zf, Flag::Sf, Flag::Of] {
+        assert!(matches!(round.flags[&flag], FlagState::Clobbered), "{flag:?}");
+    }
+    assert!(matches!(
+        lift(|a| {
+            a.pushfq().unwrap();
+            a.popfq().unwrap();
+            a.adc(rax, rcx).unwrap();
+        }),
+        Err(LiftError::Unsupported { .. })
+    ));
+}
+
+#[test]
 fn unmodeled_instructions_fail_closed_naming_the_instruction() {
     type Case = (&'static str, Box<dyn FnOnce(&mut CodeAssembler)>);
     let cases: Vec<Case> = vec![
         ("cpuid", Box::new(|a| a.cpuid().unwrap())),
-        ("pushfq", Box::new(|a| a.pushfq().unwrap())),
+        ("rdtsc", Box::new(|a| a.rdtsc().unwrap())),
     ];
     for (name, build) in cases {
         match lift(build) {
@@ -803,16 +836,22 @@ fn cmov_setcc_read_entry_flags_fold_constants_and_fail_closed() {
         sem.regs[&Gpr::Rdx],
         zext64(trunc(Width::W32, input("rcx_in")))
     );
-    let cmov = lift(|a| {
+    // `shl` clobbers CF, so `cmovb` SELECTS on a flag whose computation was not
+    // modeled. That is a selection, not a branch: the condition becomes a free
+    // term and the block lifts, with a destination no evaluation can pin down.
+    // Control flow is untouched -- a conditional jump on a clobbered flag still
+    // fails closed.
+    let get = |name: &str| input_value(0, name);
+    let cmov = ok(|a| {
         a.shl(eax, 1).unwrap();
         a.cmovb(ebx, ecx).unwrap();
     });
-    assert!(matches!(cmov, Err(LiftError::Unsupported { .. })));
-    let set = lift(|a| {
+    assert_eq!(eval_with(&cmov.regs[&Gpr::Rbx], &get), None);
+    let set = ok(|a| {
         a.shl(eax, 1).unwrap();
         a.sete(dl).unwrap();
     });
-    assert!(matches!(set, Err(LiftError::Unsupported { .. })));
+    assert_eq!(eval_with(&set.regs[&Gpr::Rdx], &get), None);
 }
 
 fn wide_mul_ref(bits: u32, signed: bool, a: u64, b: u64) -> (u64, u64) {
@@ -1114,14 +1153,28 @@ fn loads_forward_from_a_wider_store_and_skip_disjoint_ranges() {
     }
     assert_eq!(sem.reads.len(), 1);
     assert!(!sem.assumes_stack_disjoint);
-    // straddles the end of the store: still unprovable
-    assert!(matches!(
-        lift(|a| {
-            a.mov(dword_ptr(rcx), edx).unwrap();
-            a.mov(rax, qword_ptr(rcx)).unwrap();
-        }),
-        Err(LiftError::MemoryAliasing { .. })
-    ));
+    // A load that CONTAINS a store is composed from several writes rather than
+    // refused. With the high half also stored, every byte is known, so the
+    // result is checkable -- this is VMProtect's `push r; xor [rsp],e32; pop r`
+    // idiom, where an 8-byte load sits over a 4-byte store.
+    let sem = ok(|a| {
+        a.mov(qword_ptr(rcx), rsi).unwrap();
+        a.mov(dword_ptr(rcx), edx).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+    });
+    assert!(sem.reads.is_empty());
+    for seed in SEEDS {
+        let (d, si) = (inp(seed, Gpr::Rdx), inp(seed, Gpr::Rsi));
+        assert_eq!(reg(&sem, seed, Gpr::Rax), (si & !0xFFFF_FFFF) | (d & 0xFFFF_FFFF));
+    }
+    // With the high half never written, the composition reads exactly the four
+    // bytes it is missing and nothing more.
+    let sem = ok(|a| {
+        a.mov(dword_ptr(rcx), edx).unwrap();
+        a.mov(rax, qword_ptr(rcx)).unwrap();
+    });
+    assert_eq!(sem.reads.len(), 1);
+    assert_eq!(sem.reads[0].width, Width::W32);
 }
 
 #[test]
@@ -1483,16 +1536,20 @@ fn shld_shrd_shift_in_bits_from_the_source() {
         }
     }
 
-    // A variable count on a 16-bit operand is undefined (mask admits 16..=31).
-    assert!(matches!(
-        lift(|a| a.shld(bx, cx, cl).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
-    // A constant count at/over the operand size on a 16-bit operand is undefined.
-    assert!(matches!(
-        lift(|a| a.shld(bx, cx, 20u32).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
+    // Undefined per the ISA -- a variable count on a 16-bit operand (the mask
+    // admits 16..=31), and any constant count at or over the operand size.
+    // Both now LIFT, writing an opaque term: the hardware result is some
+    // function of the operands, and a free term over-approximates every such
+    // function. `eval_with` cannot evaluate it, which is the point -- the
+    // destination holds no claimed value.
+    for sem in [
+        ok(|a| a.shld(bx, cx, cl).unwrap()),
+        ok(|a| a.shld(bx, cx, 20u32).unwrap()),
+        ok(|a| a.bswap(bx).unwrap()),
+    ] {
+        let get = |name: &str| input_value(0, name);
+        assert_eq!(eval_with(&sem.regs[&Gpr::Rbx], &get), None);
+    }
 }
 
 fn rotate_carry_ref(left: bool, bits: u32, dst: u64, cin: u64, count: u64) -> (u64, u64) {
@@ -1551,15 +1608,17 @@ fn rcl_rcr_rotate_the_operand_through_carry() {
     let noop = ok(|a| a.rcl(ebx, 0u32).unwrap());
     assert!(noop.written.is_empty());
 
-    // Fail closed: 64-bit (carry bit has no wider native width) and variable counts.
-    assert!(matches!(
-        lift(|a| a.rcl(rbx, 3u32).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
-    assert!(matches!(
-        lift(|a| a.rcr(ebx, cl).unwrap()),
-        Err(LiftError::Unsupported { .. })
-    ));
+    // The two shapes the exact path cannot express -- a 64-bit operand (the
+    // rotated value needs 65 bits) and a variable count (the modulus is
+    // width+1, so the count cannot be masked) -- are over-approximated as an
+    // unknown function of the operands rather than refused. Defined behaviour
+    // modelled loosely, so the destination is opaque but the block lifts.
+    for sem in [
+        ok(|a| a.rcl(rbx, 3u32).unwrap()),
+        ok(|a| a.rcr(ebx, cl).unwrap()),
+    ] {
+        assert_eq!(eval_with(&sem.regs[&Gpr::Rbx], &|name| input_value(0, name)), None);
+    }
     // Fail closed when the carry-in is not modeled (imul clobbers CF).
     assert!(matches!(
         lift(|a| {
@@ -1568,4 +1627,84 @@ fn rcl_rcr_rotate_the_operand_through_carry() {
         }),
         Err(LiftError::Unsupported { .. })
     ));
+}
+
+fn lift_entry_args(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftError> {
+    let mut asm = CodeAssembler::new(64).expect("assembler");
+    build(&mut asm);
+    let bytes = asm.assemble(0x1000).expect("assemble");
+    let options = LiftOptions {
+        entry_args_disjoint_from_frame: true,
+        ..LiftOptions::default()
+    };
+    lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, options)
+}
+
+#[test]
+fn an_incoming_argument_load_is_disjoint_from_an_own_frame_store_only_on_request() {
+    let build = |a: &mut CodeAssembler| {
+        a.push(rbx).unwrap();
+        a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+        a.mov(rax, qword_ptr(rdx + 8)).unwrap();
+        a.pop(rbx).unwrap();
+    };
+    assert!(matches!(lift_default(build), Err(LiftError::MemoryAliasing { .. })));
+    let sem = lift_entry_args(build).expect("lift");
+    assert!(sem.assumes_stack_disjoint);
+}
+
+#[test]
+fn the_entry_argument_relaxation_stays_closed_for_everything_else() {
+    type Build = Box<dyn Fn(&mut CodeAssembler)>;
+    let refused: Vec<(&str, Build)> = vec![
+        (
+            "argument register modified before the load",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rdx, rdi).unwrap();
+                a.mov(rax, qword_ptr(rdx + 8)).unwrap();
+            }),
+        ),
+        (
+            "non-argument base",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rax, qword_ptr(rbx + 8)).unwrap();
+            }),
+        ),
+        (
+            "indexed address",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 0x20), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx + rdi)).unwrap();
+            }),
+        ),
+        (
+            "store reaches the entry rsp",
+            Box::new(|a| {
+                a.mov(qword_ptr(rsp - 4), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+        (
+            "store through a non-argument base",
+            Box::new(|a| {
+                a.mov(qword_ptr(rbx), rsi).unwrap();
+                a.mov(rax, qword_ptr(rdx)).unwrap();
+            }),
+        ),
+    ];
+    for (name, build) in refused {
+        assert!(
+            matches!(lift_entry_args(&build), Err(LiftError::MemoryAliasing { .. })),
+            "{name}"
+        );
+    }
+}
+
+fn lift_default(build: impl FnOnce(&mut CodeAssembler)) -> Result<Sem, LiftError> {
+    let mut asm = CodeAssembler::new(64).expect("assembler");
+    build(&mut asm);
+    let bytes = asm.assemble(0x1000).expect("assemble");
+    lift_bytes_with(&NativeAlgebra, &bytes, 0x1000, LiftOptions::default())
 }

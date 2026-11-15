@@ -121,6 +121,72 @@ fn read_image_value(pe: &PeImage<'_>, address: u64, width: BitWidth) -> Option<u
     Some(width.truncate(value))
 }
 
+/// `PeImage::rva_to_file_offset` with the last-hit section cached for tight read
+/// loops. The cache is only used for a section no earlier section overlaps, where
+/// the method's first-match scan can only land on that section, so every answer
+/// equals the uncached one.
+struct ImageReader<'a, 'p> {
+    pe: &'a PeImage<'p>,
+    disjoint: Vec<bool>,
+    hint: usize,
+}
+
+impl<'a, 'p> ImageReader<'a, 'p> {
+    fn new(pe: &'a PeImage<'p>) -> Self {
+        let range = |i: usize| {
+            let section = &pe.sections[i];
+            let start = u64::from(section.virtual_address.0);
+            (start, start + u64::from(section.mapped_span()))
+        };
+        let disjoint = (0..pe.sections.len())
+            .map(|i| {
+                let (start, end) = range(i);
+                (0..i).all(|j| {
+                    let (other_start, other_end) = range(j);
+                    other_start >= end || start >= other_end
+                })
+            })
+            .collect();
+        Self { pe, disjoint, hint: 0 }
+    }
+
+    fn file_offset(&mut self, rva: Rva) -> Option<usize> {
+        let pe = self.pe;
+        if rva.0 >= pe.optional.size_of_headers {
+            if let Some(section) = pe.sections.get(self.hint)
+                && self.disjoint[self.hint]
+                && let Some(delta) = rva.0.checked_sub(section.virtual_address.0)
+                && delta < section.mapped_span()
+            {
+                if delta >= section.size_of_raw_data || section.pointer_to_raw_data.get() == 0 {
+                    return None;
+                }
+                let raw = section.pointer_to_raw_data.get().checked_add(u64::from(delta))?;
+                if raw >= u64::try_from(pe.data().len()).unwrap_or(u64::MAX) {
+                    return None;
+                }
+                return usize::try_from(raw).ok();
+            }
+            if let Some(index) = pe.sections.iter().position(|s| s.contains_mapped_rva(rva)) {
+                self.hint = index;
+            }
+        }
+        usize::try_from(pe.rva_to_file_offset(rva).ok()?.get()).ok()
+    }
+
+    fn read(&mut self, address: u64, width: BitWidth) -> Option<u64> {
+        let rva = self.pe.optional.image_base.checked_rva_of(Va(address))?;
+        let mut value = 0_u64;
+        for byte in 0..width.bytes() {
+            let rva = rva.checked_add(byte)?;
+            let offset = self.file_offset(rva)?;
+            let input = *self.pe.data().get(offset)?;
+            value |= u64::from(input) << (byte * 8);
+        }
+        Some(width.truncate(value))
+    }
+}
+
 fn checked_pointer_add(address: u64, stride: i8, index: usize) -> Option<u64> {
     let index = i64::try_from(index).ok()?;
     let delta = index.checked_mul(i64::from(stride))?;
@@ -128,6 +194,57 @@ fn checked_pointer_add(address: u64, stride: i8, index: usize) -> Option<u64> {
         address.checked_add(delta.cast_unsigned())
     } else {
         address.checked_sub(delta.unsigned_abs())
+    }
+}
+
+/// A compact shape of an expression: the leaves it actually depends on. The
+/// `Debug` tree is far too deep to read in a log line.
+fn summarize(expression: &Expr) -> String {
+    let mut registers = std::collections::BTreeSet::new();
+    let mut constants = 0usize;
+    let mut loads = 0usize;
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        match &current.kind {
+            ExprKind::Const { .. } => constants += 1,
+            ExprKind::Register { name } => {
+                registers.insert(name.clone());
+            }
+            ExprKind::Load { address } => {
+                loads += 1;
+                pending.push(address);
+            }
+            ExprKind::Intrinsic { arguments, .. } => pending.extend(arguments),
+            ExprKind::Unary { value, .. }
+            | ExprKind::Extract { value, .. }
+            | ExprKind::Resize { value, .. } => pending.push(value),
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Concat {
+                high: left,
+                low: right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+        }
+    }
+    let intrinsics = expression.intrinsic_dependencies();
+    format!(
+        "regs{registers:?} intrinsics{:?} consts={constants} loads={loads}",
+        intrinsics.iter().collect::<Vec<_>>()
+    )
+}
+
+/// Why a checksum declined, printed under `VMPX_CHECKSUM_WHY=1`. Bounded, so a
+/// whole-image run cannot flood the log.
+fn checksum_decline(reason: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    if !std::env::var("VMPX_CHECKSUM_WHY").is_ok_and(|v| v == "1") {
+        return;
+    }
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 60 {
+        eprintln!("[checksum-decline] {reason}");
     }
 }
 
@@ -144,26 +261,77 @@ fn resolve_checksum(pe: &PeImage<'_>, arguments: &[Expr], byte_limit: usize) -> 
         _snapshot,
     ] = arguments
     else {
+        checksum_decline(&format!("arity {}", arguments.len()));
         return None;
     };
-    let mut accumulator = u32::try_from(constant(accumulator)?).ok()?;
-    let pointer = constant(pointer)?;
-    let length = usize::try_from(constant(length)?).ok()?;
-    let table = constant(table)?;
-    let shift_bits = u32::try_from(constant(shift_bits)?).ok()?;
-    let shift_right = constant(shift_right)? != 0;
-    let pointer_stride = u8::try_from(constant(pointer_stride)?).ok()?.cast_signed();
-    let iteration_xor = u32::try_from(constant(iteration_xor)?).ok()?;
+    let mut accumulator = u32::try_from(constant(accumulator).or_else(|| {
+        checksum_decline("accumulator not constant");
+        None
+    })?)
+    .ok()?;
+    let pointer = constant(pointer).or_else(|| {
+        checksum_decline(&format!("pointer not constant: {}", summarize(pointer)));
+        None
+    })?;
+    let length = usize::try_from(constant(length).or_else(|| {
+        checksum_decline("length not constant");
+        None
+    })?)
+    .ok()?;
+    let table = constant(table).or_else(|| {
+        checksum_decline("table not constant");
+        None
+    })?;
+    let shift_bits = u32::try_from(constant(shift_bits).or_else(|| {
+        checksum_decline("shift_bits not constant");
+        None
+    })?)
+    .ok()?;
+    let shift_right = constant(shift_right).or_else(|| {
+        checksum_decline("shift_right not constant");
+        None
+    })? != 0;
+    let pointer_stride = u8::try_from(constant(pointer_stride).or_else(|| {
+        checksum_decline("pointer_stride not constant");
+        None
+    })?)
+    .ok()?
+    .cast_signed();
+    let iteration_xor = u32::try_from(constant(iteration_xor).or_else(|| {
+        checksum_decline("iteration_xor not constant");
+        None
+    })?)
+    .ok()?;
     if length > byte_limit || shift_bits >= 32 {
+        checksum_decline(&format!(
+            "length {length} vs limit {byte_limit}, shift_bits {shift_bits}"
+        ));
         return None;
     }
+    let mut reader = ImageReader::new(pe);
     for index in 0..length {
         let input_address = checked_pointer_add(pointer, pointer_stride, index)?;
-        let input = u8::try_from(read_image_value(pe, input_address, BitWidth::W8)?).ok()?;
+        let input = u8::try_from(
+            reader
+                .read(input_address, BitWidth::W8)
+                .or_else(|| {
+                    checksum_decline(&format!("input byte unreadable at {input_address:#x}"));
+                    None
+                })?,
+        )
+        .ok()?;
         let table_index = usize::from(accumulator.to_le_bytes()[0] ^ input);
         let table_offset = u64::try_from(table_index.checked_mul(4)?).ok()?;
         let entry_address = table.checked_add(table_offset)?;
-        let entry = u32::try_from(read_image_value(pe, entry_address, BitWidth::W32)?).ok()?;
+        let entry = u32::try_from(
+            reader
+                .read(entry_address, BitWidth::W32)
+                .or_else(|| {
+                    checksum_decline(&format!("table entry unreadable at {entry_address:#x}"));
+                    None
+                })?,
+        )
+        .ok()?;
         let shifted = if shift_right {
             accumulator.wrapping_shr(shift_bits)
         } else {
@@ -415,6 +583,135 @@ pub fn recover_modulo_image_targets(
         complete,
         diagnostics,
     })
+}
+
+/// The result of proving an expression timing-invariant.
+#[derive(Clone, Debug)]
+pub struct TimingLoadFoldReport {
+    pub expression: Expr,
+    /// 1 when the expression was proven counter-independent and rewritten with
+    /// its remainder-driven reads baked; 0 when it was left unchanged.
+    pub folded: usize,
+}
+
+/// Proves an expression independent of the timestamp counter and bakes its
+/// remainder-driven image reads to constants.
+///
+/// A guard reads `.vmp` at `base + k * (rdtsc mod divisor)` and weaves the read
+/// into a checksum pointer/length; the individual reads track the counter, but
+/// the construction is arranged so the FINAL value does not. This proves that
+/// the way [`recover_modulo_image_targets`] proves a transfer target -- it
+/// substitutes the complete remainder domain (every residue `0..divisor`),
+/// concretizes the whole expression against the intact image at each, and folds
+/// only when every residue yields the SAME expression. Unlike that routine it
+/// does not require the result be a bare constant, so an invariant value that
+/// still contains a genuine runtime load (`const + *(caller+off)`) is proven
+/// too. It rejects -- returning the expression untouched -- when the quotient or
+/// the raw counter escapes the remainder, or when any residue differs, so a
+/// folded expression is genuinely counter-independent, not assumed to be.
+///
+/// Only a single division driver is handled (one counter sample); an expression
+/// with none is returned unchanged with `folded == 0`.
+///
+/// # Errors
+/// Propagates an expression rebuild or concretization failure.
+pub fn fold_timing_invariant_loads(
+    pe: &PeImage<'_>,
+    expression: &Expr,
+    limits: ModuloImageTargetLimits,
+) -> Result<TimingLoadFoldReport, ModuloImageTargetError> {
+    let unchanged = || TimingLoadFoldReport {
+        expression: expression.clone(),
+        folded: 0,
+    };
+    let why = std::env::var("VMPX_TIMING_WHY").is_ok_and(|value| value == "1");
+
+    let drivers = expression
+        .intrinsic_dependencies()
+        .into_iter()
+        .filter(|name| name.starts_with("x86_unsigned_divide_w32_"))
+        .collect::<Vec<_>>();
+    let [driver] = drivers.as_slice() else {
+        return Ok(unchanged());
+    };
+    let mut occurrences = Vec::new();
+    collect_named_intrinsic_arguments(expression, driver, &mut occurrences);
+    let Some(first) = occurrences.first() else {
+        return Ok(unchanged());
+    };
+    if occurrences.iter().any(|candidate| candidate != first) {
+        if why {
+            eprintln!("[timing] {driver}: ambiguous driver arguments");
+        }
+        return Ok(unchanged());
+    }
+    let [high, _low, divisor] = first.as_slice() else {
+        return Ok(unchanged());
+    };
+    if first.iter().any(|argument| argument.width != BitWidth::W32) || constant(high) != Some(0) {
+        return Ok(unchanged());
+    }
+    let Some(divisor) = constant(divisor).filter(|value| *value != 0) else {
+        return Ok(unchanged());
+    };
+    if usize::try_from(divisor).ok().is_none_or(|count| count > limits.max_residues) {
+        if why {
+            eprintln!("[timing] {driver}: divisor {divisor} over residue limit");
+        }
+        return Ok(unchanged());
+    }
+
+    // The value must be selected by the remainder alone: reject if the quotient
+    // or the raw counter escapes the division.
+    let packed = Expr::concat(
+        Expr::register(BitWidth::W32, "__vmpx_div_remainder"),
+        Expr::register(BitWidth::W32, "__vmpx_div_quotient"),
+    )?;
+    let sensitivity = expression
+        .rewrite_intrinsics(&mut |_, candidate, _| (candidate == driver).then(|| packed.clone()))?;
+    if sensitivity.dependencies().contains("__vmpx_div_quotient") {
+        if why {
+            eprintln!("[timing] {driver}: value depends on the DIV quotient");
+        }
+        return Ok(unchanged());
+    }
+    if sensitivity
+        .intrinsic_dependencies()
+        .iter()
+        .any(|name| name.starts_with("read_timestamp_counter_"))
+    {
+        if why {
+            eprintln!("[timing] {driver}: raw counter escapes the remainder");
+        }
+        return Ok(unchanged());
+    }
+
+    // Substitute the complete remainder domain; fold only if every residue
+    // yields the same expression.
+    let mut canonical: Option<Expr> = None;
+    for remainder in 0..divisor {
+        let assignment =
+            BTreeMap::from([(driver.clone(), Expr::constant(BitWidth::W64, remainder << 32))]);
+        let report =
+            concretize_with_immutable_image(pe, expression, &assignment, limits.concretization)?;
+        match &canonical {
+            None => canonical = Some(report.expression),
+            Some(previous) if *previous == report.expression => {}
+            Some(_) => {
+                if why {
+                    eprintln!("[timing] {driver}: residue {remainder} differs -- counter-dependent");
+                }
+                return Ok(unchanged());
+            }
+        }
+    }
+    match canonical {
+        Some(expression) => Ok(TimingLoadFoldReport {
+            expression,
+            folded: 1,
+        }),
+        None => Ok(unchanged()),
+    }
 }
 
 /// True when every one of `len` bytes starting at `address` lies in read-only
@@ -865,5 +1162,124 @@ mod table_tests {
         let error = recover_image_table_targets(&pe, &load, ImageTableBranchLimits::default())
             .expect_err("an unproven index must fail closed");
         assert!(matches!(error, ImageTableBranchError::Domain(_)));
+    }
+
+    #[test]
+    fn image_reader_offsets_match_the_uncached_mapping() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let mut reader = ImageReader::new(&pe);
+        for raw in (0..pe.optional.size_of_image + 0x400).chain([u32::MAX - 1, u32::MAX]) {
+            let rva = Rva(raw);
+            let expected = pe
+                .rva_to_file_offset(rva)
+                .ok()
+                .and_then(|o| usize::try_from(o.get()).ok());
+            assert_eq!(reader.file_offset(rva), expected, "rva {raw:#x}");
+            assert_eq!(reader.file_offset(Rva(raw / 2)), pe.rva_to_file_offset(Rva(raw / 2)).ok().and_then(|o| usize::try_from(o.get()).ok()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use crate::BinaryOp;
+    use crate::immutable_image::tests::{RDATA_VA, two_section_pe64};
+    use vmpx_pe::PeImage;
+
+    // A W8 image read at `base + (divide(0, counter, divisor) >> 32)`: the
+    // division remainder, which a VMProtect timing guard derives from `rdtsc`,
+    // selects the read. `escape` picks the low dword (the quotient) instead, the
+    // one combination the proof must reject.
+    fn remainder_load(base: u64, divisor: u32, counter: Expr, escape: bool) -> Expr {
+        let divide = Expr::intrinsic(
+            BitWidth::W64,
+            "x86_unsigned_divide_w32_9",
+            vec![
+                Expr::constant(BitWidth::W32, 0),
+                counter,
+                Expr::constant(BitWidth::W32, u64::from(divisor)),
+            ],
+        );
+        // The division packs the remainder in the high dword and the quotient
+        // in the low one (`17/5 -> (2<<32)|3`), so the guard extracts the
+        // remainder at lsb 32; `escape` instead reads the quotient at lsb 0 --
+        // the dependency the proof must reject.
+        let lane = Expr::extract(BitWidth::W32, if escape { 0 } else { 32 }, divide).expect("lane");
+        let selector = Expr::resize(ResizeOp::ZeroExtend, BitWidth::W64, lane).expect("widen");
+        let address =
+            Expr::binary(BinaryOp::Add, Expr::constant(BitWidth::W64, base), selector).expect("addr");
+        Expr::intrinsic(BitWidth::W8, "memory_load_epoch_70", vec![address])
+    }
+
+    fn fold(pe: &PeImage<'_>, expr: &Expr) -> TimingLoadFoldReport {
+        fold_timing_invariant_loads(pe, expr, ModuloImageTargetLimits::default()).expect("fold")
+    }
+
+    #[test]
+    fn invariant_window_folds_to_the_constant() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        // `.rdata` is 0xDEAD_BEEF then zeroes, so the four bytes at RDATA_VA+4
+        // are all 0 -- identical at every residue.
+        let counter = Expr::register(BitWidth::W32, "counter");
+        let report = fold(&pe, &remainder_load(RDATA_VA + 4, 4, counter, false));
+        assert_eq!(report.folded, 1);
+        assert_eq!(report.expression, Expr::constant(BitWidth::W8, 0));
+    }
+
+    #[test]
+    fn counter_dependent_window_is_left_untouched() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        // The four bytes at RDATA_VA are EF BE AD DE -- they differ per residue,
+        // so the value genuinely tracks the counter and must not fold.
+        let counter = Expr::register(BitWidth::W32, "counter");
+        let expr = remainder_load(RDATA_VA, 4, counter, false);
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
+    }
+
+    #[test]
+    fn quotient_selected_read_is_rejected() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let counter = Expr::register(BitWidth::W32, "counter");
+        // Even an invariant window must not fold when the QUOTIENT (not the
+        // remainder) selects the read: the proof covers remainders only.
+        let expr = remainder_load(RDATA_VA + 4, 4, counter, true);
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
+    }
+
+    #[test]
+    fn escaping_raw_counter_is_rejected() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let counter = Expr::register(BitWidth::W32, "counter");
+        // The raw counter also appears OUTSIDE the division, so the value is not
+        // a pure function of the remainder.
+        let load = remainder_load(RDATA_VA + 4, 4, counter, false);
+        let rdtsc = Expr::intrinsic(BitWidth::W8, "read_timestamp_counter_3", Vec::new());
+        let expr = Expr::binary(BinaryOp::Xor, load, rdtsc).expect("xor");
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+    }
+
+    #[test]
+    fn expression_without_a_division_driver_is_unchanged() {
+        let bytes = two_section_pe64();
+        let pe = PeImage::parse(&bytes).expect("synthetic PE");
+        let expr = Expr::intrinsic(
+            BitWidth::W8,
+            "memory_load_epoch_70",
+            vec![Expr::constant(BitWidth::W64, RDATA_VA)],
+        );
+        let report = fold(&pe, &expr);
+        assert_eq!(report.folded, 0);
+        assert_eq!(report.expression, expr);
     }
 }

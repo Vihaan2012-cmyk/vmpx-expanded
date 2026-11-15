@@ -1,11 +1,9 @@
-/target/
-/crates/*/target/
-/artifacts/
-*.pdb
-
-.superpowers/
-
-.claude/settings.local.json
-
-# z3 bundled build trace (local artifact)
-crates/vmpx-verify/.z3-trace
+.claude/worktrees/
+out/
+out*/
+target/
+target_*/
+autoout*/
+tgt_*/
+tmp_*/
+dumps/

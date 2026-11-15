@@ -64,7 +64,7 @@ fn config() -> HandlerCodecRecoveryConfig {
 }
 
 /// How the fixture's shared postlude and dispatch head are shaped.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct Variant {
     /// `cmp rax, rcx` instead of comparing the VSP.
@@ -276,7 +276,10 @@ fn inexact_postlude_shapes_are_not_recognized() {
     for variant in variants {
         let fixture = build(&HandlerBody::Add16, variant);
         let report = recover(&fixture, fixture.handler);
-        assert!(report.dispatch_analysis.candidates.is_empty());
+        assert!(
+            report.dispatch_analysis.candidates.is_empty(),
+            "{variant:?} must not recover a codec"
+        );
         assert_eq!(report.status, RecoveryStatus::Failed);
     }
 }

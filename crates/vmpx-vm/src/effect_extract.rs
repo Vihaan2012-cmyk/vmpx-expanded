@@ -79,6 +79,18 @@ pub struct HandlerEffectSummary {
     pub resets_key_from_vip: bool,
     pub reinitializes_handler_base: bool,
     pub arithmetic_operations: Vec<String>,
+    /// Diagnostic companion to `arithmetic_operations`: each op's slice
+    /// disposition. `LiveDependency` means its result is PROVEN to reach a
+    /// live-out register; `ConservativeMemory`/`ConservativeBarrier` mean only
+    /// that it could not be proven dead. The semantic gates require this list to
+    /// be empty, so which of those two it is decides whether the gate is tight
+    /// or merely imprecise.
+    pub arithmetic_dispositions: Vec<String>,
+    /// Canonical destination register of each `arithmetic_operations` entry, so
+    /// a semantic gate can reason about WHERE the value goes instead of only
+    /// whether the op exists. The ops are all live (see
+    /// `arithmetic_dispositions`), so liveness alone decides nothing.
+    pub arithmetic_destinations: Vec<String>,
     pub resize_operations: Vec<HandlerResizeEffect>,
     pub timestamp_counter_reads: Vec<Rva>,
     /// Stores of the low bytes of the pre-adjustment VSP to the VM stack top.
@@ -434,6 +446,8 @@ pub fn extract_handler_effects_keyed(
     let mut zero_registers = BTreeSet::new();
     let mut final_handler_base_is_static = false;
     let mut arithmetic_operations = Vec::new();
+    let mut arithmetic_dispositions = Vec::new();
+    let mut arithmetic_destinations = Vec::new();
     let mut resize_operations = Vec::new();
     let mut timestamp_counter_reads = Vec::new();
     let mut narrow_vsp_pushes = Vec::new();
@@ -614,6 +628,12 @@ pub fn extract_handler_effects_keyed(
                 .any(|role| role == canonical(instruction.op0_register())))
         {
             arithmetic_operations.push(format!("{:?}", instruction.mnemonic()));
+            arithmetic_dispositions.push(format!("{disposition:?}"));
+            arithmetic_destinations.push(if instruction.op0_kind() == OpKind::Register {
+                format!("{:?}", canonical(instruction.op0_register()))
+            } else {
+                "memory-or-implicit".to_owned()
+            });
         }
         let resize_operation = match instruction.mnemonic() {
             Mnemonic::Movzx => Some(ResizeOp::ZeroExtend),
@@ -723,6 +743,8 @@ pub fn extract_handler_effects_keyed(
         resets_key_from_vip,
         reinitializes_handler_base: final_handler_base_is_static,
         arithmetic_operations,
+        arithmetic_dispositions,
+        arithmetic_destinations,
         resize_operations,
         timestamp_counter_reads,
         narrow_vsp_pushes,
@@ -1696,11 +1718,32 @@ pub fn classify_handler_effects(
     {
         add_candidate(VmHandlerSemantic::Cpuid, Some(BitWidth::W32));
     }
+    // Arithmetic whose every destination is RCX cannot change what the leaf-only
+    // CPUID semantic models. `cpuid` reads ECX as its subleaf, so such an op IS
+    // live (see `handler_slice`'s
+    // `a_write_before_cpuid_stays_live_because_cpuid_reads_ecx`) -- but the
+    // semantic already treats that subleaf as a FRESH OPAQUE input and the four
+    // result dwords as opaque CPU-dependent intrinsics parameterized on it. A
+    // different subleaf therefore yields a different unknown, not a known value,
+    // so the recovered semantic is identical either way. RCX is not in
+    // `live_out_registers` for handler recovery ([vsp, handler, vip,
+    // rolling_key]), and `cpuid` redefines it, so the subleaf is its only live
+    // use inside the handler.
+    //
+    // Measured on systems.xpl: this is the whole reason three PROVEN virtualized
+    // functions stall. Each handler is the exact leaf-only shape -- leaf read at
+    // VmStack+0, vsp_delta -12, four dword results -- carrying one MBA write to
+    // RCX right before the `cpuid` (`ror cl,cl`, `and rcx,rbp`, `neg ch`).
+    let arithmetic_only_feeds_cpuid_subleaf = !summary.arithmetic_destinations.is_empty()
+        && summary
+            .arithmetic_destinations
+            .iter()
+            .all(|destination| destination == "RCX");
     if ordinary_operandless
         && !other_read
         && !other_write
         && !summary.captures_native_flags_to_vsp
-        && summary.arithmetic_operations.is_empty()
+        && (summary.arithmetic_operations.is_empty() || arithmetic_only_feeds_cpuid_subleaf)
         && is_cpuid_leaf_only
         && stack_effect_count == 5
         && other_effect_count == 0
@@ -1963,6 +2006,29 @@ pub fn classify_handler_effects(
             "multiple semantic candidates match the normalized effects: {candidates:?}"
         ));
     }
+    if candidates.is_empty() {
+        // `Unknown` says only that nothing matched. Every gate above is a
+        // conjunction of a handful of shape predicates, so recording their values
+        // names the clause that refused instead of leaving the next reader to
+        // re-derive it from the handler body. Measured need: the systems.xpl
+        // handlers whose dispatch codecs now recover still stop at "semantic
+        // effects remain unknown", with nothing to say which clause failed.
+        evidence.push(format!(
+            "no semantic candidate matched: stack_effects={stack_effect_count}              context_effects={context_effect_count} bytecode_effects={bytecode_effect_count}              other_effects={other_effect_count} other_read={other_read}              other_write={other_write} ordinary_operandless={ordinary_operandless}              arithmetic_ops={} flags_to_vsp={} is_cpuid={is_cpuid}              is_cpuid_leaf_only={is_cpuid_leaf_only} vsp_delta={:?}              operand_width={operand_width:?}",
+            // The NAMES, not just the count. Every one of these handlers matches
+            // the cpuid-leaf-only shape except for `arithmetic_operations`, and
+            // deciding whether that op is load-bearing or obfuscation needs to
+            // know which op it is.
+            format_args!(
+                "{}{:?}{:?}",
+                summary.arithmetic_operations.len(),
+                summary.arithmetic_operations,
+                summary.arithmetic_dispositions
+            ),
+            summary.captures_native_flags_to_vsp,
+            summary.vsp_delta,
+        ));
+    }
     evidence.extend(summary.diagnostics.iter().cloned());
     VmHandlerAnalysis {
         entry,
@@ -2021,6 +2087,7 @@ mod tests {
                 instructions,
                 next_fragment: None,
             }],
+            conditional_continuations: Vec::new(),
             stop: DirectJumpTraceStop {
                 kind: DirectJumpTraceStopKind::IndirectBranch,
                 at: stop_at,
@@ -4068,6 +4135,42 @@ mod tests {
         let analysis = assert_class(pop_flags(rdx), VmHandlerSemantic::PopFlags, BitWidth::W64);
         assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
         assert_unknown(pop_flags(rcx));
+    }
+
+    fn pop_flags_memory_push(clobber: bool) -> impl FnOnce(&mut CodeAssembler) {
+        move |a| {
+            a.push(qword_ptr(r11)).expect("push the top VM-stack qword");
+            a.add(r11, 8).expect("pop");
+            if clobber {
+                a.mov(qword_ptr(rsp), rax).expect("clobber the native stack top");
+            }
+            a.popfq().expect("restore flags");
+        }
+    }
+
+    #[test]
+    fn classifies_popfq_through_a_memory_operand_push() {
+        let analysis = assert_class(
+            pop_flags_memory_push(false),
+            VmHandlerSemantic::PopFlags,
+            BitWidth::W64,
+        );
+        assert_eq!(analysis.flags_effect, EffectKnowledge::Modified);
+        assert_unknown(pop_flags_memory_push(true));
+    }
+
+    #[test]
+    fn rejects_popfq_through_a_memory_push_of_a_non_top_cell() {
+        assert_unknown(|a| {
+            a.push(qword_ptr(r11 + 8)).expect("push the second VM-stack qword");
+            a.add(r11, 8).expect("pop");
+            a.popfq().expect("restore flags");
+        });
+        assert_unknown(|a| {
+            a.add(r11, 8).expect("pop first");
+            a.push(qword_ptr(r11)).expect("push the cell above the popped one");
+            a.popfq().expect("restore flags");
+        });
     }
 
     #[test]

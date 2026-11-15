@@ -31,7 +31,7 @@ pub use import_stubs::{
 };
 pub use native_expr::{NativeAlgebra, NativeExpr, NativeNode};
 pub use native_lift::{
-    Algebra, AlgebraError, BinOp, BlockSemantics, Flag, FlagState, Gpr, LiftError, LiftOptions,
+    Algebra, AlgebraError, BinOp, BlockSemantics, DeferredAlias, Flag, FlagState, Gpr, LiftError, LiftOptions,
     MemoryRead, MemoryWrite, Resize, UnOp, Width, lift_block, lift_block_with, lift_bytes,
     lift_bytes_with,
 };

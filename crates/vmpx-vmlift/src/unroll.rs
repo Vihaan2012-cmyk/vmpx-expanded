@@ -13,12 +13,14 @@
 //! either is an error, never a partial result.
 
 use vmpx_vm::{
-    BlockExit, CfgEdgeKind, Expr, ExprKind, NativeExitState, SymbolicExecutionLimits,
+    BlockExit, CfgEdgeKind, Expr, ExprKind, NativeExitState, NativeFrameSource, SymbolicExecutionLimits,
     SymbolicVmInitialState, VmHandlerSemantic, execute_symbolic_linear_block_with_initial_state,
 };
 use vmpx_pe::Va;
 
+use crate::cfg_lift::compose_nested_state;
 use crate::decoded_lift::{RecoveredExit, first_unliftable, recover_exit};
+use crate::nested_entry::NestedEntryResolver;
 use crate::entry_frame::frame_initial_state;
 use crate::{CollectedEffects, CollectedStore, DecodedCfgInput, ExitSemantics, PathCondition};
 
@@ -73,6 +75,7 @@ pub struct UnrolledFunction {
 
 struct Walker<'a, 'b> {
     input: &'a DecodedCfgInput<'b>,
+    nested: Option<&'a dyn NestedEntryResolver>,
     max_blocks: usize,
     max_paths: usize,
     blocks: usize,
@@ -102,6 +105,23 @@ pub fn unroll_decoded_cfg(
     max_blocks: usize,
     max_paths: usize,
 ) -> Result<UnrolledFunction, String> {
+    unroll_decoded_cfg_with_nested(input, None, max_blocks, max_paths)
+}
+
+/// [`unroll_decoded_cfg`] that also follows `NestedEntry` edges the resolver
+/// proves: the exit's native state is composed into the nested entry's frame
+/// (as the CFG lift does) and the walk continues inline. An edge the resolver
+/// cannot prove keeps the old refusal.
+///
+/// # Errors
+/// As [`unroll_decoded_cfg`]; additionally a nested entry that does not match the
+/// CFG's nested block or whose state cannot be composed.
+pub fn unroll_decoded_cfg_with_nested(
+    input: &DecodedCfgInput<'_>,
+    nested: Option<&dyn NestedEntryResolver>,
+    max_blocks: usize,
+    max_paths: usize,
+) -> Result<UnrolledFunction, String> {
     if !input.cfg.is_complete() {
         let why = input
             .cfg
@@ -113,6 +133,7 @@ pub fn unroll_decoded_cfg(
     let (state, _) = frame_initial_state(input.frame, input.top_offset);
     let mut walker = Walker {
         input,
+        nested,
         max_blocks,
         max_paths,
         blocks: 0,
@@ -139,7 +160,18 @@ pub fn unroll_decoded_cfg(
         entry_sp_offset: i64::try_from(input.top_offset)
             .unwrap_or(i64::MAX)
             .saturating_add(i64::try_from(input.frame.len() * 8).unwrap_or(i64::MAX)),
-        notes: Vec::new(),
+        notes: if input
+            .frame
+            .iter()
+            .any(|cell| matches!(cell, NativeFrameSource::RelocatedConstant { .. }))
+        {
+            vec![
+                "preferred-base frame: relocated entry-stub immediates taken at their on-disk value (relocation delta 0)"
+                    .to_owned(),
+            ]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -149,7 +181,18 @@ impl Walker<'_, '_> {
         let mut out: Vec<(u64, Va)> = Vec::new();
         for edge in &cfg.edges {
             if edge.from != key
-                || !matches!(edge.kind, CfgEdgeKind::Branch | CfgEdgeKind::GuardedBranch)
+                || !matches!(
+                    edge.kind,
+                    // A profile transition IS this block's successor: the
+                    // unconditional-branch handler pops a target and the VM
+                    // continues there under a different register profile. The
+                    // rolled frontend has counted it as one all along; leaving
+                    // it out here made the transition block's own target "not a
+                    // recovered successor".
+                    CfgEdgeKind::Branch
+                        | CfgEdgeKind::GuardedBranch
+                        | CfgEdgeKind::ProfileTransition
+                )
             {
                 continue;
             }
@@ -190,7 +233,20 @@ impl Walker<'_, '_> {
             if let Some((index, semantic, reason)) = first_unliftable(&block.instructions) {
                 return Err(format!("block {key} instruction {index} ({semantic:?}): {reason}"));
             }
-            let boundary = match block.exit {
+            // Same case `rolled.rs` handles: `BlockExit` has no variant for a
+            // cross-profile transition, so the block records as `Stalled` while
+            // the CFG carries its outgoing `ProfileTransition` edge and the
+            // graph is complete through it. The edge's own documentation says
+            // what it is -- an unconditional-branch handler pops a target off
+            // the VM stack and the VM continues under a proven-different
+            // register profile -- so it is executed as exactly that.
+            let transition = block.exit == BlockExit::Stalled
+                && input
+                    .cfg
+                    .edges
+                    .iter()
+                    .any(|edge| edge.from == key && edge.kind == CfgEdgeKind::ProfileTransition);
+            let boundary = match if transition { BlockExit::Branch } else { block.exit } {
                 BlockExit::VmExit => VmHandlerSemantic::VmExit,
                 BlockExit::Branch => VmHandlerSemantic::UnconditionalBranch,
                 BlockExit::NativeCall => return Err(format!("block {key} makes a native call")),
@@ -217,19 +273,16 @@ impl Walker<'_, '_> {
                         address: write.address.clone(),
                         value: write.value.clone(),
                         width: write.value.width,
+                        epoch: write.epoch,
                     },
                     write.epoch,
                 ));
             }
-            match block.exit {
+            // The transition classification decided the boundary above, so the
+            // walk has to see the SAME exit -- matching on `block.exit` here
+            // sent a transition block into the `unreachable!` arm.
+            match if transition { BlockExit::Branch } else { block.exit } {
                 BlockExit::VmExit => {
-                    if cfg
-                        .edges
-                        .iter()
-                        .any(|e| e.from == key && e.kind == CfgEdgeKind::NestedEntry)
-                    {
-                        return Err("exit re-enters a nested VM entry".to_owned());
-                    }
                     let handler = block
                         .instructions
                         .last()
@@ -239,11 +292,33 @@ impl Walker<'_, '_> {
                         .as_ref()
                         .or_else(|| input.exits.get(&handler))
                         .ok_or_else(|| format!("no recovered VM-exit layout for handler {handler}"))?;
-                    let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset)
+                    if let Some(to) = cfg
+                        .edges
+                        .iter()
+                        .find_map(|e| (e.from == key && e.kind == CfgEdgeKind::NestedEntry).then_some(e.to))
+                    {
+                        let resolver = self.nested.ok_or("exit re-enters a nested VM entry")?;
+                        let exit = vmpx_vm::recover_native_exit_state(&report, layout)
+                            .map_err(|e| format!("nested exit state unrecovered: {e}"))?;
+                        let entry = resolver
+                            .resolve(&exit.return_address)
+                            .ok_or("the nested VM entry is not provably resolved")?;
+                        if cfg.blocks.get(&to).and_then(|b| b.address) != Some(entry.bytecode_start) {
+                            return Err("the resolved nested entry is not the CFG's nested block".to_owned());
+                        }
+                        walk.state = compose_nested_state(&report, &exit, &entry)
+                            .map_err(|e| format!("nested entry composition failed: {e}"))?;
+                        key = to;
+                        continue;
+                    }
+                    let recovered = recover_exit(&report, layout, input.frame.len(), input.top_offset, crate::decoded_lift::RegionStaging::Full)
                         .map_err(|e| e.to_string())?;
                     let mut region_target = None;
                     let (exit, region_exit) = match recovered {
                         RecoveredExit::Callee(exit) => (exit, false),
+                        RecoveredExit::Trampoline(_) => {
+                            return Err("the exit transfers to a computed continuation above the entry frame".into());
+                        }
                         RecoveredExit::Region(region) => {
                             region_target = region.staged.first().map(|target| RegionTarget {
                                 target: target.simplify(),
@@ -318,6 +393,32 @@ impl Walker<'_, '_> {
                         continue;
                     }
                     if successors.len() < 2 {
+                        // Exactly one edge and one usable successor: the CFG
+                        // already PROVED that target -- a `Branch` edge is a
+                        // target proven constant, a `GuardedBranch` one proven
+                        // over an exhaustive input domain. Trust the same proof
+                        // the rolled walk trusts rather than refusing a target
+                        // the graph already settled.
+                        let raw = self
+                            .input
+                            .cfg
+                            .edges
+                            .iter()
+                            .filter(|e| {
+                                e.from == key
+                                    && matches!(
+                                        e.kind,
+                                        CfgEdgeKind::Branch
+                                            | CfgEdgeKind::GuardedBranch
+                                            | CfgEdgeKind::ProfileTransition
+                                    )
+                            })
+                            .count();
+                        if raw == 1 && successors.len() == 1 {
+                            self.decided += 1;
+                            key = successors[0].1;
+                            continue;
+                        }
                         return Err(format!(
                             "block {key} branch target depends on inputs but has {} recovered successor(s)",
                             successors.len()
@@ -371,7 +472,7 @@ impl Walker<'_, '_> {
 /// A selector that reads only the environment: a cpuid/segment-base probe, or
 /// loads and flags with no dependence on the function's registers. These are the
 /// protector's own gates, not branches of the protected function.
-fn is_environment_probe(selector: &Expr) -> bool {
+pub(crate) fn is_environment_probe(selector: &Expr) -> bool {
     let intrinsics = selector.intrinsic_dependencies();
     let probes = intrinsics.iter().any(|n| {
         n.starts_with("x86_cpuid") || n.starts_with("x86_gs_load") || n.starts_with("x86_fs_load")

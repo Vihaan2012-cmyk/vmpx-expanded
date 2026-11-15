@@ -6,11 +6,7 @@
 //! rewritten image must reparse from its own bytes and pass
 //! `vmpx_rebuild::validate_for_loader`. Nothing is written unless all three hold.
 
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 use vmpx_pe::{PeImage, SectionSelector, StripError, StripRequest, strip_sections};
@@ -95,7 +91,10 @@ pub enum CleanStripStage {
     /// The image has no non-standard sections to remove.
     NoProtectorSections,
     /// The protector sections were removed and the result was validated.
-    Stripped { bytes: Vec<u8>, summary: StripSummary },
+    Stripped {
+        bytes: Vec<u8>,
+        summary: StripSummary,
+    },
     /// A live reference (or another guard) kept a protector section; the image
     /// is left exactly as it was. This is the normal case for a still-protected
     /// or only partially devirtualized binary.
@@ -141,6 +140,12 @@ pub fn run_strip(
     output: &Path,
     remove: &[String],
     drop_directories: &[usize],
+    rebuild_exports: bool,
+    rebuild_exceptions: bool,
+    rebuild_imports: bool,
+    rebuild_tls: bool,
+    accept_unverified_iat: bool,
+    rebuild_directories: bool,
 ) -> Result<()> {
     if input == output {
         bail!("refusing to overwrite the input file");
@@ -154,7 +159,197 @@ pub fn run_strip(
     if remove.is_empty() {
         bail!("nothing selected; pass at least one --remove <section-name>");
     }
-    let data = crate::read_file(input)?;
+    let mut data = crate::read_file(input)?;
+    if rebuild_directories {
+        // The section table may only grow while it stays inside SizeOfHeaders,
+        // and that is what caps the rebuild -- one free slot on this sample.
+        // The padding between the headers and the first raw section is free
+        // room; claiming it moves no data. An image with none says so and the
+        // rebuild goes ahead with whatever slots it has.
+        match vmpx_rebuild::directory_relocate::grow_header_capacity(&data) {
+            Ok((grown, capacity)) => {
+                println!(
+                    "[headers] SizeOfHeaders -> {:#x}; section table ends at {:#x}, {} free slot(s)",
+                    capacity.size_of_headers, capacity.table_end, capacity.free_slots
+                );
+                data = grown;
+            }
+            Err(error) => println!("[headers] not grown: {error}"),
+        }
+        let names: Vec<&str> = remove.iter().map(String::as_str).collect();
+        // The IAT moves with the rest, so the same precondition applies: nothing
+        // that survives may reach the old table by address.
+        let scan = vmpx_rebuild::directory_relocate::scan_iat_references(&data, &names)
+            .context("scanning for references into the import address table")?;
+        println!(
+            "[directories] IAT reference scan: {} from surviving code, {} function(s) decoded, {} executable byte(s) unreachable",
+            scan.references.len(),
+            scan.decoded_functions,
+            scan.unverified_bytes
+        );
+        if let Some(first) = scan.references.first() {
+            bail!(
+                "refusing to move the IAT: {} surviving reference(s) reach it, the first at {}",
+                scan.references.len(),
+                first
+            );
+        }
+        if scan.unverified_bytes != 0 && !accept_unverified_iat {
+            bail!(
+                "refusing to move the IAT: {} executable byte(s) were never decoded; pass --accept-unverified-iat to proceed on the {} function(s) that were",
+                scan.unverified_bytes,
+                scan.decoded_functions
+            );
+        }
+        let all =
+            vmpx_rebuild::directory_relocate::rebuild_all_directories(&data, *b".vmpxdir", &names)
+                .context("rebuilding the directories out of the removed sections")?;
+        for directory in &all.moved {
+            println!(
+                "[directories] {} rebuilt: {} -> {} ({} bytes)",
+                directory.index, directory.from, directory.to, directory.size
+            );
+        }
+        println!(
+            "[directories] exceptions {} kept / {} dropped; imports {} module(s), {} symbol(s); TLS {} callback(s) kept, {} dropped; relocations {} kept, {} dropped, {} added",
+            all.exception_entries.0,
+            all.exception_entries.1,
+            all.import_modules,
+            all.import_symbols,
+            all.tls_callbacks.0,
+            all.tls_callbacks.1.len(),
+            all.relocations.kept,
+            all.relocations.dropped,
+            all.relocations.added
+        );
+        for dropped in &all.tls_callbacks.1 {
+            println!("[directories] dropped TLS callback {dropped} (inside a removed section)");
+        }
+        println!(
+            "[directories] appended section at {} ({} raw byte(s))",
+            all.section.rva, all.section.raw_size
+        );
+        data = all.bytes;
+    }
+    if rebuild_exports {
+        // The protector moves the live export directory into its own section, so
+        // the dangling-reference checker refuses the removal. Rebuild it into an
+        // appended standard section and repoint the header; the function RVAs
+        // still name the same code, which the rebuild re-reads and checks.
+        let moved = vmpx_rebuild::directory_relocate::rebuild_export_directory(&data, *b".edata2 ")
+            .context("rebuilding the export directory")?;
+        for directory in &moved.moved {
+            println!(
+                "[exports] directory {} rebuilt: {} -> {} ({} bytes)",
+                directory.index, directory.from, directory.to, directory.size
+            );
+        }
+        println!(
+            "[exports] appended section at {} ({} raw byte(s))",
+            moved.section.rva, moved.section.raw_size
+        );
+        data = moved.bytes;
+    }
+    if rebuild_exceptions {
+        let names: Vec<&str> = remove.iter().map(String::as_str).collect();
+        let (moved, summary) = vmpx_rebuild::directory_relocate::rebuild_exception_directory(
+            &data,
+            *b".pdata2 ",
+            &names,
+        )
+        .context("rebuilding the exception directory")?;
+        println!(
+            "[exceptions] {} runtime function(s) kept, {} dropped as belonging to removed sections",
+            summary.kept, summary.dropped
+        );
+        for directory in &moved.moved {
+            println!(
+                "[exceptions] directory {} rebuilt: {} -> {}",
+                directory.index, directory.from, directory.to
+            );
+        }
+        data = moved.bytes;
+    }
+    if rebuild_imports {
+        // Moving the IAT is only sound where nothing that SURVIVES reaches the
+        // old table by address. That is true of this sample because its imports
+        // are protected -- every call goes through the VM -- but it is a
+        // property of the build, not of VMProtect: with import protection off
+        // the original `call [rip+iat]` instructions remain in `.text`. So it
+        // is checked, and the part of the image the check could not decode is
+        // printed rather than assumed away.
+        let names: Vec<&str> = remove.iter().map(String::as_str).collect();
+        let scan = vmpx_rebuild::directory_relocate::scan_iat_references(&data, &names)
+            .context("scanning for references into the import address table")?;
+        println!(
+            "[imports] IAT reference scan: {} reference(s) from surviving code, {} function(s) decoded, {} executable byte(s) the scan could not reach",
+            scan.references.len(),
+            scan.decoded_functions,
+            scan.unverified_bytes
+        );
+        if let Some(first) = scan.references.first() {
+            bail!(
+                "refusing to move the IAT: {} surviving reference(s) reach it, the first at {}",
+                scan.references.len(),
+                first
+            );
+        }
+        // An ordinary PE32+ binary reaches its IAT constantly -- measured,
+        // notepad.exe has 1610 such references and ole32.dll 3912 -- so a zero
+        // here is a real property of THIS image, and only as strong as the part
+        // of it the scan could decode.
+        if scan.unverified_bytes != 0 && !accept_unverified_iat {
+            bail!(
+                "refusing to move the IAT: {} executable byte(s) are outside the exception directory and were never decoded; pass --accept-unverified-iat to proceed on the {} function(s) that were",
+                scan.unverified_bytes,
+                scan.decoded_functions
+            );
+        }
+        let (moved, summary) =
+            vmpx_rebuild::directory_relocate::rebuild_import_directory(&data, *b".idata2 ")
+                .context("rebuilding the import directory")?;
+        println!(
+            "[imports] {} module(s), {} symbol(s) rebuilt; IAT now at {} ({} bytes)",
+            summary.modules, summary.symbols, summary.iat_rva, summary.iat_size
+        );
+        for directory in &moved.moved {
+            println!(
+                "[imports] directory {} rebuilt: {} -> {}",
+                directory.index, directory.from, directory.to
+            );
+        }
+        data = moved.bytes;
+    }
+    if rebuild_tls {
+        let names: Vec<&str> = remove.iter().map(String::as_str).collect();
+        let (moved, summary) =
+            vmpx_rebuild::directory_relocate::rebuild_tls_directory(&data, *b".tls2   ", &names)
+                .context("rebuilding the TLS directory")?;
+        println!(
+            "[tls] {} callback(s) kept, {} dropped, {} raw-data byte(s) copied",
+            summary.kept_callbacks,
+            summary.dropped_callbacks.len(),
+            summary.raw_data_bytes
+        );
+        for dropped in &summary.dropped_callbacks {
+            println!("[tls] dropped callback {dropped} (inside a removed section)");
+        }
+        data = moved.bytes;
+        // Every pointer the TLS rebuild wrote is an absolute VA, so the
+        // relocation table has to be rebuilt for it in the same breath.
+        let (moved, relocations) = vmpx_rebuild::directory_relocate::rebuild_base_relocations(
+            &data,
+            *b".reloc2 ",
+            &names,
+            &summary.needs_relocation,
+        )
+        .context("rebuilding the base-relocation table")?;
+        println!(
+            "[reloc] {} fixup(s) kept, {} dropped as pointing into removed sections, {} added",
+            relocations.kept, relocations.dropped, relocations.added
+        );
+        data = moved.bytes;
+    }
     let selectors: Vec<SectionSelector> = remove
         .iter()
         .map(|name| SectionSelector::Name(name.clone()))
@@ -184,10 +379,7 @@ pub fn run_strip(
         }
         Err(failure) => {
             eprintln!("[strip] refused: {failure}");
-            bail!(
-                "strip refused {}; no output was written",
-                input.display()
-            );
+            bail!("strip refused {}; no output was written", input.display());
         }
     }
 }
