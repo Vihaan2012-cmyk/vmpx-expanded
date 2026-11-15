@@ -730,6 +730,27 @@ pub(crate) fn dynamic_export_reference(
         }
     }
 
+    // (1b) The PROTECTED INPUT's own import directory. For a mutation-only or
+    // no-original sample (e.g. win.xpl), the modules it imports name exactly the
+    // system DLLs the resolver walks; without an unprotected original these would
+    // otherwise be missed, leaving every function outside the default loader set
+    // unresolved (a null in the resolver's pointer table -> `call 0`). Their full
+    // local exports are auto-populated in (2) below via `system_modules`.
+    if let Ok(bytes) = std::fs::read(input_path) {
+        if let Ok(pe) = PeImage::parse(&bytes) {
+            let from_input = vmpx_emulate::export_reference_from_imports(&pe);
+            let (m, s) = (from_input.len(), from_input.values().map(Vec::len).sum::<usize>());
+            for (module, names) in from_input {
+                reference.entry(module).or_default().extend(names);
+            }
+            if m > 0 {
+                warnings.push(format!(
+                    "[dynamic][experimental] export reference: {m} module(s)/{s} symbol(s) from the input's own import directory"
+                ));
+            }
+        }
+    }
+
     // (2) Auto-populate real exports of local System32 loader/runtime DLLs so
     // the protector's direct export-table walk resolves any real API in them,
     // not just the subset the original imported. The default loader set, plus
