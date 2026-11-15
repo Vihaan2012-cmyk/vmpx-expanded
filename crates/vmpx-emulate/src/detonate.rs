@@ -335,7 +335,12 @@ impl Hook for IatProbeHook {
     fn on_mem(&mut self, ev: &MemEvent, _cpu: &mut Cpu, _mem: &mut Memory) -> HookAction {
         if ev.access == crate::memory::Access::Write {
             if let Some(v) = ev.value {
-                if v != 0 && self.book.borrow().contains_key(&v) {
+                // Cheap pre-filter before the map lookup: every address the model
+                // hands out (loader stubs 0x20_*, GetProcAddress 0x60_*, minted
+                // modules 0x70_*) is >= 0x20_0000_0000, far above the image/stack/
+                // heap. This skips almost every write with one comparison, so the
+                // whole-run write watch does not slow the billions-of-steps init.
+                if v >= 0x0000_0020_0000_0000 && self.book.borrow().contains_key(&v) {
                     let mut s = self.seen.borrow_mut();
                     let key = ev.addr & !7;
                     if s.len() < 100_000 || s.contains_key(&key) {

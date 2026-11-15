@@ -56,6 +56,21 @@ use serde::Serialize;
 use thiserror::Error;
 use vmpx_pe::{FileOffset, PeError, PeImage, Rva, Section};
 
+mod lzma_decode;
+pub use lzma_decode::{
+    LzmaState, decode_lzma1, decode_lzma1_snapshot, decode_lzma1_snapshot_at_input, resume_lzma1,
+};
+
+/// Decode a raw VMProtect LZMA1 section stream with the native decoder, bounded
+/// by `cap` output bytes. `properties[0]` packs lc/lp/pb the standard way.
+fn decode_native(properties: [u8; 5], payload: &[u8], cap: usize) -> Result<Vec<u8>, String> {
+    let props = u32::from(properties[0]);
+    let (lc, lp, pb) = (props % 9, (props / 9) % 5, props / 45);
+    decode_lzma1(payload, cap, lc, lp, pb)
+        .map(|(out, _consumed)| out)
+        .map_err(str::to_string)
+}
+
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
 /// Standard VMProtect packer LZMA properties: `lc=3, lp=0, pb=2`, 64 MiB dict.
 const VMPROTECT_LZMA_PROPERTIES: [u8; 5] = [0x5D, 0x00, 0x00, 0x00, 0x04];
@@ -166,11 +181,13 @@ fn lzma_source_offset(pe: &PeImage<'_>, rva: Rva) -> Option<usize> {
     (pe.data().get(raw) == Some(&0)).then_some(raw)
 }
 
+#[cfg(test)]
 struct BoundedWriter<'a> {
     destination: &'a mut [u8],
     written: usize,
 }
 
+#[cfg(test)]
 impl Write for BoundedWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let remaining = self.destination.len().saturating_sub(self.written);
@@ -806,31 +823,21 @@ pub fn unpack_to_mapped_image(
             .ok_or_else(|| {
                 UnpackError::Reconstruct(format!("block {block_index} destination exceeds image"))
             })?;
-        let mut writer = BoundedWriter {
-            destination: destination_bytes,
-            written: 0,
-        };
-        decode_into(
-            table.lzma_properties,
-            entry.decompressed_size.into(),
-            &input[source..],
-            &mut writer,
-        )
-        .map_err(|message| UnpackError::Decompress {
-            block: block_index,
-            section: section.name.clone(),
-            message,
-        })?;
-        if writer.written != expected {
+        let decoded = decode_native(table.lzma_properties, &input[source..], expected).map_err(
+            |message| UnpackError::Decompress {
+                block: block_index,
+                section: section.name.clone(),
+                message,
+            },
+        )?;
+        if decoded.len() != expected {
             return Err(UnpackError::Decompress {
                 block: block_index,
                 section: section.name.clone(),
-                message: format!(
-                    "decoded {:#X} bytes, expected {expected:#X}",
-                    writer.written
-                ),
+                message: format!("decoded {:#X} bytes, expected {expected:#X}", decoded.len()),
             });
         }
+        destination_bytes.copy_from_slice(&decoded);
         blocks.push(UnpackedBlock {
             section_index: section.index,
             section_name: section.name.clone(),

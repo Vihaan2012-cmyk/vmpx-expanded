@@ -11,10 +11,10 @@ lzma-rs.workspace = true
 thiserror.workspace = true
 vmpx-pe = { path = "../vmpx-pe" }
 vmpx-rebuild = { path = "../vmpx-rebuild" }
+vmpx-unpack = { path = "../vmpx-unpack" }
 
 [dev-dependencies]
 iced-x86 = { workspace = true, features = ["code_asm"] }
-vmpx-unpack = { path = "../vmpx-unpack" }
 
 [lints]
 workspace = true
