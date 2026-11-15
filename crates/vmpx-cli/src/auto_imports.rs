@@ -4,6 +4,7 @@
 //! overwritten).
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use vmpx_emulate::snapshot;
 use vmpx_pe::PeImage;
@@ -82,6 +83,42 @@ fn flattened_import_names(intact: &PeImage<'_>) -> Vec<(String, String)> {
         }
     }
     names
+}
+
+/// The import-slot sidecar beside a saved snapshot (`<snapshot>.imports`). It
+/// carries the detonation's observed IAT fill so a later `--snapshot` reuse can
+/// `bind_slots` without re-detonating -- and, unlike the `.idata`-reading path,
+/// it works for samples with no `.idata` section (e.g. win.xpl, whose imports
+/// live in a protector-custom table).
+pub fn slots_sidecar(snapshot: &Path) -> PathBuf {
+    let mut s = snapshot.as_os_str().to_owned();
+    s.push(".imports");
+    PathBuf::from(s)
+}
+
+/// Serialize `(slot_rva, module, symbol)` triples one-per-line as
+/// `<rva_hex>\t<module>\t<symbol>`.
+pub fn save_import_slots(path: &Path, slots: &[(u32, String, String)]) -> std::io::Result<()> {
+    let mut out = String::with_capacity(slots.len() * 48);
+    for (rva, module, name) in slots {
+        out.push_str(&format!("{rva:08x}\t{module}\t{name}\n"));
+    }
+    std::fs::write(path, out)
+}
+
+/// Inverse of [`save_import_slots`]; malformed lines are skipped.
+pub fn load_import_slots(path: &Path) -> std::io::Result<Vec<(u32, String, String)>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut slots = Vec::new();
+    for line in text.lines() {
+        let mut it = line.splitn(3, '\t');
+        if let (Some(r), Some(m), Some(n)) = (it.next(), it.next(), it.next()) {
+            if let Ok(rva) = u32::from_str_radix(r.trim(), 16) {
+                slots.push((rva, m.to_owned(), n.to_owned()));
+            }
+        }
+    }
+    Ok(slots)
 }
 
 /// Bind a set of `(slot_rva, module, symbol)` triples -- from a snapshot or a

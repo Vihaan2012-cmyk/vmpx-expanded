@@ -71,6 +71,12 @@ fn is_protector_section(name: &str) -> bool {
         ".text", ".data", ".rdata", ".idata", ".edata", ".pdata", ".xdata",
         ".bss", ".tls", ".reloc", ".rsrc", ".eh_fram", ".crt", ".gfids",
         ".giats", ".00cfg", ".sxdata", ".debug", ".ndata", ".didat", ".drectve",
+        // GCC/MinGW toolchain sections (systems.xpl is MinGW-built): read-only
+        // data, CRT ctor/dtor tables, the Java class registry and the truncated
+        // `.gcc_except_table`. Unwind handlers and code reference these, so they
+        // are standard, never protector sections. (`.rdata` above is the MSVC
+        // spelling; `.rodata` is the GCC one.)
+        ".rodata", ".ctors", ".dtors", ".CRT", ".jcr", ".gcc_exc", ".data.re",
         // MSVC read-only data (e.g. jump/function tables under /Gy); not a dot
         // section, so it would otherwise be mistaken for a protector section.
         "_RDATA",
@@ -128,7 +134,8 @@ fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
     const EXECUTE: u32 = 0x2000_0000;
     const WRITE: u32 = 0x8000_0000;
     const SMALL_DATA: u32 = 0x1_0000;
-    pe.sections
+    let mut retained: BTreeSet<String> = pe
+        .sections
         .iter()
         .filter(|s| {
             if !is_protector_section(s.name.as_str()) {
@@ -143,7 +150,63 @@ fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
             code || ro_data
         })
         .map(|s| s.name.as_str().to_owned())
-        .collect()
+        .collect();
+    // Principled, reference-based retention: also keep any section the retained
+    // application code points into, regardless of its name or characteristics.
+    retained.extend(referenced_protector_sections(pe));
+    retained
+}
+
+/// Protector-named sections the retained application code actually references
+/// (via a RIP-relative operand, the common x64 code->data reference). A section
+/// the kept code points into must stay mapped where it sits -- stripping it
+/// would strand those references -- so this is the principled, reference-based
+/// half of the retain decision, complementing the name/characteristic heuristics
+/// above. Bounded to small candidate sections: the large VM runtime is the
+/// protector (removed), and large relocated code is retained by the code rule.
+fn referenced_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
+    const MAX_SECTION: u32 = 0x4_0000; // only enumerate small candidate sections (<=256 KiB)
+    const BUDGET: usize = 20_000_000;
+    let span = |s: &vmpx_pe::Section| s.virtual_size.max(s.size_of_raw_data);
+    let candidates: Vec<&vmpx_pe::Section> = pe
+        .sections
+        .iter()
+        .filter(|s| is_protector_section(s.name.as_str()) && span(s) > 0 && span(s) <= MAX_SECTION)
+        .collect();
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    // Targets: every RVA inside a small candidate section. Sources: exclude every
+    // protector section, so only references FROM retained application code count.
+    let mut target_rvas: BTreeSet<Rva> = BTreeSet::new();
+    for s in &candidates {
+        let start = s.virtual_address.0;
+        for off in 0..span(s) {
+            if let Some(rva) = start.checked_add(off) {
+                target_rvas.insert(Rva(rva));
+            }
+        }
+    }
+    let excluded: Vec<(Rva, Rva)> = pe
+        .sections
+        .iter()
+        .filter(|s| is_protector_section(s.name.as_str()))
+        .filter_map(|s| s.virtual_address.0.checked_add(span(s)).map(|end| (s.virtual_address, Rva(end))))
+        .collect();
+    let Ok(report) =
+        vmpx_disasm::find_ip_relative_references_resync(pe, &target_rvas, &excluded, BUDGET)
+    else {
+        return BTreeSet::new();
+    };
+    let mut referenced = BTreeSet::new();
+    for reference in &report.references {
+        if let Some(s) = pe.sections.iter().find(|s| s.contains_mapped_rva(reference.target_rva)) {
+            if is_protector_section(s.name.as_str()) {
+                referenced.insert(s.name.as_str().to_owned());
+            }
+        }
+    }
+    referenced
 }
 
 /// Every protector address the application's `.text` transfers into, classified.
@@ -1104,11 +1167,16 @@ pub fn run(o: Options) -> Result<(), String> {
     }
 
     // --- imports ---
-    // A given snapshot is used directly. With none, look for one beside the
-    // input (`<input>.snap`), and if that is absent the application's imports
-    // cannot be recovered statically (`.idata` is encrypted); ask whether to
-    // proceed without them.
+    // A given `--snapshot` is used directly. Otherwise, unless the caller
+    // explicitly asked to (re)detonate (`--detonate-steps`/`--save-snapshot`),
+    // look for one beside the input (`<input>.snap`) and reuse it. With no
+    // snapshot and no detonation the imports cannot be recovered statically
+    // (`.idata` is encrypted); ask whether to proceed without them.
+    let force_detonation = o.detonate_steps.is_some() || o.save_snapshot.is_some();
     let snapshot = o.snapshot.clone().or_else(|| {
+        if force_detonation {
+            return None;
+        }
         let beside = o.input.with_extension("snap");
         beside.exists().then_some(beside)
     });
@@ -1119,9 +1187,28 @@ pub fn run(o: Options) -> Result<(), String> {
     if let Some(snapshot) = &snapshot {
         log.start("Rebuilding the application import table");
         log.trace("snapshot", &snapshot.display().to_string());
-        match crate::auto_imports::bind(&log, &pe, &bytes, &image, snapshot) {
-            Ok(bound) => {
-                image = bound;
+        // Prefer the import sidecar (the detonation's observed IAT fill) saved
+        // beside the snapshot: it binds via `bind_slots`, which works even when
+        // the input has no `.idata` section (e.g. win.xpl). Fall back to naming
+        // the snapshot's `.idata` slots directly when no sidecar is present.
+        let sidecar = crate::auto_imports::slots_sidecar(snapshot);
+        let bound = if sidecar.exists() {
+            match crate::auto_imports::load_import_slots(&sidecar) {
+                Ok(slots) => {
+                    log.step(
+                        "imports",
+                        &format!("{} slot(s) from {}", slots.len(), sidecar.display()),
+                    );
+                    crate::auto_imports::bind_slots(&log, &pe, &bytes, &image, slots)
+                }
+                Err(e) => Err(format!("could not read import sidecar {}: {e}", sidecar.display())),
+            }
+        } else {
+            crate::auto_imports::bind(&log, &pe, &bytes, &image, snapshot)
+        };
+        match bound {
+            Ok(image_bound) => {
+                image = image_bound;
                 imports_bound = true;
             }
             Err(reason) => log.warn(&format!("import binding skipped: {reason}")),
@@ -1310,6 +1397,18 @@ fn detonate_imports(
         .collect();
     slots.sort();
     slots.dedup();
+    // Persist the observed IAT fill beside the snapshot so a later --snapshot
+    // reuse can bind without re-detonating (and for samples with no .idata).
+    if let Some(path) = save_snapshot {
+        let sidecar = crate::auto_imports::slots_sidecar(path);
+        match crate::auto_imports::save_import_slots(&sidecar, &slots) {
+            Ok(()) => log.step(
+                "imports saved",
+                &format!("{} slot(s) -> {}", slots.len(), sidecar.display()),
+            ),
+            Err(e) => log.warn(&format!("could not save import sidecar: {e}")),
+        }
+    }
     Ok(slots)
 }
 
@@ -1435,10 +1534,27 @@ fn relocate_natives(
     let mut queue: VecDeque<u32> = seeds.iter().copied().collect();
     let mut seen: BTreeSet<u32> = seeds.iter().copied().collect();
     let mut blocks: BTreeMap<u64, u64> = BTreeMap::new();
+    // Per-native block lists, so a native that turns out to reference removed
+    // space can be skipped whole rather than aborting every other native.
+    let mut native_blocks: Vec<Vec<(u64, u64)>> = Vec::new();
     let mut skipped = 0usize;
     while let Some(rva) = queue.pop_front() {
-        let cfg = recover_native_cfg_pe_with(intact, Rva(rva), options)
-            .map_err(|e| format!("native cfg {rva:#x}: {e}"))?;
+        // A followed call target can be a mutation mis-decode (e.g. a `call`
+        // decoded out of junk whose rel32 lands outside the image). Recovering it
+        // would fail hard and abort every other native; instead skip it, exactly
+        // like an incomplete CFG. The original (possibly bogus) call stays as it
+        // was, and any real dangle is caught fail-closed by the dangling-ref check.
+        let cfg = match recover_native_cfg_pe_with(intact, Rva(rva), options) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                log.trace(
+                    &format!("  skip {rva:#x}"),
+                    &format!("CFG recovery failed ({e}) -- not relocated"),
+                );
+                skipped += 1;
+                continue;
+            }
+        };
         // An incomplete CFG has unresolved edges and can carry spurious blocks
         // spawned off a bad edge (e.g. a short branch that decoded into data --
         // observed as a `jge` into a "popo" address). Relocating such a function
@@ -1458,17 +1574,21 @@ fn relocate_natives(
             &format!("  recover {rva:#x}"),
             &format!("{} block(s)", cfg.blocks.len()),
         );
+        let mut list: Vec<(u64, u64)> = Vec::with_capacity(cfg.blocks.len());
         for block in cfg.blocks.values() {
             blocks.insert(block.start, block.end);
+            list.push((block.start, block.end));
             if let vmpx_mutation::Terminator::Call { target, .. }
             | vmpx_mutation::Terminator::TailCall { target } = &block.terminator
                 && let vmpx_mutation::CallTarget::Direct(va) = target
                 && let Some(next) = va.checked_sub(base).and_then(|v| u32::try_from(v).ok())
+                && vmpx_disasm::is_executable_rva(intact, Rva(next))
                 && seen.insert(next)
             {
                 queue.push_back(next);
             }
         }
+        native_blocks.push(list);
     }
     let section_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
     let payload_base = base + u64::from(section_rva);
@@ -1516,29 +1636,52 @@ fn relocate_natives(
     // copy. A misaligned overlap decodes to a DIFFERENT instruction at a distinct
     // IP, so it is kept and placed separately, exactly as the old copy-per-block
     // path did.
+    // Decode per native, so a native that references removed space (e.g. a
+    // reference to a guard that has not been devirtualized yet, or a mutation
+    // mis-decode) is skipped whole rather than aborting the entire relocation.
+    // The skipped native's `.text` reference then dangles and is caught
+    // fail-closed by the dangling-ref check -- the same contract as an incomplete
+    // CFG. `in_block` still sees every native's blocks, so a reference to another
+    // relocated block is not mistaken for removed space.
     let mut instrs: Vec<iced_x86::Instruction> = Vec::new();
     let mut seen_ip: BTreeSet<u64> = BTreeSet::new();
-    for (start, end) in &blocks {
-        let rva = u32::try_from(start - base).unwrap_or(0);
-        let off = intact
-            .rva_to_file_offset(Rva(rva))
-            .map_err(|e| e.to_string())?
-            .0 as usize;
-        let window = intact_bytes
-            .get(off..off + (end - start) as usize)
-            .ok_or("block past file")?;
-        let mut decoder = Decoder::with_ip(64, window, *start, DecoderOptions::NONE);
-        while decoder.can_decode() {
-            let ins = decoder.decode();
-            if ins.is_invalid() {
+    for list in &native_blocks {
+        let mut native_instrs: Vec<iced_x86::Instruction> = Vec::new();
+        let mut bad: Option<String> = None;
+        'blocks: for (start, end) in list {
+            let decoded = start
+                .checked_sub(base)
+                .and_then(|v| u32::try_from(v).ok())
+                .and_then(|rva| intact.rva_to_file_offset(Rva(rva)).ok())
+                .map(|off| off.0 as usize)
+                .and_then(|off| intact_bytes.get(off..off + (end - start) as usize));
+            let Some(window) = decoded else {
+                bad = Some(format!("block {start:#x} not file-backed"));
                 break;
+            };
+            let mut decoder = Decoder::with_ip(64, window, *start, DecoderOptions::NONE);
+            while decoder.can_decode() {
+                let ins = decoder.decode();
+                if ins.is_invalid() {
+                    break;
+                }
+                if let Some(t) = reference_target(&ins)
+                    && !in_block(t)
+                    && in_vmp(t)
+                {
+                    bad = Some(format!("references removed space {t:#x}"));
+                    break 'blocks;
+                }
+                native_instrs.push(ins);
             }
-            if let Some(t) = reference_target(&ins)
-                && !in_block(t)
-                && in_vmp(t)
-            {
-                return Err(format!("component references removed space at {start:#x}"));
-            }
+        }
+        if let Some(reason) = bad {
+            let at = list.first().map(|(s, _)| *s).unwrap_or(0);
+            log.trace(&format!("  skip {at:#x}"), &format!("{reason} -- not relocated"));
+            skipped += 1;
+            continue;
+        }
+        for ins in native_instrs {
             if seen_ip.insert(ins.ip()) {
                 instrs.push(ins);
             }
