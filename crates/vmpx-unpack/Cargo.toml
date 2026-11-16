@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 lzma-rs.workspace = true
+rayon = "1.10"
 serde.workspace = true
 thiserror.workspace = true
 vmpx-pe = { path = "../vmpx-pe" }

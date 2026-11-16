@@ -438,24 +438,29 @@ fn enumerate_streams(
     file_alignment: usize,
     max: usize,
 ) -> Result<Vec<(usize, u32)>, UnpackError> {
+    use rayon::prelude::*;
     let data = pe.data();
-    let mut streams = Vec::new();
-    for (start, end) in raw_data_ranges(pe) {
-        for offset in start..end {
-            if data[offset] != 0 {
-                continue;
-            }
-            if let Some(length) = stream_length(&data[offset..], file_alignment, max) {
-                let length = u32::try_from(length)
-                    .map_err(|_| UnpackError::Locate("stream length exceeds 32 bits".to_owned()))?;
-                streams.push((offset, length));
-                if streams.len() > MAX_STREAMS {
-                    return Err(UnpackError::Locate(
-                        "too many candidate LZMA1 streams - layout is unrecoverable".to_owned(),
-                    ));
-                }
-            }
-        }
+    // Every zero byte in the packed region is a candidate LZMA1 stream start
+    // (the range coder's ignored first byte), and probing one means trial-decoding
+    // it to its EOS -- millions of independent decodes, the dominant unpack cost.
+    // They have no data dependency, so fan them out across the cores.
+    let candidates: Vec<usize> = raw_data_ranges(pe)
+        .into_iter()
+        .flat_map(|(start, end)| (start..end).filter(|&o| data[o] == 0))
+        .collect();
+    let mut streams: Vec<(usize, u32)> = candidates
+        .par_iter()
+        .filter_map(|&offset| {
+            stream_length(&data[offset..], file_alignment, max)
+                .and_then(|length| u32::try_from(length).ok().map(|l| (offset, l)))
+        })
+        .collect();
+    // Deterministic order (ties in the greedy matcher break by file offset).
+    streams.sort_unstable();
+    if streams.len() > MAX_STREAMS {
+        return Err(UnpackError::Locate(
+            "too many candidate LZMA1 streams - layout is unrecoverable".to_owned(),
+        ));
     }
     Ok(streams)
 }
