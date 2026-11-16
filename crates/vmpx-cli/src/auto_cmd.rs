@@ -1064,6 +1064,25 @@ pub fn run(o: Options) -> Result<(), String> {
     ));
     log.info(&format!("protection: {:?}", report.verdict));
 
+    // Refuse to process a binary that is not confidently VMProtect-protected.
+    // The pipeline strips "protector" sections and relocates the entry to the
+    // recovered OEP; on an UNPROTECTED image those steps corrupt a clean PE --
+    // e.g. a legitimate large R/W section (import table + BSS) gets stripped and
+    // the real entry gets moved to a mis-recovered OEP. With no strong evidence
+    // there is nothing to devirtualize, so pass through untouched instead of
+    // mangling it. `VMPX_FORCE=1` overrides for a suspected detector false
+    // negative.
+    if report.verdict == vmpx_detect::DetectionVerdict::NoStrongEvidence
+        && std::env::var_os("VMPX_FORCE").is_none()
+    {
+        log.warn(
+            "no strong VMProtect evidence -- refusing to strip sections or relocate \
+             the entry (that would corrupt a clean PE). Nothing to devirtualize; \
+             set VMPX_FORCE=1 to process anyway.",
+        );
+        return Err("not a VMProtect image (NoStrongEvidence); nothing to devirtualize".to_owned());
+    }
+
     // --- auto settings ---
     log.start("Choosing settings");
     // Start at the smallest budget proven to decode a branch-complete guard
