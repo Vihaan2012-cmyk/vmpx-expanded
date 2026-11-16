@@ -277,6 +277,29 @@ enum Command {
         #[arg(long = "emit-dwarf")]
         emit_dwarf: bool,
     },
+    /// Devirtualize several images at once, as `INPUT OUTPUT` pairs, running the
+    /// same pipeline as `auto` on each concurrently (so their single-threaded
+    /// unpack/strip stages overlap). Guard threads are divided across the running
+    /// jobs; each file's full transcript goes to its own `<output>.log`.
+    ///
+    /// e.g. `vmpx batch a.xpl out/a/clean.xpl b.xpl out/b/clean.xpl --jobs 2`
+    Batch {
+        /// Alternating INPUT OUTPUT paths (an even number of arguments).
+        #[arg(required = true, num_args = 2.., value_name = "INPUT OUTPUT")]
+        pairs: Vec<PathBuf>,
+        /// Files to process concurrently (default: a share of the cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Pass `--log` to each file (full per-step trace in its `<output>.log`).
+        #[arg(long)]
+        log: bool,
+        /// Treat each input as a packed on-disk image and unpack it first.
+        #[arg(long)]
+        unpack: bool,
+        /// Detonate to recover imports, up to this many steps, per file.
+        #[arg(long = "detonate-steps")]
+        detonate_steps: Option<u64>,
+    },
     /// Devirtualize guard functions to native code and reintegrate them into a
     /// stripped image, folding the integrity checksum to a constant.
     Devirt {
@@ -1454,6 +1477,20 @@ fn main() -> Result<()> {
             save_snapshot,
             emit_dwarf,
             guard_threads: None,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?,
+        Command::Batch {
+            pairs,
+            jobs,
+            log,
+            unpack,
+            detonate_steps,
+        } => auto_cmd::run_batch(auto_cmd::BatchOptions {
+            pairs,
+            jobs,
+            verbose: log,
+            unpack,
+            detonate_steps,
         })
         .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {

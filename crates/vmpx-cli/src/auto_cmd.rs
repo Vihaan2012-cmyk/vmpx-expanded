@@ -56,6 +56,103 @@ pub struct Options {
     pub guard_threads: Option<usize>,
 }
 
+/// Options for the `batch` subcommand.
+pub struct BatchOptions {
+    /// Alternating INPUT OUTPUT paths (even length).
+    pub pairs: Vec<PathBuf>,
+    pub jobs: Option<usize>,
+    pub verbose: bool,
+    pub unpack: bool,
+    pub detonate_steps: Option<u64>,
+}
+
+/// Run `auto` on each INPUT->OUTPUT pair concurrently, as isolated subprocesses,
+/// dividing the guard-devirtualization threads across the running jobs so their
+/// single-threaded unpack/strip stages overlap. Each file's transcript lands in
+/// its own `<output>.log`; one result line is printed per file.
+pub fn run_batch(o: BatchOptions) -> Result<(), String> {
+    use std::collections::VecDeque;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    if o.pairs.len() % 2 != 0 {
+        return Err("batch takes INPUT OUTPUT pairs -- an even number of paths".to_owned());
+    }
+    let pairs: Vec<(PathBuf, PathBuf)> = o
+        .pairs
+        .chunks_exact(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
+    if pairs.is_empty() {
+        return Err("batch needs at least one INPUT OUTPUT pair".to_owned());
+    }
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot locate the vmpx executable: {e}"))?;
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = o
+        .jobs
+        .unwrap_or_else(|| (cores / 8).max(1))
+        .clamp(1, pairs.len());
+    let per_job = (cores / jobs).max(1);
+    let total = pairs.len();
+    eprintln!("[batch] {total} file(s), {jobs} at a time, {per_job} guard thread(s) each ({cores} cores)");
+
+    let queue: Mutex<VecDeque<(usize, PathBuf, PathBuf)>> =
+        Mutex::new(pairs.into_iter().enumerate().map(|(i, (a, b))| (i, a, b)).collect());
+    let failures: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| loop {
+                let next = queue.lock().unwrap().pop_front();
+                let Some((i, input, output)) = next else { break };
+                if let Some(parent) = output.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let t0 = Instant::now();
+                let mut cmd = Command::new(&exe);
+                cmd.arg("auto").arg(&input).arg(&output).arg("--no-prompt");
+                if o.unpack {
+                    cmd.arg("--unpack");
+                }
+                if o.verbose {
+                    cmd.arg("--log");
+                }
+                if let Some(n) = o.detonate_steps {
+                    cmd.arg("--detonate-steps").arg(n.to_string());
+                }
+                cmd.env("VMPX_GUARD_THREADS", per_job.to_string());
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                let ok = matches!(cmd.status(), Ok(st) if st.success());
+                let secs = t0.elapsed().as_secs();
+                eprintln!(
+                    "[batch {}/{total}] {} {} ({secs}s) -> {}",
+                    i + 1,
+                    if ok { "ok  " } else { "FAIL" },
+                    input.display(),
+                    output.display()
+                );
+                if !ok {
+                    failures.lock().unwrap().push(input);
+                }
+            });
+        }
+    });
+
+    let failed = failures.into_inner().unwrap();
+    if failed.is_empty() {
+        eprintln!("[batch] all {total} file(s) complete");
+        Ok(())
+    } else {
+        Err(format!(
+            "{}/{total} file(s) failed: {}",
+            failed.len(),
+            failed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
 const EXEC: u32 = 0x2000_0000;
 const RX: u32 = 0x6000_0020;
 
