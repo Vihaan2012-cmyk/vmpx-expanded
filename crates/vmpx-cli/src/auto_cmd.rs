@@ -72,6 +72,7 @@ pub struct BatchOptions {
 /// its own `<output>.log`; one result line is printed per file.
 pub fn run_batch(o: BatchOptions) -> Result<(), String> {
     use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use std::time::Instant;
@@ -123,8 +124,42 @@ pub fn run_batch(o: BatchOptions) -> Result<(), String> {
                     cmd.arg("--detonate-steps").arg(n.to_string());
                 }
                 cmd.env("VMPX_GUARD_THREADS", per_job.to_string());
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let ok = matches!(cmd.status(), Ok(st) if st.success());
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                // A short tag per file (the output's directory, e.g. win/xa) so the
+                // relayed lines of concurrent files stay distinguishable.
+                let tag = output
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .or_else(|| input.file_stem())
+                    .map_or_else(|| (i + 1).to_string(), |s| s.to_string_lossy().into_owned());
+                let ok = match cmd.spawn() {
+                    Ok(mut child) => {
+                        // Relay the child's concise stage output, prefixed. Guard
+                        // detail is gated, so this stays to a few lines per stage
+                        // plus the [guards] heartbeat.
+                        let etag = tag.clone();
+                        let err_thread = child.stderr.take().map(|e| {
+                            std::thread::spawn(move || {
+                                for line in BufReader::new(e).lines().map_while(Result::ok) {
+                                    eprintln!("[{etag}] {line}");
+                                }
+                            })
+                        });
+                        if let Some(out) = child.stdout.take() {
+                            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                                eprintln!("[{tag}] {line}");
+                            }
+                        }
+                        if let Some(h) = err_thread {
+                            let _ = h.join();
+                        }
+                        matches!(child.wait(), Ok(st) if st.success())
+                    }
+                    Err(e) => {
+                        eprintln!("[{tag}] spawn failed: {e}");
+                        false
+                    }
+                };
                 let secs = t0.elapsed().as_secs();
                 eprintln!(
                     "[batch {}/{total}] {} {} ({secs}s) -> {}",
@@ -2087,6 +2122,11 @@ fn devirt_guards(
     // default. Show it only in verbose (`--log`) mode or when explicitly asked
     // via VMPX_GUARD_PROGRESS (e.g. VMPX_GUARD_THREADS=1 to pin the culprit).
     let guard_progress = log.verbose() || std::env::var_os("VMPX_GUARD_PROGRESS").is_some();
+    // Coarse heartbeat so the long guard phase is not a silent black hole in the
+    // concise default: ~20 progress lines over the whole batch, to stderr.
+    let guard_total = guards.len();
+    let guard_step = (guard_total / 20).max(1);
+    let guard_done = std::sync::atomic::AtomicUsize::new(0);
     let functions: Vec<(usize, u32, Result<vmpx_recompile::Function, String>)> = pool.install(|| {
         guards
             .par_iter()
@@ -2135,6 +2175,10 @@ fn devirt_guards(
                             reason.lines().next().unwrap_or(reason)
                         ),
                     }
+                }
+                let n = guard_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if !guard_progress && (n == guard_total || n % guard_step == 0) {
+                    eprintln!("[guards] {n}/{guard_total} devirtualized");
                 }
                 (index, rva, result)
             })
