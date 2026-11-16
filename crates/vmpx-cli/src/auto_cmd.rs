@@ -104,16 +104,21 @@ struct Targets {
 /// The opaque protector sections -- VM runtime, bytecode, the rebuilt IAT -- are
 /// not pure code and stay removable.
 fn retained_protector_sections(pe: &PeImage<'_>) -> BTreeSet<String> {
-    // Pure executable code: CODE | EXECUTE | READ set, and crucially neither
-    // writable nor INITIALIZED_DATA -- the opaque protector sections (VM runtime,
-    // bytecode) carry the data bit or are writable, while a renamed `.text` does
-    // not. Matched by mask, not exact equality: VMProtect copies the real `.text`
-    // characteristics verbatim, which on some binaries carry extra flags (e.g.
-    // NOT_PAGED, 0x0800_0000) that an exact `0x6000_0020` test rejected -- which is
-    // how A380's `.IG(` (exactly `0x6000_0020`) was retained but win.xpl's `.K9-`
-    // (`0x6800_0020`, 15 MiB, 921 `.pdata` entries) was not.
+    // Executable code densely covered by `.pdata`: CODE | EXECUTE | READ set and
+    // not writable, with >= DENSE exception-function entries. The `.pdata` density
+    // is the real discriminator between a protector-renamed application `.text`
+    // (hundreds/thousands of functions) and the opaque VM runtime/bytecode (few or
+    // none); writable sections are live VM state and stay excluded. INITIALIZED_DATA
+    // is NOT disqualifying: VMProtect marks some relocated-code sections CODE+DATA
+    // (systems.xpl's `.vmp2`: `0x6800_0060`, 4.4 MiB, dense `.pdata`, holding the
+    // app's own mutated natives) -- excluding on the data bit stripped it and
+    // stranded every native that lived there. Matched by mask, not exact equality:
+    // VMProtect copies the real `.text` characteristics verbatim, which on some
+    // binaries carry extra flags (NOT_PAGED 0x0800_0000) that an exact
+    // `0x6000_0020` test rejected -- how A380's `.IG(` (`0x6000_0020`) was retained
+    // but win.xpl's `.K9-` (`0x6800_0020`, 15 MiB, 921 `.pdata`) was not.
     const CODE: u32 = 0x6000_0020; // CNT_CODE | MEM_EXECUTE | MEM_READ
-    const NON_CODE: u32 = 0x8000_0040; // MEM_WRITE | CNT_INITIALIZED_DATA
+    const NON_CODE: u32 = 0x8000_0000; // MEM_WRITE only (INITIALIZED_DATA is allowed)
     const DENSE: usize = 64;
     let mut pdata: BTreeMap<usize, usize> = BTreeMap::new();
     for function in &pe.report().exception_functions {
