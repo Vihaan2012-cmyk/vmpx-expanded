@@ -173,15 +173,16 @@ impl Default for VmCfgLimits {
             // 8 refused 37 entries on systems.xpl (4x -> 32 was +3 N1). A380's
             // nested-virtualized functions reach far more distinct nested sites,
             // so 32 stalled ~23 of them as "exceeds the nesting limit" with no
-            // other blocker; 128 recovers them. Raising this only spends budget on
-            // guards that were ALREADY failing here (a non-nested guard never
-            // reaches the cap), and the per-entry memory/wall caps still bound
-            // runaway, so the cost is productive. VMPX_MAX_NESTED tunes it down
-            // (e.g. for speed) or further up.
+            // other blocker. 32 is the DEFAULT: measured on systems.xpl, raising it
+            // to 128 slowed nested guards 20-50x (a reachable nested site re-enters
+            // deeply, so each extra level multiplies the symbolic work -- 90-270s
+            // vs 4-7s per guard), for a handful of extra A380 entries. Keep the
+            // fast default; `VMPX_MAX_NESTED=128` opts the deeper cap back in for a
+            // sample that needs it.
             max_nested_entries: std::env::var("VMPX_MAX_NESTED")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(128),
+                .unwrap_or(32),
             // Counts DISTINCT transition sites (see `transition_sites`), so this
             // bounds how many profile regions one entry may reach, not how often
             // it re-enters them. 32 still refused entries at that bound; 8x is
