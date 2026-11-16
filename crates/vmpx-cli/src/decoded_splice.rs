@@ -348,6 +348,21 @@ pub(crate) fn with_entry_input<R>(
     if candidate.seed.is_none() {
         candidate.seed = SEED_OVERRIDE.get();
     }
+    // Per-guard wall cap. A guard the recovery can't close in this budget is
+    // abandoned (left as a neutralized residual) rather than grinding one
+    // thread for minutes on a 13-phi generalization. VMPX_WALL_SECS overrides;
+    // the decompile default is far tighter than the report path's 400s net,
+    // because here a timeout costs one residual, not a measured-coverage delta.
+    // Covers BOTH entry-stream recovery (via symbolic.deadline below) and the
+    // CFG walk (via max_wall_time below, which recover_vm_cfg folds into its own
+    // symbolic deadline).
+    let wall_secs = std::env::var("VMPX_WALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s >= 1)
+        .unwrap_or(20);
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wall_secs));
     let entry_limits = EntryProfileRecoveryLimits {
         instruction_limit,
         // Parity with `report --serve-ro`, which is the mode the lift census is
@@ -360,6 +375,7 @@ pub(crate) fn with_entry_input<R>(
             serve_read_only_when_suppressed: (std::env::var_os("VMPX_DECOMPILE_SERVE_RO")
                 .is_some()
                 || crate::auto_cmd::auto_settings()),
+            deadline,
             ..vmpx_vm::SymbolicExecutionLimits::default()
         },
         ..EntryProfileRecoveryLimits::default()
@@ -379,6 +395,8 @@ pub(crate) fn with_entry_input<R>(
     // different graph.
     let limits = VmCfgLimits {
         entry: entry_limits,
+        // The decompile path's own tight default, not cfg_limits' 400s report net.
+        max_wall_time: Some(std::time::Duration::from_secs(wall_secs)),
         ..crate::report_cmd::cfg_limits(
             entry_limits.instruction_limit,
             std::env::var_os("VMPX_DECOMPILE_SERVE_RO").is_some()

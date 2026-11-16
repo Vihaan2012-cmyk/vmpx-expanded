@@ -745,7 +745,7 @@ pub(crate) fn neutralize_residual_guard_sites(
 
         // `.pdata` extents merged with each executable section's uncovered gaps --
         // the same coverage `retarget_sites` walks, so a branch in a gap is seen.
-        for (begin, end) in executable_scan_ranges(&pe) {
+        for (begin, end, _) in executable_scan_ranges(&pe) {
             if !mapped(begin) {
                 continue;
             }
@@ -1565,38 +1565,57 @@ fn detonate_imports(
 /// is the coverage the native rewriters (`retarget_sites`,
 /// `neutralize_residual_guard_sites`) walk, so the dangling-ref checker can never
 /// be weaker than the passes that rewrite into that same space.
-fn executable_scan_ranges(pe: &PeImage<'_>) -> Vec<(u32, u32)> {
+/// Each range carries `scan_data`: whether a rip-relative DATA operand found in
+/// it counts as a dangling reference. True ONLY inside a section WE emitted
+/// (`.vmpx*`: relocated natives, devirted guards, retained islands) -- the only
+/// place a data read into removed space is real (the island case) rather than a
+/// phantom. In every PRE-EXISTING section, an executable range's data operands
+/// are not scanned: real app code reads only retained data, and a rip-relative
+/// operand decoded out of embedded data tables / padding there is a phantom whose
+/// target is nonsense. Control flow is ALWAYS scanned (every range), so the
+/// checker stays no weaker than the rewriters, which only rewrite control flow in
+/// pre-existing sections and touch data solely in the `.vmpx*` code they emit.
+fn executable_scan_ranges(pe: &PeImage<'_>) -> Vec<(u32, u32, bool)> {
     let mapped = |rva: u32| pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
-    let mut ranges: Vec<(u32, u32)> = pe
+    let emitted = |rva: u32| {
+        pe.sections
+            .iter()
+            .find(|s| s.contains_mapped_rva(Rva(rva)))
+            .is_some_and(|s| s.name.starts_with(".vmpx"))
+    };
+    let mut funcs: Vec<(u32, u32)> = pe
         .report()
         .exception_functions
         .iter()
         .map(|f| (f.begin.0, f.end.0))
         .filter(|(b, e)| e > b && e - b <= 0x10_0000 && mapped(*b))
         .collect();
-    ranges.sort_unstable();
+    funcs.sort_unstable();
     let mut merged: Vec<(u32, u32)> = Vec::new();
-    for (b, e) in ranges.clone() {
+    for (b, e) in funcs.iter().copied() {
         match merged.last_mut() {
             Some(last) if b <= last.1 => last.1 = last.1.max(e),
             _ => merged.push((b, e)),
         }
     }
+    let mut ranges: Vec<(u32, u32, bool)> =
+        funcs.into_iter().map(|(b, e)| (b, e, emitted(b))).collect();
     for section in pe.sections.iter().filter(|s| s.characteristics & EXEC != 0) {
         let start = section.virtual_address.0;
         let size = section.virtual_size.max(section.size_of_raw_data);
+        let scan_data = section.name.starts_with(".vmpx");
         let mut cursor = start;
         for (b, e) in &merged {
             if *e <= start || *b >= start + size {
                 continue;
             }
             if *b > cursor {
-                ranges.push((cursor, (*b).min(start + size)));
+                ranges.push((cursor, (*b).min(start + size), scan_data));
             }
             cursor = cursor.max(*e);
         }
         if cursor < start + size {
-            ranges.push((cursor, start + size));
+            ranges.push((cursor, start + size, scan_data));
         }
     }
     ranges
@@ -1620,7 +1639,7 @@ fn count_dangling(image: &[u8]) -> usize {
     // `.pdata` bodies AND executable gaps -- a branch into removed space that
     // lives in a gap (outside any `.pdata` record) must be counted, or the
     // checker would be blind exactly where the rewriters can still reach.
-    for (b, e) in executable_scan_ranges(&pe) {
+    for (b, e, scan_data) in executable_scan_ranges(&pe) {
         if !mapped(b) {
             continue;
         }
@@ -1646,7 +1665,15 @@ fn count_dangling(image: &[u8]) -> usize {
             ) && ins.near_branch64() != 0
             {
                 Some(ins.near_branch64())
-            } else if ins.memory_base() == Register::RIP {
+            } else if ins.memory_base() == Register::RIP && scan_data {
+                // A rip-relative DATA operand only counts inside real code (a
+                // `.pdata` function body or our relocated `.vmpx*` section). The
+                // same operand decoded out of a pre-existing section's padding gap
+                // is a phantom -- e.g. a `01 01` filler run reads as
+                // `add al,[rip+0x2010101]`, a nonsense target that can land in
+                // removed space -- so it is not scanned here. Control flow is
+                // always scanned (above), so a real branch hidden in a gap stays
+                // caught, keeping the checker no weaker than the rewriters.
                 Some(ins.ip_rel_memory_address())
             } else {
                 None
@@ -1743,8 +1770,6 @@ fn relocate_natives(
         }
         native_blocks.push(list);
     }
-    let section_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
-    let payload_base = base + u64::from(section_rva);
     // Re-assemble every block at the relocation base with iced's block encoder.
     // It relaxes a branch whose target landed out of range once the blocks were
     // scattered here -- a short `jcc` between two blocks that originally sat
@@ -1846,6 +1871,96 @@ fn relocate_natives(
         // and the dangling-ref check refuses the write, fail-closed.
         return Ok((stripped.to_vec(), BTreeMap::new()));
     }
+    // --- data-island retention ---
+    // A relocated native can read a read-only CONSTANT by rip-relative address
+    // out of a protector section that strip removes (e.g. `mov eax,[rip-x]` into
+    // `.S(\`). BlockEncoder keeps the absolute target, so the read would dangle
+    // into unmapped space. Copy each such island -- bounded by the operand width,
+    // DIRECT `[rip+disp]` only (never an indexed table, a `lea` pointer, or a
+    // store) -- into a retained R-data section and retarget the read. Code refs
+    // into removed space are NOT islands: they stay skipped / fail-closed.
+    let staged = {
+        let stripped_pe = PeImage::parse(stripped).map_err(|e| e.to_string())?;
+        let in_stripped =
+            |rva: u32| stripped_pe.sections.iter().any(|s| s.contains_mapped_rva(Rva(rva)));
+        let mut want: BTreeMap<u64, usize> = BTreeMap::new();
+        for ins in &instrs {
+            if ins.memory_base() != Register::RIP
+                || ins.memory_index() != Register::None
+                || ins.op0_kind() == iced_x86::OpKind::Memory
+                || ins.flow_control() != FlowControl::Next
+            {
+                continue;
+            }
+            let size = ins.memory_size().size();
+            if size == 0 || size > 64 {
+                continue;
+            }
+            let va = ins.ip_rel_memory_address();
+            let Some(rva) = va.checked_sub(base).and_then(|v| u32::try_from(v).ok()) else {
+                continue;
+            };
+            if in_stripped(rva) {
+                continue; // target survives the strip -- nothing to copy
+            }
+            // Removed, but only an island if it is read-only and file-backed in
+            // the intact image (a const the loader would have mapped).
+            let readonly_backed = intact
+                .sections
+                .iter()
+                .find(|s| s.contains_mapped_rva(Rva(rva)))
+                .is_some_and(|s| (s.characteristics & 0x8000_0000) == 0)
+                && intact.rva_to_file_offset(Rva(rva)).is_ok();
+            if readonly_backed {
+                let slot = want.entry(va).or_insert(size);
+                *slot = (*slot).max(size);
+            }
+        }
+        if want.is_empty() {
+            stripped.to_vec()
+        } else {
+            let island_rva = next_section_rva(stripped).map_err(|e| e.to_string())?.0;
+            let mut payload = Vec::new();
+            let mut island_of: BTreeMap<u64, u64> = BTreeMap::new();
+            for (&va, &size) in &want {
+                let rva = u32::try_from(va - base).unwrap_or(0);
+                let off = intact
+                    .rva_to_file_offset(Rva(rva))
+                    .map_err(|e| e.to_string())?
+                    .0 as usize;
+                let bytes = intact_bytes
+                    .get(off..off + size)
+                    .ok_or_else(|| format!("island {va:#x} not file-backed"))?;
+                let here = island_rva + u32::try_from(payload.len()).unwrap_or(0);
+                island_of.insert(va, base + u64::from(here));
+                payload.extend_from_slice(bytes);
+            }
+            for ins in &mut instrs {
+                if ins.memory_base() == Register::RIP
+                    && ins.memory_index() == Register::None
+                    && let Some(&dst) = island_of.get(&ins.ip_rel_memory_address())
+                {
+                    ins.set_memory_displacement64(dst);
+                }
+            }
+            log.step(
+                "data islands retained",
+                &format!("{} read-only island(s), {} byte(s)", want.len(), payload.len()),
+            );
+            append_section(
+                stripped,
+                AppendSection {
+                    name: *b".vmpxdat",
+                    data: &payload,
+                    characteristics: 0x4000_0040,
+                },
+            )
+            .map_err(|e| e.to_string())?
+            .bytes
+        }
+    };
+    let payload_base =
+        base + u64::from(next_section_rva(&staged).map_err(|e| e.to_string())?.0);
     let block = iced_x86::InstructionBlock::new(&instrs, payload_base);
     let encoded = iced_x86::BlockEncoder::encode(
         64,
@@ -1870,7 +1985,7 @@ fn relocate_natives(
     }
     let moved = |va: u64| -> Option<u64> { moved_ip.get(&va).copied() };
     let rebuilt = append_section(
-        stripped,
+        &staged,
         AppendSection {
             name: *b".vmpxrel",
             data: &payload,

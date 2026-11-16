@@ -2952,6 +2952,7 @@ name = "vmpx-unpack"
 version = "0.1.0"
 dependencies = [
  "lzma-rs",
+ "rayon",
  "serde",
  "thiserror 2.0.20",
  "vmpx-pe",

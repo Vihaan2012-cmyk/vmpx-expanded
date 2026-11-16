@@ -186,6 +186,9 @@ pub struct WinApiHook {
     /// target outside both is provably not a thunk, skipping the map lookups.
     stub_span: (u64, u64),
     export_span: (u64, u64),
+    /// Recovery mode: return a benign success for unmodeled Win32 calls instead
+    /// of stopping (see the `dispatch_win32` Stop arm). Set from `VMPX_LENIENT`.
+    lenient_unmodeled: bool,
     /// Half-open `[lo, hi)` union of the watched `AddressOfFunctions` slot
     /// ranges; a read outside it cannot hit any watch.
     watch_span: (u64, u64),
@@ -312,6 +315,7 @@ impl WinApiHook {
             env_a: 0,
             env_w: 0,
             last_error: 0,
+            lenient_unmodeled: std::env::var_os("VMPX_LENIENT").is_some(),
             kusd_ready: false,
             image_base: 0,
             handle_names: BTreeMap::new(),
@@ -528,7 +532,26 @@ impl WinApiHook {
             return h;
         }
         let h = self.hmodule_next;
-        let exports = self.export_reference.get(&key).cloned().unwrap_or_default();
+        // API-set contract names (`api-ms-win-*`, `ext-ms-win-*`) are virtual
+        // DLLs with no file on disk; they forward to kernelbase.dll (or
+        // kernel32.dll). Resolve their exports from the host so GetProcAddress on
+        // an api-set finds a real export stub instead of a bare sentinel.
+        let is_apiset = key.starts_with("api-ms-win-") || key.starts_with("ext-ms-win-");
+        let exports = self
+            .export_reference
+            .get(&key)
+            .filter(|e| !e.is_empty())
+            .or_else(|| {
+                is_apiset
+                    .then(|| {
+                        self.export_reference
+                            .get("kernelbase.dll")
+                            .or_else(|| self.export_reference.get("kernel32.dll"))
+                    })
+                    .flatten()
+            })
+            .cloned()
+            .unwrap_or_default();
         match map_module_image(mem, h, &key, &exports) {
             Ok(Some(layout)) => {
                 if key == "ntdll.dll" && self.install_nt_stubs(mem, h, &layout.slots).is_err() {
@@ -1149,6 +1172,21 @@ impl WinApiHook {
 
     /// Deterministic fake proc VA for `(module, symbol)`.
     fn proc_addr(&mut self, module: &str, symbol: &str) -> u64 {
+        // Prefer the module's real export stub: it lives in `export_span`, so a
+        // guest `call`/`jmp` to the returned pointer is dispatched by `on_flow`
+        // (via `export_stub_addrs`). A bare PROC_BASE sentinel is outside every
+        // flow-interest span, so CALLING it would fault -- which is exactly what
+        // the app does with a resolved pointer. Fall back to a sentinel only when
+        // the export table is not mapped (module not loadable).
+        let mkey = module.to_lowercase();
+        if let Some((&va, _)) =
+            self.export_stub_addrs.iter().find(|(_, (m, f))| *m == mkey && f.as_str() == symbol)
+        {
+            return va;
+        }
+        if std::env::var_os("VMPX_PROC_LOG").is_some() {
+            eprintln!("[proc] GetProcAddress({module:?}, {symbol:?}) -> sentinel (no export stub)");
+        }
         let key = (module.to_string(), symbol.to_string());
         let n = self.procs.len() as u64;
         let va = *self.procs.entry(key).or_insert(PROC_BASE + n * 8);
@@ -1326,7 +1364,9 @@ impl WinApiHook {
             (_, "HeapSetInformation") => Dispatch::Ret(1),
 
             // ---- Loader ------------------------------------------------------
-            (_, "GetModuleHandleA" | "LoadLibraryA") => {
+            (_, "GetModuleHandleA" | "LoadLibraryA" | "LoadLibraryExA") => {
+                // LoadLibraryExA(name, hFile, flags): only the name (arg0) matters
+                // for resolution; hFile/flags do not change which module loads.
                 let p = Self::arg(cpu, 0);
                 let name = if p == 0 { "<self>".to_string() } else {
                     match read_cstr(mem, p) {
@@ -1336,7 +1376,7 @@ impl WinApiHook {
                 };
                 Dispatch::Ret(self.lookup_module(mem, &name, func))
             }
-            (_, "GetModuleHandleW" | "LoadLibraryW") => {
+            (_, "GetModuleHandleW" | "LoadLibraryW" | "LoadLibraryExW") => {
                 let p = Self::arg(cpu, 0);
                 let name = if p == 0 { "<self>".to_string() } else {
                     match read_wstr(mem, p) {
@@ -2332,6 +2372,17 @@ impl WinApiHook {
         }
         match self.dispatch(dll, func, cpu, mem, sab) {
             Dispatch::Stop => {
+                // Lenient recovery mode: instead of stopping on an unmodeled
+                // Win32 call, return a benign success (RAX=1) and resume. Lets a
+                // run push through CRT/support init to reach the app's OWN import
+                // resolution (GetProcAddress, which IS modeled) for import
+                // recovery. OFF by default: the value is a guess and only sound
+                // for the quarantined detonation/recovery run, never static output.
+                if self.lenient_unmodeled {
+                    self.note(&format!("LENIENT {dll}!{func} -> 1"));
+                    cpu.regs[RAX] = 1;
+                    return Self::resume(ev, cpu, mem);
+                }
                 self.note(&format!("UNMODELED {dll}!{func} (run stopped)"));
                 HookAction::Stop
             }
