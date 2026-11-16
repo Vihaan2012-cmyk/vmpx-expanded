@@ -1453,6 +1453,7 @@ fn main() -> Result<()> {
             detonate_steps,
             save_snapshot,
             emit_dwarf,
+            guard_threads: None,
         })
         .map_err(|error| anyhow::anyhow!(error))?,
         Command::Devirt {

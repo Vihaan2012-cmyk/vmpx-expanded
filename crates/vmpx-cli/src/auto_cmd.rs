@@ -51,6 +51,9 @@ pub struct Options {
     pub save_snapshot: Option<PathBuf>,
     /// Embed DWARF debug symbols (named reconstructed functions) in the clean PE.
     pub emit_dwarf: bool,
+    /// Guard-devirtualization worker threads. `None` uses the machine default (or
+    /// `VMPX_GUARD_THREADS`); `batch` sets it so concurrent files divide the cores.
+    pub guard_threads: Option<usize>,
 }
 
 const EXEC: u32 = 0x2000_0000;
@@ -1092,7 +1095,7 @@ pub fn run(o: Options) -> Result<(), String> {
     if !targets.guards.is_empty() {
         log.start("Devirtualizing guard functions");
         let (new_image, residual, placements) =
-            devirt_guards(&log, &pe, image, instruction_limit, &targets.guards)?;
+            devirt_guards(&log, &pe, image, instruction_limit, &targets.guards, o.guard_threads)?;
         image = new_image;
         residual_guards = residual;
         for (orig, new, size) in &placements {
@@ -1915,6 +1918,7 @@ fn devirt_guards(
     image: Vec<u8>,
     instruction_limit: usize,
     guards: &[u32],
+    guard_threads: Option<usize>,
 ) -> Result<(Vec<u8>, Vec<u32>, Vec<(u32, u32, u32)>), String> {
     use rayon::prelude::*;
     // Development subset: devirtualize only a handful of guards so an engine
@@ -1956,10 +1960,14 @@ fn devirt_guards(
     // Actual per-guard memory is ~100 MiB (the 1.5 GiB figure is a rarely-hit
     // self-limit), so most cores can run concurrently; a little headroom is left
     // for the occasional heavy guard. VMPX_GUARD_THREADS overrides.
-    let thread_count = std::env::var("VMPX_GUARD_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    let thread_count = guard_threads
         .filter(|n| *n >= 1)
+        .or_else(|| {
+            std::env::var("VMPX_GUARD_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+        })
         .unwrap_or_else(|| rayon::current_num_threads().saturating_sub(2).max(1));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
@@ -1977,15 +1985,19 @@ fn devirt_guards(
     // recovery is independent per guard and is the whole cost, so this scales
     // across the machine. The cheap, VA-dependent compile is split out (below)
     // so guards are packed end-to-end with no fixed slot and no size ceiling.
+    // Per-guard progress goes to stderr (flushed) so a crash names the guard it
+    // died on, but it is one line per guard -- far too noisy for the concise
+    // default. Show it only in verbose (`--log`) mode or when explicitly asked
+    // via VMPX_GUARD_PROGRESS (e.g. VMPX_GUARD_THREADS=1 to pin the culprit).
+    let guard_progress = log.verbose() || std::env::var_os("VMPX_GUARD_PROGRESS").is_some();
     let functions: Vec<(usize, u32, Result<vmpx_recompile::Function, String>)> = pool.install(|| {
         guards
             .par_iter()
             .enumerate()
             .map(|(index, &rva)| {
-                // Per-guard progress to stderr (flushed), so a crash names the
-                // guard it died on -- run with VMPX_GUARD_THREADS=1 to make the
-                // last line the exact culprit.
-                eprintln!("[guard {}/{}] {rva:#x} start", index + 1, guards.len());
+                if guard_progress {
+                    eprintln!("[guard {}/{}] {rva:#x} start", index + 1, guards.len());
+                }
                 // Escalate a guard's budget only when more budget can actually
                 // help (CFG building exhausted its budget); a structural stall
                 // returns the same result at any budget, so retrying only burns
@@ -2016,14 +2028,16 @@ fn devirt_guards(
                     result = build(used);
                 }
                 let ms = t0.elapsed().as_millis();
-                match &result {
-                    Ok(_) => eprintln!("[guard {}/{}] {rva:#x} built {ms}ms used={used}", index + 1, guards.len()),
-                    Err(reason) => eprintln!(
-                        "[guard {}/{}] {rva:#x} fail {ms}ms used={used}: {}",
-                        index + 1,
-                        guards.len(),
-                        reason.lines().next().unwrap_or(reason)
-                    ),
+                if guard_progress {
+                    match &result {
+                        Ok(_) => eprintln!("[guard {}/{}] {rva:#x} built {ms}ms used={used}", index + 1, guards.len()),
+                        Err(reason) => eprintln!(
+                            "[guard {}/{}] {rva:#x} fail {ms}ms used={used}: {}",
+                            index + 1,
+                            guards.len(),
+                            reason.lines().next().unwrap_or(reason)
+                        ),
+                    }
                 }
                 (index, rva, result)
             })
