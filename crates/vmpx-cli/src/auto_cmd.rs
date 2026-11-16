@@ -91,13 +91,19 @@ pub fn run_batch(o: BatchOptions) -> Result<(), String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot locate the vmpx executable: {e}"))?;
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let jobs = o
-        .jobs
-        .unwrap_or_else(|| (cores / 8).max(1))
-        .clamp(1, pairs.len());
+    // Default to SEQUENTIAL: the guard phase is CPU-bound and saturates the cores,
+    // and the unpack is now parallel too, so running files one-at-a-time with ALL
+    // cores each is as fast as (often faster than) splitting cores across
+    // concurrent files -- and it avoids leaving a finished job's cores idle while a
+    // slower sibling is still running. `--jobs N` opts into N-at-a-time (each file
+    // then gets cores/N guard threads), useful to overlap many small files.
+    let jobs = o.jobs.unwrap_or(1).clamp(1, pairs.len());
     let per_job = (cores / jobs).max(1);
     let total = pairs.len();
-    eprintln!("[batch] {total} file(s), {jobs} at a time, {per_job} guard thread(s) each ({cores} cores)");
+    eprintln!(
+        "[batch] {total} file(s), {jobs} at a time, {} guard thread(s) each ({cores} cores)",
+        if jobs == 1 { cores } else { per_job }
+    );
 
     let queue: Mutex<VecDeque<(usize, PathBuf, PathBuf)>> =
         Mutex::new(pairs.into_iter().enumerate().map(|(i, (a, b))| (i, a, b)).collect());
@@ -1651,6 +1657,13 @@ fn count_dangling(image: &[u8]) -> usize {
                 && !mapped(rva)
             {
                 count += 1;
+                if std::env::var_os("VMPX_DANGLE_DUMP").is_some() {
+                    use iced_x86::Formatter;
+                    let mut txt = String::new();
+                    iced_x86::NasmFormatter::new().format(&ins, &mut txt);
+                    let src_rva = ins.ip().wrapping_sub(base) as u32;
+                    eprintln!("[dangle] from {:#x} (rva {src_rva:#x}): {txt}  -> {va:#x} (rva {rva:#x})", ins.ip());
+                }
             }
         }
     }
