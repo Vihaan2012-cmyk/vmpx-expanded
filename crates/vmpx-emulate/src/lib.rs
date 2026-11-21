@@ -79,7 +79,7 @@ mod xplm;
 pub use alu::{Alu, Flags, Shift};
 pub use detonate::{
     DetonateError, DetonateOptions, DetonationResult, IatRegion, LifecycleCall, LifecycleOptions,
-    LifecycleReport, VmCounts, XplmSummary, detonate, export_reference_from_exports,
+    LifecycleReport, VmCounts, XplmSummary, detonate, detonate_with, export_reference_from_exports,
     export_reference_from_imports, observed_edges_text,
 };
 pub use dump::{

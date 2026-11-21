@@ -2889,7 +2889,10 @@ impl Emulator {
                             self.cpu.set_reg(acc_reg(n), q);
                             self.cpu.set_reg(dx_reg(n), r);
                         }
-                        self.apply(Flags { def: 0, val: 0, undef: STATUS });
+                        // REAL silicon LEAVES all status flags UNCHANGED across
+                        // div/idiv (native probe). VMPX_OLDDIV restores the old clear.
+                        let du = if std::env::var_os("VMPX_OLDDIV").is_some() { STATUS } else { 0 };
+                        self.apply(Flags { def: 0, val: 0, undef: du });
                     }
                 }
             }
@@ -2944,7 +2947,15 @@ impl Emulator {
                 } else {
                     let idx = if mn == Mnemonic::Bsf { s.trailing_zeros() } else { s.ilog2() };
                     self.write_op(ins, 0, n, u64::from(idx))?;
-                    self.apply(Flags { def: ZF, val: 0, undef: STATUS & !ZF });
+                    // REAL silicon (native probe): ZF=0, OF/SF/AF/CF cleared, and
+                    // PF = parity of the low byte of the RESULT. The emulator used to
+                    // clear PF too; VMProtect folds it as an anti-emulation check.
+                    if std::env::var_os("VMPX_OLDBSF").is_some() {
+                        self.apply(Flags { def: ZF, val: 0, undef: STATUS & !ZF });
+                    } else {
+                        let pf = if (u64::from(idx) & 0xff).count_ones() % 2 == 0 { PF } else { 0 };
+                        self.apply(Flags { def: ZF | PF, val: pf, undef: STATUS & !(ZF | PF) });
+                    }
                 }
             }
             Mnemonic::Xchg => {
@@ -3042,7 +3053,12 @@ impl Emulator {
             // Bulk flag save/restore: pushfq copies the concrete flag image (as
             // hardware does); it does not stop on an undefined bit. Only a
             // consumer that branches/computes on a flag stops (see Lahf note).
-            Mnemonic::Pushfq => self.push64(self.cpu.rflags)?,
+            Mnemonic::Pushfq => {
+                if std::env::var_os("VMPX_PUSHFLOG").is_some() {
+                    eprintln!("[pushf] rip={:#x} rflags={:#x}", self.cur.0, self.cpu.rflags);
+                }
+                self.push64(self.cpu.rflags)?
+            }
             Mnemonic::Popfq => {
                 let sp = self.cpu.regs[RSP];
                 let v = self.load(sp, 8)?;
@@ -3099,6 +3115,9 @@ impl Emulator {
             // stopping on an undefined bit: only a *consumer* that branches or
             // computes on a flag (jcc/setcc/cmov/adc/sbb/rcl/rcr/cmc) must stop.
             Mnemonic::Lahf => {
+                if std::env::var_os("VMPX_PUSHFLOG").is_some() {
+                    eprintln!("[lahf] rip={:#x} rflags={:#x}", self.cur.0, self.cpu.rflags);
+                }
                 let m5 = CF | PF | AF | ZF | SF;
                 self.cpu.set_reg(Register::AH, (self.cpu.rflags & m5) | 2);
             }
@@ -3260,7 +3279,15 @@ impl Emulator {
                 None => self.write_op(ins, 0, n, newval)?,
             }
         }
-        self.apply(Flags { def: CF, val: if cf != 0 { CF } else { 0 }, undef: OF | SF | AF | PF });
+        // bt/bts/btr/btc define CF (the tested bit) and, on REAL silicon, LEAVE
+        // OF/SF/ZF/AF/PF UNCHANGED — verified by a native flag probe. The Intel SDM
+        // calls them "undefined", but hardware retains them, and VMProtect's VM key
+        // folds those retained bits as an anti-emulation check: concretizing them to
+        // 0 (the old behaviour) diverges from silicon and fails the integrity hash.
+        // VMPX_OLDBT=1 restores the old (silicon-wrong) clearing, to locate where
+        // VMProtect reads the bt flags via a strict-mode fail-closed stop.
+        let bt_undef = if std::env::var_os("VMPX_OLDBT").is_some() { OF | SF | AF | PF } else { 0 };
+        self.apply(Flags { def: CF, val: if cf != 0 { CF } else { 0 }, undef: bt_undef });
         Ok(())
     }
 
@@ -3419,9 +3446,15 @@ const TSC_AUX: u64 = 0;
 /// - leaf `0x8000_0001`: EDX = SYSCALL | Long-Mode (64-bit capable).
 /// - any other leaf/subleaf: all zero.
 fn cpuid(leaf: u64, _sub: u64) -> (u64, u64, u64, u64) {
+    // Perturbation knobs (empirical anti-emulation hunt): VMPX_CPUID_HV sets the
+    // hypervisor-present bit + a hypervisor leaf; VMPX_CPUID_AMD swaps the vendor.
+    let hv = std::env::var_os("VMPX_CPUID_HV").is_some();
+    let amd = std::env::var_os("VMPX_CPUID_AMD").is_some();
     match leaf {
+        0x0 if amd => (0x16, 0x6874_7541, 0x444d_4163, 0x6974_6e65), // AuthenticAMD
         0x0 => (0x16, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
-        0x1 => (0x0006_06a7, 0, 0, 0x0780_8031),
+        0x1 => (0x0006_06a7, 0, if hv { 0x8000_0000 } else { 0 }, 0x0780_8031),
+        0x4000_0000 if hv => (0x4000_0001, 0x7263_694d, 0x666f_736f, 0x0000_7674), // "Microsoft Hv"
         0x8000_0000 => (0x8000_0001, 0, 0, 0),
         0x8000_0001 => (0, 0, 0, 0x2000_0800),
         _ => (0, 0, 0, 0),

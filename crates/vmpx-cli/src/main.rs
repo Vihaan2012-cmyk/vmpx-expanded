@@ -1056,6 +1056,11 @@ fn main() -> Result<()> {
     if std::env::var_os("VMPX_TRUST_MAPPED_IMAGE").is_some() {
         vmpx_vm::set_trusted_mapped_image(true);
     }
+    // Wire the symbolic-decode fallback (vmpx-mutation) into vmpx-vm's role-
+    // assignment seam. Idempotent and inert unless `VMPX_SYMBOLIC_DECODE` is set,
+    // when it surfaces a recovered decode codec for entries the pattern-matcher
+    // rejects (VMProtect's mutation-saturated handlers).
+    vmpx_mutation::install_symbolic_codec_provider();
     match cli.command {
         Command::Clean {
             input,

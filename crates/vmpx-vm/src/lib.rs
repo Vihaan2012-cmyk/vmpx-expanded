@@ -35,6 +35,7 @@ mod profile_explore;
 mod profile_paths;
 mod semantic_exec;
 mod symbolic_domain;
+pub mod symbolic_hook;
 mod transform;
 mod transition_extract;
 mod value_flow;
@@ -209,6 +210,7 @@ pub use symbolic_domain::{
     SymbolicConcreteAlternative, SymbolicDomainError, SymbolicDomainLimits, SymbolicDomainReport,
     enumerate_symbolic_value,
 };
+pub use symbolic_hook::{set_symbolic_codec_provider, SymbolicCodecProvider};
 pub use transform::{BitWidth, Transform, TransformChain, TransformError, TransformOp};
 pub use transition_extract::{
     RecoveredVmTransition, VmTransitionAnalysis, VmTransitionReport, analyze_vm_transition,

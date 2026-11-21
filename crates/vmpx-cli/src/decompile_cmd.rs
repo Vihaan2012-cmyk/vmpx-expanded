@@ -461,8 +461,12 @@ fn native(o: &Options, bytes: &[u8]) -> Result<()> {
             let name = format!("native_{rva:x}");
             println!("// ==== {name} [{rva:#x}]");
             // PROVEN_FP models call terminators (a `call` becomes Terminator::Call
-            // with the clobber modeled), so the lift can follow past it.
-            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), CfgOptions::PROVEN_FP) {
+            // with the clobber modeled), so the lift can follow past it. The labeled
+            // stack-disjoint relaxation lifts blocks PROVEN_FP refuses only on a
+            // possible load/store alias (the dominant not-lifted cause on mutated
+            // engine code); blocks that use it carry `assumes_stack_disjoint`.
+            let relaxed = CfgOptions { assume_stack_disjoint: true, ..CfgOptions::PROVEN_FP };
+            let cfg = match recover_native_cfg_pe_with(&pe, Rva(*rva), relaxed) {
                 Ok(c) => c,
                 Err(e) => {
                     println!("// {name}: cfg recovery failed: {e}\n");

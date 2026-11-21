@@ -9,8 +9,12 @@ fn main() {
     let pe = PeImage::parse(&bytes).unwrap();
     let target = u32::from_str_radix(args[2].trim_start_matches("0x"), 16).unwrap();
     let candidate = analyze_vm_entry_at(&pe, Rva(target), VmDiscoveryLimits::default()).unwrap();
-    let (report, recovered) =
-        recover_bootstrap_dispatch(&pe, &candidate, DirectJumpTraceLimits::default()).unwrap();
+    let mut limits = DirectJumpTraceLimits::default();
+    if std::env::var_os("VMPX_BOOTSTRAP_FOLLOW_COND").is_some() {
+        limits.follow_conditional_fallthrough = true;
+        limits.max_conditional_continuations = 64;
+    }
+    let (report, recovered) = recover_bootstrap_dispatch(&pe, &candidate, limits).unwrap();
     println!(
         "candidates={} rejected={}",
         report.candidates.len(),

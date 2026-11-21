@@ -17,6 +17,7 @@ pub mod linear_mba;
 pub mod sampling;
 pub mod state_model;
 pub mod substitution;
+pub mod symbolic_codec;
 
 pub use cfg_recovery::{
     IndirectTarget,
@@ -26,6 +27,9 @@ pub use cfg_recovery::{
     recover_native_cfg_with,
 };
 pub use bvutil::{eval_concrete, registers};
+pub use symbolic_codec::{
+    extract_symbolic_codec, extract_symbolic_codec_auto, install_symbolic_codec_provider,
+};
 pub use vmpx_vm::{BitWidth, Expr};
 
 /// Which family of mutation obfuscation a [`Problem`] belongs to. Drives both

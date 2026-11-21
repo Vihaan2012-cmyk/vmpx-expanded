@@ -456,6 +456,21 @@ fn unicorn_lockstep_dump(
     max_steps: u64,
 ) -> Stop {
     std::fs::create_dir_all(dir).ok();
+    // VMPX_UNICORN_SKIP: fast-forward (acceleration ON, semantics-preserving) to
+    // near a late event, then snapshot + single-step there. Lets the lockstep
+    // window target the exit (~76M steps) without a multi-GB full trace.
+    let skip = std::env::var("VMPX_UNICORN_SKIP")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if skip > 0 {
+        let s = emu.run(skip);
+        eprintln!("VMPX_UNICORN: fast-forwarded ~{skip} steps (stop={s:?}, rip={:#x})", emu.cpu.rip);
+        if emu.cpu.rip == sentinel || !matches!(s, Stop::StepLimit) {
+            eprintln!("VMPX_UNICORN: run ended during fast-forward, nothing to lockstep");
+            return s;
+        }
+    }
     emu.accelerate_checksums = false;
     emu.accelerate_literals = false;
     emu.record_trace = false;
@@ -501,7 +516,9 @@ fn unicorn_lockstep_dump(
     stop
 }
 
-fn detonate_with(
+/// Like [`detonate`], but also installs `extra` into the hook set — for
+/// diagnostics that need to observe memory/flow/syscalls during the run.
+pub fn detonate_with(
     pe: &PeImage,
     opts: &DetonateOptions,
     extra: Option<Box<dyn Hook>>,
@@ -627,7 +644,10 @@ fn detonate_with(
     // by a multi-bit rotate/shift/bt proceeds as it would on real silicon. This
     // is an observed/quarantined-tier concretization confined to this contained,
     // in-model run; it never affects sound static output.
-    emu.resolve_undefined_flags = opts.resolve_undefined_flags;
+    // VMPX_RESOLVE_UNDEF=0 forces the fail-closed stop at the first undefined-flag
+    // READ — pinpoints exactly which flag an anti-emulation check consumes.
+    emu.resolve_undefined_flags =
+        opts.resolve_undefined_flags && std::env::var("VMPX_RESOLVE_UNDEF").map_or(true, |v| v != "0");
     // Only the retired count is consumed; skip the per-step trace allocation.
     // Under VMPX_FAULT_DUMP keep a per-step trace so a fault can show the
     // executed instruction stream (real boundaries) leading up to it.

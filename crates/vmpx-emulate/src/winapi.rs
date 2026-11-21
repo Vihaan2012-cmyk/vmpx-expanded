@@ -30,7 +30,7 @@ use crate::cpu::Cpu;
 use crate::emu::{FlowEvent, FlowKind, Hook, HookAction, Interest, MemEvent};
 use crate::loader::LoadedImage;
 use crate::memory::{Access, MapError, Memory, Perm};
-use crate::ntdll::{NtDispatch, NtState};
+use crate::ntdll::{read_object_name, NtDispatch, NtState};
 use crate::observe::{ObservedFacts, SymbolOrOrdinal};
 use crate::xplm::{Call as XCall, Dispatch as XDispatch, GuestMem, Xplm};
 
@@ -90,6 +90,11 @@ const FIXED_QPC: u64 = 0x0000_0001_0000_0000;
 const POINTER_COOKIE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 // Deterministic process command line returned by GetCommandLineA/W.
 const CMDLINE: &str = "program.exe";
+
+// Command line for the run: VMPX_CMDLINE override (e.g. the protect args) or the default.
+fn cmdline_string() -> String {
+    std::env::var("VMPX_CMDLINE").unwrap_or_else(|_| CMDLINE.to_string())
+}
 
 const PAGE: u64 = 0x1000;
 
@@ -151,6 +156,13 @@ pub struct WinApiHook {
     /// Cached guest VAs of the ANSI / wide command-line strings (0 = not built).
     cmdline_a: u64,
     cmdline_w: u64,
+    /// Protect-run file serving: input bytes, its basename, open input handles
+    /// (handle -> read offset), file-mapping handles over the input, handle pool.
+    file_in: Vec<u8>,
+    file_in_name: String,
+    file_handles: BTreeMap<u64, u64>,
+    map_handles: Vec<u64>,
+    next_file_h: u64,
     /// Cached guest VAs of the ANSI / wide environment blocks (0 = not built).
     env_a: u64,
     env_w: u64,
@@ -194,6 +206,10 @@ pub struct WinApiHook {
     watch_span: (u64, u64),
     /// In-model NT object + memory state for the emulated ntdll syscall stubs.
     nt: NtState,
+    /// `\KnownDlls\<dll>` section handles -> the clean module base they map. Serves
+    /// VMProtect's anti-hook technique (open a pristine ntdll to read syscall stubs).
+    knowndll_views: BTreeMap<u64, u64>,
+    knowndll_next: u64,
     /// Real syscall numbers by `Nt*`/`Zw*` export name (offline System32 ntdll).
     syscall_numbers: BTreeMap<String, u32>,
     /// Placeholder syscall number per `Nt`/`Zw`-stripped name, for exports with no
@@ -312,6 +328,16 @@ impl WinApiHook {
             tls_next: 1,
             cmdline_a: 0,
             cmdline_w: 0,
+            file_in: std::env::var("VMPX_PROTECT_INPUT")
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default(),
+            file_in_name: std::env::var("VMPX_PROTECT_INPUT_NAME")
+                .unwrap_or_default()
+                .to_lowercase(),
+            file_handles: BTreeMap::new(),
+            map_handles: Vec::new(),
+            next_file_h: 0x0000_0070_FF00_0000,
             env_a: 0,
             env_w: 0,
             last_error: 0,
@@ -326,6 +352,8 @@ impl WinApiHook {
             walk_recorded: BTreeSet::new(),
             export_stub_addrs: BTreeMap::new(),
             nt: NtState::new(),
+            knowndll_views: BTreeMap::new(),
+            knowndll_next: 0x7700_0000_0000,
             syscall_numbers: BTreeMap::new(),
             syscall_placeholders: BTreeMap::new(),
             syscall_names: BTreeMap::new(),
@@ -552,9 +580,37 @@ impl WinApiHook {
             })
             .cloned()
             .unwrap_or_default();
-        match map_module_image(mem, h, &key, &exports) {
+        // When a REAL ntdll image is supplied (VMPX_NTDLL), map it as the loaded
+        // ntdll module so VMProtect's clean-vs-loaded anti-hook comparison matches.
+        // The real stubs keep syscall dispatch working via `on_syscall`; no synthetic
+        // stubs are installed.
+        let mut real_image_size = 0u64;
+        let real_layout = if key == "ntdll.dll" && std::env::var_os("VMPX_NTDLL").is_some() {
+            self.map_real_ntdll_module(mem, h).map(|(l, sz)| {
+                real_image_size = sz;
+                l
+            })
+        } else if let Some(p) = Self::real_sysdll_path(&key) {
+            // Map a real on-disk copy of any other system DLL (kernel32, user32, …)
+            // so VMProtect's per-module integrity CRC sees distinct real code.
+            self.map_real_module(mem, h, p.as_os_str(), false).map(|(l, sz)| {
+                real_image_size = sz;
+                l
+            })
+        } else {
+            None
+        };
+        let mapped = if let Some(layout) = real_layout {
+            Ok(Some(layout))
+        } else {
+            map_module_image(mem, h, &key, &exports)
+        };
+        match mapped {
             Ok(Some(layout)) => {
-                if key == "ntdll.dll" && self.install_nt_stubs(mem, h, &layout.slots).is_err() {
+                if key == "ntdll.dll"
+                    && real_image_size == 0
+                    && self.install_nt_stubs(mem, h, &layout.slots).is_err()
+                {
                     return 0;
                 }
                 for export in layout.slots.iter().flatten() {
@@ -583,10 +639,210 @@ impl WinApiHook {
             Ok(None) => {}
             Err(_) => return 0,
         }
-        self.hmodule_next += MODULE_IMAGE_SIZE;
+        // A real ntdll image spans more than one module stride; advance past it so
+        // the next module does not overlap its sections.
+        self.hmodule_next += real_image_size.max(MODULE_IMAGE_SIZE);
         self.name_handles.insert(key.clone(), h);
         self.handle_names.insert(h, key);
         h
+    }
+
+    /// Map the REAL ntdll image (from `VMPX_NTDLL`) at `base` as the loaded module.
+    ///
+    /// VMProtect's anti-hook technique reads the clean KnownDlls ntdll AND the
+    /// loaded ntdll and COMPARES them byte-for-byte; a synthetic loaded module
+    /// differs from the real clean copy -> "a debugger has been found". Serving the
+    /// REAL image as the loaded module (and the same base for the clean copy) makes
+    /// the comparison match and the whole-image verification pass.
+    ///
+    /// The emulator never needs the synthetic export table here: imports resolved
+    /// through GetProcAddress point at STUB_REGION sentinels (unchanged), direct
+    /// syscalls execute the real stub's `syscall` (dispatched by `on_syscall` with
+    /// the offline real syscall numbers), and a manual export-table walk reads the
+    /// real directory. We still register the real export addresses so a call that
+    /// lands on an `Nt*` export entry is dispatched in-model by name. Returns the
+    /// layout (to register the read-watch) and the image's `SizeOfImage`.
+    fn map_real_ntdll_module(&mut self, mem: &mut Memory, base: u64) -> Option<(ExportLayout, u64)> {
+        let path = std::env::var_os("VMPX_NTDLL")?;
+        self.map_real_module(mem, base, &path, true)
+    }
+
+    /// Resolve a real on-disk copy of a system DLL to map as the loaded module, so
+    /// VMProtect's per-module integrity CRC sees real, distinct code (the synthetic
+    /// stub module is mostly zero -> every module hashes the same -> "File corrupted").
+    /// Order: `VMPX_SYSDIR/<key>`, then System32, when `VMPX_REAL_SYSDLLS` is set.
+    fn real_sysdll_path(key: &str) -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("VMPX_SYSDIR") {
+            let p = std::path::Path::new(&dir).join(key);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        if std::env::var_os("VMPX_REAL_SYSDLLS").is_some() {
+            let p = crate::system_root().join("System32").join(key);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Map a REAL PE image (`path`) at `base` as a loaded module: one region, real
+    /// bytes, real export addresses registered for in-model dispatch. When `is_ntdll`,
+    /// also extract each `Nt*` stub's real syscall number into `syscall_names` for
+    /// inline-`syscall` dispatch. See `map_real_ntdll_module` for the rationale.
+    fn map_real_module(
+        &mut self,
+        mem: &mut Memory,
+        base: u64,
+        path: &std::ffi::OsStr,
+        is_ntdll: bool,
+    ) -> Option<(ExportLayout, u64)> {
+        let bytes = std::fs::read(path).ok()?;
+        let pe = vmpx_pe::PeImage::parse(&bytes).ok()?;
+        let report = pe.report();
+        let file = pe.data();
+        let up = |v: u64| (v + 0xfff) & !0xfff;
+        let image_size = up(u64::from(report.optional.size_of_image));
+        // Map the WHOLE image as ONE region with a single permission. A real mapped
+        // image is one allocation (one AllocationBase): if we instead mapped each
+        // section with its own perm, VMProtect's VirtualQuery sweep would see ntdll
+        // as ~7 separate allocations and its region-enumeration integrity check would
+        // overflow ("File corrupted"). One region keeps the allocation count right.
+        mem.map(base, image_size, Perm::RX).ok()?;
+        let n = (report.optional.size_of_headers as usize).min(file.len());
+        let _ = mem.poke(base, &file[..n]);
+        for s in &report.sections {
+            let va = base + u64::from(s.virtual_address.0);
+            if u64::from(s.mapped_span()) == 0 {
+                continue;
+            }
+            let raw = s.pointer_to_raw_data.0 as usize;
+            let rlen = (s.size_of_raw_data as usize).min(s.mapped_span() as usize);
+            if rlen > 0 && raw + rlen <= file.len() {
+                let _ = mem.poke(va, &file[raw..raw + rlen]);
+            }
+        }
+        // Apply base relocations so absolute pointers in the image point at THIS
+        // base, exactly as the Windows loader would. A real loaded DLL is relocated;
+        // VMProtect's anti-hook/key hashing reads .rdata (incl. relocated pointers),
+        // so unrelocated bytes would diverge from a genuinely-loaded module.
+        let delta = base.wrapping_sub(report.optional.image_base.0);
+        if delta != 0 && std::env::var_os("VMPX_NORELOC").is_none() {
+            for blk in &report.relocations {
+                for e in &blk.entries {
+                    // Type 10 = IMAGE_REL_BASED_DIR64 (the only type ntdll/x64 uses).
+                    if e.kind == 10 {
+                        let at = base + u64::from(blk.page_rva.0) + u64::from(e.offset);
+                        if let Ok(v) = mem.read_uint(at, 8) {
+                            let _ = mem.write_uint(at, 8, v.wrapping_add(delta));
+                        }
+                    }
+                }
+            }
+        }
+        // Build the export layout from the REAL export directory: slot i = the
+        // export at ordinal (ordinal_base + i), VA = base + its real RVA. Forwarders
+        // have no code VA, so they are left as empty slots.
+        let exp = report.exports.as_ref()?;
+        let max_idx = exp.symbols.iter().map(|s| s.ordinal).max().unwrap_or(0) as usize;
+        let mut slots: Vec<Option<ResolvedExport>> = (0..=max_idx).map(|_| None).collect();
+        for sym in &exp.symbols {
+            if sym.forwarder.is_some() {
+                continue;
+            }
+            let idx = sym.ordinal as usize;
+            let va = base + u64::from(sym.rva.0);
+            let symbol = match &sym.name {
+                Some(nm) => SymbolOrOrdinal::Name(nm.clone()),
+                None => SymbolOrOrdinal::Ordinal((exp.ordinal_base + sym.ordinal) as u16),
+            };
+            // VMProtect reads each `Nt*` stub to obtain its syscall number, then
+            // issues the `syscall` inline. Extract that number from the real stub
+            // bytes (`4C 8B D1 B8 <imm32>`) so `on_syscall` can dispatch it by name.
+            if let Some(nm) = &sym.name {
+                if is_ntdll && (nm.starts_with("Nt") || nm.starts_with("Zw")) && nm.len() > 2 {
+                    let mut st = [0u8; 8];
+                    if mem.read(va, &mut st).is_ok() && st[0..4] == [0x4C, 0x8B, 0xD1, 0xB8] {
+                        let nr = u32::from_le_bytes([st[4], st[5], st[6], st[7]]);
+                        let canon = format!("Nt{}", &nm[2..]);
+                        if !self.syscall_names.contains_key(&nr) || nm.starts_with("Nt") {
+                            self.syscall_names.insert(nr, canon);
+                        }
+                    }
+                }
+            }
+            slots[idx] = Some(ResolvedExport { symbol, va });
+        }
+        // AddressOfFunctions VA (export dir + 0x1C), for the read-watch.
+        let functions_va = report
+            .directories
+            .iter()
+            .find(|d| d.index == 0 && d.address != 0)
+            .map(|d| base + u64::from(d.address))
+            .and_then(|dir| mem.read_uint(dir + 0x1C, 4).ok().map(|r| base + r))
+            .unwrap_or(base);
+        Some((ExportLayout { functions_va, slots }, image_size))
+    }
+
+    /// Serve VMProtect's clean-ntdll anti-hook technique: `\KnownDlls\<dll>` opened
+    /// as a section and mapped must resolve to the emulator's already-mapped clean
+    /// module (a well-formed PE with canonical syscall stubs). Without this the open
+    /// fails `OBJECT_NAME_NOT_FOUND`, the protector raises a hard error and exits.
+    /// Returns `Some(status)` when it handled the call; `None` to fall through.
+    fn knowndll_section(&mut self, func: &str, cpu: &mut Cpu, mem: &mut Memory, sab: u64) -> Option<NtDispatch> {
+        const STATUS_OBJECT_NAME_NOT_FOUND: u64 = 0xC000_0034;
+        // Args 0..3 are in registers; args >= 4 live on the stack at `sab`.
+        let stack_arg = |mem: &Memory, i: usize| mem.read_uint(sab + ((i - 4) as u64) * 8, 8).unwrap_or(0);
+        let stem = func.strip_prefix("Nt").or_else(|| func.strip_prefix("Zw")).unwrap_or(func);
+        match stem {
+            "OpenSection" => {
+                // NtOpenSection(*Handle, Access, *ObjectAttributes).
+                let name = read_object_name(mem, Self::arg(cpu, 2)).unwrap_or_default().to_lowercase();
+                let dll = name.strip_prefix("\\knowndlls\\")?;
+                // VMProtect's anti-hook compares the clean KnownDlls ntdll against the
+                // LOADED ntdll byte-for-byte. Serve the SAME loaded base, overwritten
+                // with the REAL image, so clean == loaded == real: the comparison is
+                // against identical memory (no hooks) and the whole-image verification
+                // passes. The export stubs intercept by address, so real bytes are safe.
+                // The loaded ntdll is already the REAL image (mapped by module_handle
+                // when VMPX_NTDLL is set), so serving its base for the clean view makes
+                // the anti-hook comparison read identical real memory.
+                let base = self.module_handle(mem, dll);
+                let p_handle = Self::arg(cpu, 0);
+                if base == 0 {
+                    return Some(NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND));
+                }
+                let h = self.knowndll_next;
+                self.knowndll_next = self.knowndll_next.wrapping_add(0x1000);
+                self.knowndll_views.insert(h, base);
+                let _ = mem.write_uint(p_handle, 8, h);
+                if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                    eprintln!("[knowndll] {dll} -> base={base:#x} handle={h:#x}");
+                }
+                Some(NtDispatch::Status(0))
+            }
+            "MapViewOfSection" => {
+                // NtMapViewOfSection(Section, Process, *BaseAddress, Zero, Commit,
+                // *SectionOffset, *ViewSize, ..). BaseAddress=arg2, ViewSize=arg6.
+                let base = *self.knowndll_views.get(&Self::arg(cpu, 0))?;
+                let _ = mem.write_uint(Self::arg(cpu, 2), 8, base);
+                let p_vs = stack_arg(mem, 6);
+                if p_vs != 0 {
+                    let _ = mem.write_uint(p_vs, 8, MODULE_IMAGE_SIZE);
+                }
+                Some(NtDispatch::Status(0))
+            }
+            "Close" => {
+                // Let the generic handler run too (return None) unless it is ours.
+                if self.knowndll_views.remove(&Self::arg(cpu, 0)).is_some() {
+                    Some(NtDispatch::Status(0))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Pre-populate the guest `PEB_LDR_DATA` module lists so a protector that
@@ -686,6 +942,9 @@ impl WinApiHook {
 
     /// Record an anti-analysis probe and the clean answer it received.
     fn log_call(&mut self, what: String) {
+        if std::env::var_os("VMPX_API_VERBOSE").is_some() {
+            eprintln!("API {what}");
+        }
         if self.memcalls < 400
             && ["Protect", "VirtualAlloc", "VirtualFree", "Free", "Allocate", "WriteProcess", "Query"]
                 .iter()
@@ -1651,13 +1910,122 @@ impl WinApiHook {
                 Dispatch::Ret(Self::arg(cpu, 0) ^ POINTER_COOKIE)
             }
 
+            // ---- File serving (protect-run harness) --------------------------
+            // Serves the configured input file's real bytes; buffers writes. Lets
+            // VMProtect's protect engine read a valid PE and run for real.
+            (_, "CreateFileW") | (_, "CreateFileA") => {
+                let wide = func.ends_with('W');
+                let p = Self::arg(cpu, 0);
+                let name = if wide { read_wstr(mem, p) } else { read_cstr(mem, p) }
+                    .unwrap_or_default();
+                let base = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_lowercase();
+                let h = self.next_file_h;
+                self.next_file_h += 8;
+                let is_input = !self.file_in.is_empty()
+                    && !self.file_in_name.is_empty()
+                    && base.contains(&self.file_in_name);
+                if is_input {
+                    self.file_handles.insert(h, 0);
+                    self.note(&format!("FILE open-input {base:?} -> {h:#x}"));
+                }
+                Dispatch::Ret(h)
+            }
+            (_, "GetFileSize") => {
+                let h = Self::arg(cpu, 0);
+                if self.file_handles.contains_key(&h) {
+                    Dispatch::Ret(self.file_in.len() as u64)
+                } else {
+                    Dispatch::Ret(0)
+                }
+            }
+            (_, "GetFileSizeEx") => {
+                let h = Self::arg(cpu, 0);
+                let out = Self::arg(cpu, 1);
+                if self.file_handles.contains_key(&h) {
+                    let _ = mem.write_uint(out, 8, self.file_in.len() as u64);
+                    Dispatch::Ret(1)
+                } else {
+                    Dispatch::Ret(0)
+                }
+            }
+            (_, "SetFilePointer") => {
+                let h = Self::arg(cpu, 0);
+                let dist = Self::arg(cpu, 1) as i32 as i64;
+                let method = Self::arg(cpu, 3);
+                let len = self.file_in.len() as i64;
+                if let Some(off) = self.file_handles.get_mut(&h) {
+                    let n = match method {
+                        1 => *off as i64 + dist,
+                        2 => len + dist,
+                        _ => dist,
+                    }
+                    .clamp(0, len) as u64;
+                    *off = n;
+                    Dispatch::Ret(n)
+                } else {
+                    Dispatch::Ret(0)
+                }
+            }
+            (_, "ReadFile") => {
+                let h = Self::arg(cpu, 0);
+                let buf = Self::arg(cpu, 1);
+                let n = Self::arg(cpu, 2);
+                let pread = Self::arg(cpu, 3);
+                if let Some(&off) = self.file_handles.get(&h) {
+                    let end = (off + n).min(self.file_in.len() as u64);
+                    let chunk = self.file_in[off as usize..end as usize].to_vec();
+                    let _ = mem.write(buf, &chunk);
+                    if pread != 0 {
+                        let _ = mem.write_uint(pread, 4, chunk.len() as u64);
+                    }
+                    self.file_handles.insert(h, end);
+                    Dispatch::Ret(1)
+                } else {
+                    if pread != 0 {
+                        let _ = mem.write_uint(pread, 4, 0);
+                    }
+                    Dispatch::Ret(1)
+                }
+            }
+            (_, "CreateFileMappingW") | (_, "CreateFileMappingA") => {
+                let hfile = Self::arg(cpu, 0);
+                let h = self.next_file_h;
+                self.next_file_h += 8;
+                if self.file_handles.contains_key(&hfile) {
+                    self.map_handles.push(h);
+                }
+                Dispatch::Ret(h)
+            }
+            (_, "MapViewOfFile") | (_, "MapViewOfFileEx") => {
+                let hmap = Self::arg(cpu, 0);
+                if self.map_handles.contains(&hmap) {
+                    let va = self.alloc(mem, self.file_in.len() as u64);
+                    if va != 0 {
+                        let bytes = self.file_in.clone();
+                        let _ = mem.write(va, &bytes);
+                        self.note(&format!("FILE map-input -> {va:#x} ({} bytes)", bytes.len()));
+                    }
+                    Dispatch::Ret(va)
+                } else {
+                    Dispatch::Ret(0)
+                }
+            }
+            (_, "WriteFile") => {
+                let n = Self::arg(cpu, 2);
+                let pwrote = Self::arg(cpu, 3);
+                if pwrote != 0 {
+                    let _ = mem.write_uint(pwrote, 4, n);
+                }
+                Dispatch::Ret(1)
+            }
+
             // ---- Process environment ----------------------------------------
             // A deterministic command line, materialized once into guest memory;
             // the same pointer is returned on repeat calls. Fail closed if the
             // backing buffer cannot be mapped.
             (_, "GetCommandLineA") => {
                 if self.cmdline_a == 0 {
-                    let mut bytes = CMDLINE.as_bytes().to_vec();
+                    let mut bytes = cmdline_string().into_bytes();
                     bytes.push(0);
                     match self.write_buf(mem, &bytes) {
                         Some(va) => self.cmdline_a = va,
@@ -1667,9 +2035,12 @@ impl WinApiHook {
                 Dispatch::Ret(self.cmdline_a)
             }
             (_, "GetCommandLineW") => {
+                if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                    self.note("CMDLINE GetCommandLineW called");
+                }
                 if self.cmdline_w == 0 {
                     let mut bytes: Vec<u8> =
-                        CMDLINE.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                        cmdline_string().encode_utf16().flat_map(u16::to_le_bytes).collect();
                     bytes.extend_from_slice(&[0, 0]);
                     match self.write_buf(mem, &bytes) {
                         Some(va) => self.cmdline_w = va,
@@ -2164,6 +2535,19 @@ impl Hook for WinApiHook {
                 }
                 let sab = Self::stack_arg_base(ev, cpu);
                 let a0 = [Self::arg(cpu, 0), Self::arg(cpu, 1), Self::arg(cpu, 2), Self::arg(cpu, 3)];
+                // Serve \KnownDlls\<dll> (clean ntdll for the anti-hook / direct-
+                // syscall technique) before the generic NT dispatch.
+                if let Some(d) = self.knowndll_section(&func, cpu, mem, sab) {
+                    return match d {
+                        NtDispatch::Status(s) => {
+                            self.note_nt(&func, cpu, s);
+                            self.log_call(format!("{func}(knowndll,{:#x},{:#x},{:#x},{:#x}) from={:#x} -> {s:#x}", a0[0], a0[1], a0[2], a0[3], ev.from));
+                            cpu.regs[RAX] = s;
+                            Self::resume(ev, cpu, mem)
+                        }
+                        NtDispatch::Stop => HookAction::Stop,
+                    };
+                }
                 return match self.nt.dispatch(&func, cpu, mem, sab) {
                     NtDispatch::Status(s) => {
                         self.note_nt(&func, cpu, s);
@@ -2328,6 +2712,12 @@ impl WinApiHook {
         cpu: &mut Cpu,
         mem: &mut Memory,
     ) -> HookAction {
+        // Targeted debug: log the specific call VMPX_LOGADDR (hex VA of the callee).
+        if let Ok(a) = std::env::var("VMPX_LOGADDR") {
+            if u64::from_str_radix(a.trim_start_matches("0x"), 16).ok() == Some(ev.to) {
+                eprintln!("[LOGADDR] call to {:#x} = {dll}!{func} from={:#x}", ev.to, ev.from);
+            }
+        }
         // CONTAINMENT: a hard, un-bypassable network denylist, checked BEFORE any
         // API modeling. These are untrusted real-world samples; no networking API
         // is ever serviceable. A resolved network import stops the run (reason:
@@ -2379,9 +2769,21 @@ impl WinApiHook {
                 // recovery. OFF by default: the value is a guess and only sound
                 // for the quarantined detonation/recovery run, never static output.
                 if self.lenient_unmodeled {
+                    // Surface the API trail at a lenient ExitProcess so the bail
+                    // decision is visible even though the run continues.
+                    if func == "ExitProcess" && std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                        for (i, c) in self.recent.iter().enumerate() {
+                            eprintln!("EXITTRAIL-{i:02} {c}");
+                        }
+                    }
                     self.note(&format!("LENIENT {dll}!{func} -> 1"));
                     cpu.regs[RAX] = 1;
                     return Self::resume(ev, cpu, mem);
+                }
+                // Dump the recent API-call trail so the bail path is visible
+                // (e.g. ExitProcess reached after an anti-emulation check).
+                for (i, c) in self.recent.iter().enumerate() {
+                    self.note(&format!("RECENT-{i:02} {c}"));
                 }
                 self.note(&format!("UNMODELED {dll}!{func} (run stopped)"));
                 HookAction::Stop

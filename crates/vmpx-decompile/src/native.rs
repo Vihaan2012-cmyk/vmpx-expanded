@@ -148,103 +148,89 @@ fn build_cond(cc: &str, flags: &BTreeMap<Flag, Expr>) -> Cond {
 pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
     let mut blocks: BTreeMap<NodeId, Block> = BTreeMap::new();
     let env: BTreeMap<String, Expr> = Gpr::ALL.iter().map(|g| (g.input_name(), reg(*g))).collect();
+    let mut notes: Vec<String> = Vec::new();
     for (addr, nb) in &cfg.blocks {
-        let sem = nb
-            .semantics
-            .as_ref()
-            .ok_or_else(|| format!("block {addr:#x} was not lifted ({:?})", nb.terminator))?;
-        let subst = |e: &Expr| -> Result<Expr, String> {
-            let s = e.substitute(&env).map_err(|x| x.to_string())?;
-            let s = cleanup(&s);
-            if let Some(stray) = s.dependencies().into_iter().find(|d| d.ends_with("_in")) {
-                return Err(format!(
-                    "block {addr:#x} reads carried flag/input `{stray}`"
+        // Lower the block's data effect, falling back to an honest-opaque block
+        // on ANY refusal (unlifted semantics, a carried-flag read, a store/load
+        // mix): its recovered control flow is always kept, so one unliftable
+        // block no longer sinks the whole function.
+        let built: Result<Block, String> = (|| {
+            let sem = nb
+                .semantics
+                .as_ref()
+                .ok_or_else(|| format!("semantics refused ({:?})", nb.terminator))?;
+            let subst = |e: &Expr| -> Result<Expr, String> {
+                let s = e.substitute(&env).map_err(|x| x.to_string())?;
+                let s = cleanup(&s);
+                if let Some(stray) = s.dependencies().into_iter().find(|d| d.ends_with("_in")) {
+                    return Err(format!("reads carried flag/input `{stray}`"));
+                }
+                Ok(s)
+            };
+            let mut assigns = Vec::new();
+            for g in &sem.written {
+                assigns.push((g.name().to_owned(), subst(&sem.regs[g])?));
+            }
+            let mut stores = Vec::new();
+            for w in &sem.writes {
+                let _ = bw(w.width);
+                stores.push(Store { address: subst(&w.address)?, value: subst(&w.value)? });
+            }
+            let mut flags: BTreeMap<Flag, Expr> = BTreeMap::new();
+            for (f, st) in &sem.flags {
+                if let FlagState::Value(e) = st {
+                    flags.insert(*f, subst(e)?);
+                }
+            }
+            let term = match &nb.terminator {
+                Terminator::FallThrough(t) | Terminator::Jump(t) => Term::Goto(*t),
+                Terminator::CondJump { cc, taken, not_taken } => Term::Branch {
+                    cond: build_cond(cc, &flags),
+                    then: *taken,
+                    els: *not_taken,
+                },
+                Terminator::Return => {
+                    let rax = if sem.written.contains(&Gpr::Rax) {
+                        subst(&sem.regs[&Gpr::Rax])?
+                    } else {
+                        reg(Gpr::Rax)
+                    };
+                    Term::Return(vec![("rax".to_owned(), rax)])
+                }
+                Terminator::Call { next, .. } => Term::Goto(*next),
+                Terminator::TailCall { target } => {
+                    let callee = match target {
+                        CallTarget::Direct(a) => format!("sub_{a:x}"),
+                        CallTarget::Import(a) => format!("import_at_{a:x}"),
+                        CallTarget::Indirect(_) => "tailcall_indirect".to_owned(),
+                    };
+                    let args = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9]
+                        .into_iter()
+                        .map(|g| {
+                            let v = if sem.written.contains(&g) { sem.regs[&g].clone() } else { reg(g) };
+                            subst(&v)
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Term::Return(vec![("rax".to_owned(), Expr::intrinsic(BitWidth::W64, callee, args))])
+                }
+                Terminator::Unsupported(why) => return Err(why.clone()),
+            };
+            if !stores.is_empty() && assigns.iter().any(|(_, e)| has_load(e)) {
+                return Err("mixes stores and loads".to_owned());
+            }
+            Ok(Block { id: *addr, assigns, stores, term })
+        })();
+        match built {
+            Ok(b) => {
+                blocks.insert(*addr, b);
+            }
+            Err(why) => {
+                notes.push(format!(
+                    "block {addr:#x} not lifted ({why}); data effect opaque, control flow kept"
                 ));
-            }
-            Ok(s)
-        };
-        let mut assigns = Vec::new();
-        for g in &sem.written {
-            let d = subst(&sem.regs[g])?;
-            assigns.push((g.name().to_owned(), d));
-        }
-        let mut stores = Vec::new();
-        for w in &sem.writes {
-            let _ = bw(w.width);
-            stores.push(Store {
-                address: subst(&w.address)?,
-                value: subst(&w.value)?,
-            });
-        }
-        let mut flags: BTreeMap<Flag, Expr> = BTreeMap::new();
-        for (f, st) in &sem.flags {
-            if let FlagState::Value(e) = st {
-                flags.insert(*f, subst(e)?);
+                blocks.insert(*addr, opaque_block(*addr, &nb.terminator));
             }
         }
-        let term = match &nb.terminator {
-            Terminator::FallThrough(t) | Terminator::Jump(t) => Term::Goto(*t),
-            Terminator::CondJump {
-                cc,
-                taken,
-                not_taken,
-            } => Term::Branch {
-                cond: build_cond(cc, &flags),
-                then: *taken,
-                els: *not_taken,
-            },
-            Terminator::Return => {
-                let rax = if sem.written.contains(&Gpr::Rax) {
-                    subst(&sem.regs[&Gpr::Rax])?
-                } else {
-                    reg(Gpr::Rax)
-                };
-                Term::Return(vec![("rax".to_owned(), rax)])
-            }
-            // A modeled call (PROVEN_FP) carries its clobber in the block
-            // semantics; control continues at the fall-through.
-            Terminator::Call { next, .. } => Term::Goto(*next),
-            // A tail call `jmp target`: the function IS the callee, so its result
-            // is `target(args)`. Faithful: emit a call intrinsic over the Win64
-            // integer-arg registers and return it (opaque result -- sound).
-            Terminator::TailCall { target } => {
-                let callee = match target {
-                    CallTarget::Direct(a) => format!("sub_{a:x}"),
-                    CallTarget::Import(a) => format!("import_at_{a:x}"),
-                    CallTarget::Indirect(_) => "tailcall_indirect".to_owned(),
-                };
-                let args = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9]
-                    .into_iter()
-                    .map(|g| {
-                        let v = if sem.written.contains(&g) {
-                            sem.regs[&g].clone()
-                        } else {
-                            reg(g)
-                        };
-                        subst(&v)
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let call = Expr::intrinsic(BitWidth::W64, callee, args);
-                Term::Return(vec![("rax".to_owned(), call)])
-            }
-            Terminator::Unsupported(why) => return Err(format!("block {addr:#x}: {why}")),
-        };
-        // a block that stores and loads cannot be ordered faithfully here
-        if !stores.is_empty() {
-            let has_load = assigns.iter().any(|(_, e)| has_load(e));
-            if has_load {
-                return Err(format!("block {addr:#x} mixes stores and loads"));
-            }
-        }
-        blocks.insert(
-            *addr,
-            Block {
-                id: *addr,
-                assigns,
-                stores,
-                term,
-            },
-        );
     }
     // The Return block of a native function reads rax only; remaining
     // assignments in it are dead and removed by DCE.
@@ -253,8 +239,28 @@ pub fn lower(cfg: &NativeCfg, name: &str) -> Result<Func, String> {
         entry: cfg.entry,
         blocks,
         params: Vec::new(),
-        notes: Vec::new(),
+        notes,
     })
+}
+
+/// An honest-opaque stand-in for a block the lifter refused: no data effect,
+/// but the recovered control-flow edges are preserved (an opaque condition for
+/// a conditional branch, since no flags were lifted).
+fn opaque_block(addr: NodeId, terminator: &Terminator) -> Block {
+    let empty: BTreeMap<Flag, Expr> = BTreeMap::new();
+    let term = match terminator {
+        Terminator::FallThrough(t) | Terminator::Jump(t) => Term::Goto(*t),
+        Terminator::CondJump { cc, taken, not_taken } => Term::Branch {
+            cond: build_cond(cc, &empty),
+            then: *taken,
+            els: *not_taken,
+        },
+        Terminator::Call { next, .. } => Term::Goto(*next),
+        Terminator::Return | Terminator::TailCall { .. } | Terminator::Unsupported(_) => {
+            Term::Return(vec![("rax".to_owned(), reg(Gpr::Rax))])
+        }
+    };
+    Block { id: addr, assigns: Vec::new(), stores: Vec::new(), term }
 }
 
 fn has_load(e: &Expr) -> bool {

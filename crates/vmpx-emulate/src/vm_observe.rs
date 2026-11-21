@@ -120,8 +120,37 @@ pub struct ObservedVmEdge {
     pub to_vip: u64,
     /// Handler entered from the `from_vip` dispatch (0 if none was seen).
     pub handler_va: u64,
+    /// Rolling-key register (RBP) value in effect at `from_vip` — the key that
+    /// decoded `handler_va` from the bytecode token there. Captured at the first
+    /// occurrence of this edge. This is the concrete bootstrap value static
+    /// discovery can't reach: with it the recovered codec decodes the stream.
+    pub rolling_key: u64,
+    /// Code address of the `jmp reg` that dispatched to `handler_va` — i.e. the
+    /// decode/dispatch TAIL. Recover this instance's own codec by tracing from
+    /// here (a handler ENTRY yields no codec; the decode is at the tail).
+    pub tail_va: u64,
+    /// Full GPR snapshot at that `jmp reg` (the exact decode instant), in
+    /// `Register` index order RAX..R15. Lets the key register be identified
+    /// per-instance (it is not RBP for every VM) without re-running.
+    pub regs: [u64; 16],
     /// Times this exact edge was observed.
     pub dispatch_count: u64,
+}
+
+/// GPRs in iced `Register` order RAX,RCX,RDX,RBX,RSP,RBP,RSI,RDI,R8..R15.
+const GPR16: [Register; 16] = [
+    Register::RAX, Register::RCX, Register::RDX, Register::RBX,
+    Register::RSP, Register::RBP, Register::RSI, Register::RDI,
+    Register::R8, Register::R9, Register::R10, Register::R11,
+    Register::R12, Register::R13, Register::R14, Register::R15,
+];
+
+fn snapshot_regs(cpu: &Cpu) -> [u64; 16] {
+    let mut a = [0u64; 16];
+    for (k, &r) in GPR16.iter().enumerate() {
+        a[k] = cpu.reg(r).unwrap_or(0);
+    }
+    a
 }
 
 /// Shared recording filled during a run. Clone the [`Rc`] before installing the
@@ -187,6 +216,10 @@ impl VmObservations {
 
 /// Cap on recorded handler entries / distinct edges (memory backstop).
 const MAX_RECORDS: usize = 1 << 21;
+/// A `jmp` whose target is nearer than this to the dispatch site is treated as an
+/// intra-block opaque-predicate skip, not a handler dispatch. Real VM handlers sit
+/// far away in the `.vmp` section; the mis-captured artifacts were `jmp +3`/`+5`.
+const MIN_HANDLER_DIST: u64 = 0x40;
 
 /// An instance with its region resolved to absolute VAs, plus run state.
 struct Live {
@@ -201,6 +234,14 @@ struct Live {
 struct Walk {
     last_vip: Option<u64>,
     last_handler: u64,
+    /// RBP at the previous dispatch — the key that decoded the handler on the
+    /// edge now being recorded (the key rolls across the handler, so the current
+    /// RBP is already the next step's key).
+    last_key: Option<u64>,
+    /// Code address of the `jmp reg` that entered `last_handler` (its decode tail).
+    last_tail: u64,
+    /// Full GPR snapshot captured at that `jmp reg` (the decode instant).
+    last_regs: [u64; 16],
 }
 
 /// Observes VM-dispatcher handler traces, per-instance VIP edges and concolic
@@ -338,11 +379,15 @@ impl VmObserveHook {
 
 impl VmObserveHook {
     /// Record the edge from the instance's previous dispatch VIP to `vip`.
-    fn note_dispatch(&mut self, o: &mut VmObservations, i: usize, vip: u64) {
+    fn note_dispatch(&mut self, o: &mut VmObservations, i: usize, vip: u64, key: u64) {
         let id = self.live[i].id;
         let w = self.walks.entry(id).or_default();
         let handler = w.last_handler;
+        let tail = w.last_tail;
+        let regs = w.last_regs;
+        let site_key = w.last_key.replace(key);
         let Some(site) = w.last_vip.replace(vip) else { return };
+        let site_key = site_key.unwrap_or(0);
         if o.branch_targets.len() < MAX_RECORDS && self.bt_seen.insert((site, vip)) {
             o.branch_targets.push((site, vip));
         }
@@ -356,6 +401,9 @@ impl VmObserveHook {
                     from_vip: site,
                     to_vip: vip,
                     handler_va: handler,
+                    rolling_key: site_key,
+                    tail_va: tail,
+                    regs,
                     dispatch_count: 0,
                 });
                 self.edge_ix.insert(key, edges.len() - 1);
@@ -397,13 +445,26 @@ impl Hook for VmObserveHook {
 
         // Handler trace: record the dispatcher's first jmp/ret-out (`jmp reg`
         // or the threaded `push reg; ret`) as a handler entry, then re-arm when
-        // control returns to a dispatcher.
+        // control returns to a dispatcher. A short FORWARD direct `jmp` (an
+        // opaque-predicate skip inside the decode block, e.g. `jmp +3`) is not a
+        // real handler dispatch — skip it and stay armed so the actual `jmp reg`
+        // to a far handler is the one recorded. (This removed the `tail==handler-3`
+        // local-jump artifacts that inflated every instance's miss rate.)
         if let (Some(i), FlowKind::Jmp | FlowKind::Ret) = (self.armed, ev.kind) {
-            if o.handlers.len() < MAX_RECORDS {
-                o.handlers.push(ev.to);
+            let local_skip = matches!(ev.kind, FlowKind::Jmp)
+                && ev.to >= ev.from
+                && ev.to - ev.from < MIN_HANDLER_DIST;
+            if !local_skip {
+                if o.handlers.len() < MAX_RECORDS {
+                    o.handlers.push(ev.to);
+                }
+                let regs = snapshot_regs(cpu);
+                let w = self.walks.entry(self.live[i].id).or_default();
+                w.last_handler = ev.to;
+                w.last_tail = ev.from;
+                w.last_regs = regs;
+                self.armed = None;
             }
-            self.walks.entry(self.live[i].id).or_default().last_handler = ev.to;
-            self.armed = None;
         }
         if let Some(cands) = self.dispatchers.get(&ev.to) {
             let Some((i, vip)) = self.resolve(cands, cpu, mem) else {
@@ -413,7 +474,8 @@ impl Hook for VmObserveHook {
             self.armed = Some(i);
             // At dispatcher entry the VIP is the bytecode site about to be
             // decoded; the previous dispatch VIP -> this one is the edge.
-            self.note_dispatch(&mut o, i, vip);
+            let key = cpu.reg(Register::RBP).unwrap_or(0);
+            self.note_dispatch(&mut o, i, vip, key);
         }
 
         // Transfer-sited dispatch: VIP and handler are both known right here.
@@ -423,11 +485,16 @@ impl Hook for VmObserveHook {
                     o.unattributed += 1;
                     return HookAction::Continue;
                 };
-                self.note_dispatch(&mut o, i, vip);
+                let key = cpu.reg(Register::RBP).unwrap_or(0);
+                self.note_dispatch(&mut o, i, vip, key);
                 if o.handlers.len() < MAX_RECORDS {
                     o.handlers.push(ev.to);
                 }
-                self.walks.entry(self.live[i].id).or_default().last_handler = ev.to;
+                let regs = snapshot_regs(cpu);
+                let w = self.walks.entry(self.live[i].id).or_default();
+                w.last_handler = ev.to;
+                w.last_tail = ev.from;
+                w.last_regs = regs;
             }
         }
 
@@ -494,7 +561,25 @@ mod tests {
     }
 
     fn edge(instance: u32, from_vip: u64, to_vip: u64, handler_va: u64, n: u64) -> ObservedVmEdge {
-        ObservedVmEdge { instance, from_vip, to_vip, handler_va, dispatch_count: n }
+        ObservedVmEdge {
+            instance,
+            from_vip,
+            to_vip,
+            handler_va,
+            rolling_key: 0,
+            tail_va: 0,
+            regs: [0; 16],
+            dispatch_count: n,
+        }
+    }
+
+    /// Zero the observational-only fields (tail/regs/key) so edge topology can be
+    /// compared against `edge(...)`; those fields capture run-specific CPU state.
+    fn norm(mut e: ObservedVmEdge) -> ObservedVmEdge {
+        e.tail_va = 0;
+        e.regs = [0; 16];
+        e.rolling_key = 0;
+        e
     }
 
     fn two_dispatcher_specs() -> Vec<VmInstanceSpec> {
@@ -526,7 +611,7 @@ mod tests {
         let edges = run_two(BASE);
         let (ha, hb) = (BASE + 0x9000, BASE + 0x9100);
         assert_eq!(
-            edges,
+            edges.into_iter().map(norm).collect::<Vec<_>>(),
             vec![
                 edge(1, 0x1000, 0x1004, ha, 1),
                 edge(2, 0x8000, 0x8010, hb, 1),
@@ -541,7 +626,7 @@ mod tests {
         let other = 0x7ff6_0000_0000;
         let edges = run_two(other);
         assert_eq!(edges.len(), 3);
-        assert_eq!(edges[0], edge(1, 0x1000, 0x1004, other + 0x9000, 1));
+        assert_eq!(norm(edges[0]), edge(1, 0x1000, 0x1004, other + 0x9000, 1));
         // A dispatcher at the OLD base's address is not watched on the new one.
         let mut h = VmObserveHook::with_instances(other, two_dispatcher_specs(), None);
         let (mut c, mut m) = (Cpu::new(0), Memory::new());
@@ -572,7 +657,7 @@ mod tests {
         let o = obs.borrow();
         assert_eq!(o.unattributed, 1);
         assert_eq!(
-            o.edges,
+            o.edges.iter().copied().map(norm).collect::<Vec<_>>(),
             vec![
                 edge(1, BASE + 0x1000, BASE + 0x1008, hd, 1),
                 edge(2, BASE + 0x3000, BASE + 0x3010, hd, 1),
@@ -597,7 +682,7 @@ mod tests {
         }
         let o = obs.borrow();
         assert_eq!(
-            o.edges,
+            o.edges.iter().copied().map(norm).collect::<Vec<_>>(),
             vec![
                 edge(7, 0x10, 0x20, 0xA0, 1),
                 edge(7, 0x20, 0x10, 0xA0, 2),
@@ -613,8 +698,8 @@ mod tests {
         }
         let o = obs.borrow();
         assert_eq!(o.edges.len(), 3);
-        assert_eq!(o.edges[0], edge(7, 0x10, 0x20, 0xA0, 2));
-        assert_eq!(o.edges[1], edge(7, 0x20, 0x10, 0xA0, 3));
+        assert_eq!(norm(o.edges[0]), edge(7, 0x10, 0x20, 0xA0, 2));
+        assert_eq!(norm(o.edges[1]), edge(7, 0x20, 0x10, 0xA0, 3));
     }
 
     fn delivered(i: &Interest, to: u64) -> bool {
@@ -692,7 +777,7 @@ mod tests {
         assert_eq!(o.unattributed, 0);
         assert_eq!(o.handlers, vec![hd; 4], "ret-out recorded as the handler");
         assert_eq!(
-            o.edges,
+            o.edges.iter().copied().map(norm).collect::<Vec<_>>(),
             vec![
                 edge(3, 0x4000, 0x3ffc, hd, 1),
                 edge(3, 0x3ffc, 0x3ff4, hd, 1),

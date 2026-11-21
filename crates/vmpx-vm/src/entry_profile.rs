@@ -26,8 +26,25 @@ pub struct EntryProfileRecoveryLimits {
 
 impl Default for EntryProfileRecoveryLimits {
     fn default() -> Self {
+        let mut trace = DirectJumpTraceLimits::default();
+        // Opt-in (`VMPX_BOOTSTRAP_FOLLOW_COND`): walk the bootstrap trace past
+        // undecidable opaque-predicate conditionals in a heavily-mutated bootstrap,
+        // so it can reach the register-indirect dispatch tail. Choosing an arm is
+        // NOT a proof, so any recovery this enables is unproven/labeled -- it exists
+        // for bootstraps (e.g. VMProtect.exe's own) that interpose junk predicates
+        // between the entry and the `jmp reg` dispatch. Set `=target` to follow the
+        // taken arm instead of the fallthrough; `VMPX_BOOTSTRAP_COND_BUDGET` sets how
+        // many conditionals may be walked (default 64).
+        if let Some(mode) = std::env::var_os("VMPX_BOOTSTRAP_FOLLOW_COND") {
+            trace.follow_conditional_fallthrough = true;
+            trace.follow_conditional_target = mode.to_string_lossy().contains("target");
+            trace.max_conditional_continuations = std::env::var("VMPX_BOOTSTRAP_COND_BUDGET")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64);
+        }
         Self {
-            trace: DirectJumpTraceLimits::default(),
+            trace,
             dispatch_proof: RegisterDispatchProofLimits::default(),
             instruction_limit: 4_096,
             symbolic: SymbolicExecutionLimits::default(),

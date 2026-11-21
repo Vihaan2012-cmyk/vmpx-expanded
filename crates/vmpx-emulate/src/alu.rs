@@ -365,12 +365,17 @@ pub fn rotate(kind: Rotate, a: u64, count: u64, cf_in: bool, bytes: u32) -> Opti
         Rotate::Ror | Rotate::Rcr => bit(res, bits - 1) ^ bit(res, bits - 2),
     };
     let mut def = CF;
-    let mut undef = 0;
     let val = pick(cf != 0, CF) | pick(of != 0, OF);
+    // OF is defined only for a 1-bit rotate. For a multi-bit rotate REAL SILICON
+    // LEAVES OF UNCHANGED (verified by native probe) — the Intel SDM calls it
+    // "undefined", but hardware retains it, and VMProtect folds it as an
+    // anti-emulation check. So for count>1 we touch neither def nor undef: OF keeps
+    // its prior value. (SF/ZF/AF/PF are never affected by a rotate.)
+    let mut undef = 0;
     if masked == 1 {
         def |= OF;
-    } else {
-        undef |= OF;
+    } else if std::env::var_os("VMPX_OLDROL").is_some() {
+        undef |= OF; // old (silicon-wrong) multi-bit OF marking, for A/B testing
     }
     Some((res, Flags { def, val, undef }))
 }

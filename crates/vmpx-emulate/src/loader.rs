@@ -267,6 +267,27 @@ fn map_teb_peb(mem: &mut Memory, image_base: u64) -> Result<u64, LoadError> {
     mem.poke(peb + PEB_PROCESS_HEAP, &PROCESS_HEAP.to_le_bytes())?;
     mem.poke(peb + PEB_IMAGE_BASE, &image_base.to_le_bytes())?;
     mem.poke(peb + PEB_LDR, &ldr.to_le_bytes())?;
+    // Optional protect-run command line: build an RTL_USER_PROCESS_PARAMETERS so the
+    // CRT's argv/__wargv (which reads PEB.ProcessParameters.CommandLine, NOT
+    // GetCommandLineW) sees the args. Offsets (x64): PEB.ProcessParameters=0x20;
+    // RTL_USER_PROCESS_PARAMETERS.CommandLine (UNICODE_STRING) at 0x70 (Len u16,
+    // MaxLen u16, Buffer @ +0x78).
+    if let Ok(cmd) = std::env::var("VMPX_CMDLINE") {
+        let params = teb + 0xC00;
+        let buf = teb + 0xE00;
+        let wide: Vec<u8> = cmd.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let len = wide.len() as u16;
+        mem.poke(buf, &wide)?;
+        mem.poke(buf + u64::from(len), &[0u8, 0u8])?;
+        mem.poke(params + 0x70, &len.to_le_bytes())?; // CommandLine.Length
+        mem.poke(params + 0x72, &(len + 2).to_le_bytes())?; // MaximumLength
+        mem.poke(params + 0x78, &buf.to_le_bytes())?; // Buffer
+        // ImagePathName (0x60) points at argv[0] too (good enough: the full buffer).
+        mem.poke(params + 0x60, &len.to_le_bytes())?;
+        mem.poke(params + 0x62, &(len + 2).to_le_bytes())?;
+        mem.poke(params + 0x68, &buf.to_le_bytes())?;
+        mem.poke(peb + 0x20, &params.to_le_bytes())?; // PEB.ProcessParameters
+    }
     // PEB_LDR_DATA: three module lists, each an empty (self-linked) LIST_ENTRY.
     for list in [ldr + 0x10, ldr + 0x20, ldr + 0x30] {
         mem.poke(list, &list.to_le_bytes())?;
@@ -307,9 +328,20 @@ impl LoadedImage {
         if mem.map(RETURN_SENTINEL & !(PAGE_SIZE - 1), PAGE_SIZE, Perm::R).is_ok() {
             mem.poke(RETURN_SENTINEL, &[RETURN_PROBE_BYTE])?;
         }
-        mem.poke(sp, &RETURN_SENTINEL.to_le_bytes())?;
+        // VMPX_ENTRY_RET=<hex>: override the entry return address (perturbation test
+        // for whether VMProtect checks that it points into a loaded module).
+        let ret = std::env::var("VMPX_ENTRY_RET")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(RETURN_SENTINEL);
+        mem.poke(sp, &ret.to_le_bytes())?;
 
         let mut cpu = Cpu::new(rip);
+        // Real user-mode rflags has IF (bit 9) SET — interrupts are enabled and user
+        // code cannot clear IF, so it is an environment-independent constant (0x202).
+        // VMProtect folds the pushf'd flags into its VM key; IF=0 (the bare Cpu::new
+        // default) diverges from silicon and fails the integrity hash.
+        cpu.rflags = if std::env::var_os("VMPX_NOIF").is_some() { 2 } else { 0x202 };
         cpu.gs_base = self.gs_base;
         cpu.regs[RSP] = sp;
         for (i, &v) in args.iter().take(ARG_REGS.len()).enumerate() {

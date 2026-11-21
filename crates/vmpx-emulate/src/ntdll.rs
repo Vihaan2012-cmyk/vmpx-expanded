@@ -121,6 +121,11 @@ pub(crate) struct NtState {
     next_handle: u64,
     alloc_next: u64,
     view_next: u64,
+    /// Protect-run input file: its bytes, basename to match, and the handles we
+    /// minted for it (so a section created over one is backed by the real bytes).
+    file_in: Vec<u8>,
+    file_in_name: String,
+    input_handles: std::collections::BTreeMap<u64, u64>,
 }
 
 /// Reads NT call arguments: the first four from registers, the rest from the
@@ -147,10 +152,27 @@ impl Args<'_> {
 
 impl NtState {
     pub(crate) fn new() -> Self {
+        // Perturbation knobs: VMProtect's VM key may fold a handle value or an
+        // allocation address. The emulator's deterministic bases differ from real
+        // Windows (small handles 0x4/0x8…; ASLR allocations), so these let us test
+        // whether the integrity "File corrupted" verdict depends on them.
+        let env_u64 = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+                .unwrap_or(d)
+        };
         Self {
-            next_handle: NT_HANDLE_BASE,
-            alloc_next: NT_ALLOC_BASE,
-            view_next: NT_VIEW_BASE,
+            next_handle: env_u64("VMPX_HANDLE_BASE", NT_HANDLE_BASE),
+            alloc_next: env_u64("VMPX_ALLOC_BASE", NT_ALLOC_BASE),
+            view_next: env_u64("VMPX_VIEW_BASE", NT_VIEW_BASE),
+            file_in: std::env::var("VMPX_PROTECT_INPUT")
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default(),
+            file_in_name: std::env::var("VMPX_PROTECT_INPUT_NAME")
+                .unwrap_or_default()
+                .to_lowercase(),
             ..Self::default()
         }
     }
@@ -178,7 +200,13 @@ impl NtState {
             "QueryVirtualMemory" => Self::query_vm(cpu, mem, stack_arg_base),
             "CreateSection" => self.create_section(cpu, mem, stack_arg_base),
             "MapViewOfSection" => self.map_view(cpu, mem, stack_arg_base),
-            "OpenSection" => NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND),
+            "OpenSection" => {
+                let name = read_object_name(mem, cpu.regs[ARG[2]]).unwrap_or_default();
+                if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                    eprintln!("[nt] open_section name={name:?}");
+                }
+                NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)
+            }
             "Close" => self.close(cpu),
             "QueryInformationProcess" => Self::query_process(cpu, mem, stack_arg_base),
             "QueryInformationThread" => Self::query_thread(cpu, mem, stack_arg_base),
@@ -186,13 +214,45 @@ impl NtState {
             // Debug registers read as zero; a set is accepted as a no-op (no DRx
             // breakpoint is ever armed). Anything beyond DEBUG_REGISTERS is unmodeled.
             "GetContextThread" | "SetContextThread" => {
-                if debug_context(mem, cpu.regs[ARG[1]], base == "GetContextThread") {
-                    NtDispatch::Status(STATUS_SUCCESS)
+                if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                    // Probe each candidate arg as the CONTEXT pointer (the real one has
+                    // ContextFlags with the AMD64 bit 0x100000 at +0x30).
+                    for (lbl, i) in [("arg1", 1usize), ("arg2", 2), ("arg3", 3)] {
+                        let ctx = cpu.regs[ARG[i]];
+                        let fl = mem.read_uint(ctx + 0x30, 4).unwrap_or(0);
+                        if fl & 0x10_0000 != 0 || (ctx > 0x10000 && ctx < 0x8000_0000_0000) {
+                            let rip = mem.read_uint(ctx + 0xF8, 8).unwrap_or(0);
+                            let rsp = mem.read_uint(ctx + 0x98, 8).unwrap_or(0);
+                            eprintln!("[ctx] {base} {lbl} ptr={ctx:#x} flags={fl:#x} rip={rip:#x} rsp={rsp:#x}");
+                        }
+                    }
+                }
+                // GetContextThread: fill the (debug-register) context, reading DRx
+                // as zero. SetContextThread: applying a context to a thread the
+                // single-threaded model does not run is a sound no-op; the protector
+                // sets an empty/debug-only context here (flags=0). A context that
+                // redirects the CURRENT thread (CONTROL + Rip) is not used on this
+                // path; guard it so a future such case fails closed instead of
+                // silently dropping a jump.
+                if base == "GetContextThread" {
+                    if debug_context(mem, cpu.regs[ARG[1]], true) {
+                        NtDispatch::Status(STATUS_SUCCESS)
+                    } else {
+                        NtDispatch::Stop
+                    }
                 } else {
-                    NtDispatch::Stop
+                    let ctx = cpu.regs[ARG[1]];
+                    let flags = mem.read_uint(ctx + 0x30, 4).unwrap_or(0);
+                    const CONTEXT_CONTROL: u64 = 0x0010_0001; // AMD64 | CONTROL
+                    if flags & 0x1 != 0 && (flags & CONTEXT_CONTROL) == CONTEXT_CONTROL {
+                        NtDispatch::Stop // sets Rip/Rsp of a thread — needs real apply
+                    } else {
+                        NtDispatch::Status(STATUS_SUCCESS) // empty/debug-only: no-op
+                    }
                 }
             }
-            "OpenFile" => Self::open_file(cpu, mem, stack_arg_base),
+            "OpenFile" | "CreateFile" => self.open_file(cpu, mem, stack_arg_base),
+            "ReadFile" => self.read_file(cpu, mem, stack_arg_base),
             // No in-model registry: opening any key fails closed (NOT_FOUND),
             // never fabricating a handle or key contents.
             "OpenKey" | "OpenKeyEx" => Self::open_key(cpu, mem),
@@ -202,6 +262,76 @@ impl NtState {
             | "SetInformationThread"
             | "SetInformationProcess"
             | "DelayExecution" => NtDispatch::Status(STATUS_SUCCESS),
+            // VMProtect's self-debugging anti-debug: it creates a debug object and
+            // attaches it to itself so no OTHER debugger can. Mint a handle and
+            // accept the attach/wait as benign (single-threaded model, no real
+            // debugger). Without this NtCreateDebugObject fails and it bails.
+            "CreateDebugObject" => {
+                let h = self.mint_handle();
+                self.handles.insert(h); // so NtClose/NtQueryObject recognize it
+                if mem.write_uint(cpu.regs[ARG[0]], 8, h).is_err() {
+                    return NtDispatch::Stop;
+                }
+                NtDispatch::Status(STATUS_SUCCESS)
+            }
+            "DebugActiveProcess"
+            | "RemoveProcessDebug"
+            | "DebugContinue"
+            | "SetInformationDebugObject" => NtDispatch::Status(STATUS_SUCCESS),
+            // VMProtect queries the debug object's type (ObjectTypeInformation=2),
+            // expecting TypeName "DebugObject". Write a minimal OBJECT_TYPE_INFORMATION.
+            "QueryObject" => {
+                let class = cpu.regs[ARG[1]];
+                let buf = cpu.regs[ARG[2]];
+                let length = cpu.regs[ARG[3]];
+                if class == 2 && buf != 0 && length >= 0x70 {
+                    // Zero the OBJECT_TYPE_INFORMATION first so the system-wide counts
+                    // (TotalNumberOfObjects @0x10, TotalNumberOfHandles @0x14) read as
+                    // the protector's own object only — NOT garbage that looks like a
+                    // debugger is present.
+                    let _ = mem.write(buf, &vec![0u8; 0x68]);
+                    let name: Vec<u16> = "DebugObject".encode_utf16().collect();
+                    let nlen = (name.len() * 2) as u64;
+                    let name_at = buf + 0x68;
+                    let _ = mem.write_uint(buf, 2, nlen); // TypeName.Length
+                    let _ = mem.write_uint(buf + 2, 2, nlen + 2); // MaximumLength
+                    let _ = mem.write_uint(buf + 8, 8, name_at); // TypeName.Buffer
+                    let _ = mem.write_uint(buf + 0x10, 4, 1); // TotalNumberOfObjects
+                    let _ = mem.write_uint(buf + 0x14, 4, 1); // TotalNumberOfHandles
+                    for (i, w) in name.iter().enumerate() {
+                        let _ = mem.write_uint(name_at + (i as u64) * 2, 2, u64::from(*w));
+                    }
+                    let _ = mem.write_uint(name_at + nlen, 2, 0);
+                    let pr = mem.read_uint(stack_arg_base, 8).unwrap_or(0);
+                    if pr != 0 {
+                        let _ = mem.write_uint(pr, 4, name_at + nlen + 2 - buf);
+                    }
+                    NtDispatch::Status(STATUS_SUCCESS)
+                } else {
+                    NtDispatch::Status(STATUS_SUCCESS)
+                }
+            }
+            // VMProtect probes for named kernel objects (an analysis-tool tell). On a
+            // clean system these do not exist -> NAME_NOT_FOUND (a definite, benign
+            // answer), NOT the blunt NOT_IMPLEMENTED the lenient fallback gives,
+            // which it treats as "can't tell" and bails (ZwRaiseHardError).
+            "OpenIoCompletion" | "OpenMutant" | "OpenEvent" | "OpenSemaphore"
+            | "OpenTimer" | "OpenJobObject" => {
+                NtDispatch::Status(0xC000_0034) // STATUS_OBJECT_NAME_NOT_FOUND
+            }
+            // Genuinely privileged/boot-only: report NOT_IMPLEMENTED definitively.
+            "FilterBootOption" => NtDispatch::Status(0xC000_0002),
+            // Unmodeled Nt syscall. VMProtect's startup fires a sequence of rare
+            // syscalls (NtFilterBootOption, ...) largely as anti-analysis probes;
+            // under VMPX_LENIENT return STATUS_NOT_IMPLEMENTED so the run proceeds
+            // instead of stopping at each. Unproven (a syscall with a real out-param
+            // effect would be mis-served), so it stays opt-in and is logged.
+            _ if std::env::var_os("VMPX_LENIENT").is_some() => {
+                if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+                    eprintln!("[nt] LENIENT unmodeled {base} -> STATUS_NOT_IMPLEMENTED");
+                }
+                NtDispatch::Status(0xC000_0002) // STATUS_NOT_IMPLEMENTED
+            }
             _ => NtDispatch::Stop,
         }
     }
@@ -304,8 +434,19 @@ impl NtState {
         let (Some(page_protect), Some(file_handle)) = (a.get(4), a.get(6)) else {
             return NtDispatch::Stop;
         };
-        // Only anonymous (pagefile-backed) sections are modeled soundly; a
-        // file/image-backed section needs file bytes we do not have -> fail closed.
+        // A section over the protect-input file handle is backed by the real input
+        // bytes (so VMProtect maps a valid PE and runs its engine).
+        if self.input_handles.contains_key(&file_handle) {
+            let h = self.mint_handle();
+            let bytes = self.file_in.clone();
+            self.sections.insert(h, Section { bytes, protect: page_protect });
+            if mem.write_uint(p_handle, 8, h).is_err() {
+                return NtDispatch::Stop;
+            }
+            return NtDispatch::Status(STATUS_SUCCESS);
+        }
+        // Only anonymous (pagefile-backed) sections are otherwise modeled soundly; a
+        // non-input file/image-backed section needs bytes we do not have -> fail closed.
         if file_handle != 0 {
             return NtDispatch::Status(STATUS_INVALID_HANDLE);
         }
@@ -379,7 +520,11 @@ impl NtState {
     /// debugger would turn it into `EXCEPTION_INVALID_HANDLE`).
     fn close(&mut self, cpu: &Cpu) -> NtDispatch {
         let h = cpu.regs[ARG[0]];
-        if self.sections.remove(&h).is_some() || self.handles.remove(&h) || is_pseudo_handle(h) {
+        if self.sections.remove(&h).is_some()
+            || self.handles.remove(&h)
+            || self.input_handles.remove(&h).is_some()
+            || is_pseudo_handle(h)
+        {
             NtDispatch::Status(STATUS_SUCCESS)
         } else {
             NtDispatch::Status(STATUS_INVALID_HANDLE)
@@ -456,8 +601,11 @@ impl NtState {
                 b[32..40].copy_from_slice(&1u64.to_le_bytes()); // AffinityMask
                 b
             }
-            // ThreadHideFromDebugger (17): the query form returns the BOOLEAN state.
-            17 => vec![0u8],
+            // ThreadHideFromDebugger (17): the query returns the BOOLEAN state. The
+            // protector SETS it then queries, expecting 1 (hidden) — a 0 reads as "a
+            // debugger stripped the flag" and it bails. The emulator never strips it,
+            // so a clean run reports it set.
+            17 => vec![1u8],
             _ => return NtDispatch::Status(STATUS_INVALID_INFO_CLASS),
         };
         if buf != 0 && (length as usize) >= bytes.len() && mem.write(buf, &bytes).is_err() {
@@ -538,12 +686,69 @@ impl NtState {
     /// We have no host filesystem and cannot soundly fabricate file contents, so
     /// opening any file fails closed. (A section the protector then tries to back
     /// with the returned handle also fails closed in `create_section`.)
-    fn open_file(cpu: &Cpu, mem: &mut Memory, _sab: u64) -> NtDispatch {
+    /// `NtOpenFile`/`NtCreateFile`: FileHandle=arg0, ObjectAttributes=arg2. If the
+    /// object name's basename matches the configured protect-input, mint a handle
+    /// backed by the real input bytes; otherwise fail closed as before.
+    fn open_file(&mut self, cpu: &Cpu, mem: &mut Memory, _sab: u64) -> NtDispatch {
         let p_handle = cpu.regs[ARG[0]];
+        let oa = cpu.regs[ARG[2]];
+        let name = read_object_name(mem, oa).unwrap_or_default().to_lowercase();
+        if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+            eprintln!("[nt] open_file name={name:?}");
+        }
+        let base = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_string();
+        let is_input = !self.file_in.is_empty()
+            && !self.file_in_name.is_empty()
+            && base.contains(&self.file_in_name);
+        if is_input {
+            let h = self.mint_handle();
+            self.input_handles.insert(h, 0);
+            if p_handle != 0 {
+                let _ = mem.write_uint(p_handle, 8, h);
+            }
+            // IoStatusBlock (arg3): Information = FILE_OPENED (1), Status = success.
+            let iosb = cpu.regs[ARG[3]];
+            if iosb != 0 {
+                let _ = mem.write_uint(iosb, 8, 0);
+                let _ = mem.write_uint(iosb + 8, 8, 1);
+            }
+            return NtDispatch::Status(STATUS_SUCCESS);
+        }
         if p_handle != 0 {
             let _ = mem.write_uint(p_handle, 8, 0);
         }
         NtDispatch::Status(STATUS_OBJECT_NAME_NOT_FOUND)
+    }
+
+    /// `NtReadFile(File, Event, Apc, ApcCtx, IoStatusBlock, Buffer, Length,
+    /// ByteOffset, Key)`. Serves the protect-input bytes for an input handle.
+    fn read_file(&mut self, cpu: &Cpu, mem: &mut Memory, sab: u64) -> NtDispatch {
+        let a = Args { cpu, mem: &*mem, stack_arg_base: sab };
+        let h = a.reg(0);
+        let (Some(iosb), Some(buf), Some(len), byte_off) = (a.get(4), a.get(5), a.get(6), a.get(7))
+        else {
+            return NtDispatch::Stop;
+        };
+        let Some(&cur) = self.input_handles.get(&h) else {
+            return NtDispatch::Status(STATUS_INVALID_HANDLE);
+        };
+        let total = self.file_in.len() as u64;
+        let off = byte_off
+            .filter(|&p| p != 0)
+            .and_then(|p| mem.read_uint(p, 8).ok())
+            .filter(|&v| v <= total)
+            .unwrap_or(cur);
+        let end = (off + len).min(total);
+        let chunk = self.file_in[off as usize..end as usize].to_vec();
+        if mem.poke(buf, &chunk).is_err() {
+            return NtDispatch::Stop;
+        }
+        self.input_handles.insert(h, end);
+        if iosb != 0 {
+            let _ = mem.write_uint(iosb, 8, 0); // Status
+            let _ = mem.write_uint(iosb + 8, 8, chunk.len() as u64); // Information
+        }
+        NtDispatch::Status(STATUS_SUCCESS)
     }
 
     /// `NtRaiseHardError(Status, NumberOfParameters, UnicodeStringParameterMask,
@@ -552,6 +757,29 @@ impl NtState {
     /// continuable (informational) error does not abort the run.
     fn raise_hard_error(cpu: &Cpu, mem: &mut Memory, sab: u64) -> NtDispatch {
         let status = cpu.regs[ARG[0]] as u32;
+        if std::env::var_os("VMPX_FILE_TRACE").is_some() {
+            // Parameters=arg3; UnicodeStringParameterMask=arg2 marks which are
+            // pointers to UNICODE_STRINGs. Dump the message text.
+            let nparams = cpu.regs[ARG[1]] as u32;
+            let mask = cpu.regs[ARG[2]] as u32;
+            let params = cpu.regs[ARG[3]];
+            eprintln!("[harderr] status={status:#x} nparams={nparams} mask={mask:#x}");
+            for i in 0..nparams.min(8) {
+                let p = mem.read_uint(params + u64::from(i) * 8, 8).unwrap_or(0);
+                if mask & (1 << i) != 0 {
+                    let len = mem.read_uint(p, 2).unwrap_or(0) as usize;
+                    let buf = mem.read_uint(p + 8, 8).unwrap_or(0);
+                    let mut s = String::new();
+                    for j in 0..(len / 2).min(256) {
+                        let c = mem.read_uint(buf + (j as u64) * 2, 2).unwrap_or(0) as u16;
+                        s.push(char::from_u32(u32::from(c)).unwrap_or('?'));
+                    }
+                    eprintln!("[harderr]   param{i} (string) = {s:?}");
+                } else {
+                    eprintln!("[harderr]   param{i} = {p:#x}");
+                }
+            }
+        }
         // An error-severity hard error (top two bits set, 0xC0000000+) is meant
         // to terminate the process: fail closed rather than fabricate a resume.
         // A continuable (success/informational/warning) error returns to the
@@ -663,6 +891,29 @@ fn read_opt(mem: &Memory, ptr: u64) -> Option<u64> {
     }
 }
 
+/// Read the wide object name from an `OBJECT_ATTRIBUTES` (x64): `ObjectName` is a
+/// `UNICODE_STRING*` at offset 0x10; the string has `Length` (u16, bytes) at +0 and
+/// `Buffer` at +8. NT paths look like `\??\C:\dir\file.exe`.
+pub(crate) fn read_object_name(mem: &Memory, oa: u64) -> Option<String> {
+    if oa == 0 {
+        return None;
+    }
+    let us = mem.read_uint(oa + 0x10, 8).ok()?;
+    if us == 0 {
+        return None;
+    }
+    let len = mem.read_uint(us, 2).ok()? as usize;
+    let buf = mem.read_uint(us + 8, 8).ok()?;
+    if buf == 0 || len == 0 || len > 0x1000 {
+        return None;
+    }
+    let mut units = Vec::with_capacity(len / 2);
+    for i in 0..(len / 2) {
+        units.push(mem.read_uint(buf + (i as u64) * 2, 2).ok()? as u16);
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
 /// Ensure `[base, base+len)` is mapped with at least `perm`: map the unmapped
 /// pages and reprotect the already-mapped ones (an NT commit/reprotect).
 fn ensure_mapped(mem: &mut Memory, base: u64, len: u64, perm: Perm) -> Result<(), ()> {
@@ -705,7 +956,13 @@ fn basic_memory_info(mem: &Memory, addr: u64) -> [u8; 48] {
         // HYPOTHESIS TEST: the loaded image (lowest region, ~0x36x-0x37x) is a mapped
         // module → MEM_IMAGE on real Windows; VirtualAlloc heaps (0x50../0x70..) stay
         // MEM_PRIVATE. VMProtect checks its own code region is MEM_IMAGE.
-        let ty = if (0x3_6000_0000..0x3_8000_0000).contains(&lo) { MEM_IMAGE } else { MEM_PRIVATE };
+        let ty = if (0x3_6000_0000..0x3_8000_0000).contains(&lo)
+            || (0x1_4000_0000..0x1_5000_0000).contains(&lo) // VMProtect_Con main image
+        {
+            MEM_IMAGE
+        } else {
+            MEM_PRIVATE
+        };
         b[40..44].copy_from_slice(&(ty as u32).to_le_bytes()); // Type
     } else {
         // Free region: bound it by the next mapped page above (best-effort).

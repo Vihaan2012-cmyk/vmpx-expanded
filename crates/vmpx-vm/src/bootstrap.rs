@@ -765,13 +765,28 @@ pub fn recover_bootstrap_dispatch(
             confidence: candidate.confidence,
         })
         .collect::<Vec<_>>();
-    let diagnostics = match recovered.len() {
+    let mut diagnostics = match recovered.len() {
         0 => vec!["no role assignment produced a valid bootstrap dispatch".to_owned()],
         1 => Vec::new(),
         count => vec![format!(
             "{count} role assignments remain behaviorally valid; bootstrap is ambiguous"
         )],
     };
+    // Opt-in symbolic-decode fallback: when the pattern-matcher rejects every role
+    // assignment (VMProtect's mutation-saturated decode), consult the installed
+    // symbolic recovery to surface the MBA-folded decode codec for the operator.
+    // Unproven (follows opaque-predicate arms); a diagnostic only, never a proof.
+    if recovered.is_empty() && crate::symbolic_hook::symbolic_decode_enabled() {
+        let key_candidates: Vec<Register> =
+            X64_GPRS.into_iter().filter(|register| *register != handler).collect();
+        if let Some(codec) =
+            crate::symbolic_hook::symbolic_codec(pe, entry.rva, handler, &key_candidates)
+        {
+            diagnostics.push(format!(
+                "symbolic-decode fallback recovered a candidate decode codec (unproven): {codec:?}"
+            ));
+        }
+    }
     let selected = (recovered.len() == 1).then(|| recovered.remove(0));
     Ok((
         BootstrapDispatchReport {

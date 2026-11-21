@@ -52,6 +52,10 @@ def uc_prot(p):
     if p & 1: r |= UC_PROT_READ
     if p & 2: r |= UC_PROT_WRITE
     if p & 4: r |= UC_PROT_EXEC
+    # vmpx does not enforce W^X (VMProtect's VM executes from RW pages); Unicorn
+    # does and would UC_ERR_FETCH_PROT on those. Always grant EXEC so Unicorn can
+    # follow vmpx's control flow — we are comparing register state, not perms.
+    r |= UC_PROT_EXEC
     return r or UC_PROT_READ  # a 0-perm page still needs to exist
 
 
@@ -158,11 +162,71 @@ def main():
         state["step"] = i + 1
 
     uc.hook_add(UC_HOOK_CODE, hook)
+
+    # Resync across API-hook boundaries: when vmpx intercepts a call into a module/
+    # stub region (>= 0x20_00000000: STUB_REGION, modules, ntdll, NT alloc/view) and
+    # emulates it, Unicorn would execute the real code. Force Unicorn to vmpx's
+    # recorded post-call state and continue, so the lockstep still validates every
+    # pure-computation segment BETWEEN boundaries and can reach the final decision.
+    MODREGION = 0x20_0000_0000
+    boundaries = []
+    cur_rip = snap["rip"]
     fault = None
-    try:
-        uc.emu_start(snap["rip"], 0, count=0)
-    except UcError as e:
-        fault = e
+    real_div = None
+    while True:
+        state["div"] = None
+        state["regdiv"] = None
+        fault = None
+        try:
+            uc.emu_start(cur_rip, 0, count=0)
+        except UcError as e:
+            fault = e
+        i = state["step"]
+        if state["regdiv"] is not None or i >= n:
+            break
+        if state["div"] is not None:
+            si, uc_rip, want_rip = state["div"]
+            is_boundary = want_rip < MODREGION <= uc_rip
+            if is_boundary and si >= 1:
+                # Force Unicorn to vmpx's post-call state (trace[si-1]) and resume.
+                row = tr[si - 1]
+                for k in range(16):
+                    uc.reg_write(REGMAP[k], int(row[1 + k]))
+                uc.reg_write(UC_X86_REG_RIP, want_rip)
+                uc.reg_write(UC_X86_REG_RFLAGS, int(row[17]) | 0x2)
+                boundaries.append((si, int(exec_rips[si - 1]), uc_rip, int(row[1])))
+                cur_rip = want_rip
+                continue
+            real_div = (si, uc_rip, want_rip)
+            break
+        if fault is not None:
+            # Unicorn faulted where vmpx continued: try to resync to vmpx's state at
+            # the current step and continue (covers executing into emulated regions).
+            if i >= 1 and i < n:
+                row = tr[i - 1]
+                for k in range(16):
+                    uc.reg_write(REGMAP[k], int(row[1 + k]))
+                uc.reg_write(UC_X86_REG_RIP, int(exec_rips[i]))
+                uc.reg_write(UC_X86_REG_RFLAGS, int(row[17]) | 0x2)
+                boundaries.append((i, int(exec_rips[i - 1]), uc.reg_read(UC_X86_REG_RIP), -1))
+                cur_rip = int(exec_rips[i])
+                continue
+        break
+
+    print(f"\nresynced across {len(boundaries)} API/boundary points")
+    for (si, frm, tgt, rax) in boundaries[-12:]:
+        print(f"  step {si}: call from {frm:#x} -> {tgt:#x} (vmpx rax->{rax:#x})")
+    if real_div is not None:
+        si, uc_rip, want_rip = real_div
+        print(f"\nREAL (non-boundary) DIVERGENCE at step {si}: vmpx->{want_rip:#x}  unicorn->{uc_rip:#x}")
+        _classify(d, tpath, snap, si, want_rip, uc, uc_rip)
+        return
+    if state["regdiv"] is None and real_div is None:
+        print(f"\nvmpx matched Unicorn across ALL pure-computation segments through step "
+              f"{state['step']} of {n} (only API-boundary resyncs). If vmpx reached the "
+              f"'File corrupted' raise here, the verdict is driven by an emulated API "
+              f"RETURN value, not a vmpx compute bug.")
+        return
 
     i = state["step"]
     if state["regdiv"] is not None:

@@ -352,7 +352,12 @@ fn is_sign_extension(instruction: &Instruction, target: Register, width: BitWidt
 }
 
 fn handler_adds_target(instruction: &Instruction, handler: Register, target: Register) -> bool {
-    instruction.mnemonic() == Mnemonic::Add
+    // `add` is the clean handler = table_base + offset; `adc` is VMProtect's
+    // carry-mutated form (CF=0 guaranteed by the VM's mutation). Accepting adc is
+    // an assumption, gated behind VMPX_MUTATED_ARITH (labeled unproven).
+    let allow_carry = std::env::var_os("VMPX_MUTATED_ARITH").is_some();
+    (instruction.mnemonic() == Mnemonic::Add
+        || (allow_carry && instruction.mnemonic() == Mnemonic::Adc))
         && instruction.op0_kind() == OpKind::Register
         && instruction.op1_kind() == OpKind::Register
         && instruction.op0_register().size() == 8
@@ -743,10 +748,17 @@ fn attempt_candidate(
                 decoded.rva
             ));
         }
+        // `add`/`sub` is the clean VIP advance; `adc`/`sbb` is VMProtect's
+        // carry-mutated form of the same (correct only when CF is 0, which the
+        // VM's own mutation guarantees). Accepting adc/sbb is an assumption, so it
+        // is gated behind `VMPX_MUTATED_ARITH` and labeled unproven.
+        let allow_carry_advance = std::env::var_os("VMPX_MUTATED_ARITH").is_some();
         if direction == BytecodeDirection::Ascending
             && instruction.op0_kind() == OpKind::Register
             && canonical(instruction.op0_register()) == canonical(roles.vip)
-            && matches!(instruction.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
+            && (matches!(instruction.mnemonic(), Mnemonic::Add | Mnemonic::Sub)
+                || (allow_carry_advance
+                    && matches!(instruction.mnemonic(), Mnemonic::Adc | Mnemonic::Sbb)))
         {
             if instruction.op0_register().size() != 8 {
                 return Err("VIP adjustment is not a full-width write".to_owned());
@@ -754,8 +766,8 @@ fn attempt_candidate(
             let delta = signed_immediate(instruction, 1)
                 .ok_or_else(|| "VIP adjustment is not an immediate".to_owned())?;
             vip_delta = match instruction.mnemonic() {
-                Mnemonic::Add => vip_delta.checked_add(delta),
-                Mnemonic::Sub => vip_delta.checked_sub(delta),
+                Mnemonic::Add | Mnemonic::Adc => vip_delta.checked_add(delta),
+                Mnemonic::Sub | Mnemonic::Sbb => vip_delta.checked_sub(delta),
                 _ => unreachable!(),
             }
             .ok_or_else(|| "VIP adjustment overflows".to_owned())?;
